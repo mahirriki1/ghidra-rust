@@ -230,9 +230,7 @@ that check does not link/run a Windows executable or validate the bundled SQLite
 build on Windows. Native MSVC build, unit tests, and a PE worker test are configured
 in CI; a native Windows runtime result is still pending.
 
-See [Daybreak Blue&#39;s latest security review and responses](docs/security/daybreak-round-8.md).
-The Windows sandbox and project-parser trust limitations above remain explicit;
-these focused reviews are not a comprehensive security or dependency audit. One stalled directory read
+One stalled directory read
 can still remain blocked, but repeated cancellations cannot accumulate reader threads.
 Final publication is not relative to retained directory handles; same-user parent
 directory substitutions and Windows delete-sharing renames remain residual races.

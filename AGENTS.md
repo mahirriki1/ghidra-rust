@@ -1,0 +1,141 @@
+# Project guidance
+
+This file applies to the whole repository. Read `README.md`, `Cargo.toml`, and
+the relevant source modules before changing behavior. Follow more specific
+`AGENTS.md` files if any are added beneath this directory.
+
+## Purpose and scope
+
+- Build a responsive, memory-conscious native Rust reverse-engineering desktop
+  with a familiar Ghidra layout and function-graph navigation.
+- The current implementation supports linked x86/x86-64 ELF, PE, and Mach-O
+  images. It is an experimental subset, not a complete Ghidra or IDA replacement.
+- Keep the core desktop independent of Java and Python runtimes. Plugins,
+  scripting, debugger integration, type/variable editing, and a user-facing CLI
+  are future work unless explicitly requested.
+- Measure performance and memory before claiming improvements over Ghidra.
+  Account for worker memory and duplicated image bytes, not just the GUI process.
+
+## Architecture
+
+- `src/main.rs`: native eframe startup and the internal worker entry point.
+- `src/app.rs`: GUI state, navigation, annotations, asynchronous jobs, and result
+  adoption. `theme.rs` owns the shared dark appearance; `file_dialog.rs` owns the
+  in-app chooser.
+- `src/client.rs`, `worker.rs`, `model.rs`: disposable worker lifecycle, bounded
+  JSON transport, request/response types, and shared result limits.
+- `src/analysis.rs`: loading, immutable image snapshots, instruction/CFG recovery,
+  function discovery, and analysis requests.
+- `src/decompile.rs`: semantic emission through public engine APIs, including
+  restoration of the original printer/action after errors or panics.
+- `src/selection.rs`, `highlight.rs`, `graph.rs`: validated instruction/pseudocode
+  mappings, lexical syntax highlighting, and graph rendering/interaction.
+- `src/project.rs`, `session.rs`: SQLite `.grproj` snapshots, JSON annotations,
+  binary identity, fingerprint verification, and protected atomic saves.
+- `src/decode.rs`, `decoder_ui.rs`, `crypto.rs`: bounded decoding and independently
+  maintained cryptographic constant signatures.
+- `src/limits.rs`, `windows.rs`: platform resource controls and Windows APIs.
+- `tests/fixtures/sample.c`: original source fixture. Integration tests exercise
+  real worker processes; most module/UI tests live alongside the implementation.
+
+The engine is a pinned `ghidra-decompiler` Git dependency. Use its public APIs;
+do not edit Cargo's dependency cache or restore an unused Ghidra checkout into
+this repository. Intentional engine updates must also consider project cache
+fingerprints, correctness tests, and upstream attribution in `NOTICE`.
+
+## GUI and interaction
+
+- Preserve the classic dark layout: symbol/program trees and functions on the
+  left, listing/CFG and analysis tabs in the middle, full-height decompiler on the
+  right. Keep panes resizable and use shared theme helpers.
+- Preserve syntax colors while overlaying semantic selection highlights.
+  Selection links must come from genuine engine addresses. Many instructions
+  can map to one expression; optimized-away instructions may remain unmapped.
+  Do not infer links from matching text, row numbers, or nearest addresses.
+- Keep call double-click navigation and back/forward history working alongside
+  single-click selection synchronization.
+- Maintain the existing bindings: `L`, `G`, `;`, `Space`, `Alt+Left/Right`, and
+  `Ctrl+S/Z`. Respect text-field focus, modal dialogs, repeat keys, and file jobs.
+- Keep expensive analysis, decoding, directory reads, and project I/O off the
+  GUI thread. Use bounded work, virtualized lists, cached geometry/highlighting,
+  and one-shot counterpart scrolling rather than resetting scroll every frame.
+- Bind asynchronous results to their request, binary generation, selection, and
+  annotation revision. Clear stale function views and mappings on navigation.
+
+## Data and process boundaries
+
+- Treat binaries, project files, symbols, and worker replies as untrusted data.
+  Keep byte/count/depth budgets and checked address arithmetic. Consult the
+  constants in `model.rs`, `analysis.rs`, `project.rs`, and `session.rs` rather
+  than duplicating limits that can drift.
+- Validate mapping bounds, UTF-8 boundaries, ordering, address counts, and
+  executable file-backed membership before displaying them. Avoid multiplying
+  independent collection limits; use indexed interval lookups for repeated PCs.
+- Preserve immutable analyzed snapshots and retained opened-file identity.
+  Never write to an input binary, including through renamed paths or aliases.
+- Save complete new files with destination checks before creation and immediately
+  before atomic publication. Carry every protected-file guard through the save.
+- Keep `.grproj` versioning, exact schema checks, bounded deserialization,
+  private extraction paths, SHA-256 binding, and engine cache fingerprints.
+  Source hints are display-only; external binaries require explicit selection.
+- A matching binary hash does not authenticate cached analysis. Keep saved-result
+  provenance visible until each result class is recomputed. Preserve JSON
+  annotation compatibility; treat format changes as migrations, not silent edits.
+- Retain extracted-image ownership through worker termination and reaping.
+  Preserve Linux bubblewrap isolation and resource limits. Windows jobs/watchdogs
+  limit resources but provide no filesystem/network sandbox; do not describe
+  Windows as safe for hostile inputs. Project SQLite parsing is also not isolated
+  in a worker. Keep these actual limitations documented.
+- Keep platform-specific code behind the appropriate `cfg` gates and document
+  every `unsafe` block's invariants. Fail closed when identity/containment setup
+  fails rather than silently weakening protection.
+
+## Build and validation
+
+Use the toolchain pinned in `.github/workflows/ci.yml` (currently Rust 1.98.1,
+edition 2024), a native C/C++ toolchain, and an OpenGL-capable desktop. Linux GUI
+analysis also requires bubblewrap and working unprivileged user namespaces.
+Native Windows builds use x64 MSVC tools and a Windows SDK; see `README.md`.
+
+```sh
+cargo run --release --locked
+cargo fmt --all --check
+cargo test --locked
+cargo clippy --all-targets --locked -- -D warnings
+cargo build --release --locked
+```
+
+For Rust behavior changes, add focused regression coverage where useful and run
+the applicable checks above. Do not add tests that merely mirror implementation.
+For documentation-only edits, check paths and factual accuracy without rebuilding
+the application. Do not discard or regenerate `Cargo.lock` unnecessarily.
+
+Linux worker integration tests compile the C fixture using GCC. Windows CI
+compiles it into PE and sets `GHIDRA_RUST_TEST_PE` for `tests/windows_worker.rs`;
+without that variable the PE integration test skips locally. Cross-compilation
+checks are not evidence that the native Windows GUI or worker was run.
+
+For GUI changes, exercise the native desktop with the safe fixture when a display
+is available. Include navigation, selection syncing, and project save/reopen when
+those paths change. Headless egui tests are useful but do not replace native
+runtime validation. On affected WSL/Mesa hosts, the documented fallback is:
+
+```sh
+env -u WAYLAND_DISPLAY LIBGL_ALWAYS_SOFTWARE=1 cargo run --release --locked
+```
+
+Software rendering is a compatibility workaround, not a speed improvement.
+Report which checks actually ran and any platform validation that remains pending.
+
+## Repository hygiene
+
+- Keep source, fixture source, tests, CI, current documentation, `LICENSE`,
+  `NOTICE`, and the lockfile. Preserve independent signature provenance in
+  `docs/crypto-signatures.md`.
+- Put generated executables, build caches, and local test projects outside the
+  tracked source tree or under ignored `target/` paths. Do not commit real sample
+  binaries or analyst project data.
+- Do not add private review reports, agent transcripts, session handoff files,
+  or obsolete planning mockups to the repository.
+- Preserve unrelated user changes. Keep edits scoped to the requested task and
+  update public documentation when supported behavior or limitations change.
