@@ -1103,6 +1103,9 @@ mod tests {
         let path = directory.path("session.json");
         let file = File::create(&path).unwrap();
         file.set_len(MAX_SESSION_BYTES + 1).unwrap();
+        // The loader deliberately denies write sharing on Windows. Close the
+        // fixture's writable handle so this reaches the size-limit check.
+        drop(file);
         assert!(
             Session::load(&path, &"a".repeat(64))
                 .unwrap_err()

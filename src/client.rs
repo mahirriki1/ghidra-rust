@@ -176,24 +176,50 @@ fn worker_command(exe: &Path, binary_path: &Path) -> Result<Command, String> {
         .map(Path::new).find(|path| path.is_file())
         .ok_or("Linux analysis requires bubblewrap (bwrap). Install it with your distribution's package manager.")?;
     let mut command = Command::new(bwrap);
+    command.args([
+        "--die-with-parent",
+        "--new-session",
+        "--unshare-all",
+        "--clearenv",
+        "--setenv",
+        "LANG",
+        "C.UTF-8",
+        "--ro-bind",
+        "/usr",
+        "/usr",
+    ]);
+    // Preserve the host's loader layout: Arch's /lib64 resolves to /usr/lib,
+    // whereas Ubuntu's resolves to /usr/lib64. Pointing both at /usr/lib makes
+    // an Ubuntu-built worker fail before its first instruction executes.
+    for library in ["/lib", "/lib64"] {
+        let path = Path::new(library);
+        let metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if library == "/lib64" && error.kind() == std::io::ErrorKind::NotFound => {
+                continue;
+            }
+            Err(error) => return Err(format!("Cannot inspect system library directory: {error}")),
+        };
+        if metadata.file_type().is_symlink() {
+            let resolved = path
+                .canonicalize()
+                .map_err(|error| format!("Cannot resolve {library}: {error}"))?;
+            if !resolved.starts_with("/usr") || !resolved.is_dir() {
+                return Err(format!(
+                    "Linux analysis requires {library} to resolve to a library directory under /usr"
+                ));
+            }
+            // Canonical targets avoid depending on other host symlinks that
+            // are deliberately absent from the sandbox's private root.
+            command.arg("--symlink").arg(resolved).arg(path);
+        } else if metadata.is_dir() {
+            command.arg("--ro-bind").arg(path).arg(path);
+        } else {
+            return Err(format!("System library path is not a directory: {library}"));
+        }
+    }
     command
         .args([
-            "--die-with-parent",
-            "--new-session",
-            "--unshare-all",
-            "--clearenv",
-            "--setenv",
-            "LANG",
-            "C.UTF-8",
-            "--ro-bind",
-            "/usr",
-            "/usr",
-            "--symlink",
-            "usr/lib",
-            "/lib",
-            "--symlink",
-            "usr/lib",
-            "/lib64",
             "--proc",
             "/proc",
             "--dev",
