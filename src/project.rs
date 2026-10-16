@@ -863,7 +863,9 @@ mod tests {
         fs::write(&path, b"example binary").unwrap();
         let protection = BinaryProtection::open(&path).unwrap();
         let info = BinaryInfo {
-            path: path.to_string_lossy().into_owned(),
+            // Match WorkerClient's canonical display path. Windows runner temp
+            // paths may use an 8.3 alias that canonicalize expands to its name.
+            path: protection.path().to_string_lossy().into_owned(),
             architecture: "x86-64".into(),
             format: "ELF".into(),
             entry: 0x1000,
