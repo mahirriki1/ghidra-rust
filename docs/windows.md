@@ -113,12 +113,19 @@ to establish its hosted build and test results.
    locate the original binary and verify its hash. Close the app and verify no
    analysis-worker process remains.
 
-The pinned engine does not load MSVC PDB symbols or PE export names automatically;
-this fixture initially lists only its entry point. **G** accepts a known function's
-hexadecimal virtual address. The automated integration test reads the fixture's
-export table to exercise `branch_loop` directly, including its conditional flow
-and backedge. **Discover functions** can find additional functions, but complete
-function/name recovery is not guaranteed.
+PE export names and x64 exception-table function entries now load automatically.
+The fixture should list `branch_loop`; its integration test also removes exports
+from a private copy to verify recovery of stripped functions. For large images,
+the 10,000-function list prioritizes the entry point, exports, and nearby runtime
+functions and displays **Partial function list**. **G** accepts a known function's
+hexadecimal virtual address. Open **Analysis notes** for coverage limits.
+
+Import slots and recognized jump thunks gain their imported names, but PDB types,
+API prototypes, library signature matching, delay imports, and Control Flow Guard
+substitutions remain incomplete. **Discover functions** can find additional
+functions, but complete function/name recovery is not guaranteed. Compare file
+SHA-256 values and the same function address against Ghidra; a saved Ghidra program
+may predate an installed application's update.
 
 If the desktop cannot create an OpenGL context, update the graphics driver from
 the GPU vendor and try a local desktop session. Remote/virtual sessions can expose

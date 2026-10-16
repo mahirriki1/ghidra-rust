@@ -60,13 +60,58 @@ fn fixture() -> Option<(tempfile::TempDir, PathBuf, PathBuf)> {
 }
 
 #[test]
+fn stripped_pe_runtime_functions_load_without_explicit_discovery() {
+    let Some((_directory, binary, executable)) = fixture() else {
+        return;
+    };
+    let mut bytes = std::fs::read(&binary).unwrap();
+    let image = object::File::parse(bytes.as_slice()).unwrap();
+    let branch = image
+        .exports()
+        .unwrap()
+        .into_iter()
+        .find(|export| export.name() == b"branch_loop")
+        .unwrap()
+        .address();
+    let pe = u32::from_le_bytes(bytes[0x3c..0x40].try_into().unwrap()) as usize;
+    let directory = pe + 24 + 112; // PE32+ export data directory.
+    // Modify only this test's private copy of our original source fixture.
+    bytes[directory..directory + 8].fill(0);
+    std::fs::write(&binary, bytes).unwrap();
+    let mut worker = WorkerClient::start_using_executable(
+        eframe::egui::Context::default(),
+        &binary,
+        &executable,
+    )
+    .unwrap();
+    let Response::Opened { info } = request(
+        &mut worker,
+        Request::Open {
+            path: binary.to_string_lossy().into_owned(),
+        },
+    ) else {
+        panic!("Cannot open the stripped PE fixture");
+    };
+    assert!(info.functions.len() > 1);
+    assert!(
+        info.functions
+            .iter()
+            .any(|function| function.address == branch),
+        "The exception table must recover the original non-exported branch function"
+    );
+    let Response::Graph { view } = request(&mut worker, Request::Graph { address: branch }) else {
+        panic!("Cannot browse the recovered stripped function");
+    };
+    assert!(view.blocks.len() >= 3);
+}
+
+#[test]
 fn real_windows_worker_and_embedded_project_round_trip() {
     let Some((directory, binary, executable)) = fixture() else {
         return;
     };
-    // MSVC's PDB/export names are not imported by the pinned engine. Resolve
-    // our known original fixture explicitly so this cannot silently exercise
-    // CRT startup in place of the intended branch/loop function.
+    // Resolve the original fixture's export independently of our loader so this
+    // cannot silently exercise CRT startup instead of the branch/loop function.
     let image_bytes = std::fs::read(&binary).unwrap();
     let image = object::File::parse(image_bytes.as_slice()).unwrap();
     let exports = image.exports().unwrap();
@@ -93,6 +138,12 @@ fn real_windows_worker_and_embedded_project_round_trip() {
         panic!("Windows worker did not open PE fixture");
     };
     assert_eq!(info.format, "PE");
+    assert!(
+        info.functions
+            .iter()
+            .any(|function| function.address == address && function.name == "branch_loop"),
+        "PE export names must load before explicit function discovery"
+    );
     assert_eq!(
         Path::new(&info.path),
         binary.canonicalize().unwrap(),
@@ -146,6 +197,10 @@ fn real_windows_worker_and_embedded_project_round_trip() {
     };
     assert_eq!(decompiled_address, address);
     assert!(!text.trim().is_empty());
+    assert!(
+        text.contains("branch_loop"),
+        "Loaded PE names must reach the real decompiler: {text}"
+    );
     assert!(
         !mappings.is_empty(),
         "PE decompilation must return semantic instruction locations"

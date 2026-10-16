@@ -773,6 +773,7 @@ mod tests {
             source_identity: Some(protection.identity),
             sections: Vec::new(),
             functions: Vec::new(),
+            functions_truncated: false,
             warnings: Vec::new(),
         }
     }
