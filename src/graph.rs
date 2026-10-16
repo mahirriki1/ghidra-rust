@@ -1,0 +1,744 @@
+//! A bounded native instruction CFG. Construct a new canvas when analysis changes;
+//! selection changes alone intentionally retain the current camera.
+
+use crate::model::{EdgeKind, FunctionView};
+use crate::theme;
+use eframe::egui::{
+    self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2, pos2, vec2,
+};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+const WIDTH: f32 = 420.0;
+const HEADER: f32 = 32.0;
+const ROW: f32 = 20.0;
+const PREVIEW: usize = 8;
+const MAX_BLOCKS: usize = 128;
+const MAX_EDGES: usize = 4096;
+
+struct Node {
+    address: u64,
+    rect: Rect,
+    instruction_addresses: BTreeSet<u64>,
+    rows: Vec<(u64, String)>,
+    remaining: usize,
+}
+
+struct RoutedEdge {
+    points: Vec<Pos2>,
+    kind: EdgeKind,
+    label: String,
+    label_position: Pos2,
+    unresolved: bool,
+}
+
+struct Layout {
+    nodes: Vec<Node>,
+    edges: Vec<RoutedEdge>,
+    bounds: Rect,
+}
+
+pub struct GraphCanvas {
+    function: u64,
+    layout: Layout,
+    zoom: f32,
+    pan: Vec2,
+    needs_fit: bool,
+    reveal: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GraphAction {
+    Select(u64),
+    Navigate(u64),
+}
+
+fn instruction_action(view: &FunctionView, address: u64, double_clicked: bool) -> GraphAction {
+    if double_clicked
+        && let Some(target) = view
+            .calls
+            .iter()
+            .find(|call| call.address == address)
+            .and_then(|call| call.target)
+    {
+        return GraphAction::Navigate(target);
+    }
+    GraphAction::Select(address)
+}
+
+impl GraphCanvas {
+    pub fn new(view: &FunctionView) -> Self {
+        Self {
+            function: view.address,
+            layout: Layout::new(view),
+            zoom: 1.0,
+            pan: Vec2::ZERO,
+            needs_fit: true,
+            reveal: None,
+        }
+    }
+
+    pub fn reveal_instruction(&mut self, address: u64) {
+        self.reveal = Some(address);
+    }
+
+    pub fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        view: &FunctionView,
+        selected: Option<u64>,
+    ) -> Option<GraphAction> {
+        self.show_selected(ui, view, selected, &BTreeSet::new())
+    }
+
+    pub fn show_selected(
+        &mut self,
+        ui: &mut egui::Ui,
+        view: &FunctionView,
+        selected: Option<u64>,
+        related: &BTreeSet<u64>,
+    ) -> Option<GraphAction> {
+        if self.function != view.address {
+            *self = Self::new(view);
+        }
+        let mut zoom_change = 1.0;
+        ui.horizontal(|ui| {
+            if ui.button("Fit").clicked() {
+                self.needs_fit = true;
+            }
+            if ui.button("−").clicked() {
+                zoom_change /= 1.2;
+            }
+            if ui.button("+").clicked() {
+                zoom_change *= 1.2;
+            }
+            ui.label(format!("{:.0}%", self.zoom * 100.0));
+            ui.small("Drag to pan · Ctrl+wheel to zoom · double-click a call to follow");
+        });
+        ui.horizontal_wrapped(|ui| {
+            for (kind, label) in [
+                (EdgeKind::True, "T: true"),
+                (EdgeKind::False, "F: false"),
+                (EdgeKind::Branch, "B: branch"),
+                (EdgeKind::Unknown, "?: unresolved"),
+            ] {
+                ui.colored_label(edge_color(kind), label);
+            }
+            if view.blocks.len() > MAX_BLOCKS {
+                ui.label("Graph preview limited to 128 blocks");
+            }
+        });
+        let size = ui.available_size().max(vec2(1.0, 1.0));
+        let (canvas, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
+        if self.needs_fit {
+            self.fit(canvas.size());
+        }
+        self.change_zoom(zoom_change, canvas.size() * 0.5);
+        if let Some(address) = self.reveal.take()
+            && let Some(node) = self
+                .layout
+                .nodes
+                .iter()
+                .find(|n| n.address == address || n.instruction_addresses.contains(&address))
+        {
+            let visible = Rect::from_min_max(
+                canvas.min + self.pan + node.rect.min.to_vec2() * self.zoom,
+                canvas.min + self.pan + node.rect.max.to_vec2() * self.zoom,
+            );
+            if !canvas.contains_rect(visible) {
+                self.pan += canvas.center() - visible.center();
+            }
+        }
+
+        if response.dragged() {
+            self.pan += response.drag_delta();
+        }
+        if response.hovered() {
+            let (zoom_delta, scroll, pointer) = ui.input(|input| {
+                (
+                    input.zoom_delta(),
+                    input.smooth_scroll_delta,
+                    input.pointer.hover_pos(),
+                )
+            });
+            if let Some(pointer) = pointer {
+                self.change_zoom(zoom_delta, pointer - canvas.min);
+            }
+            // Ctrl-wheel is supplied as zoom_delta by egui. Ordinary wheel scroll
+            // remains useful for panning a large graph without dragging.
+            self.pan += scroll;
+        }
+        let painter = ui.painter_at(canvas);
+        painter.rect_filled(canvas, 0.0, theme::GRAPH_BACKGROUND);
+        if self.layout.nodes.is_empty() {
+            painter.text(
+                canvas.center(),
+                Align2::CENTER_CENTER,
+                "No decoded basic blocks",
+                FontId::proportional(16.0),
+                theme::MUTED,
+            );
+            return None;
+        }
+        let screen = |point: Pos2| canvas.min + self.pan + point.to_vec2() * self.zoom;
+        for edge in &self.layout.edges {
+            let points: Vec<_> = edge.points.iter().copied().map(screen).collect();
+            if !Rect::from_points(&points).expand(24.0).intersects(canvas) {
+                continue;
+            }
+            let stroke = Stroke::new(1.5, edge_color(edge.kind));
+            for pair in points.windows(2) {
+                if edge.unresolved {
+                    dashed_line(&painter, pair[0], pair[1], stroke);
+                } else {
+                    painter.line_segment([pair[0], pair[1]], stroke);
+                }
+            }
+            if let [.., previous, tip] = points.as_slice() {
+                let direction = (*tip - *previous).normalized();
+                let side = vec2(-direction.y, direction.x);
+                painter.line_segment([*tip, *tip - direction * 9.0 + side * 4.0], stroke);
+                painter.line_segment([*tip, *tip - direction * 9.0 - side * 4.0], stroke);
+            }
+            if self.zoom >= 0.35 {
+                let at = screen(edge.label_position);
+                // A background keeps edge labels readable at crossings.
+                let galley = painter.layout_no_wrap(
+                    edge.label.clone(),
+                    FontId::monospace(11.0),
+                    stroke.color,
+                );
+                painter.rect_filled(
+                    Rect::from_min_size(at - vec2(2.0, 1.0), galley.size() + vec2(4.0, 2.0)),
+                    2.0,
+                    theme::GRAPH_BACKGROUND,
+                );
+                painter.galley(at, galley, stroke.color);
+            }
+        }
+        let mut clicked = None;
+        for node in &self.layout.nodes {
+            let rect = Rect::from_min_max(screen(node.rect.min), screen(node.rect.max));
+            if !rect.intersects(canvas) {
+                continue;
+            }
+            let is_selected = selected == Some(node.address)
+                || selected.is_some_and(|address| node.instruction_addresses.contains(&address))
+                || node
+                    .instruction_addresses
+                    .iter()
+                    .any(|a| related.contains(a));
+            painter.rect_filled(rect, 0.0, theme::VIEW);
+            painter.rect_stroke(
+                rect,
+                0.0,
+                Stroke::new(
+                    if is_selected { 2.0 } else { 1.0 },
+                    if is_selected {
+                        theme::BLUE
+                    } else {
+                        theme::BORDER
+                    },
+                ),
+                StrokeKind::Inside,
+            );
+            let header =
+                Rect::from_min_max(rect.min, pos2(rect.max.x, rect.min.y + HEADER * self.zoom));
+            let is_return = view
+                .blocks
+                .iter()
+                .find(|block| block.address == node.address)
+                .and_then(|block| block.instructions.last())
+                .is_some_and(|instruction| instruction.mnemonic.starts_with("RET"));
+            let header_color = if is_selected {
+                Color32::from_rgb(99, 85, 48)
+            } else if node.address == view.address {
+                Color32::from_rgb(36, 80, 36)
+            } else if is_return {
+                Color32::from_rgb(113, 50, 50)
+            } else {
+                theme::HEADER
+            };
+            painter.rect_filled(header.shrink(1.0), 0.0, header_color);
+            painter.text(
+                header.left_center() + vec2(9.0 * self.zoom, 0.0),
+                Align2::LEFT_CENTER,
+                format!("block {:x}", node.address),
+                FontId::monospace((14.0 * self.zoom).clamp(9.0, 24.0)),
+                theme::TEXT,
+            );
+            let first_row = selected
+                .and_then(|address| node.rows.iter().position(|(a, _)| *a == address))
+                .map_or(0, |index| {
+                    index
+                        .saturating_sub(PREVIEW / 2)
+                        .min(node.rows.len().saturating_sub(PREVIEW))
+                });
+            if self.zoom >= 0.45 {
+                for (index, (address, text)) in
+                    node.rows.iter().skip(first_row).take(PREVIEW).enumerate()
+                {
+                    let row = Rect::from_min_size(
+                        pos2(
+                            rect.min.x,
+                            rect.min.y + (HEADER + index as f32 * ROW) * self.zoom,
+                        ),
+                        vec2(rect.width(), ROW * self.zoom),
+                    );
+                    if selected == Some(*address) || related.contains(address) {
+                        painter.rect_filled(row.shrink2(vec2(2.0, 0.0)), 0.0, theme::CURRENT_LINE);
+                    }
+                    painter.with_clip_rect(rect.intersect(canvas)).text(
+                        row.left_center() + vec2(8.0 * self.zoom, 0.0),
+                        Align2::LEFT_CENTER,
+                        text,
+                        FontId::monospace(12.0 * self.zoom),
+                        theme::TEXT,
+                    );
+                }
+                if node.remaining > 0 {
+                    painter.text(
+                        screen(pos2(node.rect.left() + 8.0, node.rect.bottom() - 11.0)),
+                        Align2::LEFT_CENTER,
+                        format!("… {} more instructions", node.remaining),
+                        FontId::monospace(11.0 * self.zoom),
+                        theme::MUTED,
+                    );
+                }
+            }
+            if (response.clicked() || response.double_clicked())
+                && let Some(pointer) = response.interact_pointer_pos()
+                && rect.contains(pointer)
+            {
+                let world = ((pointer - canvas.min) - self.pan) / self.zoom;
+                let address = node.hit_at(pos2(world.x, world.y), self.zoom, first_row);
+                clicked = Some(instruction_action(view, address, response.double_clicked()));
+            }
+        }
+        clicked
+    }
+
+    fn fit(&mut self, size: Vec2) {
+        let bounds = self.layout.bounds;
+        self.zoom = ((size.x - 48.0).max(1.0) / bounds.width().max(1.0))
+            .min((size.y - 48.0).max(1.0) / bounds.height().max(1.0))
+            .clamp(0.08, 1.2);
+        self.pan = size * 0.5 - bounds.center().to_vec2() * self.zoom;
+        self.needs_fit = false;
+    }
+
+    fn change_zoom(&mut self, factor: f32, anchor: Vec2) {
+        if !factor.is_finite() || factor <= 0.0 {
+            return;
+        }
+        let next = (self.zoom * factor).clamp(0.08, 2.5);
+        self.pan = anchor - (anchor - self.pan) * (next / self.zoom);
+        self.zoom = next;
+    }
+}
+
+impl Node {
+    #[cfg(test)]
+    fn hit(&self, point: Pos2, zoom: f32) -> u64 {
+        self.hit_at(point, zoom, 0)
+    }
+    fn hit_at(&self, point: Pos2, zoom: f32, first_row: usize) -> u64 {
+        let row = (point.y - self.rect.min.y - HEADER) / ROW;
+        if zoom >= 0.45 && row >= 0.0 && row < PREVIEW as f32 {
+            self.rows
+                .get(first_row + row.floor() as usize)
+                .map_or(self.address, |(address, _)| *address)
+        } else {
+            self.address
+        }
+    }
+}
+
+impl Layout {
+    fn new(view: &FunctionView) -> Self {
+        let mut blocks: BTreeMap<_, _> = BTreeMap::new();
+        for block in view.blocks.iter().take(MAX_BLOCKS) {
+            blocks.entry(block.address).or_insert(block);
+        }
+        let mut successors: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
+        for edge in view.edges.iter().take(MAX_EDGES) {
+            if let Some(target) = edge.target
+                && blocks.contains_key(&edge.source)
+                && blocks.contains_key(&target)
+            {
+                successors.entry(edge.source).or_default().insert(target);
+            }
+        }
+        let mut ranks = BTreeMap::<u64, usize>::new();
+        let roots = std::iter::once(view.address).chain(blocks.keys().copied());
+        for root in roots {
+            if !blocks.contains_key(&root) || ranks.contains_key(&root) {
+                continue;
+            }
+            let first_rank = ranks.values().max().map_or(0, |rank| rank + 1);
+            ranks.insert(root, first_rank);
+            let mut queue = VecDeque::from([root]);
+            while let Some(source) = queue.pop_front() {
+                let next = ranks[&source] + 1;
+                for target in successors.get(&source).into_iter().flatten() {
+                    if !ranks.contains_key(target) {
+                        ranks.insert(*target, next);
+                        queue.push_back(*target);
+                    }
+                }
+            }
+        }
+        let mut rows: BTreeMap<usize, Vec<u64>> = BTreeMap::new();
+        for (&address, &rank) in &ranks {
+            rows.entry(rank).or_default().push(address);
+        }
+        let max_columns = rows.values().map(Vec::len).max().unwrap_or(1);
+        let total_width = max_columns as f32 * (WIDTH + 60.0) - 60.0;
+        let mut nodes = Vec::new();
+        let mut y = 0.0;
+        for addresses in rows.values() {
+            let mut row_height: f32 = 0.0;
+            let row_width = addresses.len() as f32 * (WIDTH + 60.0) - 60.0;
+            for (column, address) in addresses.iter().enumerate() {
+                let block = blocks[address];
+                let remaining = block.instructions.len().saturating_sub(PREVIEW);
+                let height = HEADER
+                    + block.instructions.len().min(PREVIEW) as f32 * ROW
+                    + if remaining > 0 { 23.0 } else { 8.0 };
+                row_height = row_height.max(height);
+                let rect = Rect::from_min_size(
+                    pos2(
+                        (total_width - row_width) / 2.0 + column as f32 * (WIDTH + 60.0),
+                        y,
+                    ),
+                    vec2(WIDTH, height),
+                );
+                nodes.push(Node {
+                    address: *address,
+                    rect,
+                    instruction_addresses: block
+                        .instructions
+                        .iter()
+                        .map(|instruction| instruction.address)
+                        .collect(),
+                    rows: block
+                        .instructions
+                        .iter()
+                        .map(|instruction| {
+                            (
+                                instruction.address,
+                                crop(
+                                    &format!(
+                                        "{:08x}  {:<8} {}",
+                                        instruction.address,
+                                        instruction.mnemonic,
+                                        instruction.operands
+                                    ),
+                                    53,
+                                ),
+                            )
+                        })
+                        .collect(),
+                    remaining,
+                });
+            }
+            y += row_height + 84.0;
+        }
+        let positions: BTreeMap<_, _> =
+            nodes.iter().map(|node| (node.address, node.rect)).collect();
+        let mut bounds = nodes
+            .iter()
+            .map(|node| node.rect)
+            .reduce(Rect::union)
+            .unwrap_or(Rect::from_min_size(Pos2::ZERO, vec2(1.0, 1.0)));
+        let mut edges = Vec::new();
+        for (index, edge) in view.edges.iter().take(MAX_EDGES).enumerate() {
+            let Some(source) = positions.get(&edge.source) else {
+                continue;
+            };
+            let (label, color_kind) = match edge.kind {
+                EdgeKind::True => ("T", EdgeKind::True),
+                EdgeKind::False => ("F", EdgeKind::False),
+                EdgeKind::Branch => ("B", EdgeKind::Branch),
+                EdgeKind::Unknown => ("?", EdgeKind::Unknown),
+            };
+            let offset = match edge.kind {
+                EdgeKind::True => -24.0,
+                EdgeKind::False => 24.0,
+                _ => 0.0,
+            };
+            let start = source.center_bottom() + vec2(offset, 0.0);
+            let (points, label, unresolved) =
+                if let Some(target) = edge.target.and_then(|address| positions.get(&address)) {
+                    let end = target.center_top() + vec2(offset, 0.0);
+                    if target.top() > source.bottom() {
+                        let middle = (source.bottom() + target.top()) / 2.0 + offset * 0.3;
+                        (
+                            vec![start, pos2(start.x, middle), pos2(end.x, middle), end],
+                            label.to_owned(),
+                            false,
+                        )
+                    } else {
+                        let channel = total_width + 28.0 + (index % 8) as f32 * 15.0;
+                        (
+                            vec![
+                                start,
+                                start + vec2(0.0, 20.0),
+                                pos2(channel, start.y + 20.0),
+                                pos2(channel, end.y - 20.0),
+                                end - vec2(0.0, 20.0),
+                                end,
+                            ],
+                            format!("{label} ↶"),
+                            false,
+                        )
+                    }
+                } else {
+                    let end = start + vec2(110.0, 48.0);
+                    let target = edge.target.map_or_else(
+                        || "unresolved".into(),
+                        |address| format!("{address:x} outside graph"),
+                    );
+                    (
+                        vec![start, pos2(start.x, end.y), end],
+                        format!("{label} → {target}"),
+                        true,
+                    )
+                };
+            let label_position = if unresolved {
+                *points.last().unwrap() + vec2(4.0, -7.0)
+            } else {
+                points[1] + vec2(5.0, -15.0)
+            };
+            bounds = bounds
+                .union(Rect::from_points(&points))
+                .union(Rect::from_min_size(
+                    label_position,
+                    vec2(if unresolved { 190.0 } else { 40.0 }, 18.0),
+                ));
+            edges.push(RoutedEdge {
+                points,
+                kind: if unresolved {
+                    EdgeKind::Unknown
+                } else {
+                    color_kind
+                },
+                label,
+                label_position,
+                unresolved,
+            });
+        }
+        Self {
+            nodes,
+            edges,
+            bounds,
+        }
+    }
+}
+
+fn crop(text: &str, limit: usize) -> String {
+    let mut characters = text.chars();
+    let prefix: String = characters.by_ref().take(limit).collect();
+    if characters.next().is_some() {
+        format!("{prefix}…")
+    } else {
+        prefix
+    }
+}
+
+fn edge_color(kind: EdgeKind) -> Color32 {
+    match kind {
+        EdgeKind::True => theme::SYNTAX_CONSTANT,
+        EdgeKind::False => theme::ERROR,
+        EdgeKind::Branch => theme::BLUE,
+        EdgeKind::Unknown => theme::WARNING,
+    }
+}
+
+fn dashed_line(painter: &egui::Painter, start: Pos2, end: Pos2, stroke: Stroke) {
+    let length = start.distance(end);
+    if length <= f32::EPSILON {
+        return;
+    }
+    let direction = (end - start) / length;
+    let mut distance = 0.0;
+    while distance < length {
+        painter.line_segment(
+            [
+                start + direction * distance,
+                start + direction * (distance + 6.0).min(length),
+            ],
+            stroke,
+        );
+        distance += 11.0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{BasicBlock, CallSite, Edge, Instruction};
+
+    fn fixture() -> FunctionView {
+        FunctionView {
+            address: 0x401146,
+            blocks: [0x401146, 0x40115a, 0x40116b, 0x40117d, 0x401190]
+                .into_iter()
+                .map(|address| BasicBlock {
+                    address,
+                    instructions: vec![
+                        Instruction {
+                            address,
+                            bytes: vec![0x83, 0xf8, 0x05],
+                            mnemonic: "cmp".into(),
+                            operands: "eax, 5".into(),
+                        },
+                        Instruction {
+                            address: address + 3,
+                            bytes: vec![0x75, 0x05],
+                            mnemonic: "jne".into(),
+                            operands: "0x40116b".into(),
+                        },
+                    ],
+                })
+                .collect(),
+            edges: vec![
+                Edge {
+                    source: 0x401146,
+                    target: Some(0x40115a),
+                    kind: EdgeKind::True,
+                },
+                Edge {
+                    source: 0x401146,
+                    target: Some(0x40116b),
+                    kind: EdgeKind::False,
+                },
+                Edge {
+                    source: 0x40115a,
+                    target: Some(0x40117d),
+                    kind: EdgeKind::Branch,
+                },
+                Edge {
+                    source: 0x40116b,
+                    target: Some(0x40117d),
+                    kind: EdgeKind::Branch,
+                },
+                Edge {
+                    source: 0x40117d,
+                    target: Some(0x401146),
+                    kind: EdgeKind::True,
+                },
+                Edge {
+                    source: 0x401190,
+                    target: None,
+                    kind: EdgeKind::Unknown,
+                },
+            ],
+            calls: vec![],
+            warnings: vec![],
+        }
+    }
+
+    #[test]
+    fn cycles_and_disconnected_nodes_have_deterministic_nonoverlapping_layout() {
+        let view = fixture();
+        let layout = Layout::new(&view);
+        assert_eq!(layout.nodes.len(), 5);
+        for (index, node) in layout.nodes.iter().enumerate() {
+            for other in &layout.nodes[index + 1..] {
+                assert!(!node.rect.intersects(other.rect));
+            }
+        }
+        let mut shuffled = fixture();
+        shuffled.blocks.reverse();
+        let again = Layout::new(&shuffled);
+        assert_eq!(
+            layout
+                .nodes
+                .iter()
+                .map(|node| (node.address, node.rect))
+                .collect::<Vec<_>>(),
+            again
+                .nodes
+                .iter()
+                .map(|node| (node.address, node.rect))
+                .collect::<Vec<_>>()
+        );
+        assert!(layout.edges.iter().any(|edge| edge.label.contains('↶')));
+        assert!(layout.edges.iter().any(|edge| edge.unresolved));
+    }
+
+    #[test]
+    fn hit_testing_selects_instruction_or_header_and_zoom_preserves_anchor() {
+        let view = fixture();
+        let mut graph = GraphCanvas::new(&view);
+        let node = &graph.layout.nodes[0];
+        assert_eq!(
+            node.hit(node.rect.min + vec2(20.0, 10.0), 1.0),
+            node.address
+        );
+        assert_eq!(
+            node.hit(node.rect.min + vec2(20.0, HEADER + ROW + 5.0), 1.0),
+            node.address + 3
+        );
+        assert_eq!(
+            node.hit(node.rect.min + vec2(20.0, HEADER + ROW + 5.0), 0.3),
+            node.address
+        );
+        graph.pan = vec2(40.0, 60.0);
+        let anchor = vec2(150.0, 200.0);
+        let before = (anchor - graph.pan) / graph.zoom;
+        graph.change_zoom(1.4, anchor);
+        assert!(((anchor - graph.pan) / graph.zoom - before).length() < 0.001);
+    }
+
+    #[test]
+    fn following_calls_uses_call_metadata_and_keeps_branch_and_indirect_selection() {
+        let mut view = fixture();
+        view.calls = vec![
+            CallSite {
+                address: 0x401149,
+                target: Some(0x402000),
+            },
+            CallSite {
+                address: 0x40115d,
+                target: None,
+            },
+        ];
+        // A resolved call follows its call-site target, independently of CFG edges
+        // or the display text in the instruction operands.
+        assert_eq!(
+            instruction_action(&view, 0x401149, true),
+            GraphAction::Navigate(0x402000)
+        );
+        assert_eq!(
+            instruction_action(&view, 0x401149, false),
+            GraphAction::Select(0x401149)
+        );
+        assert_eq!(
+            instruction_action(&view, 0x401146, true),
+            GraphAction::Select(0x401146)
+        );
+        assert_eq!(
+            instruction_action(&view, 0x40115d, true),
+            GraphAction::Select(0x40115d)
+        );
+    }
+
+    #[test]
+    fn headless_native_render_retains_camera_across_selection_changes() {
+        let view = fixture();
+        let mut graph = GraphCanvas::new(&view);
+        let context = egui::Context::default();
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| {
+            graph.show(ui, &view, Some(0x401146));
+        });
+        assert!(!output.shapes.is_empty());
+        output.textures_delta.clear();
+        let camera = (graph.zoom, graph.pan);
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| {
+            graph.show(ui, &view, Some(0x40116b));
+        });
+        output.textures_delta.clear();
+        assert_eq!(camera, (graph.zoom, graph.pan));
+    }
+}

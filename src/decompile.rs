@@ -1,0 +1,641 @@
+//! Capture machine locations from the engine's semantic print marks.
+//!
+//! An action decorator reads analyzed p-code immediately before printing. The
+//! normal Program::decompile path still performs string enrichment, analysis,
+//! pretty printing, and cleanup. Neither cached source nor the engine is patched.
+
+use crate::model::{
+    CodeMapping, MAX_CODE_ADDRESS_REFS, MAX_CODE_MAPPINGS, MAX_DECOMPILED_BYTES,
+    MAX_MAPPING_ADDRESSES, SectionInfo,
+};
+use crate::selection::ExecutableRanges;
+use ghidra_decompiler::action::{Action, ActionBase, ActionGroupList};
+use ghidra_decompiler::architecture::Architecture;
+use ghidra_decompiler::error::{Error, Result};
+use ghidra_decompiler::funcdata::Funcdata;
+use ghidra_decompiler::op::{OpId, PcodeOp};
+use ghidra_decompiler::prettyprint::*;
+use ghidra_decompiler::program::Program;
+use ghidra_decompiler::space::SpaceRef;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex};
+
+const MAX_CAPTURED_OPS: usize = 131_072;
+const MAX_STATEMENT_DEPTH: usize = 256;
+const TEXT_BUDGET: usize = MAX_DECOMPILED_BYTES - 100;
+
+#[derive(Default)]
+struct Capture {
+    operations: BTreeMap<OpId, u64>,
+    spans: Vec<CodeMapping>,
+    truncated: bool,
+}
+
+type Shared = Arc<Mutex<Capture>>;
+type ReturnedAction = Arc<Mutex<Option<Box<dyn Action>>>>;
+
+struct CaptureAction {
+    inner: Option<Box<dyn Action>>,
+    returned: ReturnedAction,
+    capture: Shared,
+    executable: ExecutableRanges,
+}
+
+impl CaptureAction {
+    fn inner(&self) -> &dyn Action {
+        self.inner.as_deref().expect("Installed action")
+    }
+    fn inner_mut(&mut self) -> &mut dyn Action {
+        self.inner.as_deref_mut().expect("Installed action")
+    }
+}
+
+impl Drop for CaptureAction {
+    fn drop(&mut self) {
+        *self
+            .returned
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = self.inner.take();
+    }
+}
+
+impl Action for CaptureAction {
+    fn base(&self) -> &ActionBase {
+        self.inner().base()
+    }
+    fn base_mut(&mut self) -> &mut ActionBase {
+        self.inner_mut().base_mut()
+    }
+    fn clone_action(&self, groups: &ActionGroupList) -> Option<Box<dyn Action>> {
+        self.inner().clone_action(groups)
+    }
+    fn reset(&mut self, data: &mut Funcdata, architecture: &mut Architecture) {
+        self.inner_mut().reset(data, architecture);
+    }
+    fn apply(&mut self, data: &mut Funcdata, architecture: &mut Architecture) -> Result<i32> {
+        self.inner_mut().apply(data, architecture)
+    }
+    fn perform(&mut self, data: &mut Funcdata, architecture: &mut Architecture) -> Result<i32> {
+        let result = self.inner_mut().perform(data, architecture)?;
+        let mut capture = self
+            .capture
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        capture.operations.clear();
+        let mut current = data.obank.begin_alive();
+        for _ in 0..MAX_CAPTURED_OPS {
+            let Some(id) = current else { break };
+            let operation = data.op(id);
+            let address = operation.get_addr();
+            let pc = address.get_offset();
+            if !address.is_invalid() && self.executable.contains(pc) {
+                capture.operations.insert(id, pc);
+            }
+            current = data.obank.next_in_list(id, PcodeOp::INSERT_LIST);
+        }
+        Ok(result)
+    }
+}
+
+/// Return bounded C and sorted, non-overlapping UTF-8 byte mappings. Instructions
+/// eliminated by optimization have no invented source location.
+pub fn render(
+    program: &mut Program,
+    address: u64,
+    sections: &[SectionInfo],
+) -> Result<(String, Vec<CodeMapping>)> {
+    let capture = Shared::default();
+    let executable = ExecutableRanges::new(sections).map_err(Error::Lowlevel)?;
+    let returned = ReturnedAction::default();
+    let architecture = program.architecture();
+    let name = architecture
+        .allacts
+        .currentact
+        .clone()
+        .ok_or_else(|| Error::Lowlevel("No decompiler action selected".into()))?;
+    let print_index = architecture.print;
+    let printer = architecture
+        .printlist
+        .get_mut(print_index)
+        .and_then(Option::as_mut)
+        .ok_or_else(|| Error::Lowlevel("No decompiler printer selected".into()))?;
+    let mut pretty = EmitPrettyPrint::new();
+    let line_size = printer.base().emit.get_max_line_size();
+    if line_size > 0 {
+        pretty.set_max_line_size(line_size)?;
+    }
+    pretty.set_indent_increment(printer.base().emit.get_indent_increment());
+    pretty.lowlevel = Box::new(LocationEmitter::new(Arc::clone(&capture)));
+    let original_action = architecture
+        .allacts
+        .actionmap
+        .remove(&name)
+        .ok_or_else(|| Error::Lowlevel("Decompiler action unavailable".into()))?;
+    let original_emit = std::mem::replace(&mut printer.base_mut().emit, Box::new(pretty));
+    architecture.allacts.actionmap.insert(
+        name.clone(),
+        Box::new(CaptureAction {
+            inner: Some(original_action),
+            returned: Arc::clone(&returned),
+            capture: Arc::clone(&capture),
+            executable,
+        }),
+    );
+    let result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| program.decompile(address)));
+    let architecture = program.architecture();
+    drop(architecture.allacts.actionmap.remove(&name));
+    if let Some(original_action) = returned
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take()
+    {
+        architecture.allacts.actionmap.insert(name, original_action);
+    }
+    architecture.printlist[print_index]
+        .as_mut()
+        .expect("Restored printer")
+        .base_mut()
+        .emit = original_emit;
+    let mut text = result.unwrap_or_else(|payload| std::panic::resume_unwind(payload))?;
+    let mut capture = capture.lock().unwrap_or_else(|error| error.into_inner());
+    let mappings = flatten(std::mem::take(&mut capture.spans), &text);
+    if capture.truncated {
+        text.push_str("\n/* Decompiler output truncated at the 2 MiB prototype limit. */\n");
+    }
+    Ok((text, mappings))
+}
+
+struct Statement {
+    start: usize,
+    addresses: BTreeSet<u64>,
+}
+
+struct LocationEmitter {
+    base: EmitBase,
+    text: Vec<u8>,
+    capture: Shared,
+    statements: Vec<Statement>,
+    overflow_depth: usize,
+    saturated: bool,
+}
+
+impl LocationEmitter {
+    fn new(capture: Shared) -> Self {
+        Self {
+            base: EmitBase::new(),
+            text: Vec::new(),
+            capture,
+            statements: Vec::new(),
+            overflow_depth: 0,
+            saturated: false,
+        }
+    }
+    fn location(&self, mark: Option<OpMark>) -> Option<u64> {
+        let mark = mark?;
+        self.capture
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .operations
+            .get(&mark.id)
+            .copied()
+    }
+    fn record(&self, start: usize, addresses: Vec<u64>) {
+        if start >= self.text.len() || addresses.is_empty() {
+            return;
+        }
+        let mut capture = self
+            .capture
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if capture.spans.len() < MAX_CODE_MAPPINGS {
+            capture.spans.push(CodeMapping {
+                start,
+                end: self.text.len(),
+                addresses,
+            });
+        }
+    }
+    fn append(&mut self, text: &str) {
+        if self.saturated {
+            return;
+        }
+        let mut count = TEXT_BUDGET.saturating_sub(self.text.len()).min(text.len());
+        while !text.is_char_boundary(count) {
+            count -= 1;
+        }
+        self.text.extend_from_slice(&text.as_bytes()[..count]);
+        if count < text.len() {
+            self.saturated = true;
+            self.capture
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .truncated = true;
+        }
+    }
+    fn spaces_bounded(&mut self, count: i32) {
+        if self.saturated {
+            return;
+        }
+        let count = count.max(0) as usize;
+        let available = TEXT_BUDGET.saturating_sub(self.text.len());
+        self.text
+            .resize(self.text.len() + count.min(available), b' ');
+        if count > available {
+            self.saturated = true;
+            self.capture
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .truncated = true;
+        }
+    }
+    fn token(&mut self, text: &str, mark: Option<OpMark>) -> Result<()> {
+        let start = self.text.len();
+        self.append(text);
+        // A fully omitted token must not contribute PCs to an earlier visible
+        // prefix of the same statement. A partial visible token retains its PC.
+        if self.text.len() == start {
+            return Ok(());
+        }
+        let pc = self.location(mark);
+        for statement in &mut self.statements {
+            if let Some(pc) = pc
+                && statement.addresses.len() < MAX_MAPPING_ADDRESSES
+            {
+                statement.addresses.insert(pc);
+            }
+        }
+        if self.statements.is_empty()
+            && let Some(pc) = pc
+        {
+            self.record(start, vec![pc]);
+        }
+        Ok(())
+    }
+}
+
+macro_rules! no_output {
+    ($($name:ident($($argument:ident:$ty:ty),*) -> $result:ty = $value:expr;)*) => {
+        $(fn $name(&mut self, $($argument:$ty),*) -> Result<$result> { Ok($value) })*
+    };
+}
+
+impl Emit for LocationEmitter {
+    fn base(&self) -> &EmitBase {
+        &self.base
+    }
+    fn base_mut(&mut self) -> &mut EmitBase {
+        &mut self.base
+    }
+    fn as_dyn(&mut self) -> &mut dyn Emit {
+        self
+    }
+    no_output! {
+        begin_document() -> i32 = 0;
+        end_document(_id:i32) -> () = ();
+        begin_function(_function:Option<&FuncMark>) -> i32 = 0;
+        end_function(_id:i32) -> () = ();
+        begin_block(_block:Option<BlockMark>) -> i32 = 0;
+        end_block(_id:i32) -> () = ();
+        begin_return_type(_node:Option<VarnodeMark>) -> i32 = 0;
+        end_return_type(_id:i32) -> () = ();
+        begin_var_decl(_symbol:Option<SymbolMark>) -> i32 = 0;
+        end_var_decl(_id:i32) -> () = ();
+        begin_func_proto() -> i32 = 0;
+        end_func_proto(_id:i32) -> () = ();
+    }
+    fn begin_statement(&mut self, mark: Option<OpMark>) -> Result<i32> {
+        if self.overflow_depth > 0 || self.statements.len() >= MAX_STATEMENT_DEPTH {
+            self.overflow_depth = self.overflow_depth.saturating_add(1);
+            return Ok(-1);
+        }
+        let addresses = self.location(mark).into_iter().collect();
+        self.statements.push(Statement {
+            start: self.text.len(),
+            addresses,
+        });
+        Ok(self.statements.len() as i32)
+    }
+    fn end_statement(&mut self, _id: i32) -> Result<()> {
+        // EmitPrettyPrint forwards its own token IDs, rather than the return
+        // values from this lowlevel emitter's begin_statement.
+        if self.overflow_depth > 0 {
+            self.overflow_depth = self.overflow_depth.saturating_sub(1);
+            return Ok(());
+        }
+        if let Some(statement) = self.statements.pop() {
+            self.record(statement.start, statement.addresses.into_iter().collect());
+        }
+        Ok(())
+    }
+    fn tag_line(&mut self) -> Result<()> {
+        self.tag_line_indent(self.base.indentlevel)
+    }
+    fn tag_line_indent(&mut self, indent: i32) -> Result<()> {
+        self.append("\n");
+        self.spaces_bounded(indent);
+        Ok(())
+    }
+    fn tag_variable(
+        &mut self,
+        text: &str,
+        _highlight: SyntaxHighlight,
+        _node: Option<VarnodeMark>,
+        op: Option<OpMark>,
+    ) -> Result<()> {
+        self.token(text, op)
+    }
+    fn tag_op(
+        &mut self,
+        text: &str,
+        _highlight: SyntaxHighlight,
+        op: Option<OpMark>,
+    ) -> Result<()> {
+        self.token(text, op)
+    }
+    fn tag_func_name(
+        &mut self,
+        text: &str,
+        _highlight: SyntaxHighlight,
+        _function: Option<&FuncMark>,
+        op: Option<OpMark>,
+    ) -> Result<()> {
+        self.token(text, op)
+    }
+    fn tag_type(
+        &mut self,
+        text: &str,
+        _highlight: SyntaxHighlight,
+        _datatype: Option<&TypeMark>,
+    ) -> Result<()> {
+        self.token(text, None)
+    }
+    fn tag_field(
+        &mut self,
+        text: &str,
+        _highlight: SyntaxHighlight,
+        _datatype: Option<&TypeMark>,
+        _offset: i32,
+        op: Option<OpMark>,
+    ) -> Result<()> {
+        self.token(text, op)
+    }
+    fn tag_bit_field(
+        &mut self,
+        text: &str,
+        _highlight: SyntaxHighlight,
+        _datatype: Option<&TypeMark>,
+        _id: i32,
+        op: Option<OpMark>,
+    ) -> Result<()> {
+        self.token(text, op)
+    }
+    fn tag_comment(
+        &mut self,
+        text: &str,
+        _highlight: SyntaxHighlight,
+        _space: Option<&SpaceRef>,
+        _offset: u64,
+    ) -> Result<()> {
+        self.token(text, None)
+    }
+    fn tag_label(
+        &mut self,
+        text: &str,
+        _highlight: SyntaxHighlight,
+        _space: Option<&SpaceRef>,
+        _offset: u64,
+    ) -> Result<()> {
+        self.token(text, None)
+    }
+    fn tag_case_label(
+        &mut self,
+        text: &str,
+        _highlight: SyntaxHighlight,
+        op: Option<OpMark>,
+        _value: u64,
+    ) -> Result<()> {
+        self.token(text, op)
+    }
+    fn print(&mut self, text: &str, _highlight: SyntaxHighlight) -> Result<()> {
+        self.token(text, None)
+    }
+    fn open_paren(&mut self, paren: &str, id: i32) -> Result<i32> {
+        self.append(paren);
+        self.base.parenlevel += 1;
+        Ok(id)
+    }
+    fn close_paren(&mut self, paren: &str, _id: i32) -> Result<()> {
+        self.append(paren);
+        self.base.parenlevel -= 1;
+        Ok(())
+    }
+    fn spaces(&mut self, count: i32, _bump: i32) -> Result<()> {
+        self.spaces_bounded(count);
+        Ok(())
+    }
+    fn set_output_stream(&mut self, text: Vec<u8>) {
+        self.text = text;
+    }
+    fn get_output_stream(&mut self) -> &mut Vec<u8> {
+        &mut self.text
+    }
+    fn emits_markup(&self) -> bool {
+        false
+    }
+}
+
+fn flatten(spans: Vec<CodeMapping>, text: &str) -> Vec<CodeMapping> {
+    let mut events = Vec::with_capacity(spans.len() * 2);
+    for (index, span) in spans.iter().enumerate() {
+        if span.start >= span.end
+            || span.end > text.len()
+            || !text.is_char_boundary(span.start)
+            || !text.is_char_boundary(span.end)
+        {
+            continue;
+        }
+        events.push((span.start, true, index));
+        events.push((span.end, false, index));
+    }
+    events.sort_unstable();
+    let mut active = BTreeSet::new();
+    let mut mappings: Vec<CodeMapping> = Vec::new();
+    let mut references = 0;
+    let mut cursor = 0;
+    while cursor < events.len() {
+        let position = events[cursor].0;
+        while cursor < events.len() && events[cursor].0 == position {
+            let (_, begin, index) = events[cursor];
+            let key = (spans[index].end - spans[index].start, index);
+            if begin {
+                active.insert(key);
+            } else {
+                active.remove(&key);
+            }
+            cursor += 1;
+        }
+        let Some(&(end, _, _)) = events.get(cursor) else {
+            break;
+        };
+        let Some(&(_, index)) = active.first() else {
+            continue;
+        };
+        let addresses = &spans[index].addresses;
+        if let Some(previous) = mappings.last_mut()
+            && previous.end == position
+            && previous.addresses == *addresses
+        {
+            previous.end = end;
+            continue;
+        }
+        if mappings.len() >= MAX_CODE_MAPPINGS
+            || addresses.len() > MAX_CODE_ADDRESS_REFS - references
+        {
+            break;
+        }
+        references += addresses.len();
+        mappings.push(CodeMapping {
+            start: position,
+            end,
+            addresses: addresses.clone(),
+        });
+    }
+    mappings
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn omitted_tokens_cannot_add_locations_to_a_truncated_visible_statement() {
+        let capture = Shared::default();
+        capture.lock().unwrap().operations.extend([
+            (OpId(0), 0x401010),
+            (OpId(1), 0x401013),
+            (OpId(2), 0x401016),
+        ]);
+        let mut emitter = LocationEmitter::new(Arc::clone(&capture));
+        let first = OpMark {
+            id: OpId(0),
+            time: 1,
+        };
+        emitter.begin_statement(Some(first)).unwrap();
+        emitter
+            .tag_op("x", SyntaxHighlight::NoColor, Some(first))
+            .unwrap();
+        emitter.spaces_bounded((TEXT_BUDGET - 1) as i32);
+        for id in [OpId(1), OpId(2)] {
+            emitter
+                .tag_op(
+                    "omitted",
+                    SyntaxHighlight::NoColor,
+                    Some(OpMark { id, time: 2 }),
+                )
+                .unwrap();
+        }
+        emitter.end_statement(1).unwrap();
+        let text = String::from_utf8(emitter.text).unwrap();
+        let mappings = flatten(std::mem::take(&mut capture.lock().unwrap().spans), &text);
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(mappings[0].addresses, [0x401010]);
+        assert!(capture.lock().unwrap().truncated);
+    }
+
+    #[test]
+    fn expression_statement_retains_multiple_machine_locations_and_utf8_spans() {
+        let capture = Shared::default();
+        capture
+            .lock()
+            .unwrap()
+            .operations
+            .extend([(OpId(0), 0x401010), (OpId(1), 0x401013)]);
+        let mut emitter = LocationEmitter::new(Arc::clone(&capture));
+        emitter
+            .begin_statement(Some(OpMark {
+                id: OpId(0),
+                time: 1,
+            }))
+            .unwrap();
+        emitter
+            .tag_variable(
+                "π",
+                SyntaxHighlight::VarColor,
+                None,
+                Some(OpMark {
+                    id: OpId(0),
+                    time: 1,
+                }),
+            )
+            .unwrap();
+        emitter.print(" + ", SyntaxHighlight::NoColor).unwrap();
+        emitter
+            .tag_op(
+                "x",
+                SyntaxHighlight::NoColor,
+                Some(OpMark {
+                    id: OpId(1),
+                    time: 2,
+                }),
+            )
+            .unwrap();
+        emitter.end_statement(12345).unwrap();
+        let text = String::from_utf8(emitter.text.clone()).unwrap();
+        let mappings = flatten(std::mem::take(&mut capture.lock().unwrap().spans), &text);
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(&text[mappings[0].start..mappings[0].end], "π + x");
+        assert_eq!(mappings[0].addresses, [0x401010, 0x401013]);
+    }
+
+    #[test]
+    fn oversized_unicode_and_nested_statements_stay_bounded() {
+        let capture = Shared::default();
+        let mut emitter = LocationEmitter::new(Arc::clone(&capture));
+        for _ in 0..MAX_STATEMENT_DEPTH + 20 {
+            emitter.begin_statement(None).unwrap();
+        }
+        emitter
+            .print(
+                &"界".repeat(TEXT_BUDGET / 3 + 100),
+                SyntaxHighlight::NoColor,
+            )
+            .unwrap();
+        for _ in 0..MAX_STATEMENT_DEPTH + 20 {
+            emitter.end_statement(999).unwrap();
+        }
+        assert!(emitter.text.len() <= TEXT_BUDGET);
+        assert!(std::str::from_utf8(&emitter.text).is_ok());
+        assert!(capture.lock().unwrap().truncated);
+        assert!(emitter.statements.is_empty());
+        assert_eq!(emitter.overflow_depth, 0);
+    }
+
+    #[test]
+    fn nested_mappings_choose_inner_statement_and_never_overlap() {
+        let text = "a β c";
+        let mappings = flatten(
+            vec![
+                CodeMapping {
+                    start: 0,
+                    end: text.len(),
+                    addresses: vec![1],
+                },
+                CodeMapping {
+                    start: 2,
+                    end: 4,
+                    addresses: vec![2, 3],
+                },
+            ],
+            text,
+        );
+        assert_eq!(
+            mappings
+                .iter()
+                .map(|mapping| (mapping.start, mapping.end))
+                .collect::<Vec<_>>(),
+            [(0, 2), (2, 4), (4, 6)]
+        );
+        assert_eq!(mappings[1].addresses, [2, 3]);
+    }
+}

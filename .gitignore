@@ -1,0 +1,5 @@
+/target/
+/tests/fixtures/ghidra-rust-sample
+__pycache__/
+*.pyc
+
