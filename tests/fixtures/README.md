@@ -38,6 +38,8 @@ The Windows integration test uses the production suspended worker/job startup,
 opens the PE from Unicode paths, verifies handle identity and writer exclusion,
 requests real graph/decompiler/string results, and saves/replaces/reopens an
 embedded project. CI compiles the fixture and sets this variable.
+It verifies exported names reach the decompiler and that a private copy with its
+export directory removed still recovers functions from x64 runtime metadata.
 Without the variable, this integration check skips locally; Windows unit tests
 still exercise file identity, replacement, path validation, and job lifetime.
 
@@ -46,6 +48,16 @@ the production WorkerClient/bubblewrap test in debug and release. The latter
 requires working unprivileged namespaces and tests the host's loader layout,
 Unicode paths, analysis mappings, and embedded project replacement/reopening.
 It fails if sandbox startup fails; it does not substitute an unrestricted worker.
+
+For an optional large-PE check, copy a trusted executable beneath ignored
+`target/local-input`, set `GHIDRA_RUST_TEST_LARGE_PE` to that copy, and run
+`cargo test --release --locked --test large_pe -- --ignored --nocapture`.
+On Windows also pass `--target x86_64-pc-windows-msvc`. Optional hexadecimal
+`GHIDRA_RUST_TEST_FUNCTION` selects a function; `GHIDRA_RUST_TEST_IMPORT` checks
+an expected imported name in its pseudocode. The check uses production worker
+containment and stores temporary projects beneath `target/large-pe-test`.
+It never executes the selected input. Do not commit third-party executables or
+their analysis projects.
 
 The crypto table contains standardized numeric constants from AES (FIPS 197),
 not a copied signature database. This fixture does not establish broad processor,

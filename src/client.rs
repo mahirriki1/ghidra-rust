@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 const MAX_RESPONSE: usize = 16 * 1024 * 1024;
 
 pub enum WorkerEvent {
-    Reply(WorkerResponse),
+    Reply(Box<WorkerResponse>),
     Failed(String),
 }
 
@@ -85,7 +85,7 @@ impl WorkerClient {
                                     }
                                     info.path.clone_from(&display_path);
                                 }
-                                WorkerEvent::Reply(reply)
+                                WorkerEvent::Reply(Box::new(reply))
                             }
                             Err(e) => WorkerEvent::Failed(format!("Invalid worker response: {e}")),
                         },

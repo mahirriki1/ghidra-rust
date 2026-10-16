@@ -48,6 +48,25 @@ or distro-specific installer is not produced by these scripts.
 Ubuntu 24.04 and some other distributions can additionally restrict unprivileged
 user namespaces through local security policy. Bubblewrap must be allowed by that
 policy; do not disable the application's worker sandbox to make it launch.
+Ubuntu supplies its purpose-built `bwrap-userns-restrict` profile in the optional
+`apparmor-profiles` package. On Ubuntu 24.04 with AppArmor enabled, an administrator
+can install and load that distribution-provided profile:
+
+```sh
+sudo apt-get install --no-install-recommends -y apparmor apparmor-profiles
+if [ ! -e /etc/apparmor.d/bwrap-userns-restrict ]; then
+  sudo install -m 0644 \
+    /usr/share/apparmor/extra-profiles/bwrap-userns-restrict \
+    /etc/apparmor.d/bwrap-userns-restrict
+fi
+sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
+```
+
+This uses Ubuntu's scoped policy and leaves the global user-namespace restriction
+enabled. See [Ubuntu's security explanation](https://discourse.ubuntu.com/t/understanding-apparmor-user-namespace-restriction/58007)
+and [profile packaging announcement](https://lists.ubuntu.com/archives/noble-changes/2024-September/041745.html).
+The Linux CI job loads that same profile and checks namespace/loader startup with
+visible diagnostics before running the production worker tests.
 
 ## Build and desktop check
 

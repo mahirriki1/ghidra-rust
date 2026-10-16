@@ -26,6 +26,10 @@ rustup toolchain install 1.98.1 --component rustfmt,clippy
 rustup run 1.98.1 bash scripts/build-linux.sh
 ```
 
+On Ubuntu with AppArmor user-namespace restrictions, load the distribution's
+bubblewrap profile as described in [Linux runtime compatibility](linux.md)
+before running the sandboxed tests.
+
 On Windows x64, install Rust and Visual Studio Build Tools with **Desktop
 development with C++** and the Windows SDK. From PowerShell in a local checkout:
 

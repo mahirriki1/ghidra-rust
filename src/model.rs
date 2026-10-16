@@ -81,6 +81,8 @@ pub struct BinaryInfo {
     pub source_identity: Option<FileIdentity>,
     pub sections: Vec<SectionInfo>,
     pub functions: Vec<FunctionInfo>,
+    #[serde(default)]
+    pub functions_truncated: bool,
     pub warnings: Vec<String>,
 }
 
@@ -173,6 +175,7 @@ pub enum Response {
     },
     Functions {
         functions: Vec<FunctionInfo>,
+        truncated: bool,
     },
     Renamed {
         address: u64,
