@@ -29,6 +29,8 @@ pub struct LoadedProgram {
     // duplicates at most 128 MiB. Both copies originate from exactly the hashed bytes.
     // This favors consistent analysis over live file reads; engine snapshot sharing is future work.
     snapshot: Arc<[u8]>,
+    pe_ranges: Vec<(u64, u64)>,
+    pe_imports: BTreeMap<u64, String>,
     pub info: BinaryInfo,
 }
 
@@ -161,8 +163,8 @@ fn metadata(path: &Path, bytes: &[u8]) -> Result<BinaryInfo, String> {
     Ok(BinaryInfo {
         path: path.to_string_lossy().into_owned(), architecture: architecture.into(), format: format.into(),
         sha256: format!("{:x}", Sha256::digest(bytes)), source_identity: None,
-        entry: object.entry(), file_len: bytes.len() as u64, sections, functions: Vec::new(),
-        warnings: vec!["Prototype analysis: symbol loading is immediate; deeper function discovery is explicit. Optimized C++/Rust types and source reconstruction are incomplete.".into(), "Function lists are capped at 10,000 entries and names at 256 bytes in this prototype.".into()],
+        entry: object.entry(), file_len: bytes.len() as u64, sections, functions: Vec::new(), functions_truncated: false,
+        warnings: vec!["Prototype analysis: symbols and supported PE function metadata load immediately; deeper function discovery is explicit. Optimized C++/Rust types and source reconstruction are incomplete.".into(), "Function lists are capped at 10,000 entries and names at 256 bytes in this prototype.".into()],
     })
 }
 
@@ -201,15 +203,33 @@ impl LoadedProgram {
         let mut info = metadata(path, &bytes)?;
         info.source_identity = FileIdentity::from_file(&file);
         let snapshot = Arc::from(bytes.as_slice());
-        let program =
+        let pe = crate::pe::parse(&bytes, &info.sections)?;
+        let mut program =
             Program::from_image(&path.to_string_lossy(), bytes, None).map_err(engine_error)?;
-        info.functions = function_list(&program, &info)?;
+        let mut pe_ranges = Vec::new();
+        let mut pe_imports = BTreeMap::new();
+        if let Some(pe) = pe {
+            crate::pe_symbols::register(
+                &mut program,
+                &pe,
+                if info.architecture == "x86-64" { 8 } else { 4 },
+            )?;
+            info.functions_truncated = pe.functions_truncated;
+            for note in pe.warnings {
+                warning(&mut info.warnings, note);
+            }
+            pe_ranges = pe.function_ranges;
+            pe_imports = pe.imports;
+        }
+        info.functions = function_list(&program, &mut info)?;
         if !executable(&info.sections, info.entry, 1) {
             info.warnings.push("The binary entry point is not inside a supported executable section; select a function from the list.".into());
         }
         Ok(Self {
             program,
             snapshot,
+            pe_ranges,
+            pe_imports,
             info,
         })
     }
@@ -217,15 +237,17 @@ impl LoadedProgram {
     pub fn handle(&mut self, request: Request) -> Result<Response, String> {
         match request {
             Request::Graph { address } => Ok(Response::Graph {
-                view: recover_graph(
+                view: recover_graph_with_ranges(
                     &self.program,
                     &self.info.sections,
                     &self.info.functions,
                     address,
+                    &self.pe_ranges,
                 )?,
             }),
             Request::Decompile { address } => {
                 self.check_code(address)?;
+                self.resolve_import_thunks(address)?;
                 let (mut text, mut mappings) =
                     crate::decompile::render(&mut self.program, address, &self.info.sections)
                         .map_err(engine_error)?;
@@ -248,9 +270,10 @@ impl LoadedProgram {
             }
             Request::Discover => {
                 self.program.discover_functions().map_err(engine_error)?;
-                self.info.functions = function_list(&self.program, &self.info)?;
+                self.info.functions = function_list(&self.program, &mut self.info)?;
                 Ok(Response::Functions {
                     functions: self.info.functions.clone(),
+                    truncated: self.info.functions_truncated,
                 })
             }
             Request::Rename { address, name } => {
@@ -266,7 +289,7 @@ impl LoadedProgram {
                     .set_function_name(address, &name)
                     .map_err(engine_error)?;
                 self.synchronize_function_name(address, &name)?;
-                self.info.functions = function_list(&self.program, &self.info)?;
+                self.info.functions = function_list(&self.program, &mut self.info)?;
                 Ok(Response::Renamed { address, name })
             }
             Request::Bytes { address, length } => {
@@ -287,6 +310,64 @@ impl LoadedProgram {
                 "{address:#x} is outside file-backed executable sections."
             ))
         }
+    }
+
+    fn resolve_import_thunks(&mut self, entry: u64) -> Result<(), String> {
+        if self.pe_imports.is_empty() {
+            return Ok(());
+        }
+        let mut pending = VecDeque::from([entry]);
+        let mut visited = BTreeSet::new();
+        let mut targets = BTreeSet::new();
+        // The decompiler can follow a tail branch into another known function.
+        // Resolve imports from those exact CFG call targets as well, with a
+        // fixed work budget. Never treat arbitrary byte matches as code entries.
+        while visited.len() < 8 {
+            let Some(address) = pending.pop_front() else {
+                break;
+            };
+            if !visited.insert(address) {
+                continue;
+            }
+            let Ok(view) = recover_graph_with_ranges(
+                &self.program,
+                &self.info.sections,
+                &self.info.functions,
+                address,
+                &self.pe_ranges,
+            ) else {
+                continue;
+            };
+            for target in view.calls.iter().filter_map(|call| call.target) {
+                if targets.len() < crate::pe_symbols::MAX_THUNK_TARGETS {
+                    targets.insert(target);
+                }
+            }
+            let blocks: BTreeSet<_> = view.blocks.iter().map(|block| block.address).collect();
+            for target in view.edges.iter().filter_map(|edge| edge.target) {
+                if !blocks.contains(&target)
+                    && self
+                        .pe_ranges
+                        .binary_search_by_key(&target, |range| range.0)
+                        .is_ok()
+                    && !visited.contains(&target)
+                {
+                    pending.push_back(target);
+                }
+            }
+        }
+        crate::pe_symbols::register_import_thunks(
+            &mut self.program,
+            &self.pe_imports,
+            &self.snapshot,
+            &self.info.sections,
+            &targets,
+            if self.info.architecture == "x86-64" {
+                8
+            } else {
+                4
+            },
+        )
     }
 
     fn synchronize_function_name(&mut self, address: u64, name: &str) -> Result<(), String> {
@@ -452,21 +533,28 @@ impl LoadedProgram {
     }
 }
 
-fn function_list(program: &Program, info: &BinaryInfo) -> Result<Vec<FunctionInfo>, String> {
-    let mut functions: Vec<_> = program
+fn function_list(program: &Program, info: &mut BinaryInfo) -> Result<Vec<FunctionInfo>, String> {
+    let mut entries = program
         .functions()
         .map_err(engine_error)?
         .into_iter()
-        .filter(|f| executable(&info.sections, f.address, 1))
-        .take(MAX_RESULTS - 1)
+        .filter(|f| executable(&info.sections, f.address, 1));
+    let mut functions: Vec<_> = entries
+        .by_ref()
+        .take(MAX_RESULTS)
         .map(|f| FunctionInfo {
             address: f.address,
             name: bounded_name(&f.name),
         })
         .collect();
+    let truncated = entries.next().is_some();
     if executable(&info.sections, info.entry, 1)
         && !functions.iter().any(|f| f.address == info.entry)
     {
+        if functions.len() == MAX_RESULTS {
+            functions.pop();
+            info.functions_truncated = true;
+        }
         functions.push(FunctionInfo {
             address: info.entry,
             name: "entry".into(),
@@ -474,6 +562,7 @@ fn function_list(program: &Program, info: &BinaryInfo) -> Result<Vec<FunctionInf
     }
     functions.sort_by_key(|f| f.address);
     functions.dedup_by_key(|f| f.address);
+    info.functions_truncated |= truncated;
     Ok(functions)
 }
 
@@ -583,6 +672,16 @@ pub fn recover_graph(
     functions: &[FunctionInfo],
     entry: u64,
 ) -> Result<FunctionView, String> {
+    recover_graph_with_ranges(program, sections, functions, entry, &[])
+}
+
+fn recover_graph_with_ranges(
+    program: &Program,
+    sections: &[SectionInfo],
+    functions: &[FunctionInfo],
+    entry: u64,
+    pe_ranges: &[(u64, u64)],
+) -> Result<FunctionView, String> {
     if !executable(sections, entry, 1) {
         return Err(format!(
             "{entry:#x} is outside file-backed executable sections."
@@ -617,7 +716,12 @@ pub fn recover_graph(
             );
             continue;
         }
-        if other_entries.contains(&address) {
+        if other_entries.contains(&address)
+            || (address != entry
+                && pe_ranges
+                    .binary_search_by_key(&address, |range| range.0)
+                    .is_ok())
+        {
             warning(
                 &mut warnings,
                 "A path reaches another known function entry; displayed as an external/tail exit.",
@@ -964,6 +1068,97 @@ pub(crate) mod tests {
                 && e.target == Some(0x1004)
                 && e.kind == EdgeKind::False)
         );
+    }
+
+    #[test]
+    fn graph_honors_function_entries_outside_the_displayed_inventory() {
+        // jmp 0x1005; mov eax,1; ret. The jump is a known function's tail entry,
+        // retained in PE ranges even when that function is outside the UI page.
+        let bytes = vec![0xe9, 0, 0, 0, 0, 0xb8, 1, 0, 0, 0, 0xc3];
+        let program =
+            Program::from_raw_bytes(bytes.clone(), "x86:LE:64:default:windows", 0x1000).unwrap();
+        let sections = vec![SectionInfo {
+            name: ".text".into(),
+            address: 0x1000,
+            size: bytes.len() as u64,
+            file_offset: 0,
+            file_size: bytes.len() as u64,
+            executable: true,
+        }];
+        let view = recover_graph_with_ranges(&program, &sections, &[], 0x1000, &[(0x1005, 0x100b)])
+            .unwrap();
+        assert_eq!(
+            view.blocks
+                .iter()
+                .flat_map(|block| &block.instructions)
+                .count(),
+            1
+        );
+        assert!(
+            view.warnings
+                .iter()
+                .any(|warning| warning.contains("another known function entry"))
+        );
+    }
+
+    #[test]
+    fn imports_resolve_through_confirmed_calls_in_a_tail_function() {
+        let mut bytes = vec![0xcc; 0x100];
+        bytes[..5].copy_from_slice(&[0xe9, 0x0b, 0, 0, 0]); // tail to 0x1010
+        bytes[0x10..0x16].copy_from_slice(&[0xe8, 0x0b, 0, 0, 0, 0xc3]);
+        bytes[0x20..0x26].copy_from_slice(&[0xff, 0x25, 0x5a, 0, 0, 0]);
+        let mut program =
+            Program::from_raw_bytes(bytes.clone(), "x86:LE:64:default:windows", 0x1000).unwrap();
+        let mut symbols = crate::pe::PeMetadata::default();
+        symbols.functions.insert(0x1000, "entry".into());
+        symbols.functions.insert(0x1010, "tail".into());
+        symbols.imports.insert(0x1080, "ExitProcess".into());
+        crate::pe_symbols::register(&mut program, &symbols, 8).unwrap();
+        let sections = vec![SectionInfo {
+            name: ".text".into(),
+            address: 0x1000,
+            size: 0x100,
+            file_offset: 0,
+            file_size: 0x100,
+            executable: true,
+        }];
+        let mut info = BinaryInfo {
+            path: "synthetic".into(),
+            architecture: "x86-64".into(),
+            format: "PE".into(),
+            entry: 0x1000,
+            file_len: bytes.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(&bytes)),
+            source_identity: None,
+            sections,
+            functions: vec![],
+            functions_truncated: false,
+            warnings: vec![],
+        };
+        info.functions = function_list(&program, &mut info).unwrap();
+        let mut loaded = LoadedProgram {
+            program,
+            snapshot: Arc::from(bytes),
+            info,
+            pe_ranges: vec![(0x1000, 0x1005), (0x1010, 0x1016)],
+            pe_imports: symbols.imports,
+        };
+        loaded.resolve_import_thunks(0x1000).unwrap();
+        assert!(
+            loaded
+                .program
+                .functions()
+                .unwrap()
+                .iter()
+                .any(|function| function.address == 0x1020 && function.name == "ExitProcess")
+        );
+        let Response::Decompiled { text, .. } = loaded
+            .handle(Request::Decompile { address: 0x1010 })
+            .unwrap()
+        else {
+            panic!("Expected decompiler result")
+        };
+        assert!(text.contains("ExitProcess"), "{text}");
     }
 
     #[test]

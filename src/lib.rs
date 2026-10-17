@@ -10,6 +10,8 @@ pub mod graph;
 pub mod highlight;
 pub mod limits;
 pub mod model;
+mod pe;
+mod pe_symbols;
 pub mod project;
 pub mod selection;
 pub mod session;

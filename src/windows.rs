@@ -336,19 +336,26 @@ mod tests {
 
     #[test]
     fn file_identity_tracks_hard_links_and_atomic_replacement() {
-        let directory = std::env::temp_dir().join(format!("grust-windows-{}", std::process::id()));
-        std::fs::create_dir_all(&directory).unwrap();
-        let original = directory.join("original");
-        let alias = directory.join("alias");
-        let replacement = directory.join("replacement");
+        let directory = tempfile::tempdir().unwrap();
+        let original = directory.path().join("original");
+        let alias = directory.path().join("alias");
+        let replacement = directory.path().join("replacement");
         std::fs::write(&original, b"first").unwrap();
         std::fs::hard_link(&original, &alias).unwrap();
-        let pinned = File::open(&original).unwrap();
+        let mut options = OpenOptions::new();
+        options.read(true);
+        configure_read(&mut options);
+        let pinned = options.open(&original).unwrap();
         let identity = file_identity(&pinned).unwrap();
         assert_eq!(
             identity,
             file_identity(&File::open(&alias).unwrap()).unwrap()
         );
+        // Delete sharing permits moving the guarded input. MoveFileExW need
+        // not replace an open destination; exercise replacement of an ordinary
+        // closed output while the old input remains pinned under another name.
+        std::fs::rename(&original, directory.path().join("retained")).unwrap();
+        std::fs::write(&original, b"old destination").unwrap();
         std::fs::write(&replacement, b"second").unwrap();
         atomic_replace(&replacement, &original).unwrap();
         assert_eq!(identity, file_identity(&pinned).unwrap());
@@ -358,7 +365,7 @@ mod tests {
         );
         assert_eq!(std::fs::read(&original).unwrap(), b"second");
         drop(pinned);
-        std::fs::remove_dir_all(directory).unwrap();
+        directory.close().unwrap();
     }
 
     #[test]
