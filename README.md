@@ -1,6 +1,6 @@
 # Ghidra Rust
 
-An experimental native Rust reverse engineering desktop with Ghidra-derived
+An early alpha native Rust reverse engineering desktop with Ghidra-derived
 decompilation and IDA-inspired function-graph navigation. The desktop runs without
 Java or Python. It is an initial implementation, not a full Ghidra replacement.
 
@@ -9,10 +9,10 @@ Java or Python. It is an initial implementation, not a full Ghidra replacement.
 Use Rust 1.98 or newer, a native C/C++ build toolchain, and an OpenGL-capable desktop.
 Linux analysis requires **bubblewrap** (`bwrap`) and working unprivileged user
 namespaces. The Linux sandbox setup currently targets conventional `/usr`-based
-distributions. Windows x64 now has an experimental native MSVC build path and
-Windows-specific file identity and worker resource controls. Linux is the locally
-exercised runtime; Windows runtime checks are configured in CI and still need a
-native Windows run. macOS remains unvalidated.
+distributions. Windows x64 has an experimental native MSVC build path and
+Windows-specific file identity and worker resource controls. See the
+[Windows build/run guide](docs/windows.md) for the portable package, validation
+script, and desktop check. macOS remains unvalidated.
 
 ```sh
 cargo run --release --locked
@@ -22,7 +22,18 @@ Use **Open binary**, **Open project**, or drop a file into the window. You can a
 when launching the desktop executable. The initial engine build can take several
 minutes. Release builds are appropriate for evaluating interactive performance.
 
+For downloadable Linux/Windows packages and the workflow to ship every version,
+see [building and shipping releases](docs/releases.md). Version tags build both
+platforms and retain executables, complete archives, and checksums as workflow
+artifacts. [Linux runtime requirements](docs/linux.md) include compatible glibc,
+desktop graphics, and bubblewrap; Linux downloads are not universal static builds.
+
 ### Native Windows
+
+For a prebuilt download, double-click `ghidra-rust-VERSION-windows-x64.exe` from a
+local Windows folder to open the GUI directly. No build tools are required to run
+it. The ZIP bundle includes documentation and the accompanying license notices.
+See the [Windows guide](docs/windows.md#run-the-prebuilt-exe).
 
 Install Rust and Visual Studio Build Tools with **Desktop development with C++**
 (including an x64 MSVC toolchain and Windows SDK), as described in
@@ -30,16 +41,29 @@ Install Rust and Visual Studio Build Tools with **Desktop development with C++**
 From PowerShell in this repository on Windows:
 
 ```powershell
-rustup toolchain install 1.98.1-x86_64-pc-windows-msvc
-cargo +1.98.1-x86_64-pc-windows-msvc run --release --locked
+rustup toolchain install 1.98.1-x86_64-pc-windows-msvc --component rustfmt,clippy
+cargo +1.98.1-x86_64-pc-windows-msvc build --release --locked --target x86_64-pc-windows-msvc
+.\target\x86_64-pc-windows-msvc\release\ghidra-rust.exe
 ```
 
-The built desktop is `target\release\ghidra-rust.exe`. It uses native Windows
+The built desktop is `target\x86_64-pc-windows-msvc\release\ghidra-rust.exe`. It uses native Windows
 OpenGL and does not need WSL, bubblewrap, Java, or Python. Build it from a Windows
 checkout rather than copying the Linux executable. SQLite is bundled into the
-build; a separate SQLite installation is unnecessary. Local disk files are
+build, and the MSVC runtime is linked statically; a separate SQLite or MSVC runtime
+installation is unnecessary. Local disk files are
 supported; device paths, alternate streams, UNC paths, and mapped network drives
 are rejected. File systems must support the Windows file-ID APIs.
+
+For the full Windows checks and a ZIP with licenses, run:
+
+```powershell
+rustup run 1.98.1-x86_64-pc-windows-msvc powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-windows.ps1
+```
+
+The standalone EXE, ZIP, and SHA-256 checksums are written under `target\dist`. Extract the ZIP and
+double-click `ghidra-rust.exe`. The Windows CI job uses this same script and retains
+the package as a workflow artifact after successful checks. See
+[Windows instructions and troubleshooting](docs/windows.md) for details.
 
 Windows worker limits are resource controls, **not a security sandbox**. Use this
 experimental Windows build with trusted inputs. It has no filesystem or network
@@ -98,9 +122,11 @@ navigates to that function.
   Other architectures, raw images, archives, relocatable objects, and sectionless
   images are currently rejected explicitly.
 - Browse/filter known functions; start at `main` when found, otherwise the entry
-  point. **Discover functions** explicitly runs additional engine discovery, which
-  currently primarily expands stripped images. Complete function recovery is not
-  guaranteed.
+  point. PE exports and x64 exception-table function entries load on open, including
+  stripped images. The list is capped at 10,000 entries; large PEs prioritize the
+  entry point, exports, and runtime functions near entry, with a visible partial-list
+  notice. **Discover functions** explicitly runs additional engine discovery.
+  Complete function recovery is not guaranteed.
 - Navigate a function's instruction CFG with pan, zoom, branch labels, and
   unresolved-flow markers. CFG recovery is bounded; warnings identify unsupported
   or incomplete cases such as indirect flow. Calls are displayed separately from
@@ -108,7 +134,8 @@ navigates to that function.
 - Switch between the graph and listing. Read separately requested C-like
   decompilation, inspect outgoing direct calls, and navigate by address.
 - Scan mapped bytes for ASCII and a printable ASCII subset of UTF-16LE strings.
-  This is not complete Unicode or Rust string-slice recovery.
+  The tree shows **not scanned** until a scan runs. This is not complete Unicode
+  or Rust string-slice recovery. **Analysis notes** shows loading and coverage limits.
 - Use **Decode** for selected memory or pasted text/hex: UTF-8, UTF-16LE/BE,
   standard padded Base64, hex, or XOR. XOR keys use explicit `hex:` or `text:`
   prefixes. Common-decoding suggestions are heuristics and require analyst review.
@@ -221,16 +248,35 @@ at commit `268c3a406d8d964bc00ae2ead4d3e1e1373aaa27`. It supplies the engine and
 embedded language data; a separate Ghidra source checkout is unnecessary for
 building or running this desktop.
 
-The Linux prototype passed 113 unit/UI tests, one real worker-process integration
-test, formatting, strict Clippy, and an optimized build. Native GUI checks exercised
+The Linux prototype passed unit/UI tests, real worker-process integration,
+production bubblewrap worker/project integration, formatting, strict Clippy, and
+an optimized build. Native GUI checks exercised
 the three-pane layout, graph/decompiler navigation, string decoding, crypto scanning,
 manual file-path entry, and saving/reopening annotations and an embedded project.
-Windows Rust code and test targets have been compilation-checked from Linux;
-that check does not link/run a Windows executable or validate the bundled SQLite C
-build on Windows. Native MSVC build, unit tests, and a PE worker test are configured
-in CI; a native Windows runtime result is still pending.
+Native Windows x64 validation with Rust 1.98.1 and MSVC compiled bundled SQLite,
+linked debug and release executables, and passed unit/UI tests plus the real
+PE worker/project integration test in both debug and release. One ignored unit
+test is a subprocess fixture exercised by the job-lifecycle test. The release
+OpenGL GUI was launched on Windows and used to save and reopen an embedded
+project with saved listing/pseudocode. The EXE imports Windows system DLLs without
+MSVC-runtime or SQLite DLL dependencies. These are local results; consult GitHub
+Actions for hosted results for the exact commit. The Windows build script is
+shared with CI.
 
-One stalled directory read
+PE loading supplies export names, x64 runtime-function starts, and named import
+slots to the decompiler. Ordinary import jump thunks reached by confirmed calls
+are named during bounded function analysis. PDB types, imported API prototypes,
+library signature matching, delay imports, and Windows Control Flow Guard
+substitutions remain incomplete. Known hexadecimal addresses remain navigable.
+The PE integration tests check named exports and recovery after exports are removed.
+
+The PE analysis update invalidates older saved graph/decompiler caches when a
+project reopens; compatible annotations are retained. When comparing against a
+Ghidra project, compare the recorded executable SHA-256 and the selected function
+address. An installed program can change at the same path after an update.
+
+The Windows sandbox and project-parser trust limitations above remain explicit;
+the application has not had a comprehensive security or dependency audit. One stalled directory read
 can still remain blocked, but repeated cancellations cannot accumulate reader threads.
 Final publication is not relative to retained directory handles; same-user parent
 directory substitutions and Windows delete-sharing renames remain residual races.

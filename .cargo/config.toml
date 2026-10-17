@@ -1,0 +1,4 @@
+# Keep the Windows desktop and its worker portable without an MSVC runtime DLL
+# installation. cc also uses this setting when compiling bundled SQLite.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

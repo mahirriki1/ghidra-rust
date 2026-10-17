@@ -214,6 +214,7 @@ pub struct DesktopApp {
     string_filter: String,
     strings: Vec<StringEntry>,
     strings_truncated: bool,
+    strings_scanned: bool,
     filtered_strings: Vec<usize>,
     crypto: Vec<CryptoMatch>,
     crypto_truncated: bool,
@@ -286,6 +287,7 @@ impl DesktopApp {
             string_filter: String::new(),
             strings: Vec::new(),
             strings_truncated: false,
+            strings_scanned: false,
             filtered_strings: Vec::new(),
             crypto: Vec::new(),
             crypto_truncated: false,
@@ -402,6 +404,7 @@ impl DesktopApp {
         self.cached_crypto = false;
         self.strings.clear();
         self.strings_truncated = false;
+        self.strings_scanned = false;
         self.filtered_strings.clear();
         self.crypto.clear();
         self.crypto_truncated = false;
@@ -691,6 +694,7 @@ impl DesktopApp {
                     self.session = Some(project.project.data.session.clone());
                     if project.project.cache_compatible {
                         info.functions = project.project.data.info.functions.clone();
+                        info.functions_truncated = project.project.data.info.functions_truncated;
                     }
                     info.path = project.project.source_hint.clone();
                 } else if opening.preserve
@@ -815,13 +819,25 @@ impl DesktopApp {
                     self.status = "Ready".into();
                 }
             }
-            (Request::Discover, Response::Functions { functions }) => {
+            (
+                Request::Discover,
+                Response::Functions {
+                    functions,
+                    truncated,
+                },
+            ) => {
                 self.cached_functions = false;
                 if let Some(info) = &mut self.info {
                     info.functions = functions;
+                    info.functions_truncated = truncated;
                 }
                 self.rebuild_filter();
-                self.status = "Function discovery complete".into();
+                self.status = if truncated {
+                    "Function list limit reached; results are partial"
+                } else {
+                    "Function discovery complete"
+                }
+                .into();
             }
             (
                 Request::Rename {
@@ -865,6 +881,7 @@ impl DesktopApp {
                 self.cached_strings = false;
                 self.strings = strings;
                 self.strings_truncated = truncated;
+                self.strings_scanned = true;
                 self.rebuild_string_filter();
                 self.tab = Tab::Strings;
                 self.status = if truncated {
@@ -1071,6 +1088,7 @@ impl DesktopApp {
         self.cached_crypto = cache_compatible && !data.crypto.is_empty();
         self.strings = data.strings;
         self.strings_truncated = data.strings_truncated;
+        self.strings_scanned = self.cached_strings || data.strings_truncated;
         self.crypto = data.crypto;
         self.crypto_truncated = data.crypto_truncated;
         self.rebuild_string_filter();
@@ -1929,12 +1947,16 @@ impl DesktopApp {
                                         for index in rows {
                                             let item = &info.functions[index];
                                             if ui
-                                                .selectable_label(
-                                                    self.view
-                                                        .as_ref()
-                                                        .is_some_and(|v| v.address == item.address),
-                                                    crop(&item.name, 100),
+                                                .add(
+                                                    egui::Button::selectable(
+                                                        self.view.as_ref().is_some_and(|v| {
+                                                            v.address == item.address
+                                                        }),
+                                                        crop(&item.name, 100),
+                                                    )
+                                                    .truncate(),
                                                 )
+                                                .on_hover_text(&item.name)
                                                 .clicked()
                                             {
                                                 function = Some(item.address);
@@ -1969,10 +1991,11 @@ impl DesktopApp {
                                     ui.weak("No user labels");
                                 }
                             });
-                            egui::CollapsingHeader::new(format!(
-                                "Strings ({})",
-                                self.strings.len()
-                            ))
+                            egui::CollapsingHeader::new(if self.strings_scanned {
+                                format!("Strings ({})", self.strings.len())
+                            } else {
+                                "Strings (not scanned)".into()
+                            })
                             .show(ui, |ui| {
                                 if self.strings.is_empty() {
                                     if ui.small_button("Find strings").clicked() {
@@ -2076,6 +2099,14 @@ impl DesktopApp {
             self.rebuild_filter();
         }
         ui.weak(format!("{} functions", self.filtered_functions.len()));
+        if self
+            .info
+            .as_ref()
+            .is_some_and(|info| info.functions_truncated)
+        {
+            ui.colored_label(theme::WARNING, "Partial function list")
+                .on_hover_text("The function list reached its 10,000-entry budget. PE entries near the program entry point are prioritized. Use Go to navigate a known address; see Analysis notes for details.");
+        }
         ui.label(RichText::new("Address       Name").monospace().weak());
         let mut navigate = None;
         let row_height = ui.text_style_height(&egui::TextStyle::Body) + 6.0;
@@ -2094,12 +2125,18 @@ impl DesktopApp {
                             .map(|annotation| annotation.label.as_str())
                             .filter(|label| !label.is_empty())
                             .unwrap_or(&function.name);
-                        let response = ui.selectable_label(
-                            self.view
-                                .as_ref()
-                                .is_some_and(|view| view.address == function.address),
-                            format!("{:08x}  {}", function.address, label),
-                        );
+                        let response = ui
+                            .add(
+                                egui::Button::selectable(
+                                    self.view
+                                        .as_ref()
+                                        .is_some_and(|view| view.address == function.address),
+                                    RichText::new(format!("{:08x}  {}", function.address, label))
+                                        .monospace(),
+                                )
+                                .truncate(),
+                            )
+                            .on_hover_text(format!("{:x}  {}", function.address, label));
                         if response.clicked() {
                             navigate = Some(function.address);
                         }
@@ -2738,6 +2775,14 @@ impl DesktopApp {
                         "{} · {} · {} bytes",
                         info.format, info.architecture, info.file_len
                     ));
+                    if !info.warnings.is_empty() {
+                        ui.menu_button("Analysis notes", |ui| {
+                            ui.set_max_width(520.0);
+                            for warning in info.warnings.iter().take(64) {
+                                ui.label(crop(warning, 1024));
+                            }
+                        });
+                    }
                 }
             });
         });
@@ -2835,6 +2880,44 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn scan_results_distinguish_partial_functions_and_unscanned_strings() {
+        let mut app = keyboard_app();
+        assert!(!app.strings_scanned);
+        let pending = |request| Pending {
+            id: 1,
+            request,
+            started: Instant::now(),
+            selection: app.selection_generation,
+            revision: app.revision,
+        };
+        let functions = app.info.as_ref().unwrap().functions.clone();
+        let function_request = pending(Request::Discover);
+        let string_request = pending(Request::Strings);
+        app.receive(
+            function_request,
+            Response::Functions {
+                functions,
+                truncated: true,
+            },
+            &egui::Context::default(),
+        );
+        assert!(app.info.as_ref().unwrap().functions_truncated);
+        assert!(app.status.contains("partial"));
+        app.receive(
+            string_request,
+            Response::Strings {
+                strings: vec![],
+                truncated: false,
+            },
+            &egui::Context::default(),
+        );
+        assert!(app.strings_scanned);
+        assert!(app.strings.is_empty());
+        app.clear_views();
+        assert!(!app.strings_scanned);
+    }
+
     fn keyboard_app() -> DesktopApp {
         let mut app = DesktopApp::empty(None);
         app.info = Some(BinaryInfo {
@@ -2864,6 +2947,7 @@ mod tests {
                 },
             ],
             warnings: Vec::new(),
+            functions_truncated: false,
         });
         app.session = Some(Session::new("a".repeat(64)));
         app.selected = Some(0x1000);
