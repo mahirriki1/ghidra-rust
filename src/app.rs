@@ -1713,6 +1713,7 @@ impl DesktopApp {
         let context = ui.ctx().clone();
         let loaded = self.info.is_some();
         egui::MenuBar::new().ui(ui, |ui| {
+            theme::brand_mark(ui);
             ui.menu_button("File", |ui| {
                 if ui.button("Open binary…").clicked() {
                     self.request_intent(Intent::OpenDialog, &context);
@@ -2527,15 +2528,18 @@ impl DesktopApp {
                 scroll.show_rows(ui, row, self.listing.len(), |ui, rows| {
                     for index in rows {
                         let instruction = &self.listing[index];
-                        let response = ui.selectable_label(
-                            self.selected == Some(instruction.address)
-                                || self.semantic.addresses.contains(&instruction.address),
-                            theme::listing_row(
-                                instruction.address,
-                                &hex(&instruction.bytes),
-                                &instruction.mnemonic,
-                                &instruction.operands,
-                            ),
+                        let response = ui.add(
+                            egui::Button::selectable(
+                                self.selected == Some(instruction.address)
+                                    || self.semantic.addresses.contains(&instruction.address),
+                                theme::listing_row(
+                                    instruction.address,
+                                    &hex(&instruction.bytes),
+                                    &instruction.mnemonic,
+                                    &instruction.operands,
+                                ),
+                            )
+                            .wrap_mode(egui::TextWrapMode::Extend),
                         );
                         let response = if let Some(note) = self
                             .session
@@ -3332,6 +3336,54 @@ mod tests {
         assert!(app.semantic.ranges.is_empty());
         assert!(app.pending_listing_scroll.is_none());
         assert!(app.status.contains("no machine instruction mapping"));
+    }
+
+    #[test]
+    fn narrow_listing_keeps_long_instructions_on_single_scrollable_rows() {
+        let context = egui::Context::default();
+        theme::install(&context);
+        let mut app = semantic_app();
+        let operands = "rax, qword ptr [rip + a_long_symbol_name_that_exceeds_the_pane_width]";
+        for instruction in &mut app.listing {
+            instruction.operands = operands.into();
+        }
+        let mut output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(360.0, 500.0),
+                )),
+                ..Default::default()
+            },
+            |ui| app.main_panel(ui),
+        );
+        output.textures_delta.clear();
+        let rows: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| {
+                if let egui::epaint::Shape::Text(text) = &shape.shape {
+                    text.galley
+                        .text()
+                        .contains(operands)
+                        .then_some(&text.galley)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(rows.len(), app.listing.len());
+        for row in rows {
+            assert_eq!(
+                row.rows.len(),
+                1,
+                "long instructions must not consume adjacent rows"
+            );
+            assert!(
+                row.rect.width() > 360.0,
+                "retain the full horizontally scrollable instruction"
+            );
+        }
     }
 
     #[test]

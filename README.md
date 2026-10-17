@@ -1,4 +1,4 @@
-# Ghidra Rust
+# <img src="docs/images/ghidra-rust-logo.svg" width="40" height="40" alt="Ghidra Rust logo"> Ghidra Rust
 
 An early alpha native Rust reverse engineering desktop with Ghidra-derived
 decompilation and IDA-inspired function-graph navigation. The desktop runs without
@@ -71,13 +71,26 @@ isolation equivalent to the Linux worker.
 
 The workspace follows Ghidra's familiar layout: Symbol/Program Trees and Functions
 on the left, the Listing or Function Graph in the middle, and the Decompiler on
-the right. Annotation editing opens in a separate tool window. File selection is
-built into the app and does not require a desktop file-dialog portal.
+the right. Long instruction rows stay on one line with horizontal scrolling.
+Annotation editing opens in a separate tool window. File selection is built into
+the app and does not require a desktop file-dialog portal.
 
-The default appearance keeps Ghidra's classic layout in dark mode: charcoal toolbars
-and provider headers, dark analysis views, rectangular controls, and colored listing
-columns. Decompiled code uses Ghidra's dark syntax palette for keywords, types,
-comments, constants/strings, and identifiers. Highlighting is lexical; semantic
+The rust-orange dragon is the current project logo, shared by the native window
+icon, README, and a small mark immediately before **File** in the menu bar. The
+vector source is [ghidra-rust-logo.svg](docs/images/ghidra-rust-logo.svg); regenerate
+the transparent PNG used by the native app with:
+
+```sh
+rsvg-convert --width 256 --height 256 docs/images/ghidra-rust-logo.svg -o docs/images/ghidra-rust-icon.png
+```
+
+The window icon is separate from Windows executable-file icon resources.
+
+The default appearance combines compact Graphite controls with Ghidra's classic
+layout: charcoal provider headers, solid dark analysis views, restrained rounding
+and blue hover/focus accents, and colored listing columns. Decompiled code uses
+Ghidra's dark syntax palette for keywords, types, comments, constants/strings,
+and identifiers. Highlighting is lexical; semantic
 roles such as parameters versus globals require richer engine token information.
 Text is tokenized when a new result arrives and visible lines are drawn from cached
 spans. The cache is capped at 65,536 spans; unusually dense results fall back to

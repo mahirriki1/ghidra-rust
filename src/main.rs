@@ -23,6 +23,7 @@ fn main() -> std::process::ExitCode {
 fn run_desktop(initial_path: Option<PathBuf>) -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
+            .with_icon(ghidra_rust::brand::icon())
             .with_inner_size([1440.0, 920.0])
             .with_min_inner_size([1000.0, 640.0]),
         renderer: eframe::Renderer::Glow,
