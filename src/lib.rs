@@ -1,5 +1,6 @@
 pub mod analysis;
 pub mod app;
+pub mod brand;
 pub mod client;
 pub mod crypto;
 pub mod decode;
