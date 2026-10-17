@@ -21,65 +21,72 @@ pub const SYNTAX_VARIABLE: Color32 = Color32::from_rgb(192, 192, 128);
 pub const GRAPH_BACKGROUND: Color32 = Color32::from_rgb(36, 36, 36);
 const ACTIVE_HEADER: Color32 = Color32::from_rgb(52, 75, 115);
 
+/// Compact Graphite controls around the familiar Ghidra analysis panes.
 pub fn install(context: &egui::Context) {
-    context.set_visuals(egui::Visuals::dark());
-    context.global_style_mut(|style| {
-        let visuals = &mut style.visuals;
-        visuals.panel_fill = CHROME;
-        visuals.window_fill = CHROME;
-        visuals.extreme_bg_color = VIEW;
-        visuals.text_edit_bg_color = Some(VIEW);
-        visuals.code_bg_color = VIEW;
-        visuals.faint_bg_color = Color32::from_rgb(39, 39, 43);
-        visuals.weak_text_color = Some(MUTED);
-        visuals.selection.bg_fill = SELECTION;
-        visuals.selection.stroke = Stroke::new(1.0, TEXT);
-        visuals.hyperlink_color = BLUE;
-        visuals.warn_fg_color = WARNING;
-        visuals.error_fg_color = ERROR;
-        visuals.window_corner_radius = CornerRadius::ZERO;
-        visuals.menu_corner_radius = CornerRadius::ZERO;
-        visuals.window_stroke = Stroke::new(1.0, BORDER);
-        for widget in [
-            &mut visuals.widgets.noninteractive,
-            &mut visuals.widgets.inactive,
-            &mut visuals.widgets.hovered,
-            &mut visuals.widgets.active,
-            &mut visuals.widgets.open,
-        ] {
-            widget.corner_radius = CornerRadius::ZERO;
-            widget.expansion = 0.0;
-            widget.fg_stroke = Stroke::new(1.0, TEXT);
-            widget.bg_stroke = Stroke::new(1.0, BORDER);
-        }
-        visuals.widgets.noninteractive.bg_fill = CHROME;
-        visuals.widgets.noninteractive.weak_bg_fill = CHROME;
-        visuals.widgets.inactive.bg_fill = CHROME;
-        visuals.widgets.inactive.weak_bg_fill = CHROME;
-        visuals.widgets.hovered.bg_fill = Color32::from_rgb(65, 65, 70);
-        visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(55, 65, 85);
-        visuals.widgets.active.bg_fill = HEADER;
-        visuals.widgets.active.weak_bg_fill = HEADER;
-        visuals.widgets.open.bg_fill = HEADER;
-        visuals.widgets.open.weak_bg_fill = HEADER;
-        style.spacing.item_spacing = egui::vec2(5.0, 3.0);
-        style.spacing.button_padding = egui::vec2(5.0, 2.0);
-        style.spacing.interact_size.y = 20.0;
-        style
-            .text_styles
-            .insert(TextStyle::Body, FontId::proportional(13.0));
-        style
-            .text_styles
-            .insert(TextStyle::Button, FontId::proportional(13.0));
-        style
-            .text_styles
-            .insert(TextStyle::Monospace, FontId::monospace(13.0));
-        style.animation_time = 0.0;
-    });
+    context.set_theme(egui::Theme::Dark);
+    let mut style = egui::Style::default();
+    let visuals = &mut style.visuals;
+    *visuals = egui::Visuals::dark();
+    let chrome = Color32::from_rgb(37, 42, 51);
+    let border = Color32::from_rgb(62, 70, 82);
+    let text = Color32::from_rgb(231, 234, 240);
+    let accent = Color32::from_rgb(116, 179, 255);
+    let selected = Color32::from_rgb(37, 62, 94);
+    visuals.override_text_color = Some(text);
+    visuals.weak_text_color = Some(Color32::from_rgb(165, 176, 192));
+    visuals.panel_fill = chrome;
+    visuals.window_fill = chrome;
+    visuals.extreme_bg_color = Color32::from_rgb(22, 26, 33);
+    visuals.text_edit_bg_color = Some(visuals.extreme_bg_color);
+    visuals.selection.bg_fill = selected;
+    visuals.selection.stroke = Stroke::new(1.0, accent);
+    visuals.hyperlink_color = accent;
+    visuals.error_fg_color = Color32::from_rgb(255, 158, 158);
+    visuals.warn_fg_color = Color32::from_rgb(238, 202, 133);
+    visuals.window_corner_radius = CornerRadius::same(12);
+    visuals.window_stroke = Stroke::new(1.0, border);
+    for widget in [
+        &mut visuals.widgets.noninteractive,
+        &mut visuals.widgets.inactive,
+        &mut visuals.widgets.hovered,
+        &mut visuals.widgets.active,
+        &mut visuals.widgets.open,
+    ] {
+        widget.corner_radius = CornerRadius::same(3);
+        widget.expansion = 0.0;
+        widget.fg_stroke.color = text;
+        widget.bg_stroke = Stroke::new(1.0, border);
+    }
+    visuals.widgets.inactive.bg_fill = chrome;
+    visuals.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
+    visuals.widgets.hovered.bg_fill = selected;
+    visuals.widgets.hovered.weak_bg_fill = selected;
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, accent);
+    visuals.widgets.active.bg_fill = selected;
+    visuals.widgets.active.weak_bg_fill = selected;
+    visuals.widgets.active.bg_stroke = Stroke::new(1.5, accent);
+    style.spacing.item_spacing = egui::vec2(5.0, 3.0);
+    style.spacing.button_padding = egui::vec2(5.0, 2.0);
+    style.spacing.interact_size.y = 20.0;
+    style
+        .text_styles
+        .insert(TextStyle::Body, FontId::proportional(13.0));
+    style
+        .text_styles
+        .insert(TextStyle::Button, FontId::proportional(13.0));
+    style
+        .text_styles
+        .insert(TextStyle::Monospace, FontId::monospace(13.0));
+    context.set_style_of(egui::Theme::Dark, style);
 }
 
 pub fn view_frame() -> Frame {
     Frame::NONE.fill(VIEW).inner_margin(5)
+}
+
+/// The shared project logo, kept within the existing menu row.
+pub fn brand_mark(ui: &mut Ui) -> egui::Response {
+    crate::brand::menu_mark(ui)
 }
 
 /// A toolbar history button drawn without depending on an arrow font glyph.
