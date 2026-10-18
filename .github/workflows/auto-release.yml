@@ -1,0 +1,74 @@
+name: Automatic main release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+      sha: ${{ steps.version.outputs.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Check release tooling
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
+      - name: Reserve the next patch release snapshot
+        id: version
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        run: python3 scripts/prepare-release.py --source "$SOURCE_SHA" --run-id "$GITHUB_RUN_ID"
+
+  packages:
+    needs: prepare
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.prepare.outputs.sha }}
+
+  publish:
+    needs: [prepare, packages]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: write
+    # Different main updates retain independent builds and publication jobs.
+    concurrency:
+      group: publish-main-release-${{ needs.prepare.outputs.tag }}
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+      RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+      RELEASE_SHA: ${{ needs.prepare.outputs.sha }}
+      SOURCE_SHA: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Download both tested native packages
+        run: |
+          gh run download "$GITHUB_RUN_ID" --name ghidra-rust-linux-x64 --dir target/release-assets
+          gh run download "$GITHUB_RUN_ID" --name ghidra-rust-windows-x64 --dir target/release-assets
+      - name: Verify complete packages and SHA-256 checksums
+        run: |
+          python3 scripts/check-release-version.py --tag "$RELEASE_TAG"
+          python3 scripts/verify-release-assets.py target/release-assets
+      - name: Generate update notes and publish all assets
+        run: bash scripts/publish-release.sh

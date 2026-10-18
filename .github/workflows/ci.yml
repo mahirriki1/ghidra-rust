@@ -1,10 +1,15 @@
 name: Native desktop correctness
 on:
   push:
-    branches: ['**']
+    branches-ignore: [main] # Main is built by the automatic release workflow.
   pull_request:
   workflow_dispatch:
   workflow_call:
+    inputs:
+      ref:
+        description: Exact release snapshot to build
+        required: false
+        type: string
 permissions:
   contents: read
 jobs:
@@ -13,6 +18,12 @@ jobs:
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - name: Check release tooling
+        run: |
+          python3 scripts/check-release-version.py
+          python3 -m unittest discover -s scripts -p 'test_*.py'
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
         with:
           toolchain: 1.98.1
@@ -63,6 +74,8 @@ jobs:
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
         with:
           toolchain: 1.98.1
