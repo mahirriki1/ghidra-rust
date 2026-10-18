@@ -117,7 +117,7 @@ try {
     $bundle = Join-Path $staging $bundleName
     [IO.Directory]::CreateDirectory($bundle) | Out-Null
     Copy-BundleFile $executable (Join-Path $bundle 'ghidra-rust.exe')
-    foreach ($relative in @('README.md', 'LICENSE', 'NOTICE', 'docs/releases.md', 'docs/windows.md', 'docs/linux.md', 'docs/crypto-signatures.md')) {
+    foreach ($relative in @('README.md', 'LICENSE', 'NOTICE', 'docs/releases.md', 'docs/windows.md', 'docs/linux.md', 'docs/crypto-signatures.md', 'docs/architectures.md')) {
         Copy-BundleFile (Join-Path $repository $relative) (Join-Path $bundle $relative)
     }
     $images = Join-Path $repository 'docs/images'

@@ -208,7 +208,7 @@ def main():
         run("strip", "--strip-unneeded", str(bundled_binary))
         bundled_binary.chmod(0o755)
         assert_executable(bundled_binary)
-        for relative in ("README.md", "LICENSE", "NOTICE", "docs/releases.md", "docs/crypto-signatures.md"):
+        for relative in ("README.md", "LICENSE", "NOTICE", "docs/releases.md", "docs/crypto-signatures.md", "docs/architectures.md"):
             copy_file(package_file(ROOT, relative), bundle / relative)
         for relative in ("docs/linux.md", "docs/windows.md"):
             if (ROOT / relative).exists():

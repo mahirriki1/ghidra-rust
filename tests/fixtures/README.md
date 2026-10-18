@@ -63,3 +63,21 @@ The crypto table contains standardized numeric constants from AES (FIPS 197),
 not a copied signature database. This fixture does not establish broad processor,
 compiler, binary-format, C++, or Rust compatibility. Compiler-generated startup
 code and addresses can vary with the compiler and system libraries.
+
+## AArch64
+
+`aarch64.S` is original assembly with explicit little-endian instruction words.
+`tests/common/mod.rs` generates minimal linked ELF64, Windows ARM64 PE32+, and
+baseline arm64 Mach-O containers from it in temporary paths. The instructions
+are analyzed, never executed. No cross compiler or emulator is required.
+`cargo test --locked --test aarch64` exercises contained native workers, genuine
+semantic mappings, and protected embedded projects for all three containers;
+it also checks stripped ELF discovery and invalid instruction boundaries.
+The release build scripts run this test against the optimized worker too.
+See [architecture coverage](../../docs/architectures.md) for unsupported modes
+and platform validation limits.
+
+`fixture_indirect` deliberately jumps through unknown register `x2`. The engine's
+"Could not recover jumptable" warning is expected there; this fixture contains
+no actual jump table. Its call-like pseudocode fallback does not establish a call
+target. The instruction graph retains an unresolved jump instead.

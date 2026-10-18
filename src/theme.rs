@@ -84,6 +84,32 @@ pub fn view_frame() -> Frame {
     Frame::NONE.fill(VIEW).inner_margin(5)
 }
 
+/// Activity without an invented completion percentage. The parent uses a
+/// right-to-left status layout, so the track stays at the window's right edge.
+pub fn analysis_activity(ui: &mut Ui, task: &str, elapsed: std::time::Duration) {
+    let (track, response) = ui.allocate_exact_size(egui::vec2(88.0, 6.0), egui::Sense::hover());
+    let label = format!("{task} · {:.1}s", elapsed.as_secs_f32());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::Role::ProgressIndicator, ui.is_enabled(), &label)
+    });
+    response.on_hover_text("Analysis is running. Use Analysis → Cancel analysis to stop it.");
+    if ui.is_rect_visible(track) {
+        ui.painter()
+            .rect_filled(track, 2, ui.visuals().extreme_bg_color);
+        let width = track.width() * 0.28;
+        let phase = (elapsed.as_secs_f32() * std::f32::consts::PI).sin() * 0.5 + 0.5;
+        let segment = egui::Rect::from_min_size(
+            track.min + egui::vec2((track.width() - width) * phase, 0.0),
+            egui::vec2(width, track.height()),
+        );
+        ui.painter()
+            .rect_filled(segment, 2, ui.visuals().selection.stroke.color);
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(66));
+    }
+    ui.label(RichText::new(label).small());
+}
+
 /// The shared project logo, kept within the existing menu row.
 pub fn brand_mark(ui: &mut Ui) -> egui::Response {
     crate::brand::menu_mark(ui)

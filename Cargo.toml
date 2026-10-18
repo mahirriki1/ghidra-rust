@@ -8,7 +8,7 @@ description = "An experimental native reverse engineering desktop"
 [dependencies]
 base64 = "0.22"
 eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "wayland", "x11", "clipboard"] }
-ghidra-decompiler = { git = "https://github.com/koute/ghidra-decompiler", rev = "268c3a406d8d964bc00ae2ead4d3e1e1373aaa27", default-features = false, features = ["demangle", "x86"] }
+ghidra-decompiler = { git = "https://github.com/koute/ghidra-decompiler", rev = "268c3a406d8d964bc00ae2ead4d3e1e1373aaa27", default-features = false, features = ["demangle", "x86", "aarch64"] }
 object = { version = "0.37", default-features = false, features = ["read", "std"] }
 rusqlite = { version = "0.40.2", features = ["bundled", "limits", "hooks", "blob"] }
 serde = { version = "1", features = ["derive"] }
