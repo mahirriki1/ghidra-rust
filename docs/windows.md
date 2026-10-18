@@ -120,7 +120,12 @@ the 10,000-function list prioritizes the entry point, exports, and nearby runtim
 functions and displays **Partial function list**. **G** accepts a known function's
 hexadecimal virtual address. Open **Analysis notes** for coverage limits.
 
-Import slots and recognized jump thunks gain their imported names, but PDB types,
+Windows ARM64 PE inputs use the AArch64 Windows ABI; ARM64 unwind-based function
+recovery and import-veneer naming remain deferred. See
+[architecture coverage](architectures.md). These are input formats, not a native
+ARM64 Windows desktop build claim.
+
+Import slots and recognized x86 jump thunks gain their imported names, but PDB types,
 API prototypes, library signature matching, delay imports, and Control Flow Guard
 substitutions remain incomplete. **Discover functions** can find additional
 functions, but complete function/name recovery is not guaranteed. Compare file

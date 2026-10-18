@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 const APPLICATION_ID: i64 = 0x4752504a; // GRPJ
 const VERSION: i64 = 1;
 pub const ENGINE_FINGERPRINT: &str =
-    "ghidra-rust-project-v1-mapping-v1-pe-v1:268c3a406d8d964bc00ae2ead4d3e1e1373aaa27";
+    "ghidra-rust-project-v1-mapping-v1-pe-v1-aarch64-v1:268c3a406d8d964bc00ae2ead4d3e1e1373aaa27";
 const MAX_BINARY: usize = 128 * 1024 * 1024;
 const MAX_BODY: usize = 16 * 1024 * 1024;
 const MAX_PROJECT: u64 = 192 * 1024 * 1024;
@@ -1125,7 +1125,9 @@ mod tests {
         let db = Connection::open(&path).unwrap();
         let bytes = read_blob(&db, "body", MAX_BODY).unwrap().unwrap();
         let mut body: Body = serde_json::from_slice(&bytes).unwrap();
-        body.engine = "old engine".into();
+        body.engine =
+            "ghidra-rust-project-v1-mapping-v1-pe-v1:268c3a406d8d964bc00ae2ead4d3e1e1373aaa27"
+                .into();
         db.execute(
             "UPDATE project_data SET value=?1 WHERE key='body'",
             [encode(&body, MAX_BODY).unwrap()],

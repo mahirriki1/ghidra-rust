@@ -29,4 +29,5 @@ cargo build --release --locked
 # Exercise the actual optimized worker and persisted project round trip.
 cargo test --release --locked --test worker_process
 cargo test --release --locked --test linux_worker
+cargo test --release --locked --test aarch64
 python3 scripts/package-linux.py

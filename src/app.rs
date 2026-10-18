@@ -1833,7 +1833,7 @@ impl DesktopApp {
             });
             ui.menu_button("Help", |ui| {
                 ui.label("Ghidra / Rust — native prototype");
-                ui.weak("x86 / x86-64 · limited analysis and signature coverage");
+                ui.weak("x86 / x86-64 / AArch64 · limited analysis and signature coverage");
                 ui.weak("Save .grproj projects or export JSON annotations. Java plugins are not supported.");
                 ui.label("L: rename function / label · G: go to · ;: comment");
                 ui.label("Space: Listing / Graph · Alt+Left/Right: history");
@@ -2769,26 +2769,50 @@ impl DesktopApp {
         }
         egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
         egui::Panel::bottom("status").show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                if self.pending.is_some() || self.file_job.is_some() {
-                    ui.spinner();
-                }
-                ui.label(&self.status);
-                if let Some(info) = &self.info {
-                    ui.weak(format!(
-                        "{} · {} · {} bytes",
-                        info.format, info.architecture, info.file_len
-                    ));
-                    if !info.warnings.is_empty() {
-                        ui.menu_button("Analysis notes", |ui| {
-                            ui.set_max_width(520.0);
-                            for warning in info.warnings.iter().take(64) {
-                                ui.label(crop(warning, 1024));
+            egui::Sides::new().shrink_left().wrap().show(
+                ui,
+                |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        if self.file_job.is_some() {
+                            ui.spinner();
+                        }
+                        ui.label(&self.status);
+                        if let Some(info) = &self.info {
+                            ui.weak(format!(
+                                "{} · {} · {} bytes",
+                                info.format, info.architecture, info.file_len
+                            ));
+                            if !info.warnings.is_empty() {
+                                ui.menu_button("Analysis notes", |ui| {
+                                    ui.set_max_width(520.0);
+                                    for warning in info.warnings.iter().take(64) {
+                                        ui.label(crop(warning, 1024));
+                                    }
+                                });
                             }
-                        });
+                        }
+                    });
+                },
+                |ui| {
+                    if let Some(pending) = &self.pending {
+                        let elapsed = pending.started.elapsed();
+                        // Avoid flashing the bar for jobs which finish immediately.
+                        if elapsed >= Duration::from_millis(200) {
+                            let task = match pending.request {
+                                Request::Open { .. } => "Opening binary",
+                                Request::Graph { .. } => "Building graph",
+                                Request::Decompile { .. } => "Decompiling",
+                                Request::Discover => "Discovering functions",
+                                Request::Rename { .. } => "Renaming function",
+                                Request::Bytes { .. } => "Reading bytes",
+                                Request::Strings => "Finding strings",
+                                Request::Crypto => "Scanning constants",
+                            };
+                            theme::analysis_activity(ui, task, elapsed);
+                        }
                     }
-                }
-            });
+                },
+            );
         });
         egui::Panel::left("navigation-dock-v2")
             .default_size(260.0)
@@ -3779,6 +3803,44 @@ mod tests {
             &egui::Context::default(),
         );
         assert!(app.decompiled.is_empty());
+    }
+
+    #[test]
+    fn analysis_activity_stays_bottom_right_and_disappears_on_cancel() {
+        let context = egui::Context::default();
+        theme::install(&context);
+        let mut app = DesktopApp::empty(None);
+        app.pending = Some(Pending {
+            id: 1,
+            request: Request::Decompile { address: 0x1000 },
+            started: Instant::now() - Duration::from_secs(2),
+            selection: 0,
+            revision: 0,
+        });
+        let frame = |app: &mut DesktopApp| {
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1000.0, 640.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| app.draw(ui),
+            );
+            output.textures_delta.clear();
+            output
+        };
+        // Settle panel sizing before checking placement at the minimum window size.
+        frame(&mut app);
+        let output = frame(&mut app);
+        let position = text_position(&output, "Decompiling ·", 0);
+        assert!(position.x > 650.0 && position.x < 1000.0, "{position:?}");
+        assert!(position.y > 600.0 && position.y < 640.0, "{position:?}");
+        app.stop_worker();
+        let output = frame(&mut app);
+        assert!(!output.shapes.iter().any(|shape| matches!(&shape.shape,
+            egui::epaint::Shape::Text(text) if text.galley.text().contains("Decompiling ·"))));
     }
 
     #[test]
