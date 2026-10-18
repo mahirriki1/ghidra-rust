@@ -68,9 +68,50 @@ compiler, direct shared-library dependencies, and measured GLIBC symbol versions
 Read [Linux runtime compatibility](linux.md) and the [Windows guide](windows.md)
 before shipping to another machine.
 
-## Version tags and GitHub Actions
+## Automatic releases after main updates
 
-For each release:
+The **Automatic main release** workflow runs for every push to `main`, including
+merged pull requests. It prepares the next patch version (for example, `v0.0.4`,
+then `v0.0.5`), builds and tests Linux and Windows, verifies the complete package
+set and checksums, and publishes a GitHub Release with automatically generated
+GitHub update notes, merged pull requests, and contributors. Notes also list up to
+100 direct commit summaries since the previous published version, so updates made
+without a pull request are included. The release links its exact source commit,
+native build/test run, and the full GitHub change comparison.
+
+Version allocation uses the highest existing `vX.Y.Z` tag and the version in
+`Cargo.toml`. An intentional higher version in the manifest is respected; otherwise
+the latest patch is incremented. Keep the manifest and lockfile synchronized.
+Automatic versioning requires a plain `X.Y.Z` application version.
+
+Each version tag points to a release snapshot whose parent is the triggering main
+commit. Only the application versions in `Cargo.toml` and `Cargo.lock` change in
+that snapshot. The workflow does not push version commits back to main, so it
+cannot trigger a release loop. Main retains its development version; inspect the
+release tag for the shipped version. Tags reserved by failed builds are retained,
+so successful release numbers may have gaps. Concurrent updates reserve different
+tags, and rerunning a failed workflow reuses its original tag.
+
+The workflow calls the same native jobs used by PR CI. Main pushes use this release
+pipeline instead of starting duplicate unversioned native builds. Both platforms
+must pass before publication; partial asset uploads remain in an unpublished draft
+and can be resumed by rerunning the workflow. A rerun of an already published
+release leaves its assets intact. A slower older main update does not replace the
+current main update as the latest release. The published executables, archives,
+and four adjacent `.sha256` files are permanent release assets.
+
+The preparation and publication jobs use the repository's built-in `GITHUB_TOKEN`
+with `contents: write`; build jobs retain read-only repository access. No personal
+token or additional repository secret is required. Tags pushed with that token do
+not trigger the separate tag-build workflow; this run invokes the native jobs
+directly for the reserved snapshot. Repository/organization policy must allow the
+workflow's write permission. To retry a failure, rerun the existing Actions run.
+To create another release from current main, manually dispatch **Automatic main
+release** on `main`; dispatches on other branches are skipped.
+
+## Manual version tags and GitHub Actions
+
+For a manually versioned package build:
 
 1. Change `[package].version` in `Cargo.toml`. Update the corresponding
    `ghidra-rust` entry in `Cargo.lock`, or run `cargo check` to refresh it.
@@ -107,7 +148,7 @@ Windows remains for trusted inputs and trusted project files; its Job Objects
 are resource controls rather than a filesystem/network sandbox.
 
 The packages are unsigned. Checksums detect changes when obtained through a
-trusted channel, but do not authenticate the publisher. Signing and automatic
-publication are separate from this build-and-package workflow. A configured
+trusted channel, but do not authenticate the publisher. Automatic publication
+does not sign the packages. A configured
 workflow is not evidence of a successful hosted run; inspect the actual jobs and
 their test results for the tagged commit.

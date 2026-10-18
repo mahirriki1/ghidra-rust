@@ -23,9 +23,11 @@ when launching the desktop executable. The initial engine build can take several
 minutes. Release builds are appropriate for evaluating interactive performance.
 
 For downloadable Linux/Windows packages and the workflow to ship every version,
-see [building and shipping releases](docs/releases.md). Version tags build both
-platforms and retain executables, complete archives, and checksums as workflow
-artifacts. [Linux runtime requirements](docs/linux.md) include compatible glibc,
+see [building and shipping releases](docs/releases.md). Each push/merge to `main`
+automatically reserves the next patch version, builds and tests both platforms,
+then publishes a GitHub Release with update notes, executables, complete archives,
+and checksums. Version tags can also build packages manually.
+[Linux runtime requirements](docs/linux.md) include compatible glibc,
 desktop graphics, and bubblewrap; Linux downloads are not universal static builds.
 
 ### Native Windows
