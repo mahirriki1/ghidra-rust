@@ -50,6 +50,8 @@ try {
     # pipes explicitly; the debug/console-subsystem test cannot establish this.
     & cargo test --release --locked --target $target --test windows_worker
     if ($LASTEXITCODE -ne 0) { throw 'Windows release worker/project test failed.' }
+    & cargo test --release --locked --target $target --test aarch64
+    if ($LASTEXITCODE -ne 0) { throw 'AArch64 release worker/project test failed.' }
     & "$PSScriptRoot\package-windows.ps1"
 } finally {
     $env:GHIDRA_RUST_TEST_PE = $previousFixture
