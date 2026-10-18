@@ -8,8 +8,9 @@ the relevant source modules before changing behavior. Follow more specific
 
 - Build a responsive, memory-conscious native Rust reverse-engineering desktop
   with a familiar Ghidra layout and function-graph navigation.
-- The current implementation supports linked x86/x86-64 ELF, PE, and Mach-O
-  images. It is an experimental subset, not a complete Ghidra or IDA replacement.
+- The current implementation supports linked x86/x86-64 and little-endian
+  AArch64 (64-bit ABI) ELF, PE, and baseline arm64 Mach-O images. It is an
+  experimental subset, not a complete Ghidra or IDA replacement.
 - Keep the core desktop independent of Java and Python runtimes. Plugins,
   scripting, debugger integration, type/variable editing, and a user-facing CLI
   are future work unless explicitly requested.
@@ -24,6 +25,7 @@ the relevant source modules before changing behavior. Follow more specific
   in-app chooser.
 - `src/client.rs`, `worker.rs`, `model.rs`: disposable worker lifecycle, bounded
   JSON transport, request/response types, and shared result limits.
+- `src/architecture.rs`: supported architecture/ABI selection and validation.
 - `src/analysis.rs`: loading, immutable image snapshots, instruction/CFG recovery,
   function discovery, and analysis requests.
 - `src/decompile.rs`: semantic emission through public engine APIs, including

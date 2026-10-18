@@ -22,9 +22,12 @@ const MAX_RESULTS: usize = 10_000;
 const SCAN_CHUNK: usize = 256 * 1024;
 const MAX_STRING_PREVIEW: usize = 512;
 const MAX_IMAGE_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_DISCOVERY_FUNCTIONS: usize = 128;
+const MAX_DISCOVERY_INSTRUCTIONS: usize = 16_384;
 
 pub struct LoadedProgram {
     program: Program,
+    target: crate::architecture::Target,
     // The engine currently takes ownership of a Vec, so the immutable scan snapshot
     // duplicates at most 128 MiB. Both copies originate from exactly the hashed bytes.
     // This favors consistent analysis over live file reads; engine snapshot sharing is future work.
@@ -58,7 +61,15 @@ fn executable(sections: &[SectionInfo], address: u64, length: usize) -> bool {
     })
 }
 
+#[cfg(test)]
 fn metadata(path: &Path, bytes: &[u8]) -> Result<BinaryInfo, String> {
+    metadata_with_target(path, bytes).map(|(info, _)| info)
+}
+
+fn metadata_with_target(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<(BinaryInfo, crate::architecture::Target), String> {
     let object = object::File::parse(bytes).map_err(|e| format!("Cannot parse executable: {e}"))?;
     let format = match object.format() {
         object::BinaryFormat::Elf => "ELF",
@@ -76,18 +87,7 @@ fn metadata(path: &Path, bytes: &[u8]) -> Result<BinaryInfo, String> {
     ) {
         return Err("Only linked executables and shared libraries are supported; relocatable object files are not supported yet.".into());
     }
-    let architecture = match object.architecture() {
-        object::Architecture::I386 => "x86",
-        object::Architecture::X86_64 => "x86-64",
-        other => {
-            return Err(format!(
-                "Unsupported architecture {other:?}; this prototype supports x86 and x86-64 only."
-            ));
-        }
-    };
-    if !object.is_little_endian() {
-        return Err("Only little-endian x86 executables are supported.".into());
-    }
+    let target = crate::architecture::Target::for_image(&object)?;
     let mut sections = Vec::new();
     for section in object.sections() {
         let kind = section.kind();
@@ -160,12 +160,39 @@ fn metadata(path: &Path, bytes: &[u8]) -> Result<BinaryInfo, String> {
             return Err("Overlapping mapped sections are not supported by this prototype.".into());
         }
     }
-    Ok(BinaryInfo {
-        path: path.to_string_lossy().into_owned(), architecture: architecture.into(), format: format.into(),
+    // object 0.37 exposes LC_MAIN's file offset, not a virtual address.
+    // Translate only through validated file-backed executable sections. A Mach-O
+    // without a supported LC_MAIN entry remains navigable by symbols/address.
+    let entry = if object.format() == object::BinaryFormat::MachO {
+        let offset = object.entry();
+        let mut entry = None;
+        // A zero value also means no LC_MAIN in object 0.37. Do not invent an
+        // entry for legacy LC_UNIXTHREAD images or file-offset aliases.
+        if offset != 0 {
+            for section in &sections {
+                let Some(relative) = offset.checked_sub(section.file_offset) else {
+                    continue;
+                };
+                if section.executable && relative < section.file_size {
+                    if entry.is_some() {
+                        return Err(
+                            "Mach-O entry file offset has ambiguous executable mappings.".into(),
+                        );
+                    }
+                    entry = section.address.checked_add(relative);
+                }
+            }
+        }
+        entry.unwrap_or(0)
+    } else {
+        object.entry()
+    };
+    Ok((BinaryInfo {
+        path: path.to_string_lossy().into_owned(), architecture: target.name.into(), format: format.into(),
         sha256: format!("{:x}", Sha256::digest(bytes)), source_identity: None,
-        entry: object.entry(), file_len: bytes.len() as u64, sections, functions: Vec::new(), functions_truncated: false,
+        entry, file_len: bytes.len() as u64, sections, functions: Vec::new(), functions_truncated: false,
         warnings: vec!["Prototype analysis: symbols and supported PE function metadata load immediately; deeper function discovery is explicit. Optimized C++/Rust types and source reconstruction are incomplete.".into(), "Function lists are capped at 10,000 entries and names at 256 bytes in this prototype.".into()],
-    })
+    }, target))
 }
 
 impl LoadedProgram {
@@ -200,20 +227,34 @@ impl LoadedProgram {
         if bytes.len() as u64 > MAX_IMAGE_BYTES {
             return Err("Executable grew beyond the 128 MiB prototype limit while reading.".into());
         }
-        let mut info = metadata(path, &bytes)?;
+        let (mut info, target) = metadata_with_target(path, &bytes)?;
+        if target.name == "AArch64" {
+            warning(
+                &mut info.warnings,
+                "AArch64 analysis is experimental: indirect branches, jump tables, exception flow, and newer ISA extensions may be incomplete.",
+            );
+            if info.format == "PE" {
+                warning(
+                    &mut info.warnings,
+                    "AArch64 PE loads exports and import slots; ARM64 unwind function recovery and import-veneer naming are not implemented.",
+                );
+            }
+        }
         info.source_identity = FileIdentity::from_file(&file);
         let snapshot = Arc::from(bytes.as_slice());
         let pe = crate::pe::parse(&bytes, &info.sections)?;
         let mut program =
-            Program::from_image(&path.to_string_lossy(), bytes, None).map_err(engine_error)?;
+            Program::from_image(&path.to_string_lossy(), bytes, Some(target.language))
+                .map_err(engine_error)?;
+        if program.language_id() != target.language {
+            return Err(
+                "Engine language does not match the validated binary architecture and ABI.".into(),
+            );
+        }
         let mut pe_ranges = Vec::new();
         let mut pe_imports = BTreeMap::new();
         if let Some(pe) = pe {
-            crate::pe_symbols::register(
-                &mut program,
-                &pe,
-                if info.architecture == "x86-64" { 8 } else { 4 },
-            )?;
+            crate::pe_symbols::register(&mut program, &pe, target.pointer_bytes)?;
             info.functions_truncated = pe.functions_truncated;
             for note in pe.warnings {
                 warning(&mut info.warnings, note);
@@ -222,11 +263,18 @@ impl LoadedProgram {
             pe_imports = pe.imports;
         }
         info.functions = function_list(&program, &mut info)?;
-        if !executable(&info.sections, info.entry, 1) {
-            info.warnings.push("The binary entry point is not inside a supported executable section; select a function from the list.".into());
+        if !info.entry.is_multiple_of(target.instruction_alignment)
+            || !executable(
+                &info.sections,
+                info.entry,
+                target.instruction_alignment as usize,
+            )
+        {
+            info.warnings.push("The binary entry point is not a supported aligned file-backed instruction address; select a function from the list.".into());
         }
         Ok(Self {
             program,
+            target,
             snapshot,
             pe_ranges,
             pe_imports,
@@ -269,7 +317,11 @@ impl LoadedProgram {
                 })
             }
             Request::Discover => {
-                self.program.discover_functions().map_err(engine_error)?;
+                if self.target.name == "AArch64" {
+                    self.discover_aarch64()?;
+                } else {
+                    self.program.discover_functions().map_err(engine_error)?;
+                }
                 self.info.functions = function_list(&self.program, &mut self.info)?;
                 Ok(Response::Functions {
                     functions: self.info.functions.clone(),
@@ -302,8 +354,88 @@ impl LoadedProgram {
         }
     }
 
+    fn discover_aarch64(&mut self) -> Result<(), String> {
+        // The pinned engine's discovery uses the raw Mach-O LC_MAIN offset and
+        // skips call discovery when function symbols exist. Walk our bounded CFG
+        // instead, and register only genuine direct-call targets through public
+        // APIs. Never guess function entries from constants or instruction text.
+        let mut known: BTreeMap<_, _> = self
+            .info
+            .functions
+            .iter()
+            .map(|function| (function.address, function.name.clone()))
+            .collect();
+        self.info.functions_truncated |= known.len() > MAX_DISCOVERY_FUNCTIONS;
+        let mut pending = VecDeque::new();
+        if self.check_code(self.info.entry).is_ok() {
+            pending.push_back(self.info.entry);
+        }
+        pending.extend(known.keys().copied().take(MAX_DISCOVERY_FUNCTIONS));
+        let mut visited = BTreeSet::new();
+        let mut instructions = 0;
+        while let Some(address) = pending.pop_front() {
+            if visited.contains(&address) {
+                continue;
+            }
+            if visited.len() >= MAX_DISCOVERY_FUNCTIONS
+                || instructions >= MAX_DISCOVERY_INSTRUCTIONS
+            {
+                self.info.functions_truncated = true;
+                break;
+            }
+            visited.insert(address);
+            let functions: Vec<_> = known
+                .iter()
+                .map(|(&address, name)| FunctionInfo {
+                    address,
+                    name: name.clone(),
+                })
+                .collect();
+            let Ok((view, decoded_count)) =
+                recover_graph_counted(&self.program, &self.info.sections, &functions, address, &[])
+            else {
+                self.info.functions_truncated = true;
+                continue;
+            };
+            instructions += decoded_count;
+            self.info.functions_truncated |=
+                decoded_count >= MAX_INSTRUCTIONS || view.blocks.len() >= MAX_BLOCKS;
+            for target in view.calls.iter().filter_map(|call| call.target) {
+                if self.check_code(target).is_err() {
+                    continue;
+                }
+                let has_capacity = known.len() < MAX_RESULTS;
+                if let std::collections::btree_map::Entry::Vacant(entry) = known.entry(target) {
+                    if !has_capacity {
+                        self.info.functions_truncated = true;
+                        continue;
+                    }
+                    let name = format!("FUN_{target:08x}");
+                    self.program
+                        .set_function_name(target, &name)
+                        .map_err(engine_error)?;
+                    entry.insert(name);
+                }
+                if !visited.contains(&target) {
+                    pending.push_back(target);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn check_code(&self, address: u64) -> Result<(), String> {
-        if executable(&self.info.sections, address, 1) {
+        if !address.is_multiple_of(self.target.instruction_alignment) {
+            return Err(format!(
+                "{} instructions require {}-byte aligned addresses.",
+                self.target.name, self.target.instruction_alignment
+            ));
+        }
+        if executable(
+            &self.info.sections,
+            address,
+            self.target.instruction_alignment as usize,
+        ) {
             Ok(())
         } else {
             Err(format!(
@@ -313,7 +445,8 @@ impl LoadedProgram {
     }
 
     fn resolve_import_thunks(&mut self, entry: u64) -> Result<(), String> {
-        if self.pe_imports.is_empty() {
+        // This recognizer decodes x86 FF /4 import jumps, not AArch64 ADRP/LDR/BR veneers.
+        if self.target.name == "AArch64" || self.pe_imports.is_empty() {
             return Ok(());
         }
         let mut pending = VecDeque::from([entry]);
@@ -362,11 +495,7 @@ impl LoadedProgram {
             &self.snapshot,
             &self.info.sections,
             &targets,
-            if self.info.architecture == "x86-64" {
-                8
-            } else {
-                4
-            },
+            self.target.pointer_bytes,
         )
     }
 
@@ -534,11 +663,15 @@ impl LoadedProgram {
 }
 
 fn function_list(program: &Program, info: &mut BinaryInfo) -> Result<Vec<FunctionInfo>, String> {
+    let alignment = crate::architecture::instruction_alignment(program.language_id());
+    let code_entry = |address: u64| {
+        address.is_multiple_of(alignment) && executable(&info.sections, address, alignment as usize)
+    };
     let mut entries = program
         .functions()
         .map_err(engine_error)?
         .into_iter()
-        .filter(|f| executable(&info.sections, f.address, 1));
+        .filter(|f| code_entry(f.address));
     let mut functions: Vec<_> = entries
         .by_ref()
         .take(MAX_RESULTS)
@@ -548,9 +681,7 @@ fn function_list(program: &Program, info: &mut BinaryInfo) -> Result<Vec<Functio
         })
         .collect();
     let truncated = entries.next().is_some();
-    if executable(&info.sections, info.entry, 1)
-        && !functions.iter().any(|f| f.address == info.entry)
-    {
+    if code_entry(info.entry) && !functions.iter().any(|f| f.address == info.entry) {
         if functions.len() == MAX_RESULTS {
             functions.pop();
             info.functions_truncated = true;
@@ -682,7 +813,23 @@ fn recover_graph_with_ranges(
     entry: u64,
     pe_ranges: &[(u64, u64)],
 ) -> Result<FunctionView, String> {
-    if !executable(sections, entry, 1) {
+    recover_graph_counted(program, sections, functions, entry, pe_ranges).map(|(view, _)| view)
+}
+
+fn recover_graph_counted(
+    program: &Program,
+    sections: &[SectionInfo],
+    functions: &[FunctionInfo],
+    entry: u64,
+    pe_ranges: &[(u64, u64)],
+) -> Result<(FunctionView, usize), String> {
+    let alignment = crate::architecture::instruction_alignment(program.language_id());
+    if !entry.is_multiple_of(alignment) {
+        return Err(format!(
+            "Instructions require {alignment}-byte aligned addresses."
+        ));
+    }
+    if !executable(sections, entry, alignment as usize) {
         return Err(format!(
             "{entry:#x} is outside file-backed executable sections."
         ));
@@ -709,7 +856,8 @@ fn recover_graph_with_ranges(
             );
             break;
         }
-        if !executable(sections, address, 1) {
+        if !address.is_multiple_of(alignment) || !executable(sections, address, alignment as usize)
+        {
             warning(
                 &mut warnings,
                 "A control-flow target leaves the supported executable regions.",
@@ -755,7 +903,10 @@ fn recover_graph_with_ranges(
                 continue;
             }
         };
-        if instruction.length == 0 || !executable(sections, address, instruction.length) {
+        if instruction.length == 0
+            || (alignment == 4 && instruction.length != 4)
+            || !executable(sections, address, instruction.length)
+        {
             warning(
                 &mut warnings,
                 "An instruction crosses the boundary of an executable region.",
@@ -888,13 +1039,16 @@ fn recover_graph_with_ranges(
         &mut warnings,
         "CFG uses bounded static instruction flow; indirect jump tables, exceptions, and no-return calls may be incomplete.",
     );
-    Ok(FunctionView {
-        address: entry,
-        blocks,
-        edges,
-        calls,
-        warnings,
-    })
+    Ok((
+        FunctionView {
+            address: entry,
+            blocks,
+            edges,
+            calls,
+            warnings,
+        },
+        nodes.len(),
+    ))
 }
 
 fn flow(
@@ -973,6 +1127,83 @@ fn flow(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    fn raw_aarch64(bytes: Vec<u8>) -> LoadedProgram {
+        let mut image = elf_fixture();
+        image[18..20].copy_from_slice(&183u16.to_le_bytes());
+        let (mut info, target) = metadata_with_target(Path::new("synthetic"), &image).unwrap();
+        info.entry = 0x1000;
+        info.sections = vec![SectionInfo {
+            name: ".text".into(),
+            address: 0x1000,
+            size: bytes.len() as u64,
+            file_offset: 0,
+            file_size: bytes.len() as u64,
+            executable: true,
+        }];
+        LoadedProgram {
+            program: Program::from_raw_bytes(bytes.clone(), target.language, 0x1000).unwrap(),
+            target,
+            snapshot: Arc::from(bytes),
+            info,
+            pe_ranges: vec![],
+            pe_imports: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn aarch64_discovery_counts_decoded_instructions_omitted_by_block_limit() {
+        // Each unconditional B starts a block. Decode 256 instructions but retain
+        // only 128 blocks; discovery must charge all decoded instructions.
+        let mut bytes = 0x14000001u32.to_le_bytes().repeat(255);
+        bytes.extend_from_slice(&0xd65f03c0u32.to_le_bytes());
+        let mut loaded = raw_aarch64(bytes);
+        let (view, count) =
+            recover_graph_counted(&loaded.program, &loaded.info.sections, &[], 0x1000, &[])
+                .unwrap();
+        assert_eq!(count, 256);
+        assert_eq!(view.blocks.len(), MAX_BLOCKS);
+        assert_eq!(
+            view.blocks
+                .iter()
+                .map(|block| block.instructions.len())
+                .sum::<usize>(),
+            128
+        );
+        let Response::Functions { truncated, .. } = loaded.handle(Request::Discover).unwrap()
+        else {
+            panic!("Expected function list");
+        };
+        assert!(
+            truncated,
+            "Graph truncation must be visible during discovery"
+        );
+    }
+
+    #[test]
+    fn aarch64_discovery_reports_unvisited_seeds_without_losing_known_names() {
+        let mut loaded = raw_aarch64(0xd65f03c0u32.to_le_bytes().repeat(130));
+        for index in 0..130 {
+            loaded
+                .program
+                .set_function_name(0x1000 + index * 4, &format!("original_{index}"))
+                .unwrap();
+        }
+        loaded.info.functions = function_list(&loaded.program, &mut loaded.info).unwrap();
+        let Response::Functions {
+            functions,
+            truncated,
+        } = loaded.handle(Request::Discover).unwrap()
+        else {
+            panic!("Expected function list");
+        };
+        assert!(
+            truncated,
+            "Omitted seeds must not report complete discovery"
+        );
+        assert_eq!(functions.len(), 130);
+        assert!(functions.iter().any(|f| f.name == "original_129"));
+    }
 
     pub(crate) fn elf_fixture() -> Vec<u8> {
         fn put16(bytes: &mut [u8], offset: usize, value: u16) {
@@ -1137,6 +1368,10 @@ pub(crate) mod tests {
         };
         info.functions = function_list(&program, &mut info).unwrap();
         let mut loaded = LoadedProgram {
+            target: crate::architecture::Target::for_image(
+                &object::File::parse(elf_fixture().as_slice()).unwrap(),
+            )
+            .unwrap(),
             program,
             snapshot: Arc::from(bytes),
             info,
@@ -1257,7 +1492,7 @@ pub(crate) mod tests {
         assert_eq!(info.sections[0].file_offset, 0x100);
         assert_eq!(info.sections[1].address, 0x402000);
         assert_eq!(info.sha256.len(), 64);
-        bytes[18..20].copy_from_slice(&183u16.to_le_bytes());
+        bytes[18..20].copy_from_slice(&243u16.to_le_bytes());
         assert!(
             metadata(Path::new("fixture.elf"), &bytes)
                 .unwrap_err()

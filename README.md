@@ -133,9 +133,12 @@ navigates to that function.
 
 ## Current workflow
 
-- Open linked x86/x86-64 ELF, PE, or Mach-O images with file-backed mapped sections.
-  Other architectures, raw images, archives, relocatable objects, and sectionless
-  images are currently rejected explicitly.
+- Open linked x86/x86-64 or little-endian AArch64 ELF, PE, or Mach-O images with
+  file-backed mapped sections. AArch64 uses the container's 64-bit ABI, including
+  Windows ARM64 and baseline Apple Silicon arm64. ARM/Thumb, arm64e, ARM64EC,
+  ILP32, big-endian images, other processors, raw images, archives, relocatable
+  objects, universal/fat Mach-O, and sectionless images are rejected.
+  See [architecture coverage and limits](docs/architectures.md).
 - Browse/filter known functions; start at `main` when found, otherwise the entry
   point. PE exports and x64 exception-table function entries load on open, including
   stripped images. The list is capped at 10,000 entries; large PEs prioritize the
@@ -207,6 +210,9 @@ canceling, a transport failure, or a 30-second wall-time limit stops that worker
 The next action can reopen it. UI results are bound to the current request,
 selection, and annotation state. Dialogs, session I/O, and decoding jobs run in
 background threads. Lists draw visible rows and graph geometry is cached.
+Analysis jobs lasting over 200 ms show a compact animated bar at the bottom right,
+with the active task and elapsed time. It indicates activity without estimating
+a completion percentage. **Analysis → Cancel analysis** stops the worker.
 
 Linux workers run under bubblewrap with private namespaces, no network, read-only
 `/usr`, a read-only executable, and only the selected input file exposed from the
@@ -253,9 +259,11 @@ cargo build --release --locked
 ```
 
 Linux process integration tests compile the small original C fixture using GCC.
-Unit tests cover real x86 CFG behavior, malformed/bounded requests, immutable image
-reads, decoding, signature detection, session identity/write protection, and GUI
-components rendered without a display.
+Unit tests cover architecture/ABI selection, real x86 CFG behavior,
+malformed/bounded requests, immutable image reads, decoding, signature detection,
+session identity/write protection, and GUI components rendered without a display.
+The original AArch64 fixture exercises contained ELF/PE/Mach-O workers and embedded
+project round trips without a cross compiler or emulator.
 
 The pinned analysis dependency is
 [`koute/ghidra-decompiler`](https://github.com/koute/ghidra-decompiler/tree/268c3a406d8d964bc00ae2ead4d3e1e1373aaa27)
@@ -279,16 +287,17 @@ Actions for hosted results for the exact commit. The Windows build script is
 shared with CI.
 
 PE loading supplies export names, x64 runtime-function starts, and named import
-slots to the decompiler. Ordinary import jump thunks reached by confirmed calls
-are named during bounded function analysis. PDB types, imported API prototypes,
-library signature matching, delay imports, and Windows Control Flow Guard
-substitutions remain incomplete. Known hexadecimal addresses remain navigable.
+slots to the decompiler. Ordinary x86 import jump thunks reached by confirmed calls
+are named during bounded function analysis. AArch64 PE does not yet recover
+functions from ARM64 unwind records or name ADRP/LDR/BR import veneers. PDB types,
+imported API prototypes, library signature matching, delay imports, and Windows
+Control Flow Guard substitutions remain incomplete. Known hexadecimal addresses remain navigable.
 The PE integration tests check named exports and recovery after exports are removed.
 
-The PE analysis update invalidates older saved graph/decompiler caches when a
-project reopens; compatible annotations are retained. When comparing against a
-Ghidra project, compare the recorded executable SHA-256 and the selected function
-address. An installed program can change at the same path after an update.
+The architecture/ABI analysis update invalidates older saved graph/decompiler
+caches when a project reopens; compatible annotations are retained. When comparing
+against a Ghidra project, compare the recorded executable SHA-256 and the selected
+function address. An installed program can change at the same path after an update.
 
 The Windows sandbox and project-parser trust limitations above remain explicit;
 the application has not had a comprehensive security or dependency audit. One stalled directory read
