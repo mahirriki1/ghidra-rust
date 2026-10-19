@@ -257,9 +257,450 @@ pub(crate) fn register_import_thunks(
     register(program, &metadata, pointer_bytes)
 }
 
+/// Resolve only the conventional three-instruction ARM64 PE import veneer.
+/// The inputs are established function entries or confirmed call targets, never
+/// arbitrary offsets from a signature scan. The IAT remains loader-written data;
+/// naming this veneer does not resolve its indirect branch to a runtime address.
+pub(crate) fn register_aarch64_import_thunks(
+    program: &mut Program,
+    imports: &BTreeMap<u64, String>,
+    snapshot: &[u8],
+    sections: &[SectionInfo],
+    targets: &BTreeSet<u64>,
+) -> Result<(), String> {
+    let mut remaining = MAX_THUNK_TARGETS * 3;
+    register_aarch64_import_thunks_budgeted(
+        program,
+        imports,
+        snapshot,
+        sections,
+        targets,
+        &mut remaining,
+    )
+    .map(|_| ())
+}
+
+/// Charge the same shared instruction budget used by confirmed-call discovery.
+/// False means a syntactically eligible candidate could not fit the budget.
+pub(crate) fn register_aarch64_import_thunks_budgeted(
+    program: &mut Program,
+    imports: &BTreeMap<u64, String>,
+    snapshot: &[u8],
+    sections: &[SectionInfo],
+    targets: &BTreeSet<u64>,
+    remaining: &mut usize,
+) -> Result<bool, String> {
+    if imports.len() > MAX_IMPORTS || targets.len() > MAX_THUNK_TARGETS {
+        return Err("PE import thunk candidates exceed the registration limits".into());
+    }
+    let mut metadata = PeMetadata::default();
+    let mut complete = true;
+    for &target in targets {
+        if target % 4 != 0 {
+            continue;
+        }
+        let Some(bytes) = mapped_bytes(snapshot, sections, target, 12, true) else {
+            continue;
+        };
+        let words = [0, 4, 8]
+            .map(|offset| u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()));
+        let Some(slot) = aarch64_veneer_slot(target, words) else {
+            continue;
+        };
+        let Some(name) = imports.get(&slot) else {
+            continue;
+        };
+        if slot % 8 != 0 || mapped_bytes(snapshot, sections, slot, 8, false).is_none() {
+            continue;
+        }
+        let Some(available) = remaining.checked_sub(3) else {
+            complete = false;
+            break;
+        };
+        *remaining = available;
+        let Ok(decoded) = program.disassemble(target, 3) else {
+            continue;
+        };
+        if decoded.len() != 3
+            || !decoded.iter().zip(["ADRP", "LDR", "BR"]).enumerate().all(
+                |(index, (instruction, mnemonic))| {
+                    instruction.address == target + index as u64 * 4
+                        && instruction.length == 4
+                        && instruction.bytes == bytes[index * 4..index * 4 + 4]
+                        && instruction.mnemonic.eq_ignore_ascii_case(mnemonic)
+                },
+            )
+        {
+            continue;
+        }
+        let Ok(pcode) = program.pcode(target, 3) else {
+            continue;
+        };
+        if pcode.len() != 3
+            || !pcode.iter().enumerate().all(|(index, instruction)| {
+                instruction.address == target + index as u64 * 4 && instruction.length == 4
+            })
+            || !pcode[1].operations.iter().any(|operation| {
+                operation.opcode == OpCode::Load
+                    && operation
+                        .output
+                        .as_ref()
+                        .is_some_and(|output| output.size == 8)
+            })
+            || !pcode[2].operations.iter().any(|operation| {
+                operation.opcode == OpCode::Branchind
+                    && operation
+                        .inputs
+                        .first()
+                        .is_some_and(|input| input.size == 8)
+            })
+            || pcode
+                .iter()
+                .flat_map(|instruction| &instruction.operations)
+                .any(|operation| {
+                    matches!(
+                        operation.opcode,
+                        OpCode::Branch
+                            | OpCode::Cbranch
+                            | OpCode::Call
+                            | OpCode::Callind
+                            | OpCode::Return
+                    )
+                })
+        {
+            continue;
+        }
+        metadata.functions.insert(target, name.clone());
+    }
+
+    // Most candidates are already generic functions recovered from unwind data
+    // or calls. Register missing entries first, then promote only exact generated
+    // names. Preserve exports and analyst-chosen meaningful names.
+    let existing = program
+        .functions()
+        .map_err(|error| error.explain().to_string())?
+        .into_iter()
+        .map(|function| (function.address, function.name))
+        .collect::<BTreeMap<_, _>>();
+    register(program, &metadata, 8)?;
+    let architecture = program.architecture();
+    let table = architecture
+        .symboltab_ref()
+        .map_err(|error| error.explain().to_string())?;
+    let global = table
+        .get_global_scope()
+        .ok_or("Missing global scope while naming ARM64 veneers")?;
+    let mut names = table
+        .symbols
+        .iter()
+        .filter(|(_, symbol)| symbol.get_scope() == global)
+        .map(|(_, symbol)| symbol.get_name().to_owned())
+        .collect::<BTreeSet<_>>();
+    for (&address, requested) in &metadata.functions {
+        let Some(old_name) = existing.get(&address) else {
+            continue;
+        };
+        if old_name != &format!("FUN_{address:x}") && old_name != &format!("FUN_{address:08x}") {
+            continue;
+        }
+        let name = unique_name(&mut names, requested, address, "FUN");
+        program
+            .set_function_name(address, &name)
+            .map_err(|error| error.explain().to_string())?;
+        // Program::set_function_name updates its record and global symbol, but
+        // not already materialized Funcdata/local scopes in the pinned engine.
+        let architecture = program.architecture();
+        let code = architecture
+            .manager
+            .get_default_code_space()
+            .ok_or("Missing code space while naming ARM64 veneers")?;
+        let symbol = architecture
+            .symboltab_ref()
+            .map_err(|error| error.explain().to_string())?
+            .scope_find_function(global, &Address::new(code, address))
+            .ok_or("Missing function while naming ARM64 veneer")?;
+        architecture
+            .with_function(symbol, |function, architecture| {
+                architecture.clear_analysis(function);
+                function.name = name.clone();
+                function.display_name = name.clone();
+                if let Some(scope) = function.get_scope_local() {
+                    let local = architecture.symboltab_mut()?.scope_mut(scope);
+                    local.name = name.clone();
+                    local.display_name = name.clone();
+                }
+                Ok(())
+            })
+            .map_err(|error| error.explain().to_string())?;
+    }
+    Ok(complete)
+}
+
+fn mapped_bytes<'a>(
+    snapshot: &'a [u8],
+    sections: &[SectionInfo],
+    address: u64,
+    size: u64,
+    executable: bool,
+) -> Option<&'a [u8]> {
+    let index = sections.partition_point(|section| section.address <= address);
+    let section = sections.get(index.checked_sub(1)?)?;
+    let offset = address.checked_sub(section.address)?;
+    let end = offset.checked_add(size)?;
+    if section.executable != executable || end > section.file_size || end > section.size {
+        return None;
+    }
+    address.checked_add(size)?;
+    let start = usize::try_from(section.file_offset.checked_add(offset)?).ok()?;
+    snapshot.get(start..start.checked_add(usize::try_from(size).ok()?)?)
+}
+
+fn aarch64_veneer_slot(address: u64, [adrp, ldr, branch]: [u32; 3]) -> Option<u64> {
+    // ADRP Xn; LDR Xm,[Xn,#imm12*8]; BR Xm. W-register loads, SP/ZR,
+    // pre/post-indexed loads and register-offset forms are deliberately excluded.
+    if adrp & 0x9f00_0000 != 0x9000_0000
+        || ldr & 0xffc0_0000 != 0xf940_0000
+        || branch & 0xffff_fc1f != 0xd61f_0000
+    {
+        return None;
+    }
+    let base = adrp & 31;
+    let loaded = ldr & 31;
+    if base == 31 || loaded == 31 || (ldr >> 5) & 31 != base || (branch >> 5) & 31 != loaded {
+        return None;
+    }
+    let immediate = ((adrp >> 29) & 3) | (((adrp >> 5) & 0x7ffff) << 2);
+    let signed_pages = i64::from((immediate as i32) << 11 >> 11);
+    (address & !0xfff)
+        .checked_add_signed(signed_pages * 4096)?
+        .checked_add(u64::from((ldr >> 10) & 0xfff) * 8)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const ARM64_VENEER: [u32; 3] = [0x9000_0010, 0xf940_4211, 0xd61f_0220];
+
+    #[test]
+    fn arm64_veneer_naming_respects_shared_instruction_budget() {
+        let (bytes, sections, metadata) = arm64_fixture(ARM64_VENEER);
+        let mut program =
+            Program::from_raw_bytes(bytes.clone(), "AARCH64:LE:64:v8A:windows", 0x1000).unwrap();
+        register(&mut program, &metadata, 8).unwrap();
+        let targets = BTreeSet::from([0x1040]);
+        for available in [0, 1, 2] {
+            let mut remaining = available;
+            assert!(
+                !register_aarch64_import_thunks_budgeted(
+                    &mut program,
+                    &metadata.imports,
+                    &bytes,
+                    &sections,
+                    &targets,
+                    &mut remaining,
+                )
+                .unwrap()
+            );
+            assert_eq!(remaining, available);
+            assert_eq!(program.functions().unwrap()[1].name, "FUN_1040");
+        }
+        let mut remaining = 3;
+        assert!(
+            register_aarch64_import_thunks_budgeted(
+                &mut program,
+                &metadata.imports,
+                &bytes,
+                &sections,
+                &targets,
+                &mut remaining,
+            )
+            .unwrap()
+        );
+        assert_eq!(remaining, 0);
+        assert_eq!(program.functions().unwrap()[1].name, "ExitProcess");
+    }
+
+    fn arm64_fixture(words: [u32; 3]) -> (Vec<u8>, Vec<SectionInfo>, PeMetadata) {
+        let mut bytes = vec![0; 0x100];
+        // Original safe fixture: save LR; BL 0x1040; restore LR; RET.
+        for (index, word) in [
+            0xa9bf_7bfdu32,
+            0x9100_03fd,
+            0x9400_000e,
+            0xa8c1_7bfd,
+            0xd65f_03c0,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            bytes[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        for (index, word) in words.into_iter().enumerate() {
+            bytes[0x40 + index * 4..0x44 + index * 4].copy_from_slice(&word.to_le_bytes());
+        }
+        // This raw lookup value deliberately resembles code. It must never be
+        // treated as the import's runtime destination.
+        bytes[0x80..0x88].copy_from_slice(&0x1040u64.to_le_bytes());
+        let sections = vec![
+            SectionInfo {
+                name: ".text".into(),
+                address: 0x1000,
+                size: 0x80,
+                file_offset: 0,
+                file_size: 0x80,
+                executable: true,
+            },
+            SectionInfo {
+                name: ".idata".into(),
+                address: 0x1080,
+                size: 0x80,
+                file_offset: 0x80,
+                file_size: 0x80,
+                executable: false,
+            },
+        ];
+        let mut metadata = PeMetadata::default();
+        metadata.functions.insert(0x1000, "caller".into());
+        metadata.functions.insert(0x1040, "FUN_1040".into());
+        metadata.imports.insert(0x1080, "ExitProcess".into());
+        (bytes, sections, metadata)
+    }
+
+    #[test]
+    fn arm64_import_veneer_promotes_materialized_generic_function_without_resolving_branch() {
+        let (bytes, sections, metadata) = arm64_fixture(ARM64_VENEER);
+        let mut program =
+            Program::from_raw_bytes(bytes.clone(), "AARCH64:LE:64:v8A:windows", 0x1000).unwrap();
+        register(&mut program, &metadata, 8).unwrap();
+        // Exercise the pinned engine's independently cached Funcdata and scope.
+        let before = program.decompile(0x1040).unwrap();
+        assert!(before.contains("FUN_1040"), "{before}");
+        register_aarch64_import_thunks(
+            &mut program,
+            &metadata.imports,
+            &bytes,
+            &sections,
+            &BTreeSet::from([0x1040]),
+        )
+        .unwrap();
+        assert_eq!(program.functions().unwrap()[1].name, "ExitProcess");
+        let definition = program.decompile(0x1040).unwrap();
+        assert!(definition.contains("ExitProcess("), "{definition}");
+        assert!(!definition.contains("FUN_1040"), "{definition}");
+        let caller = program.decompile(0x1000).unwrap();
+        assert!(caller.contains("ExitProcess("), "{caller}");
+        let branch = program.pcode(0x1048, 1).unwrap();
+        assert!(
+            branch[0]
+                .operations
+                .iter()
+                .any(|op| op.opcode == OpCode::Branchind)
+        );
+        assert!(
+            !branch[0]
+                .operations
+                .iter()
+                .any(|op| op.opcode == OpCode::Branch)
+        );
+    }
+
+    #[test]
+    fn arm64_veneer_rejects_unestablished_or_malformed_targets_and_slots() {
+        // Wrong base/destination relationships, SP/ZR, 32-bit load, post-index
+        // load, direct jump, and a well-formed load from a non-IAT address.
+        for words in [
+            [ARM64_VENEER[0], 0xf940_4231, ARM64_VENEER[2]],
+            [ARM64_VENEER[0], ARM64_VENEER[1], 0xd61f_0200],
+            [0x9000_001f, 0xf940_43f1, ARM64_VENEER[2]],
+            [ARM64_VENEER[0], 0xf940_421f, 0xd61f_03e0],
+            [ARM64_VENEER[0], 0xb940_8211, ARM64_VENEER[2]],
+            [ARM64_VENEER[0], 0xf840_8611, ARM64_VENEER[2]],
+            [ARM64_VENEER[0], ARM64_VENEER[1], 0x1400_0000],
+            [ARM64_VENEER[0], 0xf940_4611, ARM64_VENEER[2]],
+        ] {
+            let (bytes, sections, metadata) = arm64_fixture(words);
+            let mut program =
+                Program::from_raw_bytes(bytes.clone(), "AARCH64:LE:64:v8A:windows", 0x1000)
+                    .unwrap();
+            register(&mut program, &metadata, 8).unwrap();
+            register_aarch64_import_thunks(
+                &mut program,
+                &metadata.imports,
+                &bytes,
+                &sections,
+                &BTreeSet::from([0x1040]),
+            )
+            .unwrap();
+            assert_eq!(
+                program.functions().unwrap()[1].name,
+                "FUN_1040",
+                "{words:x?}"
+            );
+        }
+        let (bytes, sections, metadata) = arm64_fixture(ARM64_VENEER);
+        let mut program =
+            Program::from_raw_bytes(bytes.clone(), "AARCH64:LE:64:v8A:windows", 0x1000).unwrap();
+        register(&mut program, &metadata, 8).unwrap();
+        for targets in [BTreeSet::new(), BTreeSet::from([0x1041])] {
+            register_aarch64_import_thunks(
+                &mut program,
+                &metadata.imports,
+                &bytes,
+                &sections,
+                &targets,
+            )
+            .unwrap();
+            assert_eq!(program.functions().unwrap()[1].name, "FUN_1040");
+        }
+        for (section_index, backed) in [(0, 0x4b), (1, 7)] {
+            let mut truncated = sections.clone();
+            truncated[section_index].file_size = backed;
+            register_aarch64_import_thunks(
+                &mut program,
+                &metadata.imports,
+                &bytes,
+                &truncated,
+                &BTreeSet::from([0x1040]),
+            )
+            .unwrap();
+            assert_eq!(program.functions().unwrap()[1].name, "FUN_1040");
+        }
+        register_aarch64_import_thunks(
+            &mut program,
+            &metadata.imports,
+            &bytes[..0x87],
+            &sections,
+            &BTreeSet::from([0x1040]),
+        )
+        .unwrap();
+        assert_eq!(program.functions().unwrap()[1].name, "FUN_1040");
+    }
+
+    #[test]
+    fn arm64_veneer_preserves_export_names_and_checks_signed_page_arithmetic() {
+        let (bytes, sections, mut metadata) = arm64_fixture(ARM64_VENEER);
+        metadata.functions.insert(0x1040, "MeaningfulExport".into());
+        let mut program =
+            Program::from_raw_bytes(bytes.clone(), "AARCH64:LE:64:v8A:windows", 0x1000).unwrap();
+        register(&mut program, &metadata, 8).unwrap();
+        register_aarch64_import_thunks(
+            &mut program,
+            &metadata.imports,
+            &bytes,
+            &sections,
+            &BTreeSet::from([0x1040]),
+        )
+        .unwrap();
+        assert_eq!(program.functions().unwrap()[1].name, "MeaningfulExport");
+        // ADRP X16,+0x1000 and ADRP X16,-0x1000, respectively.
+        let positive = [0xb000_0010, ARM64_VENEER[1], ARM64_VENEER[2]];
+        let negative = [0xf0ff_fff0, ARM64_VENEER[1], ARM64_VENEER[2]];
+        assert_eq!(aarch64_veneer_slot(0x2040, negative), Some(0x1080));
+        assert_eq!(aarch64_veneer_slot(0, negative), None);
+        assert_eq!(aarch64_veneer_slot(!3u64, positive), None);
+        assert_eq!(aarch64_veneer_slot(0x1040, positive), Some(0x2080));
+    }
 
     #[test]
     fn imported_slot_name_reaches_decompiler_without_becoming_code() {

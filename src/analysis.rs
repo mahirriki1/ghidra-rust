@@ -239,12 +239,6 @@ impl LoadedProgram {
                 &mut info.warnings,
                 "AArch64 analysis is experimental: indirect branches, jump tables, exception flow, and newer ISA extensions may be incomplete.",
             );
-            if info.format == "PE" {
-                warning(
-                    &mut info.warnings,
-                    "AArch64 PE loads exports and import slots; ARM64 unwind function recovery and import-veneer naming are not implemented.",
-                );
-            }
         }
         info.source_identity = FileIdentity::from_file(&file);
         let snapshot = Arc::from(bytes.as_slice());
@@ -269,6 +263,28 @@ impl LoadedProgram {
             pe_imports = pe.imports;
         }
         info.functions = function_list(&program, &mut info)?;
+        if !upx_packed && target.name == "AArch64" && !pe_imports.is_empty() {
+            let targets = info
+                .functions
+                .iter()
+                .map(|function| function.address)
+                .take(crate::pe_symbols::MAX_THUNK_TARGETS)
+                .collect();
+            crate::pe_symbols::register_aarch64_import_thunks(
+                &mut program,
+                &pe_imports,
+                &snapshot,
+                &info.sections,
+                &targets,
+            )?;
+            if info.functions.len() > crate::pe_symbols::MAX_THUNK_TARGETS {
+                warning(
+                    &mut info.warnings,
+                    "ARM64 PE import-veneer naming on open is limited to the first 2,048 established function entries; discovery and selected-function analysis can name additional confirmed targets.",
+                );
+            }
+            info.functions = function_list(&program, &mut info)?;
+        }
         if !info.entry.is_multiple_of(target.instruction_alignment)
             || !executable(
                 &info.sections,
@@ -334,6 +350,9 @@ impl LoadedProgram {
             }
             Request::Discover => {
                 self.check_unpacked()?;
+                // Selected-function analysis can materialize and name a callee
+                // since the last published inventory. Preserve those names.
+                self.info.functions = function_list(&self.program, &mut self.info)?;
                 let analysis = self.discover_calls(progress)?;
                 self.info.functions = function_list(&self.program, &mut self.info)?;
                 Ok(Response::Functions {
@@ -509,6 +528,29 @@ impl LoadedProgram {
             emit(AnalysisStage::Calls, &report, progress)?;
         }
         report.references = references.into_iter().collect();
+        if self.target.name == "AArch64" && !self.pe_imports.is_empty() {
+            let targets: BTreeSet<_> = report
+                .references
+                .iter()
+                .map(|reference| reference.target)
+                .chain(known.keys().copied())
+                .collect();
+            report.partial |= targets.len() > crate::pe_symbols::MAX_THUNK_TARGETS;
+            let targets = targets
+                .into_iter()
+                .take(crate::pe_symbols::MAX_THUNK_TARGETS)
+                .collect();
+            let mut remaining = MAX_ANALYSIS_INSTRUCTIONS - report.decode_attempts;
+            report.partial |= !crate::pe_symbols::register_aarch64_import_thunks_budgeted(
+                &mut self.program,
+                &self.pe_imports,
+                &self.snapshot,
+                &self.info.sections,
+                &targets,
+                &mut remaining,
+            )?;
+            report.decode_attempts = MAX_ANALYSIS_INSTRUCTIONS - remaining;
+        }
         emit(AnalysisStage::Publish, &report, progress)?;
         Ok(report)
     }
@@ -534,13 +576,12 @@ impl LoadedProgram {
     }
 
     fn resolve_import_thunks(&mut self, entry: u64) -> Result<(), String> {
-        // This recognizer decodes x86 FF /4 import jumps, not AArch64 ADRP/LDR/BR veneers.
-        if self.target.name == "AArch64" || self.pe_imports.is_empty() {
+        if self.pe_imports.is_empty() {
             return Ok(());
         }
         let mut pending = VecDeque::from([entry]);
         let mut visited = BTreeSet::new();
-        let mut targets = BTreeSet::new();
+        let mut targets = BTreeSet::from([entry]);
         // The decompiler can follow a tail branch into another known function.
         // Resolve imports from those exact CFG call targets as well, with a
         // fixed work budget. Never treat arbitrary byte matches as code entries.
@@ -577,6 +618,15 @@ impl LoadedProgram {
                     pending.push_back(target);
                 }
             }
+        }
+        if self.target.name == "AArch64" {
+            return crate::pe_symbols::register_aarch64_import_thunks(
+                &mut self.program,
+                &self.pe_imports,
+                &self.snapshot,
+                &self.info.sections,
+                &targets,
+            );
         }
         crate::pe_symbols::register_import_thunks(
             &mut self.program,
@@ -1027,7 +1077,7 @@ fn recover_graph_budgeted(
         {
             warning(
                 &mut warnings,
-                "A path reaches another known function entry; displayed as an external/tail exit.",
+                "A path reaches another known function entry or PE runtime-region start; displayed as an external/tail exit.",
             );
             continue;
         }

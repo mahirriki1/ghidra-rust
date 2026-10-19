@@ -166,6 +166,55 @@ pub fn pe() -> (Vec<u8>, u64) {
     (b, base)
 }
 
+pub fn arm64_pe_metadata() -> (Vec<u8>, u64) {
+    let (mut b, base) = pe();
+    b.resize(0xc00, 0);
+    b[0x108..0x110].fill(0); // stripped: no exports
+    p32(&mut b, 0x1b8, 0x800); // .rdata virtual/raw extent
+    p32(&mut b, 0x1c0, 0x800);
+    let words: Vec<_> = include_str!("../fixtures/arm64-pe.S")
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix(".inst 0x"))
+        .map(|value| u32::from_str_radix(value.split_whitespace().next().unwrap(), 16).unwrap())
+        .collect();
+    let mut source = 0;
+    for (offset, count) in [(0x80, 2), (0x90, 2), (0xa0, 5), (0xc0, 3)] {
+        for index in 0..count {
+            p32(&mut b, 0x200 + offset + index * 4, words[source]);
+            source += 1;
+        }
+    }
+    assert_eq!(source, words.len());
+    // Ordered .pdata: normal packed, isolated normal packed, fragment, full xdata.
+    p32(&mut b, 0x108 + 3 * 8, 0x2200);
+    p32(&mut b, 0x108 + 3 * 8 + 4, 32);
+    for (index, (start, unwind)) in [
+        (0x1000, 0x00e0_0029), // 40 bytes, frame16, chained FP/LR
+        (0x1080, 9),           // 8 bytes, no frame
+        (0x1090, 10),          // 8-byte fragment; no independent function evidence
+        (0x10a0, 0x2300),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        p32(&mut b, 0x600 + index * 8, start);
+        p32(&mut b, 0x604 + index * 8, unwind);
+    }
+    p32(&mut b, 0x700, 0x0820_0005); // length20, E=1/index0, one code word
+    b[0x704..0x708].copy_from_slice(&[0xe1, 0x81, 0xe4, 0xe3]);
+    // Named, loader-written IAT: do not use the on-disk lookup value as a PC.
+    p32(&mut b, 0x110, 0x2400);
+    p32(&mut b, 0x114, 40);
+    p32(&mut b, 0x800, 0x2460);
+    p32(&mut b, 0x80c, 0x2480);
+    p32(&mut b, 0x810, 0x2500);
+    p64(&mut b, 0x860, 0x24a0);
+    name(&mut b, 0x880, "fixture.dll\0");
+    name(&mut b, 0x8a2, "fixture_import\0");
+    p64(&mut b, 0x900, 0x24a0);
+    (b, base)
+}
+
 pub fn macho() -> (Vec<u8>, u64) {
     let base = 0x100001000;
     let text = code();

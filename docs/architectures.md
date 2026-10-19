@@ -50,18 +50,20 @@ fallthrough address do not seed functions. Constants, unknown indirect targets,
 and prologue patterns do not seed functions. Coverage is partial when these
 budgets are reached; complete function recovery is not guaranteed. See
 [analysis coverage and provenance](analysis.md) for call references and progress.
-AArch64 PE does not read ARM64 unwind records to recover stripped function entries
-and does not name ADRP/LDR/BR import veneers. Export names and import slots still
-reach the decompiler. x64 PE runtime-function recovery and x86 import-thunk naming
-remain available for those architectures.
+AArch64 PE reads normal packed and supported full unwind records to recover
+stripped primary entries, and names exact ADRP/LDR/BR import veneers at established
+entries and confirmed call targets. Fragment records do not independently seed
+functions; parent links and unsupported unwind forms remain explicit omissions.
+Export names and import slots reach the decompiler. x64 PE runtime-function
+recovery and x86 import-thunk naming remain available for those architectures.
 
 Indirect branches, jump tables, exception flow, no-return calls, stripped imports,
 newer vector/ISA extensions, and platform runtime metadata can be incomplete.
 Pointer authentication and authenticated/chained fixups are not recovered. The
 existing function, graph, byte, memory, CPU, and wall-time limits apply unchanged.
 The engine revision remains unchanged. NOTICE separately attributes the adapted
-confirmed-call analysis algorithm; its `calls-v1` cache fingerprint invalidates
-older cached analysis without changing the project schema or annotation format.
+confirmed-call analysis algorithm; the `calls-v1` and `arm64pe-v1` cache fingerprints
+invalidate older cached analysis without changing the project schema or annotation format.
 
 ## Regression fixtures
 
