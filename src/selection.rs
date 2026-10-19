@@ -49,6 +49,56 @@ impl ExecutableRanges {
     }
 }
 
+/// Checked, merged virtual-address intervals of all mapped sections, including
+/// zero-filled tails. Spans may cross contiguous sections but never gaps, and
+/// each lookup is logarithmic in the section count.
+pub(crate) struct MappedRanges(Vec<(u64, u64)>);
+
+impl MappedRanges {
+    pub(crate) fn new(sections: &[SectionInfo]) -> Result<Self, String> {
+        let mut intervals = Vec::with_capacity(sections.len());
+        for section in sections {
+            let end = section
+                .address
+                .checked_add(section.size)
+                .ok_or("Mapped section range overflows the address space")?;
+            if section.size != 0 {
+                intervals.push((section.address, end));
+            }
+        }
+        intervals.sort_unstable();
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(intervals.len());
+        for (start, end) in intervals {
+            if let Some(last) = merged.last_mut()
+                && start <= last.1
+            {
+                last.1 = last.1.max(end);
+            } else {
+                merged.push((start, end));
+            }
+        }
+        Ok(Self(merged))
+    }
+
+    pub(crate) fn contains(&self, address: u64) -> bool {
+        self.interval(address).is_some()
+    }
+
+    /// Whether every byte of a non-empty span is mapped. Overflowing spans are not.
+    pub(crate) fn contains_span(&self, address: u64, length: u64) -> bool {
+        length != 0
+            && address
+                .checked_add(length)
+                .is_some_and(|end| self.interval(address).is_some_and(|last| end <= last))
+    }
+
+    fn interval(&self, address: u64) -> Option<u64> {
+        let index = self.0.partition_point(|(start, _)| *start <= address);
+        let (_, end) = *self.0.get(index.checked_sub(1)?)?;
+        (address < end).then_some(end)
+    }
+}
+
 pub fn validate_mappings(
     text: &str,
     mappings: &[CodeMapping],
@@ -136,6 +186,29 @@ impl SemanticSelection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mapped_ranges_cross_contiguous_sections_but_not_gaps() {
+        let section = |address, size| SectionInfo {
+            name: String::new(),
+            address,
+            size,
+            file_offset: 0,
+            file_size: 0,
+            executable: false,
+        };
+        // Unordered input; 0x1000..0x1010 is contiguous, then a gap.
+        let ranges =
+            MappedRanges::new(&[section(0x1008, 8), section(0x1000, 8), section(0x2000, 4)])
+                .unwrap();
+        assert!(ranges.contains(0x1000) && ranges.contains(0x100f) && ranges.contains(0x2003));
+        assert!(!ranges.contains(0x0fff) && !ranges.contains(0x1010) && !ranges.contains(0x2004));
+        assert!(ranges.contains_span(0x1004, 12));
+        assert!(!ranges.contains_span(0x1004, 13));
+        assert!(!ranges.contains_span(0x1000, 0));
+        assert!(!ranges.contains_span(0x2000, u64::MAX));
+        assert!(MappedRanges::new(&[section(u64::MAX - 1, 4)]).is_err());
+    }
 
     #[test]
     fn maximum_mapping_references_use_a_logarithmic_section_lookup_budget() {

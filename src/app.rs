@@ -22,6 +22,8 @@ use crate::theme;
 const DEADLINE: Duration = Duration::from_secs(30);
 const HISTORY_LIMIT: usize = 32;
 const UNDO_BYTES: usize = 4 * 1024 * 1024;
+/// Per-frame work for the function filter, keeping typing responsive.
+const FILTER_FRAME_BUDGET: Duration = Duration::from_millis(4);
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum Tab {
@@ -229,6 +231,13 @@ pub struct DesktopApp {
     history_index: usize,
     function_filter: String,
     filtered_functions: Vec<usize>,
+    /// Lowercased effective labels, aligned with `info.functions` and valid for
+    /// `filter_keys_revision`.
+    filter_keys: Vec<String>,
+    filter_keys_revision: u64,
+    filter_query: String,
+    /// Next inventory index to examine while a filter is in progress.
+    filter_cursor: Option<usize>,
     string_filter: String,
     string_minimum: usize,
     strings_minimum_used: Option<usize>,
@@ -312,6 +321,10 @@ impl DesktopApp {
             history_index: 0,
             function_filter: String::new(),
             filtered_functions: Vec::new(),
+            filter_keys: Vec::new(),
+            filter_keys_revision: 0,
+            filter_query: String::new(),
+            filter_cursor: None,
             string_filter: String::new(),
             string_minimum: 6,
             strings_minimum_used: None,
@@ -452,6 +465,8 @@ impl DesktopApp {
         self.history.clear();
         self.history_index = 0;
         self.filtered_functions.clear();
+        self.filter_keys.clear();
+        self.filter_cursor = None;
         self.decoder = DecoderPanel::default();
     }
 
@@ -742,7 +757,12 @@ impl DesktopApp {
     fn receive(&mut self, pending: Pending, response: Response, context: &egui::Context) {
         if let Response::Error { message } = response {
             self.stop_worker();
-            self.status = message;
+            self.status = crop(&message, 4096);
+            return;
+        }
+        if let Err(error) = self.validate_reply(&response) {
+            self.stop_worker();
+            self.status = format!("Invalid worker response: {error}; worker stopped");
             return;
         }
         match (pending.request, response) {
@@ -750,13 +770,6 @@ impl DesktopApp {
                 let Some(opening) = self.opening.take() else {
                     return;
                 };
-                if let Err(error) =
-                    validate_functions(&info.functions, MAX_FUNCTION_NAME_BYTES, true)
-                {
-                    self.stop_worker();
-                    self.status = format!("Invalid worker function inventory: {error}");
-                    return;
-                }
                 let protection = match self
                     .client
                     .as_ref()
@@ -1007,10 +1020,11 @@ impl DesktopApp {
             }
             (
                 Request::Rename {
-                    address: expected, ..
+                    address: expected,
+                    name: requested,
                 },
                 Response::Renamed { address, name },
-            ) if address == expected => {
+            ) if address == expected && name == requested => {
                 self.applied_names.insert(address, name.clone());
                 if let Some(info) = &mut self.info
                     && let Ok(index) = info
@@ -1098,34 +1112,102 @@ impl DesktopApp {
         }
     }
 
+    /// Structural bounds for every reply before adoption clones, sorts, or
+    /// indexes it. Request-specific checks remain at each adoption site.
+    fn validate_reply(&self, response: &Response) -> Result<(), String> {
+        use crate::project::{validate_crypto, validate_info, validate_strings, validate_view};
+        let ranges = || {
+            let info = self.info.as_ref().ok_or("No binary is open")?;
+            crate::selection::MappedRanges::new(&info.sections)
+        };
+        match response {
+            Response::Opened { info } => {
+                validate_info(info, MAX_FUNCTION_NAME_BYTES, true).map(|_| ())
+            }
+            Response::Graph { view } => validate_view(view, &ranges()?),
+            Response::Strings { strings, .. } => {
+                validate_strings(strings, MAX_STRING_RESULTS, &ranges()?)
+            }
+            Response::Crypto { matches, .. } => validate_crypto(matches, &ranges()?),
+            _ => Ok(()),
+        }
+    }
+
+    /// Names or labels changed: drop cached search keys and refilter.
     fn rebuild_filter(&mut self) {
-        let filter = self.function_filter.to_lowercase();
-        // Inventories can hold 262,144 entries; format addresses only for
-        // queries that could match one.
-        let hex = filter.bytes().all(|byte| byte.is_ascii_hexdigit());
-        self.filtered_functions = self
-            .info
-            .as_ref()
-            .map(|info| {
-                info.functions
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, function)| {
-                        let label = self
-                            .session
-                            .as_ref()
-                            .and_then(|session| session.annotations.get(&function.address))
-                            .map(|annotation| annotation.label.as_str())
-                            .filter(|label| !label.is_empty())
-                            .unwrap_or(&function.name);
-                        filter.is_empty()
-                            || label.to_lowercase().contains(&filter)
-                            || (hex && format!("{:x}", function.address).contains(&filter))
-                    })
-                    .map(|(index, _)| index)
-                    .collect()
-            })
-            .unwrap_or_default();
+        self.filter_keys.clear();
+        self.restart_filter();
+    }
+
+    /// The query changed; cached keys remain valid.
+    fn restart_filter(&mut self) {
+        self.filter_query = self.function_filter.to_lowercase();
+        self.filtered_functions.clear();
+        self.filter_cursor = Some(0);
+        self.step_filter(FILTER_FRAME_BUDGET);
+    }
+
+    /// Advances the function filter within `budget`; returns whether it is done.
+    /// Inventories can hold 262,144 entries, so large filters span frames
+    /// instead of blocking input. Keys are lowercased once per name revision.
+    fn step_filter(&mut self, budget: Duration) -> bool {
+        // Annotation edits and undo change effective labels.
+        if self.filter_keys_revision != self.revision {
+            self.filter_keys_revision = self.revision;
+            self.filter_keys.clear();
+            self.filtered_functions.clear();
+            self.filter_cursor = Some(0);
+        }
+        let Some(mut index) = self.filter_cursor else {
+            return true;
+        };
+        let Some(info) = &self.info else {
+            self.filter_cursor = None;
+            return true;
+        };
+        let functions = &info.functions;
+        if self.filter_query.is_empty() {
+            self.filtered_functions.extend(index..functions.len());
+            self.filter_cursor = None;
+            return true;
+        }
+        // Format addresses only for queries that could match one.
+        let hex = self
+            .filter_query
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit());
+        let started = Instant::now();
+        let mut address = String::with_capacity(16);
+        while index < functions.len() {
+            let function = &functions[index];
+            if index == self.filter_keys.len() {
+                let label = self
+                    .session
+                    .as_ref()
+                    .and_then(|session| session.annotations.get(&function.address))
+                    .map(|annotation| annotation.label.as_str())
+                    .filter(|label| !label.is_empty())
+                    .unwrap_or(&function.name);
+                self.filter_keys.push(label.to_lowercase());
+            }
+            let matched = self.filter_keys[index].contains(&self.filter_query)
+                || hex && {
+                    use std::fmt::Write;
+                    address.clear();
+                    let _ = write!(address, "{:x}", function.address);
+                    address.contains(&self.filter_query)
+                };
+            if matched {
+                self.filtered_functions.push(index);
+            }
+            index += 1;
+            if index.is_multiple_of(1024) && started.elapsed() >= budget {
+                self.filter_cursor = Some(index);
+                return false;
+            }
+        }
+        self.filter_cursor = None;
+        true
     }
 
     fn should_auto_decompile(&self) -> bool {
@@ -2306,9 +2388,17 @@ impl DesktopApp {
             )
             .changed()
         {
-            self.rebuild_filter();
+            self.restart_filter();
         }
-        ui.weak(format!("{} functions", self.filtered_functions.len()));
+        if self.step_filter(FILTER_FRAME_BUDGET) {
+            ui.weak(format!("{} functions", self.filtered_functions.len()));
+        } else {
+            ui.weak(format!(
+                "Filtering… {} matches",
+                self.filtered_functions.len()
+            ));
+            ui.ctx().request_repaint();
+        }
         if self
             .info
             .as_ref()
@@ -3495,6 +3585,104 @@ mod tests {
         assert!(app.strings.is_empty());
         app.clear_views();
         assert!(!app.strings_scanned);
+    }
+
+    #[test]
+    fn unbounded_graphs_and_mismatched_renames_stop_the_worker() {
+        fn pending(app: &DesktopApp, request: Request) -> Pending {
+            Pending {
+                id: 1,
+                request,
+                started: Instant::now(),
+                selection: app.selection_generation,
+                revision: app.revision,
+                byte_origin: (app.selected, app.tab),
+            }
+        }
+        let mut app = keyboard_app();
+        let block = |address| BasicBlock {
+            address,
+            instructions: Vec::new(),
+        };
+        app.receive(
+            pending(&app, Request::Graph { address: 0x1000 }),
+            Response::Graph {
+                view: FunctionView {
+                    address: 0x1000,
+                    blocks: (0..=MAX_GRAPH_BLOCKS as u64)
+                        .map(|i| block(0x1000 + i))
+                        .collect(),
+                    edges: Vec::new(),
+                    calls: Vec::new(),
+                    warnings: Vec::new(),
+                },
+            },
+            &egui::Context::default(),
+        );
+        assert!(app.status.contains("Basic block count"), "{}", app.status);
+        assert!(app.view.is_none() && app.listing.is_empty());
+
+        let mut app = keyboard_app();
+        app.receive(
+            pending(
+                &app,
+                Request::Rename {
+                    address: 0x1000,
+                    name: "requested".into(),
+                },
+            ),
+            Response::Renamed {
+                address: 0x1000,
+                name: "other".into(),
+            },
+            &egui::Context::default(),
+        );
+        assert!(app.status.contains("Unexpected worker response"));
+        assert_eq!(app.info.as_ref().unwrap().functions[0].name, "entry");
+    }
+
+    #[test]
+    fn large_function_filters_progress_across_frames_and_follow_label_edits() {
+        let mut app = keyboard_app();
+        let info = app.info.as_mut().unwrap();
+        info.sections[0].size = 0x10_0000;
+        info.functions = (0..20_000u64)
+            .map(|i| FunctionInfo {
+                address: 0x1000 + i,
+                name: format!("Fn_{i}"),
+            })
+            .collect();
+        app.rebuild_filter();
+        assert_eq!(app.filtered_functions.len(), 20_000);
+        app.function_filter = "FN_19".into();
+        app.filter_query = app.function_filter.to_lowercase();
+        app.filtered_functions.clear();
+        app.filter_cursor = Some(0);
+        let mut steps = 0;
+        while !app.step_filter(Duration::ZERO) {
+            steps += 1;
+        }
+        assert!(steps >= 19, "{steps}");
+        let expected: Vec<_> = (0..20_000)
+            .filter(|i| format!("fn_{i}").contains("fn_19"))
+            .collect();
+        assert_eq!(app.filtered_functions, expected);
+        // A label edit bumps the revision; stale keys are rebuilt.
+        app.session.as_mut().unwrap().annotations.insert(
+            0x1000 + 5,
+            Annotation {
+                label: "fn_19_label".into(),
+                ..Default::default()
+            },
+        );
+        app.revision += 1;
+        while !app.step_filter(Duration::from_secs(1)) {}
+        assert_eq!(app.filtered_functions[0], 5);
+        // Hexadecimal queries also match addresses.
+        app.function_filter = "1fff".into();
+        app.restart_filter();
+        while !app.step_filter(Duration::from_secs(1)) {}
+        assert!(app.filtered_functions.contains(&(0x1fff - 0x1000)));
     }
 
     fn keyboard_app() -> DesktopApp {

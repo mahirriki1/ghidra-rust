@@ -133,9 +133,7 @@ fn send(output: &mut impl Write, response: WorkerResponse) -> Result<(), String>
         .map_err(|e| format!("Worker output failed: {e}"))
 }
 
-/// Fits the largest function inventory (19.7 MB, see `model.rs`) with either
-/// both reference classes (about 4.1 MB) or worst-case section metadata (6.8 MB).
-const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+use crate::model::MAX_REPLY_BYTES as MAX_RESPONSE_BYTES;
 
 #[derive(Default)]
 struct ResponseBuffer {
@@ -206,6 +204,7 @@ mod tests {
         };
         let reply = |response| {
             let mut buffer = ResponseBuffer::default();
+            // The client's preflight must admit every maximal valid reply.
             serde_json::to_writer(
                 &mut buffer,
                 &WorkerResponse {
@@ -214,6 +213,7 @@ mod tests {
                 },
             )
             .is_ok()
+                && crate::bounded::check_reply(&buffer.bytes).is_ok()
         };
         assert!(reply(Response::Functions {
             functions: functions.clone(),

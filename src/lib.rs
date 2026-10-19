@@ -1,6 +1,7 @@
 pub mod analysis;
 pub mod app;
 mod architecture;
+mod bounded;
 pub mod brand;
 pub mod call_analysis;
 pub mod client;
