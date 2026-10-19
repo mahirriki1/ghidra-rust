@@ -28,6 +28,9 @@ jobs:
         with:
           toolchain: 1.98.1
           components: rustfmt, clippy
+      # Reuse compiled dependencies (mainly the decompiler engine) between runs.
+      # Caches are scoped per branch; only main's cache is shared with others.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install native Linux build dependencies
         run: |
           sudo apt-get update
@@ -60,6 +63,9 @@ jobs:
           toolchain: 1.98.1
           targets: x86_64-pc-windows-msvc
           components: rustfmt, clippy
+      # Reuse compiled dependencies (mainly the decompiler engine) between runs.
+      # Caches are scoped per branch; only main's cache is shared with others.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Build, lint, and package Windows x64
         shell: pwsh
         run: ./scripts/build-windows.ps1 -SkipTests
