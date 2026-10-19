@@ -88,6 +88,7 @@ mod tests {
         for ((bytes, _), language) in [
             (fixtures::elf(true), "AARCH64:LE:64:v8A:default"),
             (fixtures::pe(), "AARCH64:LE:64:v8A:windows"),
+            (fixtures::arm64_pe_metadata(), "AARCH64:LE:64:v8A:windows"),
             (fixtures::macho(), "AARCH64:LE:64:AppleSilicon:default"),
         ] {
             let target = target(&bytes).unwrap();

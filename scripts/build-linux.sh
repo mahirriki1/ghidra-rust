@@ -11,7 +11,7 @@ if [[ "${CARGO_BUILD_TARGET:-x86_64-unknown-linux-gnu}" != x86_64-unknown-linux-
     echo 'Use the native x86_64-unknown-linux-gnu build target.' >&2
     exit 1
 fi
-for tool in cargo rustc gcc pkg-config strip readelf python3 bwrap; do
+for tool in cargo rustc gcc pkg-config strip readelf objdump python3 bwrap; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         echo "Required build/test tool is missing: $tool (see docs/releases.md)." >&2
         exit 1

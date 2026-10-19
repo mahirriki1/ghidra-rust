@@ -22,6 +22,8 @@ use crate::theme;
 const DEADLINE: Duration = Duration::from_secs(30);
 const HISTORY_LIMIT: usize = 32;
 const UNDO_BYTES: usize = 4 * 1024 * 1024;
+/// Per-frame work for the function filter, keeping typing responsive.
+const FILTER_FRAME_BUDGET: Duration = Duration::from_millis(4);
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum Tab {
@@ -31,6 +33,7 @@ enum Tab {
     Strings,
     Crypto,
     Decode,
+    References,
 }
 
 #[derive(Clone, Copy)]
@@ -112,6 +115,7 @@ struct Pending {
     started: Instant,
     selection: u64,
     revision: u64,
+    byte_origin: (Option<u64>, Tab),
 }
 
 struct Opening {
@@ -119,6 +123,14 @@ struct Opening {
     preserve: bool,
     follow: Option<Request>,
     revision: u64,
+    follow_origin: RequestOrigin,
+}
+
+#[derive(Clone, Copy)]
+struct RequestOrigin {
+    selection: u64,
+    revision: u64,
+    byte_origin: (Option<u64>, Tab),
 }
 
 #[derive(Clone)]
@@ -192,6 +204,14 @@ pub struct DesktopApp {
     saved_revision: u64,
     undo: VecDeque<Edit>,
     view: Option<FunctionView>,
+    call_index: Option<crate::call_analysis::CallIndex>,
+    reference_data: bool,
+    reference_target: Option<u64>,
+    reference_query: String,
+    analysis_progress: Option<AnalysisProgress>,
+    progress_events: usize,
+    reference_focus: Option<(u64, u64)>,
+    undisplayed_call: Option<u64>,
     canvas: Option<GraphCanvas>,
     listing: Vec<Instruction>,
     decompiled: String,
@@ -211,6 +231,13 @@ pub struct DesktopApp {
     history_index: usize,
     function_filter: String,
     filtered_functions: Vec<usize>,
+    /// Lowercased effective labels, aligned with `info.functions` and valid for
+    /// `filter_keys_revision`.
+    filter_keys: Vec<String>,
+    filter_keys_revision: u64,
+    filter_query: String,
+    /// Next inventory index to examine while a filter is in progress.
+    filter_cursor: Option<usize>,
     string_filter: String,
     string_minimum: usize,
     strings_minimum_used: Option<usize>,
@@ -267,6 +294,14 @@ impl DesktopApp {
             saved_revision: 0,
             undo: VecDeque::new(),
             view: None,
+            call_index: None,
+            reference_data: false,
+            reference_target: None,
+            reference_query: String::new(),
+            analysis_progress: None,
+            progress_events: 0,
+            reference_focus: None,
+            undisplayed_call: None,
             canvas: None,
             listing: Vec::new(),
             decompiled: String::new(),
@@ -286,6 +321,10 @@ impl DesktopApp {
             history_index: 0,
             function_filter: String::new(),
             filtered_functions: Vec::new(),
+            filter_keys: Vec::new(),
+            filter_keys_revision: 0,
+            filter_query: String::new(),
+            filter_cursor: None,
             string_filter: String::new(),
             string_minimum: 6,
             strings_minimum_used: None,
@@ -390,6 +429,12 @@ impl DesktopApp {
     }
 
     fn clear_views(&mut self) {
+        self.call_index = None;
+        self.reference_data = false;
+        self.reference_target = None;
+        self.reference_query.clear();
+        self.reference_focus = None;
+        self.undisplayed_call = None;
         self.browser_dialog = None;
         self.focus_comment = false;
         self.view = None;
@@ -420,10 +465,14 @@ impl DesktopApp {
         self.history.clear();
         self.history_index = 0;
         self.filtered_functions.clear();
+        self.filter_keys.clear();
+        self.filter_cursor = None;
         self.decoder = DecoderPanel::default();
     }
 
     fn stop_worker(&mut self) {
+        self.analysis_progress = None;
+        self.progress_events = 0;
         self.client = None;
         self.pending = None;
         self.opening = None;
@@ -439,6 +488,7 @@ impl DesktopApp {
         follow: Option<Request>,
         context: &egui::Context,
     ) {
+        let follow_origin = self.request_origin();
         self.stop_worker();
         match WorkerClient::start(context.clone(), &path) {
             Ok(mut client) => {
@@ -451,6 +501,7 @@ impl DesktopApp {
                     preserve,
                     follow,
                     revision: self.revision,
+                    follow_origin,
                 });
                 self.status = format!("Opening {}…", path.display());
                 self.send_direct(Request::Open {
@@ -462,6 +513,8 @@ impl DesktopApp {
     }
 
     fn send_direct(&mut self, request: Request) {
+        self.analysis_progress = None;
+        self.progress_events = 0;
         let Some(client) = &mut self.client else {
             return;
         };
@@ -473,6 +526,7 @@ impl DesktopApp {
                     started: Instant::now(),
                     selection: self.selection_generation,
                     revision: self.revision,
+                    byte_origin: (self.selected, self.tab),
                 });
             }
             Err(error) => {
@@ -485,8 +539,10 @@ impl DesktopApp {
     fn request(&mut self, request: Request, context: &egui::Context) {
         if self.opening.is_some() {
             // The new client must first prove it opened the intended binary.
+            let origin = self.request_origin();
             if let Some(opening) = &mut self.opening {
                 opening.follow = Some(request);
+                opening.follow_origin = origin;
             }
             return;
         }
@@ -531,7 +587,36 @@ impl DesktopApp {
         self.send_direct(request);
     }
 
+    fn request_origin(&self) -> RequestOrigin {
+        RequestOrigin {
+            selection: self.selection_generation,
+            revision: self.revision,
+            byte_origin: (self.selected, self.tab),
+        }
+    }
+
+    fn schedule_open_follow(&mut self, request: Request, origin: RequestOrigin) {
+        if matches!(request, Request::Bytes { .. }) {
+            // Reopening a busy worker must not bind an older byte-read action
+            // to the selection or tab active when Open eventually completes.
+            if origin.selection != self.selection_generation
+                || origin.revision != self.revision
+                || origin.byte_origin.0 != self.selected
+            {
+                return;
+            }
+            self.schedule_request(request);
+            if let Some(pending) = &mut self.pending {
+                pending.byte_origin = origin.byte_origin;
+            }
+        } else {
+            self.schedule_request(request);
+        }
+    }
+
     fn navigate(&mut self, address: u64, record: bool, context: &egui::Context) {
+        self.reference_focus = None;
+        self.undisplayed_call = None;
         self.selection_generation = self.selection_generation.wrapping_add(1);
         self.selected = Some(address);
         self.address = format!("{address:x}");
@@ -618,17 +703,7 @@ impl DesktopApp {
                     self.status = error;
                     break;
                 }
-                WorkerEvent::Reply(reply) => {
-                    let Some(pending) = self.pending.take() else {
-                        continue;
-                    };
-                    if pending.id != reply.id {
-                        self.stop_worker();
-                        self.status = "Worker replied with an unexpected request ID".into();
-                        break;
-                    }
-                    self.receive(pending, reply.response, context);
-                }
+                WorkerEvent::Reply(reply) => self.receive_worker_reply(*reply, context),
             }
         }
         if self.pending.is_some() {
@@ -636,10 +711,58 @@ impl DesktopApp {
         }
     }
 
+    fn receive_worker_reply(&mut self, reply: WorkerResponse, context: &egui::Context) {
+        let Some(pending) = &self.pending else { return };
+        if pending.id != reply.id {
+            self.stop_worker();
+            self.status = "Worker replied with an unexpected request ID".into();
+            return;
+        }
+        if let Response::Progress { progress } = reply.response {
+            // Progress never completes a request or extends its wall-time deadline.
+            self.progress_events += 1;
+            if !matches!(pending.request, Request::Discover)
+                || (self.progress_events == 1 && progress.stage != AnalysisStage::Seeds)
+                || self.progress_events > MAX_ANALYSIS_FUNCTIONS + 3
+                || progress
+                    .validate_after(self.analysis_progress.as_ref())
+                    .is_err()
+            {
+                self.stop_worker();
+                self.status = "Invalid worker analysis progress; worker stopped".into();
+                return;
+            }
+            if pending.selection == self.selection_generation && pending.revision == self.revision {
+                self.analysis_progress = Some(progress);
+            }
+            return;
+        }
+        if let Response::Functions { analysis, .. } = &reply.response
+            && self.analysis_progress.as_ref().is_none_or(|last| {
+                last.stage != AnalysisStage::Publish
+                    || last.functions_examined != analysis.functions_examined
+                    || last.decode_attempts != analysis.decode_attempts
+            })
+        {
+            self.stop_worker();
+            self.status = "Call analysis did not match its final progress; worker stopped".into();
+            return;
+        }
+        let pending = self.pending.take().expect("Checked pending request");
+        self.analysis_progress = None;
+        self.progress_events = 0;
+        self.receive(pending, reply.response, context);
+    }
+
     fn receive(&mut self, pending: Pending, response: Response, context: &egui::Context) {
         if let Response::Error { message } = response {
             self.stop_worker();
-            self.status = message;
+            self.status = crop(&message, 4096);
+            return;
+        }
+        if let Err(error) = self.validate_reply(&response) {
+            self.stop_worker();
+            self.status = format!("Invalid worker response: {error}; worker stopped");
             return;
         }
         match (pending.request, response) {
@@ -744,7 +867,7 @@ impl DesktopApp {
                 if let Some(project) = project {
                     self.restore_project(*project, context);
                 } else if let Some(request) = opening.follow {
-                    self.schedule_request(request);
+                    self.schedule_open_follow(request, opening.follow_origin);
                 } else {
                     self.navigate(first, true, context);
                 }
@@ -767,6 +890,23 @@ impl DesktopApp {
                 self.saved_analysis = false;
                 self.view = Some(view);
                 self.status = format!("Function {address:#x} ready");
+                if let Some((caller, pc)) = self.reference_focus.take()
+                    && caller == address
+                {
+                    self.select_instruction(pc);
+                    if let Some(row) = self
+                        .listing
+                        .iter()
+                        .position(|instruction| instruction.address == pc)
+                    {
+                        self.pending_listing_scroll = Some(row);
+                        if let Some(canvas) = &mut self.canvas {
+                            canvas.reveal_instruction(pc);
+                        }
+                    } else {
+                        self.undisplayed_call = Some(pc);
+                    }
+                }
                 if self.should_auto_decompile() {
                     self.schedule_request(Request::Decompile { address });
                 }
@@ -838,34 +978,60 @@ impl DesktopApp {
                 Response::Functions {
                     functions,
                     truncated,
+                    analysis,
                 },
             ) => {
+                if pending.selection != self.selection_generation
+                    || pending.revision != self.revision
+                {
+                    return;
+                }
+                let Some(info) = &self.info else { return };
+                if let Err(error) = analysis.validate(info, &functions) {
+                    self.stop_worker();
+                    self.status = format!("Invalid worker reference analysis: {error}");
+                    return;
+                }
+                self.status = format!(
+                    "{} calls · {} · {} function walks · {} decode attempts{}",
+                    analysis.references.len(),
+                    analysis.data.as_ref().map_or_else(
+                        || "data not analyzed".into(),
+                        |data| format!("{} data accesses", data.references.len())
+                    ),
+                    analysis.functions_examined,
+                    analysis.decode_attempts,
+                    if truncated
+                        || analysis.partial
+                        || analysis.data.as_ref().is_some_and(|data| data.partial)
+                    {
+                        " · partial coverage"
+                    } else {
+                        " · direct references analyzed"
+                    }
+                );
+                self.call_index = Some(crate::call_analysis::CallIndex::new(analysis));
                 self.cached_functions = false;
                 if let Some(info) = &mut self.info {
                     info.functions = functions;
                     info.functions_truncated = truncated;
                 }
                 self.rebuild_filter();
-                self.status = if truncated {
-                    "Function list limit reached; results are partial"
-                } else {
-                    "Function discovery complete"
-                }
-                .into();
             }
             (
                 Request::Rename {
-                    address: expected, ..
+                    address: expected,
+                    name: requested,
                 },
                 Response::Renamed { address, name },
-            ) if address == expected => {
+            ) if address == expected && name == requested => {
                 self.applied_names.insert(address, name.clone());
                 if let Some(info) = &mut self.info
-                    && let Some(function) = info
+                    && let Ok(index) = info
                         .functions
-                        .iter_mut()
-                        .find(|function| function.address == address)
+                        .binary_search_by_key(&address, |function| function.address)
                 {
+                    let function = &mut info.functions[index];
                     function.name = name;
                 }
                 self.rebuild_filter();
@@ -887,8 +1053,16 @@ impl DesktopApp {
                 },
                 Response::Bytes { address, bytes },
             ) if address == expected && bytes.len() <= length => {
+                if pending.selection != self.selection_generation
+                    || pending.revision != self.revision
+                    || pending.byte_origin.0 != self.selected
+                {
+                    return;
+                }
                 self.decoder.set_source(address, bytes);
-                self.tab = Tab::Decode;
+                if self.tab == pending.byte_origin.1 {
+                    self.tab = Tab::Decode;
+                }
                 self.status = "Bytes loaded into decoder".into();
             }
             (
@@ -938,31 +1112,102 @@ impl DesktopApp {
         }
     }
 
+    /// Structural bounds for every reply before adoption clones, sorts, or
+    /// indexes it. Request-specific checks remain at each adoption site.
+    fn validate_reply(&self, response: &Response) -> Result<(), String> {
+        use crate::project::{validate_crypto, validate_info, validate_strings, validate_view};
+        let ranges = || {
+            let info = self.info.as_ref().ok_or("No binary is open")?;
+            crate::selection::MappedRanges::new(&info.sections)
+        };
+        match response {
+            Response::Opened { info } => {
+                validate_info(info, MAX_FUNCTION_NAME_BYTES, true).map(|_| ())
+            }
+            Response::Graph { view } => validate_view(view, &ranges()?),
+            Response::Strings { strings, .. } => {
+                validate_strings(strings, MAX_STRING_RESULTS, &ranges()?)
+            }
+            Response::Crypto { matches, .. } => validate_crypto(matches, &ranges()?),
+            _ => Ok(()),
+        }
+    }
+
+    /// Names or labels changed: drop cached search keys and refilter.
     fn rebuild_filter(&mut self) {
-        let filter = self.function_filter.to_lowercase();
-        self.filtered_functions = self
-            .info
-            .as_ref()
-            .map(|info| {
-                info.functions
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, function)| {
-                        let label = self
-                            .session
-                            .as_ref()
-                            .and_then(|session| session.annotations.get(&function.address))
-                            .map(|annotation| annotation.label.as_str())
-                            .filter(|label| !label.is_empty())
-                            .unwrap_or(&function.name);
-                        filter.is_empty()
-                            || label.to_lowercase().contains(&filter)
-                            || format!("{:x}", function.address).contains(&filter)
-                    })
-                    .map(|(index, _)| index)
-                    .collect()
-            })
-            .unwrap_or_default();
+        self.filter_keys.clear();
+        self.restart_filter();
+    }
+
+    /// The query changed; cached keys remain valid.
+    fn restart_filter(&mut self) {
+        self.filter_query = self.function_filter.to_lowercase();
+        self.filtered_functions.clear();
+        self.filter_cursor = Some(0);
+        self.step_filter(FILTER_FRAME_BUDGET);
+    }
+
+    /// Advances the function filter within `budget`; returns whether it is done.
+    /// Inventories can hold 262,144 entries, so large filters span frames
+    /// instead of blocking input. Keys are lowercased once per name revision.
+    fn step_filter(&mut self, budget: Duration) -> bool {
+        // Annotation edits and undo change effective labels.
+        if self.filter_keys_revision != self.revision {
+            self.filter_keys_revision = self.revision;
+            self.filter_keys.clear();
+            self.filtered_functions.clear();
+            self.filter_cursor = Some(0);
+        }
+        let Some(mut index) = self.filter_cursor else {
+            return true;
+        };
+        let Some(info) = &self.info else {
+            self.filter_cursor = None;
+            return true;
+        };
+        let functions = &info.functions;
+        if self.filter_query.is_empty() {
+            self.filtered_functions.extend(index..functions.len());
+            self.filter_cursor = None;
+            return true;
+        }
+        // Format addresses only for queries that could match one.
+        let hex = self
+            .filter_query
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit());
+        let started = Instant::now();
+        let mut address = String::with_capacity(16);
+        while index < functions.len() {
+            let function = &functions[index];
+            if index == self.filter_keys.len() {
+                let label = self
+                    .session
+                    .as_ref()
+                    .and_then(|session| session.annotations.get(&function.address))
+                    .map(|annotation| annotation.label.as_str())
+                    .filter(|label| !label.is_empty())
+                    .unwrap_or(&function.name);
+                self.filter_keys.push(label.to_lowercase());
+            }
+            let matched = self.filter_keys[index].contains(&self.filter_query)
+                || hex && {
+                    use std::fmt::Write;
+                    address.clear();
+                    let _ = write!(address, "{:x}", function.address);
+                    address.contains(&self.filter_query)
+                };
+            if matched {
+                self.filtered_functions.push(index);
+            }
+            index += 1;
+            if index.is_multiple_of(1024) && started.elapsed() >= budget {
+                self.filter_cursor = Some(index);
+                return false;
+            }
+        }
+        self.filter_cursor = None;
+        true
     }
 
     fn should_auto_decompile(&self) -> bool {
@@ -1509,10 +1754,7 @@ impl DesktopApp {
         else {
             return;
         };
-        let function = info
-            .functions
-            .iter()
-            .find(|function| function.address == address);
+        let function = function_at(&info.functions, address);
         let text = session
             .annotations
             .get(&address)
@@ -1833,6 +2075,7 @@ impl DesktopApp {
                     (Tab::Strings, "Defined Strings"),
                     (Tab::Crypto, "FindCrypt"),
                     (Tab::Decode, "String Decoder"),
+                    (Tab::References, "References"),
                 ] {
                     if ui.selectable_value(&mut self.tab, tab, label).clicked() {
                         ui.close();
@@ -2023,8 +2266,7 @@ impl DesktopApp {
                                             .selectable_label(false, crop(&annotation.label, 100))
                                             .clicked()
                                         {
-                                            if info.functions.iter().any(|f| f.address == *address)
-                                            {
+                                            if function_at(&info.functions, *address).is_some() {
                                                 function = Some(*address);
                                             } else {
                                                 read = Some((*address, 128));
@@ -2146,16 +2388,24 @@ impl DesktopApp {
             )
             .changed()
         {
-            self.rebuild_filter();
+            self.restart_filter();
         }
-        ui.weak(format!("{} functions", self.filtered_functions.len()));
+        if self.step_filter(FILTER_FRAME_BUDGET) {
+            ui.weak(format!("{} functions", self.filtered_functions.len()));
+        } else {
+            ui.weak(format!(
+                "Filtering… {} matches",
+                self.filtered_functions.len()
+            ));
+            ui.ctx().request_repaint();
+        }
         if self
             .info
             .as_ref()
             .is_some_and(|info| info.functions_truncated)
         {
             ui.colored_label(theme::WARNING, "Partial function list")
-                .on_hover_text("The function list reached its 10,000-entry budget. PE entries near the program entry point are prioritized. Use Go to navigate a known address; see Analysis notes for details.");
+                .on_hover_text("Loading or discovery reached a budget or encountered incomplete flow. Known entries are retained; see References and Analysis notes for coverage.");
         }
         ui.label(RichText::new("Address       Name").monospace().weak());
         let mut navigate = None;
@@ -2207,16 +2457,11 @@ impl DesktopApp {
     fn decompiler_call_target(&self, name: &str) -> Option<u64> {
         let view = self.view.as_ref()?;
         let info = self.info.as_ref()?;
-        let mut targets = info
-            .functions
+        let mut targets = view
+            .calls
             .iter()
-            .filter(|function| {
-                function.name == name
-                    && view
-                        .calls
-                        .iter()
-                        .any(|call| call.target == Some(function.address))
-            })
+            .filter_map(|call| function_at(&info.functions, call.target?))
+            .filter(|function| function.name == name)
             .map(|function| function.address);
         let first = targets.next()?;
         // A text-only decompiler response cannot disambiguate same-name callees.
@@ -2255,7 +2500,7 @@ impl DesktopApp {
             let function = self
                 .info
                 .as_ref()
-                .and_then(|info| info.functions.iter().find(|f| f.address == view.address));
+                .and_then(|info| function_at(&info.functions, view.address));
             let name = function.map(|f| f.name.as_str()).unwrap_or("function");
             let response = ui.label(
                 RichText::new(format!("{}  ·  {:x}", crop(name, 100), view.address))
@@ -2379,13 +2624,7 @@ impl DesktopApp {
             self.name_edit = self
                 .view
                 .as_ref()
-                .and_then(|view| {
-                    self.info
-                        .as_ref()?
-                        .functions
-                        .iter()
-                        .find(|function| function.address == view.address)
-                })
+                .and_then(|view| function_at(&self.info.as_ref()?.functions, view.address))
                 .map(|function| function.name.clone())
                 .unwrap_or_default();
         }
@@ -2454,6 +2693,262 @@ impl DesktopApp {
         }
     }
 
+    fn navigate_reference(&mut self, caller: u64, pc: u64, context: &egui::Context) {
+        self.tab = Tab::Listing;
+        self.navigate(caller, true, context);
+        self.reference_focus = Some((caller, pc));
+    }
+
+    fn read_data_reference(&mut self, target: u64, size: u32, context: &egui::Context) {
+        // This action requests bytes; a memory target never becomes a function
+        // or a guessed instruction/pseudocode link. Retain code selection and
+        // project context; Decode carries the byte source's own exact address.
+        self.reference_target = Some(target);
+        self.reference_query = format!("{target:x}");
+        self.request(
+            Request::Bytes {
+                address: target,
+                length: size as usize,
+            },
+            context,
+        );
+    }
+
+    fn data_references_panel(&mut self, ui: &mut egui::Ui) {
+        let context = ui.ctx().clone();
+        let Some(index) = &self.call_index else {
+            ui.weak("Data accesses have not been analyzed in this session. Run discovery to compute them.");
+            return;
+        };
+        let Some(data) = &index.report.data else {
+            ui.weak("This result has no data-access analysis. Run discovery again.");
+            return;
+        };
+        ui.weak(format!(
+            "{} direct accesses · {} p-code operations charged · {} access candidates",
+            data.references.len(),
+            data.operations_charged,
+            data.accesses_examined
+        ));
+        ui.weak("Direct memory reads/writes in examined functions. AArch64 register constants are propagated only within a basic block; address-only values and loaded pointers are outside this pass. Recomputed after project reopen.");
+        if data.partial || index.report.partial {
+            ui.colored_label(theme::WARNING, "Partial access coverage: work limits, unsupported instructions or incomplete function walks.");
+        }
+        ui.weak(format!(
+            "{} unresolved addresses · {} omitted accesses · {} unsupported instructions",
+            data.unresolved_accesses, data.omitted_accesses, data.unsupported_instructions
+        ));
+        ui.horizontal(|ui| {
+            ui.add(
+                TextEdit::singleline(&mut self.reference_query)
+                    .hint_text("Hex target address")
+                    .desired_width(130.0)
+                    .char_limit(18),
+            );
+            if ui.small_button("Find accesses").clicked() {
+                match parse_address(&self.reference_query) {
+                    Ok(address) => self.reference_target = Some(address),
+                    Err(error) => self.status = error,
+                }
+            }
+            if ui.small_button("Current function").clicked() {
+                self.reference_target = None;
+            }
+        });
+        let rows = if let Some(target) = self.reference_target {
+            ui.label(format!("Accesses starting at {target:#x}"));
+            index.data_incoming.get(&target)
+        } else if let Some(function) = self.view.as_ref().map(|view| view.address) {
+            ui.label(format!("Accesses from function {function:#x}"));
+            index.data_outgoing.get(&function)
+        } else {
+            ui.weak("Select a function or enter an exact target address.");
+            None
+        }
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+        ui.weak(format!(
+            "{} matching accesses · an empty result does not establish absence of references",
+            rows.len()
+        ));
+        let mut source = None;
+        let mut read = None;
+        let mut target = None;
+        let row_height = ui.text_style_height(&egui::TextStyle::Body) + 6.0;
+        ScrollArea::both().id_salt("data-references").show_rows(ui, row_height, rows.len(), |ui, visible| {
+            for row in visible {
+                let reference = &data.references[rows[row]];
+                ui.horizontal(|ui| {
+                    ui.weak(match reference.access { DataAccess::Read => "Read", DataAccess::Write => "Write" });
+                    if reference.provenance == DataProvenance::Propagated {
+                        ui.weak("propagated").on_hover_text("Pointer built from register constants set earlier in the same basic block");
+                    }
+                    ui.monospace(format!("{}B", reference.size));
+                    if ui.button(format!("{:x}", reference.target))
+                        .on_hover_text("Load exactly the accessed bytes into Decode").clicked() {
+                        read = Some((reference.target, reference.size));
+                    }
+                    if ui.small_button("Refs").on_hover_text("Show accesses beginning at this exact address").clicked() {
+                        target = Some(reference.target);
+                    }
+                    if ui.button(format!("{:x} @ {:x}", reference.function, reference.address))
+                        .on_hover_text("Open the source function and select this decoded memory-access instruction").clicked() {
+                        source = Some((reference.function, reference.address));
+                    }
+                });
+            }
+        });
+        if let Some((function, pc)) = source {
+            self.navigate_reference(function, pc, &context);
+        } else if let Some((address, size)) = read {
+            self.read_data_reference(address, size, &context);
+        } else if let Some(address) = target {
+            self.reference_target = Some(address);
+            self.reference_query = format!("{address:x}");
+        }
+    }
+
+    fn references_panel(&mut self, ui: &mut egui::Ui) {
+        let context = ui.ctx().clone();
+        if ui
+            .add_enabled(
+                self.info.is_some() && self.file_job.is_none(),
+                egui::Button::new("Discover functions and references"),
+            )
+            .clicked()
+        {
+            self.request(Request::Discover, &context);
+        }
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.reference_data, false, "Calls");
+            ui.selectable_value(&mut self.reference_data, true, "Data accesses");
+        });
+        if self.reference_data {
+            self.data_references_panel(ui);
+            return;
+        }
+        let Some(index) = &self.call_index else {
+            ui.weak("Call references have not been analyzed in this session. Run discovery to compute them.");
+            return;
+        };
+        let report = &index.report;
+        ui.weak(format!(
+            "Computed this session · {} functions examined · {} decode attempts",
+            report.functions_examined, report.decode_attempts
+        ));
+        ui.weak("Confirmed direct calls in examined functions. Unknown indirect targets remain unresolved. References are recomputed after reopening a project.");
+        if report.partial {
+            ui.colored_label(
+                theme::WARNING,
+                "Partial call coverage: limits, unresolved flow, or recovery failures.",
+            );
+        }
+        ui.weak(format!(
+            "{} unresolved calls · {} failed function walks · {} fallthrough calls excluded",
+            report.unresolved_calls, report.failed_functions, report.skipped_fallthrough_calls
+        ));
+        let Some(function) = self.view.as_ref().map(|view| view.address) else {
+            ui.label("Select a function to inspect its incoming and outgoing calls.");
+            return;
+        };
+        ui.label(RichText::new(format!("Function {function:#x}")).monospace());
+        let incoming = index
+            .incoming
+            .get(&function)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let outgoing = index
+            .outgoing
+            .get(&function)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let count = incoming.len() + outgoing.len();
+        ui.label(format!(
+            "{} incoming · {} outgoing",
+            incoming.len(),
+            outgoing.len()
+        ));
+        let name = |address| {
+            self.info
+                .as_ref()
+                .and_then(|info| {
+                    info.functions
+                        .binary_search_by_key(&address, |f| f.address)
+                        .ok()
+                        .map(|i| &info.functions[i])
+                })
+                .map(|function| {
+                    self.session
+                        .as_ref()
+                        .and_then(|s| s.annotations.get(&address))
+                        .map(|a| a.label.as_str())
+                        .filter(|n| !n.is_empty())
+                        .unwrap_or(&function.name)
+                })
+                .unwrap_or("function")
+        };
+        let mut source = None;
+        let mut target = None;
+        let row_height = ui.text_style_height(&egui::TextStyle::Body) + 6.0;
+        ScrollArea::both().id_salt("call-references").show_rows(
+            ui,
+            row_height,
+            count,
+            |ui, rows| {
+                for row in rows {
+                    let is_incoming = row < incoming.len();
+                    let reference = &report.references[if is_incoming {
+                        incoming[row]
+                    } else {
+                        outgoing[row - incoming.len()]
+                    }];
+                    ui.horizontal(|ui| {
+                        ui.weak(if is_incoming { "From" } else { "To" });
+                        if ui
+                            .button(format!(
+                                "{:x} {}",
+                                if is_incoming {
+                                    reference.caller
+                                } else {
+                                    reference.target
+                                },
+                                crop(
+                                    name(if is_incoming {
+                                        reference.caller
+                                    } else {
+                                        reference.target
+                                    }),
+                                    60
+                                )
+                            ))
+                            .clicked()
+                        {
+                            target = Some(if is_incoming {
+                                reference.caller
+                            } else {
+                                reference.target
+                            });
+                        }
+                        if ui
+                            .button(format!("at {:x}", reference.address))
+                            .on_hover_text(
+                                "Open the caller and select this decoded call instruction",
+                            )
+                            .clicked()
+                        {
+                            source = Some((reference.caller, reference.address));
+                        }
+                    });
+                }
+            },
+        );
+        if let Some((caller, pc)) = source {
+            self.navigate_reference(caller, pc, &context);
+        } else if let Some(address) = target {
+            self.navigate(address, true, &context);
+        }
+    }
+
     fn main_panel(&mut self, ui: &mut egui::Ui) {
         let title = match self.tab {
             Tab::Listing => "Listing",
@@ -2461,6 +2956,7 @@ impl DesktopApp {
             Tab::Strings => "Defined Strings",
             Tab::Crypto => "FindCrypt",
             Tab::Decode => "String Decoder",
+            Tab::References => "References",
         };
         let filename = self
             .info
@@ -2480,13 +2976,14 @@ impl DesktopApp {
                     .on_hover_text("Persisted project results. Scan again to recompute.");
             }
         });
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             for (tab, name) in [
                 (Tab::Listing, "Listing"),
                 (Tab::Graph, "Function Graph"),
                 (Tab::Strings, "Strings"),
                 (Tab::Crypto, "FindCrypt"),
                 (Tab::Decode, "Decode"),
+                (Tab::References, "References"),
             ] {
                 ui.selectable_value(&mut self.tab, tab, name);
             }
@@ -2494,6 +2991,7 @@ impl DesktopApp {
         ui.separator();
         let context = ui.ctx().clone();
         match self.tab {
+            Tab::References => self.references_panel(ui),
             Tab::Graph => {
                 let mut navigate = None;
                 if let Some(view) = &self.view {
@@ -2541,6 +3039,9 @@ impl DesktopApp {
                 }
             }
             Tab::Listing => {
+                if let Some(pc) = self.undisplayed_call {
+                    ui.colored_label(theme::WARNING, format!("Referenced instruction {pc:#x} is outside this bounded source graph. Use Go to inspect its address."));
+                }
                 if self.info.is_none() {
                     ui.add_space(32.0);
                     ui.heading("Code Browser");
@@ -2552,7 +3053,7 @@ impl DesktopApp {
                     let name = self
                         .info
                         .as_ref()
-                        .and_then(|info| info.functions.iter().find(|f| f.address == view.address))
+                        .and_then(|info| function_at(&info.functions, view.address))
                         .map(|f| f.name.as_str())
                         .unwrap_or("function");
                     ui.label(
@@ -2887,7 +3388,13 @@ impl DesktopApp {
                                 }
                                 Request::Crypto => "Scanning constants",
                             };
-                            theme::analysis_activity(ui, task, elapsed);
+                            let stage = self.analysis_progress.as_ref().map(|progress| match progress.stage {
+                                AnalysisStage::Seeds => "Seeding analysis", AnalysisStage::Calls => "Analyzing references", AnalysisStage::Publish => "Publishing results",
+                            }).unwrap_or(task);
+                            let activity = ui.scope(|ui| theme::analysis_activity(ui, stage, elapsed));
+                            if let Some(progress) = &self.analysis_progress {
+                                activity.response.on_hover_text(format!("{} functions examined · {} decode attempts. Total work is unknown.", progress.functions_examined, progress.decode_attempts));
+                            }
                         }
                     }
                 },
@@ -3021,6 +3528,7 @@ mod tests {
             started: Instant::now(),
             selection: app.selection_generation,
             revision: app.revision,
+            byte_origin: (app.selected, app.tab),
         };
         app.string_minimum = 12;
         app.receive(
@@ -3048,6 +3556,7 @@ mod tests {
             started: Instant::now(),
             selection: app.selection_generation,
             revision: app.revision,
+            byte_origin: (app.selected, app.tab),
         };
         let functions = app.info.as_ref().unwrap().functions.clone();
         let function_request = pending(Request::Discover);
@@ -3057,10 +3566,12 @@ mod tests {
             Response::Functions {
                 functions,
                 truncated: true,
+                analysis: CallAnalysis::default(),
             },
             &egui::Context::default(),
         );
         assert!(app.info.as_ref().unwrap().functions_truncated);
+        assert!(app.status.contains("data not analyzed"));
         assert!(app.status.contains("partial"));
         app.receive(
             string_request,
@@ -3074,6 +3585,104 @@ mod tests {
         assert!(app.strings.is_empty());
         app.clear_views();
         assert!(!app.strings_scanned);
+    }
+
+    #[test]
+    fn unbounded_graphs_and_mismatched_renames_stop_the_worker() {
+        fn pending(app: &DesktopApp, request: Request) -> Pending {
+            Pending {
+                id: 1,
+                request,
+                started: Instant::now(),
+                selection: app.selection_generation,
+                revision: app.revision,
+                byte_origin: (app.selected, app.tab),
+            }
+        }
+        let mut app = keyboard_app();
+        let block = |address| BasicBlock {
+            address,
+            instructions: Vec::new(),
+        };
+        app.receive(
+            pending(&app, Request::Graph { address: 0x1000 }),
+            Response::Graph {
+                view: FunctionView {
+                    address: 0x1000,
+                    blocks: (0..=MAX_GRAPH_BLOCKS as u64)
+                        .map(|i| block(0x1000 + i))
+                        .collect(),
+                    edges: Vec::new(),
+                    calls: Vec::new(),
+                    warnings: Vec::new(),
+                },
+            },
+            &egui::Context::default(),
+        );
+        assert!(app.status.contains("Basic block count"), "{}", app.status);
+        assert!(app.view.is_none() && app.listing.is_empty());
+
+        let mut app = keyboard_app();
+        app.receive(
+            pending(
+                &app,
+                Request::Rename {
+                    address: 0x1000,
+                    name: "requested".into(),
+                },
+            ),
+            Response::Renamed {
+                address: 0x1000,
+                name: "other".into(),
+            },
+            &egui::Context::default(),
+        );
+        assert!(app.status.contains("Unexpected worker response"));
+        assert_eq!(app.info.as_ref().unwrap().functions[0].name, "entry");
+    }
+
+    #[test]
+    fn large_function_filters_progress_across_frames_and_follow_label_edits() {
+        let mut app = keyboard_app();
+        let info = app.info.as_mut().unwrap();
+        info.sections[0].size = 0x10_0000;
+        info.functions = (0..20_000u64)
+            .map(|i| FunctionInfo {
+                address: 0x1000 + i,
+                name: format!("Fn_{i}"),
+            })
+            .collect();
+        app.rebuild_filter();
+        assert_eq!(app.filtered_functions.len(), 20_000);
+        app.function_filter = "FN_19".into();
+        app.filter_query = app.function_filter.to_lowercase();
+        app.filtered_functions.clear();
+        app.filter_cursor = Some(0);
+        let mut steps = 0;
+        while !app.step_filter(Duration::ZERO) {
+            steps += 1;
+        }
+        assert!(steps >= 19, "{steps}");
+        let expected: Vec<_> = (0..20_000)
+            .filter(|i| format!("fn_{i}").contains("fn_19"))
+            .collect();
+        assert_eq!(app.filtered_functions, expected);
+        // A label edit bumps the revision; stale keys are rebuilt.
+        app.session.as_mut().unwrap().annotations.insert(
+            0x1000 + 5,
+            Annotation {
+                label: "fn_19_label".into(),
+                ..Default::default()
+            },
+        );
+        app.revision += 1;
+        while !app.step_filter(Duration::from_secs(1)) {}
+        assert_eq!(app.filtered_functions[0], 5);
+        // Hexadecimal queries also match addresses.
+        app.function_filter = "1fff".into();
+        app.restart_filter();
+        while !app.step_filter(Duration::from_secs(1)) {}
+        assert!(app.filtered_functions.contains(&(0x1fff - 0x1000)));
     }
 
     fn keyboard_app() -> DesktopApp {
@@ -3112,6 +3721,139 @@ mod tests {
         app.address = "1000".into();
         app.rebuild_filter();
         app
+    }
+
+    #[test]
+    fn data_targets_request_bytes_without_function_navigation_or_stale_selection() {
+        let context = egui::Context::default();
+        let mut app = semantic_app();
+        app.tab = Tab::References;
+        app.semantic.select_instruction(0x1004);
+        let function = app.view.as_ref().unwrap().address;
+        let history = app.history.clone();
+        let generation = app.selection_generation;
+        let selected = app.selected;
+        let semantic_addresses = app.semantic.addresses.clone();
+        app.read_data_reference(0x1080, 4, &context);
+        assert_eq!(app.selected, selected);
+        assert_eq!(app.reference_target, Some(0x1080));
+        assert_eq!(app.view.as_ref().unwrap().address, function);
+        assert_eq!(app.history, history);
+        assert_eq!(app.selection_generation, generation);
+        assert_eq!(app.semantic.addresses, semantic_addresses);
+        assert!(app.tab == Tab::References);
+
+        // The same reply can complete a read without stealing a newer tab.
+        for changed in 0..5 {
+            app.tab = Tab::References;
+            app.status = "waiting".into();
+            let pending = Pending {
+                id: 1,
+                request: Request::Bytes {
+                    address: 0x1080,
+                    length: 4,
+                },
+                started: Instant::now(),
+                selection: app.selection_generation,
+                revision: app.revision,
+                byte_origin: (app.selected, app.tab),
+            };
+            match changed {
+                1 => app.tab = Tab::Strings,
+                2 => app.selection_generation = app.selection_generation.wrapping_add(1),
+                3 => app.revision += 1,
+                4 => app.selected = Some(0x1008),
+                _ => {}
+            }
+            app.receive(
+                pending,
+                Response::Bytes {
+                    address: 0x1080,
+                    bytes: vec![1, 2, 3, 4],
+                },
+                &context,
+            );
+            match changed {
+                0 => assert!(app.tab == Tab::Decode),
+                1 => {
+                    assert!(app.tab == Tab::Strings);
+                    assert_eq!(app.status, "Bytes loaded into decoder");
+                }
+                _ => assert_eq!(app.status, "waiting"),
+            }
+        }
+    }
+
+    #[test]
+    fn data_reference_adoption_is_validated_and_cleared_on_reopen() {
+        let context = egui::Context::default();
+        let mut app = keyboard_app();
+        app.info.as_mut().unwrap().architecture = "x86-64".into();
+        let report = CallAnalysis {
+            decode_attempts: 1,
+            functions_examined: 1,
+            data: Some(DataAnalysis {
+                references: vec![DataReference {
+                    function: 0x1000,
+                    address: 0x1004,
+                    target: 0x1080,
+                    size: 4,
+                    access: DataAccess::Read,
+                    provenance: DataProvenance::InstructionLocal,
+                }],
+                operations_charged: 1,
+                accesses_examined: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        for valid in [true, false] {
+            let pending = Pending {
+                id: 1,
+                request: Request::Discover,
+                started: Instant::now(),
+                selection: app.selection_generation,
+                revision: app.revision,
+                byte_origin: (app.selected, app.tab),
+            };
+            let mut analysis = report.clone();
+            if !valid {
+                analysis.data.as_mut().unwrap().references[0].target = 0x2000;
+            }
+            app.receive(
+                pending,
+                Response::Functions {
+                    functions: app.info.as_ref().unwrap().functions.clone(),
+                    truncated: false,
+                    analysis,
+                },
+                &context,
+            );
+            // A malformed worker reply must not replace previously validated evidence.
+            assert_eq!(
+                app.call_index
+                    .as_ref()
+                    .unwrap()
+                    .report
+                    .data
+                    .as_ref()
+                    .unwrap()
+                    .references[0]
+                    .target,
+                0x1080
+            );
+            if !valid {
+                assert!(app.status.contains("Invalid worker reference analysis"));
+            }
+        }
+        app.reference_data = true;
+        app.reference_target = Some(0x1080);
+        app.reference_query = "1080".into();
+        app.clear_views();
+        assert!(app.call_index.is_none());
+        assert!(!app.reference_data);
+        assert!(app.reference_target.is_none());
+        assert!(app.reference_query.is_empty());
     }
 
     fn key_event(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
@@ -4023,6 +4765,7 @@ mod tests {
             started: Instant::now(),
             selection: 1,
             revision: 0,
+            byte_origin: (None, Tab::Listing),
         };
         app.receive(
             pending,
@@ -4044,6 +4787,7 @@ mod tests {
             started: Instant::now(),
             selection: 2,
             revision: 0,
+            byte_origin: (None, Tab::Listing),
         };
         app.revision = 1;
         app.receive(
@@ -4069,6 +4813,7 @@ mod tests {
             started: Instant::now() - Duration::from_secs(2),
             selection: 0,
             revision: 0,
+            byte_origin: (None, Tab::Listing),
         });
         let frame = |app: &mut DesktopApp| {
             let mut output = context.run_ui(
@@ -4097,6 +4842,158 @@ mod tests {
     }
 
     #[test]
+    fn progress_is_request_bound_nonterminal_and_does_not_extend_deadlines() {
+        let context = egui::Context::default();
+        let mut app = keyboard_app();
+        let started = Instant::now() - Duration::from_secs(3);
+        app.pending = Some(Pending {
+            id: 7,
+            request: Request::Discover,
+            started,
+            selection: app.selection_generation,
+            revision: app.revision,
+            byte_origin: (app.selected, app.tab),
+        });
+        for stage in [
+            AnalysisStage::Seeds,
+            AnalysisStage::Calls,
+            AnalysisStage::Publish,
+        ] {
+            app.receive_worker_reply(
+                WorkerResponse {
+                    id: 7,
+                    response: Response::Progress {
+                        progress: AnalysisProgress {
+                            stage,
+                            functions_examined: 0,
+                            decode_attempts: 0,
+                        },
+                    },
+                },
+                &context,
+            );
+            assert_eq!(app.pending.as_ref().unwrap().started, started);
+            assert!(app.call_index.is_none());
+        }
+        app.receive_worker_reply(
+            WorkerResponse {
+                id: 7,
+                response: Response::Functions {
+                    functions: app.info.as_ref().unwrap().functions.clone(),
+                    truncated: false,
+                    analysis: CallAnalysis::default(),
+                },
+            },
+            &context,
+        );
+        assert!(app.pending.is_none());
+        assert!(app.call_index.is_some());
+        assert!(app.analysis_progress.is_none());
+        app.clear_binary();
+        assert!(app.call_index.is_none());
+    }
+
+    #[test]
+    fn invalid_progress_and_stale_analysis_cannot_replace_reference_evidence() {
+        let context = egui::Context::default();
+        let mut app = keyboard_app();
+        app.pending = Some(Pending {
+            id: 7,
+            request: Request::Discover,
+            started: Instant::now(),
+            selection: 0,
+            revision: 0,
+            byte_origin: (None, Tab::Listing),
+        });
+        app.receive_worker_reply(
+            WorkerResponse {
+                id: 99,
+                response: Response::Progress {
+                    progress: AnalysisProgress {
+                        stage: AnalysisStage::Seeds,
+                        functions_examined: 0,
+                        decode_attempts: 0,
+                    },
+                },
+            },
+            &context,
+        );
+        assert!(app.pending.is_none());
+        assert!(app.status.contains("unexpected request ID"));
+        app.pending = Some(Pending {
+            id: 7,
+            request: Request::Discover,
+            started: Instant::now(),
+            selection: 0,
+            revision: 0,
+            byte_origin: (None, Tab::Listing),
+        });
+        app.receive_worker_reply(
+            WorkerResponse {
+                id: 7,
+                response: Response::Progress {
+                    progress: AnalysisProgress {
+                        stage: AnalysisStage::Seeds,
+                        functions_examined: MAX_ANALYSIS_FUNCTIONS + 1,
+                        decode_attempts: 0,
+                    },
+                },
+            },
+            &context,
+        );
+        assert!(app.pending.is_none());
+        assert!(app.status.contains("Invalid worker analysis progress"));
+        let pending = Pending {
+            id: 7,
+            request: Request::Discover,
+            started: Instant::now(),
+            selection: 0,
+            revision: 0,
+            byte_origin: (None, Tab::Listing),
+        };
+        app.revision += 1;
+        app.receive(
+            pending,
+            Response::Functions {
+                functions: vec![],
+                truncated: false,
+                analysis: CallAnalysis::default(),
+            },
+            &context,
+        );
+        assert!(app.call_index.is_none());
+        assert_eq!(app.info.as_ref().unwrap().functions.len(), 2);
+    }
+
+    #[test]
+    fn reference_source_navigation_selects_once_and_explains_display_omissions() {
+        let context = egui::Context::default();
+        for pc in [0x1004, 0x104c] {
+            let mut app = semantic_app();
+            let view = app.view.clone().unwrap();
+            app.auto_decompile = false;
+            app.navigate_reference(0x1000, pc, &context);
+            assert!(app.semantic.mappings.is_empty());
+            assert!(app.view.is_none());
+            let pending = Pending {
+                id: 1,
+                request: Request::Graph { address: 0x1000 },
+                started: Instant::now(),
+                selection: app.selection_generation,
+                revision: app.revision,
+                byte_origin: (app.selected, app.tab),
+            };
+            app.receive(pending, Response::Graph { view }, &context);
+            assert_eq!(app.selected, Some(pc));
+            assert!(app.semantic.addresses.contains(&pc));
+            assert_eq!(app.pending_listing_scroll, (pc == 0x1004).then_some(1));
+            assert_eq!(app.undisplayed_call, (pc == 0x104c).then_some(pc));
+            assert!(app.reference_focus.is_none());
+            assert!(app.tab == Tab::Listing);
+        }
+    }
+
+    #[test]
     fn empty_desktop_and_all_tabs_render_without_a_worker() {
         let context = egui::Context::default();
         theme::install(&context);
@@ -4108,6 +5005,7 @@ mod tests {
             Tab::Strings,
             Tab::Crypto,
             Tab::Decode,
+            Tab::References,
         ] {
             app.tab = tab;
             let mut output = context.run_ui(egui::RawInput::default(), |ui| app.draw(ui));
@@ -4138,6 +5036,7 @@ mod tests {
                 started: Instant::now(),
                 selection: 0,
                 revision: 0,
+                byte_origin: (None, Tab::Listing),
             },
             Response::Decompiled {
                 address: 0x1000,
@@ -4176,6 +5075,7 @@ mod tests {
                     started: Instant::now(),
                     selection: 0,
                     revision: 0,
+                    byte_origin: (None, Tab::Listing),
                 },
                 Response::Decompiled {
                     address: 0x1000,

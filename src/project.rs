@@ -3,9 +3,12 @@
 //! A project stores a bounded current-function cache, annotations, and optionally
 //! the exact analyzed input. The decompiler's internal database is rebuilt on open.
 use crate::model::{
-    BinaryInfo, CodeMapping, CryptoMatch, FunctionView, MAX_DECOMPILED_BYTES, StringEntry,
+    BinaryInfo, CodeMapping, CryptoMatch, FunctionView, MAX_CRYPTO_MATCHES, MAX_DECOMPILED_BYTES,
+    MAX_GRAPH_BLOCKS, MAX_GRAPH_CALLS, MAX_GRAPH_EDGES, MAX_GRAPH_INSTRUCTIONS,
+    MAX_INSTRUCTION_BYTES, MAX_PROJECT_STRINGS, MAX_SECTIONS, MAX_WARNINGS, StringEntry,
+    validate_functions,
 };
-use crate::selection::validate_mappings;
+use crate::selection::{MappedRanges, validate_mappings};
 use crate::session::{self, BinaryProtection, Session};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, config::DbConfig, limits::Limit, params};
 use serde::{Deserialize, Serialize};
@@ -19,11 +22,12 @@ use std::time::{Duration, Instant};
 
 const APPLICATION_ID: i64 = 0x4752504a; // GRPJ
 const VERSION: i64 = 1;
-pub const ENGINE_FINGERPRINT: &str =
-    "ghidra-rust-project-v1-mapping-v1-pe-v1-aarch64-v1:268c3a406d8d964bc00ae2ead4d3e1e1373aaa27";
+pub const ENGINE_FINGERPRINT: &str = "ghidra-rust-project-v1-mapping-v1-pe-v1-aarch64-v1-calls-v1-arm64pe-v1-inventory-v2:268c3a406d8d964bc00ae2ead4d3e1e1373aaa27";
 const MAX_BINARY: usize = 128 * 1024 * 1024;
-const MAX_BODY: usize = 16 * 1024 * 1024;
-const MAX_PROJECT: u64 = 192 * 1024 * 1024;
+const MAX_BODY: usize = 48 * 1024 * 1024;
+const MAX_PROJECT: u64 = 224 * 1024 * 1024;
+/// A full function inventory uses about 1.3 million metadata nodes.
+const MAX_JSON_NODES: usize = 3_000_000;
 const SCHEMA: &str = "CREATE TABLE project_data (key TEXT NOT NULL, value BLOB NOT NULL)";
 
 #[derive(Clone, Debug)]
@@ -45,11 +49,14 @@ pub struct ProjectData {
 struct Body {
     engine: String,
     #[serde(default)]
+    #[serde(deserialize_with = "crate::bounded::vec::<_, _, { crate::model::MAX_CODE_MAPPINGS }>")]
     mappings: Vec<CodeMapping>,
     info: BinaryInfo,
     view: Option<FunctionView>,
+    #[serde(deserialize_with = "crate::bounded::vec::<_, _, { MAX_PROJECT_STRINGS }>")]
     strings: Vec<StringEntry>,
     strings_truncated: bool,
+    #[serde(deserialize_with = "crate::bounded::vec::<_, _, { MAX_CRYPTO_MATCHES }>")]
     crypto: Vec<CryptoMatch>,
     crypto_truncated: bool,
     selected_address: Option<u64>,
@@ -208,7 +215,7 @@ impl ProjectData {
         let copied = std::io::copy(&mut file.take(MAX_PROJECT + 1), snapshot.as_file_mut())
             .map_err(|e| format!("Cannot snapshot project: {e}"))?;
         if copied > MAX_PROJECT {
-            return Err("Project exceeds the 192 MiB size limit".into());
+            return Err("Project exceeds the 224 MiB size limit".into());
         }
         snapshot
             .flush()
@@ -316,27 +323,15 @@ impl ProjectData {
     }
 
     fn validate(&self) -> Result<(), String> {
-        self.session.validate_ranges(&self.info.sections)?;
+        // Legacy projects allowed 4 KiB names and no aggregate name budget.
+        let ranges = validate_info(&self.info, 4096, false)?;
+        self.session.validate_ranges_with(&ranges)?;
         if self.info.sha256 != self.session.binary_sha256 {
             return Err("Project metadata and annotation fingerprints differ".into());
         }
-        if self.info.file_len > MAX_BINARY as u64 {
-            return Err("Binary exceeds the 128 MiB size limit".into());
-        }
-        bounded(self.info.path.len(), 32 * 1024, "Source hint")?;
-        bounded(self.info.architecture.len(), 128, "Architecture")?;
-        bounded(self.info.format.len(), 128, "Binary format")?;
-        for warning in &self.info.warnings {
-            bounded(warning.len(), 4096, "Warning text")?;
-        }
         if let Some(address) = self.selected_address {
-            mapped(&self.info, address)?;
+            mapped(&ranges, address)?;
         }
-        bounded(self.info.functions.len(), 10_000, "Function count")?;
-        bounded(self.info.sections.len(), 4096, "Section count")?;
-        bounded(self.info.warnings.len(), 128, "Warning count")?;
-        bounded(self.strings.len(), 20_000, "String count")?;
-        bounded(self.crypto.len(), 10_000, "Crypto match count")?;
         if self
             .decompiled
             .as_ref()
@@ -352,82 +347,20 @@ impl ProjectData {
         if self.decompiled.is_some() && self.view.is_none() {
             return Err("Decompilation has no corresponding function view".into());
         }
-        for section in &self.info.sections {
-            section
-                .address
-                .checked_add(section.size)
-                .ok_or("Section address overflows")?;
-            let end = section
-                .file_offset
-                .checked_add(section.file_size)
-                .ok_or("Section file range overflows")?;
-            if end > self.info.file_len || section.file_size > section.size {
-                return Err("Section exceeds the binary bounds".into());
-            }
-            bounded(section.name.len(), 4096, "Section name")?;
-        }
-        for function in &self.info.functions {
-            bounded(function.name.len(), 4096, "Function name")?;
-            mapped(&self.info, function.address)?;
-        }
-        for string in &self.strings {
-            bounded(string.text.len(), 4096, "String text")?;
-            bounded(string.encoding.len(), 64, "String encoding")?;
-            mapped(&self.info, string.address)?;
-        }
-        for item in &self.crypto {
-            bounded(item.algorithm.len(), 256, "Algorithm name")?;
-            bounded(item.signature.len(), 1024, "Signature name")?;
-            bounded(item.length, MAX_BINARY, "Signature length")?;
-            mapped_range(&self.info, item.address, item.length)?;
-        }
+        validate_strings(&self.strings, MAX_PROJECT_STRINGS, &ranges)?;
+        validate_crypto(&self.crypto, &ranges)?;
         if let Some(view) = &self.view {
-            mapped(&self.info, view.address)?;
-            bounded(view.blocks.len(), 128, "Basic block count")?;
-            bounded(view.edges.len(), 4096, "Edge count")?;
-            bounded(view.calls.len(), 2048, "Call count")?;
-            bounded(view.warnings.len(), 128, "Graph warning count")?;
-            let count: usize = view.blocks.iter().map(|b| b.instructions.len()).sum();
-            bounded(count, 2048, "Instruction count")?;
-            let mut blocks = std::collections::BTreeSet::new();
-            let mut instructions = std::collections::BTreeSet::new();
-            for warning in &view.warnings {
-                bounded(warning.len(), 4096, "Graph warning text")?;
-            }
-            for block in &view.blocks {
-                if !blocks.insert(block.address) {
-                    return Err("Project graph has duplicate basic blocks".into());
-                }
-                mapped(&self.info, block.address)?;
-                if block
-                    .instructions
-                    .first()
-                    .is_some_and(|i| i.address != block.address)
-                {
-                    return Err("Basic block address does not match its first instruction".into());
-                }
-                for instruction in &block.instructions {
-                    if !instructions.insert(instruction.address) {
-                        return Err("Project graph has duplicate instructions".into());
-                    }
-                    mapped_range(&self.info, instruction.address, instruction.bytes.len())?;
-                    bounded(instruction.bytes.len(), 32, "Instruction bytes")?;
-                    bounded(instruction.mnemonic.len(), 128, "Instruction mnemonic")?;
-                    bounded(instruction.operands.len(), 4096, "Instruction operands")?;
-                }
-            }
+            validate_view(view, &ranges)?;
+            // Saved graphs have always required mapped exits and call sites.
             for edge in &view.edges {
-                if !blocks.contains(&edge.source) {
-                    return Err("Graph edge source is not a basic block".into());
-                }
                 if let Some(target) = edge.target {
-                    mapped(&self.info, target)?;
+                    mapped(&ranges, target)?;
                 }
             }
             for call in &view.calls {
-                mapped(&self.info, call.address)?;
+                mapped(&ranges, call.address)?;
                 if let Some(target) = call.target {
-                    mapped(&self.info, target)?;
+                    mapped(&ranges, target)?;
                 }
             }
         }
@@ -614,35 +547,149 @@ fn verify_written_database(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn mapped_range(info: &BinaryInfo, address: u64, length: usize) -> Result<(), String> {
-    if length == 0 {
-        return Err("Project cache contains an empty mapped range".into());
+/// Binary metadata bounds shared by projects and worker `Opened` replies.
+/// Counts and sections are checked before any per-element address work; the
+/// returned intervals make each later address check logarithmic.
+pub(crate) fn validate_info(
+    info: &BinaryInfo,
+    max_name_bytes: usize,
+    name_budget: bool,
+) -> Result<MappedRanges, String> {
+    bounded(info.sections.len(), MAX_SECTIONS, "Section count")?;
+    bounded(info.warnings.len(), MAX_WARNINGS, "Warning count")?;
+    if info.file_len > MAX_BINARY as u64 {
+        return Err("Binary exceeds the 128 MiB size limit".into());
     }
-    let end = address
-        .checked_add(length as u64)
-        .ok_or("Project cache range overflows")?;
-    let mut current = address;
-    while current < end {
-        let section = info
-            .sections
-            .iter()
-            .find(|s| current >= s.address && current - s.address < s.size)
-            .ok_or("Project cache range includes unmapped bytes")?;
-        let section_end = section
+    bounded(info.path.len(), 32 * 1024, "Source hint")?;
+    bounded(info.architecture.len(), 128, "Architecture")?;
+    bounded(info.format.len(), 128, "Binary format")?;
+    bounded(info.sha256.len(), 64, "Binary fingerprint")?;
+    for warning in &info.warnings {
+        bounded(warning.len(), 4096, "Warning text")?;
+    }
+    let mut previous_end = None;
+    for section in &info.sections {
+        bounded(section.name.len(), 4096, "Section name")?;
+        let end = section
             .address
             .checked_add(section.size)
-            .ok_or("Project section range overflows")?;
-        current = end.min(section_end);
+            .ok_or("Section address overflows")?;
+        let file_end = section
+            .file_offset
+            .checked_add(section.file_size)
+            .ok_or("Section file range overflows")?;
+        if file_end > info.file_len || section.file_size > section.size {
+            return Err("Section exceeds the binary bounds".into());
+        }
+        // The loader publishes ordered, non-overlapping sections.
+        if previous_end.is_some_and(|previous| previous > section.address) {
+            return Err("Sections are unordered or overlapping".into());
+        }
+        previous_end = Some(end);
+    }
+    let ranges = MappedRanges::new(&info.sections)?;
+    validate_functions(&info.functions, max_name_bytes, name_budget)?;
+    for function in &info.functions {
+        mapped(&ranges, function.address)?;
+    }
+    Ok(ranges)
+}
+
+pub(crate) fn validate_strings(
+    strings: &[StringEntry],
+    maximum: usize,
+    ranges: &MappedRanges,
+) -> Result<(), String> {
+    bounded(strings.len(), maximum, "String count")?;
+    for string in strings {
+        bounded(string.text.len(), 4096, "String text")?;
+        bounded(string.encoding.len(), 64, "String encoding")?;
+        mapped(ranges, string.address)?;
     }
     Ok(())
 }
 
-fn mapped(info: &BinaryInfo, address: u64) -> Result<(), String> {
-    if info
-        .sections
+pub(crate) fn validate_crypto(crypto: &[CryptoMatch], ranges: &MappedRanges) -> Result<(), String> {
+    bounded(crypto.len(), MAX_CRYPTO_MATCHES, "Crypto match count")?;
+    for item in crypto {
+        bounded(item.algorithm.len(), 256, "Algorithm name")?;
+        bounded(item.signature.len(), 1024, "Signature name")?;
+        bounded(item.length, MAX_BINARY, "Signature length")?;
+        mapped_range(ranges, item.address, item.length)?;
+    }
+    Ok(())
+}
+
+/// Structural graph bounds shared by projects and worker replies. Exits and
+/// call targets may legitimately leave the displayed blocks, so only their
+/// sources are checked here.
+pub(crate) fn validate_view(view: &FunctionView, ranges: &MappedRanges) -> Result<(), String> {
+    bounded(view.blocks.len(), MAX_GRAPH_BLOCKS, "Basic block count")?;
+    bounded(view.edges.len(), MAX_GRAPH_EDGES, "Edge count")?;
+    bounded(view.calls.len(), MAX_GRAPH_CALLS, "Call count")?;
+    bounded(view.warnings.len(), MAX_WARNINGS, "Graph warning count")?;
+    let count = view
+        .blocks
         .iter()
-        .any(|s| address >= s.address && address - s.address < s.size)
-    {
+        .map(|b| b.instructions.len())
+        .fold(0usize, usize::saturating_add);
+    bounded(count, MAX_GRAPH_INSTRUCTIONS, "Instruction count")?;
+    mapped(ranges, view.address)?;
+    for warning in &view.warnings {
+        bounded(warning.len(), 4096, "Graph warning text")?;
+    }
+    let mut blocks = std::collections::BTreeSet::new();
+    let mut instructions = std::collections::BTreeSet::new();
+    for block in &view.blocks {
+        if !blocks.insert(block.address) {
+            return Err("Graph has duplicate basic blocks".into());
+        }
+        mapped(ranges, block.address)?;
+        if block
+            .instructions
+            .first()
+            .is_some_and(|i| i.address != block.address)
+        {
+            return Err("Basic block address does not match its first instruction".into());
+        }
+        for instruction in &block.instructions {
+            if !instructions.insert(instruction.address) {
+                return Err("Graph has duplicate instructions".into());
+            }
+            bounded(
+                instruction.bytes.len(),
+                MAX_INSTRUCTION_BYTES,
+                "Instruction bytes",
+            )?;
+            bounded(instruction.mnemonic.len(), 128, "Instruction mnemonic")?;
+            bounded(instruction.operands.len(), 4096, "Instruction operands")?;
+            mapped_range(ranges, instruction.address, instruction.bytes.len())?;
+        }
+    }
+    for edge in &view.edges {
+        if !blocks.contains(&edge.source) {
+            return Err("Graph edge source is not a basic block".into());
+        }
+    }
+    Ok(())
+}
+
+fn mapped_range(ranges: &MappedRanges, address: u64, length: usize) -> Result<(), String> {
+    if length == 0 {
+        return Err("Project cache contains an empty mapped range".into());
+    }
+    address
+        .checked_add(length as u64)
+        .ok_or("Project cache range overflows")?;
+    if ranges.contains_span(address, length as u64) {
+        Ok(())
+    } else {
+        Err("Project cache range includes unmapped bytes".into())
+    }
+}
+
+fn mapped(ranges: &MappedRanges, address: u64) -> Result<(), String> {
+    if ranges.contains(address) {
         Ok(())
     } else {
         Err(format!(
@@ -788,67 +835,7 @@ fn encode<T: Serialize>(value: &T, maximum: usize) -> Result<Vec<u8>, String> {
 
 /// Bound collection construction before materializing hostile cached DTOs.
 fn check_json_budget(bytes: &[u8]) -> Result<(), String> {
-    use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
-    struct Budget {
-        nodes: usize,
-    }
-    struct Seed<'a>(&'a mut Budget);
-    impl<'de> DeserializeSeed<'de> for Seed<'_> {
-        type Value = ();
-        fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
-            if self.0.nodes == 0 {
-                return Err(serde::de::Error::custom(
-                    "Project metadata exceeds its collection budget",
-                ));
-            }
-            self.0.nodes -= 1;
-            d.deserialize_any(self)
-        }
-    }
-    impl<'de> Visitor<'de> for Seed<'_> {
-        type Value = ();
-        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("bounded project JSON")
-        }
-        fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<(), E> {
-            Ok(())
-        }
-        fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<(), E> {
-            Ok(())
-        }
-        fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<(), E> {
-            Ok(())
-        }
-        fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<(), E> {
-            Ok(())
-        }
-        fn visit_unit<E: serde::de::Error>(self) -> Result<(), E> {
-            Ok(())
-        }
-        fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<(), E> {
-            if value.len() > 256 * 1024 {
-                Err(E::custom("Project metadata string exceeds size limit"))
-            } else {
-                Ok(())
-            }
-        }
-        fn visit_seq<A: SeqAccess<'de>>(self, mut access: A) -> Result<(), A::Error> {
-            while access.next_element_seed(Seed(self.0))?.is_some() {}
-            Ok(())
-        }
-        fn visit_map<A: MapAccess<'de>>(self, mut access: A) -> Result<(), A::Error> {
-            while access.next_key_seed(Seed(self.0))?.is_some() {
-                access.next_value_seed(Seed(self.0))?;
-            }
-            Ok(())
-        }
-    }
-    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
-    Seed(&mut Budget { nodes: 1_000_000 })
-        .deserialize(&mut deserializer)
-        .map_err(|e| format!("Invalid project metadata: {e}"))?;
-    deserializer
-        .end()
+    crate::bounded::check_json(bytes, MAX_JSON_NODES, 256 * 1024)
         .map_err(|e| format!("Invalid project metadata: {e}"))
 }
 
@@ -1142,6 +1129,47 @@ mod tests {
     }
 
     #[test]
+    fn excess_collections_fail_while_deserializing_and_sections_must_be_ordered() {
+        let directory = tempfile::tempdir().unwrap();
+        let (data, protection) = sample(directory.path());
+        let path = directory.path().join("warnings.grproj");
+        data.save(&path, &protection, false).unwrap();
+        let db = Connection::open(&path).unwrap();
+        let bytes = read_blob(&db, "body", MAX_BODY).unwrap().unwrap();
+        let mut body: Body = serde_json::from_slice(&bytes).unwrap();
+        body.info.warnings = vec![String::new(); MAX_WARNINGS + 1];
+        db.execute(
+            "UPDATE project_data SET value=?1 WHERE key='body'",
+            [encode(&body, MAX_BODY).unwrap()],
+        )
+        .unwrap();
+        drop(db);
+        let error = ProjectData::load(&path).unwrap_err();
+        assert!(error.contains("128-element limit"), "{error}");
+
+        let mut unordered = data.clone();
+        unordered.info.sections = vec![
+            SectionInfo {
+                name: ".b".into(),
+                address: 0x1008,
+                size: 8,
+                file_offset: 0,
+                file_size: 0,
+                executable: false,
+            },
+            unordered.info.sections[0].clone(),
+        ];
+        assert!(unordered.validate().unwrap_err().contains("unordered"));
+
+        // Legacy projects keep their larger per-name bound.
+        let mut legacy = data;
+        legacy.info.functions[0].name = "n".repeat(4096);
+        legacy.validate().unwrap();
+        legacy.info.functions[0].name.push('n');
+        assert!(legacy.validate().is_err());
+    }
+
+    #[test]
     fn bounded_records_and_collection_preflight_preserve_previous_project() {
         let directory = tempfile::tempdir().unwrap();
         let (mut data, protection) = sample(directory.path());
@@ -1152,7 +1180,7 @@ mod tests {
         assert!(data.save(&path, &protection, true).is_err());
         assert_eq!(fs::read(&path).unwrap(), original);
         assert!(
-            check_json_budget(format!("[{}]", vec!["0"; 1_000_001].join(",")).as_bytes())
+            check_json_budget(format!("[{}]", vec!["0"; MAX_JSON_NODES + 1].join(",")).as_bytes())
                 .unwrap_err()
                 .contains("budget")
         );

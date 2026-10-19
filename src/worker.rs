@@ -60,6 +60,7 @@ fn protocol(
         if enforce_limits {
             crate::limits::begin_request()?;
         }
+        let request_id = request.id;
         let result =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match request.request {
                 Request::Open { path } => {
@@ -73,7 +74,15 @@ fn protocol(
                 request => loaded
                     .as_mut()
                     .ok_or_else(|| "Open a binary first.".to_string())?
-                    .handle(request),
+                    .handle_with_progress(request, &mut |progress| {
+                        send(
+                            &mut output,
+                            WorkerResponse {
+                                id: request_id,
+                                response: Response::Progress { progress },
+                            },
+                        )
+                    }),
             }));
         let response = match result {
             Ok(Ok(response)) => response,
@@ -110,7 +119,7 @@ fn send(output: &mut impl Write, response: WorkerResponse) -> Result<(), String>
         encoded.bytes.clear();
         let fallback = WorkerResponse {
             id: response.id,
-            response: Response::Error { message: "Analysis response exceeds the 12 MiB protocol limit; narrow the requested analysis.".into() },
+            response: Response::Error { message: "Analysis response exceeds the 32 MiB protocol limit; narrow the requested analysis.".into() },
         };
         serde_json::to_writer(&mut encoded, &fallback)
             .map_err(|e| format!("Worker error response encoding failed: {e}"))?;
@@ -124,7 +133,7 @@ fn send(output: &mut impl Write, response: WorkerResponse) -> Result<(), String>
         .map_err(|e| format!("Worker output failed: {e}"))
 }
 
-const MAX_RESPONSE_BYTES: usize = 12 * 1024 * 1024;
+use crate::model::MAX_REPLY_BYTES as MAX_RESPONSE_BYTES;
 
 #[derive(Default)]
 struct ResponseBuffer {
@@ -147,6 +156,173 @@ impl Write for ResponseBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::*;
+
+    #[test]
+    fn largest_inventory_and_evidence_fit_the_response_limit() {
+        // 32 escaped bytes per name spends the full aggregate name budget.
+        let name = format!("{}ab", "\u{1}".repeat(5));
+        assert_eq!(json_escaped_len(&name), 32);
+        const { assert!(32 * MAX_FUNCTIONS == MAX_FUNCTION_NAME_JSON_BYTES) };
+        let functions: Vec<_> = (0..MAX_FUNCTIONS as u64)
+            .map(|i| FunctionInfo {
+                address: u64::MAX - i,
+                name: name.clone(),
+            })
+            .collect();
+        let call = CallReference {
+            caller: u64::MAX,
+            address: u64::MAX,
+            target: u64::MAX,
+        };
+        let data = DataReference {
+            function: u64::MAX,
+            address: u64::MAX,
+            target: u64::MAX,
+            size: u32::MAX,
+            access: DataAccess::Write,
+            provenance: DataProvenance::InstructionLocal,
+        };
+        let full = |n| usize::MAX - n;
+        let analysis = CallAnalysis {
+            references: vec![call; MAX_CALL_REFERENCES],
+            data: Some(DataAnalysis {
+                references: vec![data; MAX_DATA_REFERENCES],
+                operations_charged: full(0),
+                accesses_examined: full(1),
+                unresolved_accesses: full(2),
+                omitted_accesses: full(3),
+                unsupported_instructions: full(4),
+                partial: true,
+            }),
+            functions_examined: full(5),
+            decode_attempts: full(6),
+            unresolved_calls: full(7),
+            skipped_fallthrough_calls: full(8),
+            failed_functions: full(9),
+            partial: true,
+        };
+        let reply = |response| {
+            let mut buffer = ResponseBuffer::default();
+            // The client's preflight must admit every maximal valid reply.
+            serde_json::to_writer(
+                &mut buffer,
+                &WorkerResponse {
+                    id: u64::MAX,
+                    response,
+                },
+            )
+            .is_ok()
+                && crate::bounded::check_reply(&buffer.bytes).is_ok()
+        };
+        assert!(reply(Response::Functions {
+            functions: functions.clone(),
+            truncated: true,
+            analysis,
+        }));
+        let section = SectionInfo {
+            name: "\u{1}".repeat(256),
+            address: u64::MAX,
+            size: u64::MAX,
+            file_offset: u64::MAX,
+            file_size: u64::MAX,
+            executable: true,
+        };
+        assert!(reply(Response::Opened {
+            info: BinaryInfo {
+                path: "\u{1}".repeat(32 * 1024),
+                architecture: "AArch64".into(),
+                format: "Mach-O".into(),
+                entry: u64::MAX,
+                file_len: u64::MAX,
+                sha256: "f".repeat(64),
+                source_identity: Some(FileIdentity {
+                    device: u64::MAX,
+                    inode: u64::MAX,
+                    inode_high: u64::MAX,
+                }),
+                sections: vec![section; 4096],
+                functions,
+                functions_truncated: true,
+                warnings: vec!["\u{1}".repeat(512); 64],
+            },
+        }));
+    }
+
+    #[test]
+    fn discovery_progress_keeps_the_request_id_and_one_terminal_reply() {
+        let mut binary = tempfile::NamedTempFile::new().unwrap();
+        binary
+            .write_all(&crate::analysis::tests::elf_fixture())
+            .unwrap();
+        // Windows analysis intentionally denies concurrent writable handles.
+        // Retain automatic path cleanup while closing the fixture's writer.
+        let binary = binary.into_temp_path();
+        let requests = [
+            WorkerRequest {
+                id: 1,
+                request: Request::Open {
+                    path: binary.to_string_lossy().into_owned(),
+                },
+            },
+            WorkerRequest {
+                id: 2,
+                request: Request::Discover,
+            },
+            WorkerRequest {
+                id: 3,
+                request: Request::Bytes {
+                    address: 0x402000,
+                    length: 1,
+                },
+            },
+        ];
+        let input = requests
+            .iter()
+            .map(|request| format!("{}\n", serde_json::to_string(request).unwrap()))
+            .collect::<String>();
+        let mut output = Vec::new();
+        protocol(io::Cursor::new(input), &mut output, false).unwrap();
+        let replies: Vec<WorkerResponse> = output
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
+        assert_eq!(replies[0].id, 1);
+        assert!(
+            matches!(replies[0].response, Response::Opened { .. }),
+            "Fixture failed to open: {:?}",
+            replies[0].response
+        );
+        let mut previous = None;
+        let mut events = 0;
+        let mut terminal = 0;
+        for reply in replies.iter().filter(|reply| reply.id == 2) {
+            match &reply.response {
+                Response::Progress { progress } => {
+                    assert_eq!(terminal, 0);
+                    progress.validate_after(previous.as_ref()).unwrap();
+                    previous = Some(progress.clone());
+                    events += 1;
+                }
+                Response::Functions { analysis, .. } => {
+                    terminal += 1;
+                    let progress = previous.as_ref().unwrap();
+                    assert_eq!(progress.stage, crate::model::AnalysisStage::Publish);
+                    assert_eq!(progress.decode_attempts, analysis.decode_attempts);
+                    assert_eq!(progress.functions_examined, analysis.functions_examined);
+                }
+                other => panic!("Unexpected discovery reply: {other:?}"),
+            }
+        }
+        assert_eq!(terminal, 1);
+        assert!((3..=crate::model::MAX_ANALYSIS_FUNCTIONS + 3).contains(&events));
+        assert_eq!(replies.last().unwrap().id, 3);
+        assert!(matches!(
+            replies.last().unwrap().response,
+            Response::Bytes { .. }
+        ));
+    }
 
     #[test]
     fn oversized_response_becomes_one_error_line_with_original_id() {

@@ -1,9 +1,10 @@
 //! Bounded, file-backed PE metadata recovery. This does not execute or decode code.
 use std::collections::BTreeMap;
 
-use crate::model::SectionInfo;
+use crate::model::{MAX_FUNCTIONS, SectionInfo};
 
-pub(crate) const MAX_FUNCTIONS: usize = 10_000;
+mod arm64;
+
 pub(crate) const MAX_IMPORTS: usize = 10_000;
 const MAX_TABLE_ENTRIES: u32 = 500_000;
 const MAX_DIRECTORY_BYTES: u32 = 8 * 1024 * 1024;
@@ -30,7 +31,7 @@ impl PeMetadata {
             self.functions.insert(address, name);
         } else {
             self.functions_truncated = true;
-            self.warn("PE function metadata is limited to 10,000 functions; additional entries were omitted.");
+            self.warn(&format!("PE function metadata is limited to {MAX_FUNCTIONS} functions; additional entries were omitted."));
         }
     }
 }
@@ -215,14 +216,18 @@ pub(crate) fn parse(bytes: &[u8], sections: &[SectionInfo]) -> Result<Option<PeM
     if let Some((rva, size)) = directory(0) {
         exports(&image, rva, size, &mut metadata);
     }
-    if machine == 0x8664
+    if matches!(machine, 0x8664 | 0xaa64)
         && is64
         && let Some((rva, size)) = directory(3)
     {
         let entry = u32_at(header, 16)
             .and_then(|rva| image.address(rva))
             .unwrap_or(image.base);
-        runtime_functions(&image, rva, size, entry, &mut metadata);
+        if machine == 0xaa64 {
+            arm64::runtime_functions(&image, rva, size, entry, &mut metadata);
+        } else {
+            runtime_functions(&image, rva, size, entry, &mut metadata);
+        }
     }
     if let Some((rva, size)) = directory(1) {
         imports(&image, rva, size, is64, &mut metadata);
@@ -268,15 +273,15 @@ fn runtime_functions(image: &Image<'_>, rva: u32, size: u32, entry: u64, out: &m
     out.function_ranges.dedup();
     // Preserve exact ranges for address navigation, but bound the symbol inventory.
     // For very large images prefer actual runtime entries near the entry point.
-    let mut candidates: Vec<usize> = (0..out.function_ranges.len()).collect();
-    candidates.sort_unstable_by_key(|index| {
-        let address = out.function_ranges[*index].0;
-        (address.abs_diff(entry), address)
-    });
+    let candidates = out.function_ranges.iter().map(|range| range.0).collect();
+    register_runtime_starts(candidates, entry, out);
+}
+
+fn register_runtime_starts(mut candidates: Vec<u64>, entry: u64, out: &mut PeMetadata) {
+    candidates.sort_unstable_by_key(|address| (address.abs_diff(entry), *address));
     let count_before = out.functions.len();
     let mut omitted = false;
-    for index in candidates {
-        let address = out.function_ranges[index].0;
+    for address in candidates {
         if out.functions.contains_key(&address) {
             continue;
         }
@@ -449,21 +454,21 @@ fn imports(image: &Image<'_>, rva: u32, size: u32, is64: bool, out: &mut PeMetad
 mod tests {
     use super::*;
 
-    fn put16(bytes: &mut [u8], offset: usize, value: u16) {
+    pub(super) fn put16(bytes: &mut [u8], offset: usize, value: u16) {
         bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
     }
-    fn put32(bytes: &mut [u8], offset: usize, value: u32) {
+    pub(super) fn put32(bytes: &mut [u8], offset: usize, value: u32) {
         bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }
     fn put64(bytes: &mut [u8], offset: usize, value: u64) {
         bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
     }
-    fn file(rva: usize) -> usize {
+    pub(super) fn file(rva: usize) -> usize {
         rva - 0x2000 + 0x400
     }
 
     // Original synthetic metadata, with no third-party executable bytes.
-    fn fixture(is64: bool) -> (Vec<u8>, Vec<SectionInfo>) {
+    pub(super) fn fixture(is64: bool) -> (Vec<u8>, Vec<SectionInfo>) {
         let mut bytes = vec![0u8; 0xa00];
         bytes[..2].copy_from_slice(b"MZ");
         put32(&mut bytes, 0x3c, 0x80);
@@ -618,33 +623,36 @@ mod tests {
         let (mut bytes, mut sections) = fixture(true);
         let count = MAX_FUNCTIONS + 100;
         let table_size = count * 12;
-        bytes.resize(0x11000 + table_size + 0xa0, 0);
+        let text_size = (count * 4).next_multiple_of(0x10000);
+        let table_offset = 0x1000 + text_size;
+        let table_rva = 0x20000 + text_size as u32;
+        bytes.resize(table_offset + table_size + 0xa0, 0);
         sections[0].file_offset = 0x1000;
-        sections[0].file_size = 0x10000;
-        sections[0].size = 0x10000;
-        sections[1].address = 0x1_4002_0000;
-        sections[1].file_offset = 0x11000;
+        sections[0].file_size = text_size as u64;
+        sections[0].size = text_size as u64;
+        sections[1].address = 0x1_4000_0000 + u64::from(table_rva);
+        sections[1].file_offset = table_offset as u64;
         sections[1].file_size = (table_size + 0xa0) as u64;
         sections[1].size = (table_size + 0xa0) as u64;
         put32(&mut bytes, 0x98 + 112, 0);
         put32(&mut bytes, 0x98 + 112 + 8, 0);
-        put32(&mut bytes, 0x98 + 112 + 24, 0x20000);
+        put32(&mut bytes, 0x98 + 112 + 24, table_rva);
         put32(&mut bytes, 0x98 + 112 + 28, table_size as u32);
         let entry_rva = 0x1000 + (count as u32 - 1) * 4;
         put32(&mut bytes, 0x98 + 16, entry_rva);
         for index in 0..count {
             let begin = 0x1000 + index as u32 * 4;
-            put32(&mut bytes, 0x11000 + index * 12, begin);
-            put32(&mut bytes, 0x11000 + index * 12 + 4, begin + 4);
+            put32(&mut bytes, table_offset + index * 12, begin);
+            put32(&mut bytes, table_offset + index * 12 + 4, begin + 4);
             put32(
                 &mut bytes,
-                0x11000 + index * 12 + 8,
-                0x20000 + table_size as u32,
+                table_offset + index * 12 + 8,
+                table_rva + table_size as u32,
             );
         }
-        bytes[0x11000 + table_size] = 1;
-        let export_rva = 0x20000 + table_size as u32 + 0x20;
-        let export_offset = 0x11000 + table_size + 0x20;
+        bytes[table_offset + table_size] = 1;
+        let export_rva = table_rva + table_size as u32 + 0x20;
+        let export_offset = table_offset + table_size + 0x20;
         put32(&mut bytes, 0x98 + 112, export_rva);
         put32(&mut bytes, 0x98 + 116, 0x80);
         for (offset, value) in [

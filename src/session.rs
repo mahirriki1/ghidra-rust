@@ -268,33 +268,28 @@ impl Session {
     /// mapped regions. Like virtual byte reads, spans may cross contiguous
     /// sections and include mapped zero-filled tails, but never unmapped gaps.
     pub fn validate_ranges(&self, sections: &[SectionInfo]) -> Result<(), String> {
+        self.validate_ranges_with(&crate::selection::MappedRanges::new(sections)?)
+    }
+
+    pub(crate) fn validate_ranges_with(
+        &self,
+        ranges: &crate::selection::MappedRanges,
+    ) -> Result<(), String> {
         self.validate()?;
         for annotation in self.annotations.values() {
             for decoded in &annotation.decoded {
                 if decoded.source_length == 0 {
                     return Err("Decoded source range must contain at least one byte".into());
                 }
-                let end = decoded
+                decoded
                     .source_address
                     .checked_add(decoded.source_length as u64)
                     .ok_or("Decoded source range overflows the address space")?;
-                let mut current = decoded.source_address;
-                while current < end {
-                    let section = sections
-                        .iter()
-                        .find(|section| {
-                            current >= section.address && current - section.address < section.size
-                        })
-                        .ok_or_else(|| {
-                            format!("Decoded source includes unmapped address {current:#x}")
-                        })?;
-                    // Validate section arithmetic rather than trusting persisted or
-                    // future backend metadata to make monotonic progress for us.
-                    let section_end = section
-                        .address
-                        .checked_add(section.size)
-                        .ok_or("Mapped section range overflows the address space")?;
-                    current = end.min(section_end);
+                if !ranges.contains_span(decoded.source_address, decoded.source_length as u64) {
+                    return Err(format!(
+                        "Decoded source at {:#x} includes unmapped bytes",
+                        decoded.source_address
+                    ));
                 }
             }
         }
