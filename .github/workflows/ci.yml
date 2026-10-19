@@ -1,7 +1,8 @@
 name: Native desktop build
+# Branch builds run for pull requests only, so a push to a PR branch starts one
+# run instead of two. Main is built by the automatic release workflow; other
+# branches can be built on demand with workflow_dispatch.
 on:
-  push:
-    branches-ignore: [main] # Main is built by the automatic release workflow.
   pull_request:
   workflow_dispatch:
   workflow_call:
