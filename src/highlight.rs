@@ -1,6 +1,6 @@
 //! Lexical highlighting of the decompiler's C-like plain text.
 //!
-//! Colors follow Ghidra's dark decompiler palette. This deliberately does
+//! Colors follow the shared Carbon theme. This deliberately does
 //! not infer semantic roles such as parameters, globals, or external functions:
 //! those require information beyond the engine's current plain-text response.
 
@@ -28,8 +28,10 @@ enum Kind {
 impl Kind {
     fn color(self) -> Color32 {
         match self {
-            Self::Plain | Self::Function => theme::TEXT,
-            Self::Keyword | Self::Type => theme::BLUE,
+            Self::Plain => theme::TEXT,
+            Self::Function => theme::SYNTAX_FUNCTION,
+            Self::Keyword => theme::SYNTAX_KEYWORD,
+            Self::Type => theme::SYNTAX_TYPE,
             Self::Comment => theme::SYNTAX_COMMENT,
             Self::Constant => theme::SYNTAX_CONSTANT,
             Self::Variable => theme::SYNTAX_VARIABLE,
@@ -566,12 +568,12 @@ mod tests {
         assert_eq!(tokens("return"), [("return", Kind::Keyword)]);
         assert_eq!(tokens("local_8"), [("local_8", Kind::Variable)]);
         assert!(tokens("FUN_00401000 (local_8)").contains(&("FUN_00401000", Kind::Function)));
-        assert_eq!(Kind::Keyword.color(), Color32::from_rgb(135, 206, 250));
-        assert_eq!(Kind::Type.color(), Kind::Keyword.color());
-        assert_eq!(Kind::Comment.color(), Color32::from_rgb(238, 130, 238));
-        assert_eq!(Kind::Constant.color(), Color32::from_rgb(112, 192, 112));
-        assert_eq!(Kind::Variable.color(), Color32::from_rgb(192, 192, 128));
-        assert_eq!(Kind::Function.color(), theme::TEXT);
+        assert_eq!(Kind::Keyword.color(), theme::SYNTAX_KEYWORD);
+        assert_eq!(Kind::Type.color(), theme::SYNTAX_TYPE);
+        assert_eq!(Kind::Comment.color(), theme::SYNTAX_COMMENT);
+        assert_eq!(Kind::Constant.color(), theme::SYNTAX_CONSTANT);
+        assert_eq!(Kind::Variable.color(), theme::SYNTAX_VARIABLE);
+        assert_eq!(Kind::Function.color(), theme::SYNTAX_FUNCTION);
         assert_eq!(tokens("uintVar"), [("uintVar", Kind::Variable)]);
     }
 

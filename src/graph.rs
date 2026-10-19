@@ -239,10 +239,11 @@ impl GraphCanvas {
                     .instruction_addresses
                     .iter()
                     .any(|a| related.contains(a));
-            painter.rect_filled(rect, 0.0, theme::VIEW);
+            let radius = theme::scaled_radius(self.zoom);
+            painter.rect_filled(rect, radius, theme::VIEW);
             painter.rect_stroke(
                 rect,
-                0.0,
+                radius,
                 Stroke::new(
                     if is_selected { 2.0 } else { 1.0 },
                     if is_selected {
@@ -262,15 +263,25 @@ impl GraphCanvas {
                 .and_then(|block| block.instructions.last())
                 .is_some_and(|instruction| instruction.mnemonic.starts_with("RET"));
             let header_color = if is_selected {
-                Color32::from_rgb(99, 85, 48)
+                theme::NODE_SELECTED
             } else if node.address == view.address {
-                Color32::from_rgb(36, 80, 36)
+                theme::NODE_ENTRY
             } else if is_return {
-                Color32::from_rgb(113, 50, 50)
+                theme::NODE_RETURN
             } else {
                 theme::HEADER
             };
-            painter.rect_filled(header.shrink(self.zoom.min(1.0)), 0.0, header_color);
+            let top = radius.saturating_sub(1);
+            painter.rect_filled(
+                header.shrink(self.zoom.min(1.0)),
+                egui::CornerRadius {
+                    nw: top,
+                    ne: top,
+                    sw: 0,
+                    se: 0,
+                },
+                header_color,
+            );
             let node_painter = painter.with_clip_rect(rect.intersect(canvas));
             if self.zoom >= HEADER_TEXT_ZOOM {
                 node_painter.text(
@@ -698,7 +709,7 @@ fn clip_segment(start: Pos2, end: Pos2, clip: Rect) -> Option<(Pos2, Pos2)> {
 
 fn edge_color(kind: EdgeKind) -> Color32 {
     match kind {
-        EdgeKind::True => theme::SYNTAX_CONSTANT,
+        EdgeKind::True => theme::EDGE_TRUE,
         EdgeKind::False => theme::ERROR,
         EdgeKind::Branch => theme::BLUE,
         EdgeKind::Unknown => theme::WARNING,
