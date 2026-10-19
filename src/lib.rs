@@ -4,6 +4,8 @@ mod architecture;
 mod bounded;
 pub mod brand;
 pub mod call_analysis;
+#[cfg(feature = "capture")]
+mod capture;
 pub mod client;
 pub mod crypto;
 pub mod data_analysis;
