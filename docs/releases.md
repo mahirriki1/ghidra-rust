@@ -42,7 +42,8 @@ Both scripts check formatting, unit tests, strict Clippy, the release build, and
 the real release worker integration test before packaging. **Run them locally and
 confirm the tests pass before pushing:** GitHub Actions runs the same scripts with
 `--skip-tests` (Linux) or `-SkipTests` (Windows), so hosted runs only check
-formatting and Clippy, build, and package. Hosted jobs restore compiled
+formatting and Clippy, build, and package. Branch builds run for pull requests
+(and on manual dispatch), not for every branch push. Hosted jobs restore compiled
 dependencies from a per-branch build cache (`Swatinem/rust-cache`, pinned by
 commit), so only a dependency or toolchain change rebuilds the engine from
 scratch. They write the following files under `target/dist` (or
