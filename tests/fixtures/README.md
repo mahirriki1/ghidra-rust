@@ -48,6 +48,8 @@ the production WorkerClient/bubblewrap test in debug and release. The latter
 requires working unprivileged namespaces and tests the host's loader layout,
 Unicode paths, analysis mappings, and embedded project replacement/reopening.
 It fails if sandbox startup fails; it does not substitute an unrestricted worker.
+On the original linked C fixture, the Linux integration also compares confirmed
+call instruction addresses and direct destinations with GNU objdump from binutils.
 
 For an optional large-PE check, copy a trusted executable beneath ignored
 `target/local-input`, set `GHIDRA_RUST_TEST_LARGE_PE` to that copy, and run

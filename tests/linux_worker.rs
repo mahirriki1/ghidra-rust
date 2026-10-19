@@ -2,10 +2,11 @@
 #![cfg(target_os = "linux")]
 
 use ghidra_rust::client::{WorkerClient, WorkerEvent};
-use ghidra_rust::model::{Request, Response};
+use ghidra_rust::model::{CallAnalysis, Request, Response};
 use ghidra_rust::project::ProjectData;
 use ghidra_rust::session::{Annotation, Session};
 use object::{Object, ObjectSymbol};
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
@@ -29,6 +30,67 @@ fn request(worker: &mut WorkerClient, request: Request) -> Response {
                 panic!("Sandboxed Linux worker response timed out")
             }
             None => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+}
+
+// Differential check on our original linked C fixture only. GNU objdump is an
+// independent decoder; compare real call instruction PCs and destinations,
+// without treating disassembly text as semantic GUI mappings.
+fn compare_fixture_calls(binary: &Path, image: &object::File<'_>, analysis: &CallAnalysis) {
+    for name in ["main", "branch_loop", "decode_xor"] {
+        let caller = image
+            .symbols()
+            .find(|symbol| symbol.name().ok() == Some(name))
+            .unwrap()
+            .address();
+        let output = Command::new("objdump")
+            .arg("--no-show-raw-insn")
+            .arg(format!("--disassemble={name}"))
+            .arg(binary)
+            .output()
+            .expect("Linux differential tests require GNU objdump (binutils)");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            text.contains(&format!("<{name}>:")),
+            "Missing objdump function {name}"
+        );
+        let expected: BTreeSet<_> = text
+            .lines()
+            .filter_map(|line| {
+                let (pc, instruction) = line.trim().split_once(':')?;
+                let pc = u64::from_str_radix(pc, 16).ok()?;
+                let mut fields = instruction.split_whitespace();
+                if !matches!(fields.next()?, "call" | "callq" | "bl") {
+                    return None;
+                }
+                let destination = fields.next()?;
+                if destination.starts_with('*') {
+                    return None;
+                }
+                Some((
+                    pc,
+                    u64::from_str_radix(destination, 16).expect("Direct objdump call target"),
+                ))
+            })
+            .collect();
+        let actual: BTreeSet<_> = analysis
+            .references
+            .iter()
+            .filter(|reference| reference.caller == caller)
+            .map(|reference| (reference.address, reference.target))
+            .collect();
+        assert_eq!(
+            actual, expected,
+            "Confirmed calls differ from GNU objdump in {name}"
+        );
+        if name == "main" {
+            assert!(!expected.is_empty());
         }
     }
 }
@@ -91,6 +153,7 @@ fn sandboxed_linux_worker_and_embedded_project_round_trip() {
         panic!("Sandboxed worker did not analyze calls");
     };
     analysis.validate(&info, &functions).unwrap();
+    compare_fixture_calls(&binary, &image, &analysis);
     assert!(
         analysis
             .references
