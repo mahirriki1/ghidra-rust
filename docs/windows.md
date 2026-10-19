@@ -46,6 +46,9 @@ Release builds open a desktop window without a console. A renderer/window startu
 failure displays a native error dialog and returns a failing process exit code.
 
 Choose **Open binary**, **Open project**, or drag a file into the window.
+The menu row includes minimize, maximize/restore, and close controls. Drag empty
+menu-row space to move the window, double-click it to maximize/restore, or drag
+the window edges to resize; there is no separate native title bar.
 In the built-in file chooser, enter a directory such as `D:\Binaries` into the
 location field and press **Go**, or enter an absolute file path in **File name**.
 Spaces and Unicode paths are supported. UNC/network shares (including
@@ -57,6 +60,13 @@ console, a suspended startup, and a resource-limited kill-on-close Job Object.
 The GUI process must be allowed to start a child process and assign it to a job.
 A restrictive parent job or endpoint policy can prevent analysis; the app reports
 this failure instead of proceeding without its worker controls.
+
+If a file such as standard Rufus 4.15 has `UPX0`/`UPX1` sections, it may be
+UPX-packed: the visible entry point belongs to its unpacker rather than the
+original program. Detected conventional UPX images show an explanation and skip
+decompilation/function discovery to avoid exhausting worker memory. Unpack a
+separate copy with UPX (`upx -d -o unpacked.exe original.exe`) and open that copy
+to analyze the original code. The app does not run or unpack input executables.
 
 ## Reproduce the Windows checks and portable ZIP
 

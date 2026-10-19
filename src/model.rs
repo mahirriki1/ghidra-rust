@@ -5,6 +5,9 @@ pub const MAX_DECOMPILED_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_CODE_MAPPINGS: usize = 32_768;
 pub const MAX_MAPPING_ADDRESSES: usize = 64;
 pub const MAX_CODE_ADDRESS_REFS: usize = 131_072;
+pub const MAX_STRING_RESULTS: usize = 10_000;
+pub const MIN_STRING_LENGTH: usize = 4;
+pub const MAX_STRING_MINIMUM: usize = 64;
 
 /// UTF-8 byte span in rendered C and its originating machine instructions.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -155,6 +158,7 @@ pub enum Request {
     Rename { address: u64, name: String },
     Bytes { address: u64, length: usize },
     Strings,
+    StringsWithOptions { minimum_length: usize },
     Crypto,
 }
 

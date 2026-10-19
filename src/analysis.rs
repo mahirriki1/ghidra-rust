@@ -34,6 +34,7 @@ pub struct LoadedProgram {
     snapshot: Arc<[u8]>,
     pe_ranges: Vec<(u64, u64)>,
     pe_imports: BTreeMap<u64, String>,
+    upx_packed: bool,
     pub info: BinaryInfo,
 }
 
@@ -187,12 +188,16 @@ fn metadata_with_target(
     } else {
         object.entry()
     };
-    Ok((BinaryInfo {
+    let mut info = BinaryInfo {
         path: path.to_string_lossy().into_owned(), architecture: target.name.into(), format: format.into(),
         sha256: format!("{:x}", Sha256::digest(bytes)), source_identity: None,
         entry, file_len: bytes.len() as u64, sections, functions: Vec::new(), functions_truncated: false,
         warnings: vec!["Prototype analysis: symbols and supported PE function metadata load immediately; deeper function discovery is explicit. Optimized C++/Rust types and source reconstruction are incomplete.".into(), "Function lists are capped at 10,000 entries and names at 256 bytes in this prototype.".into()],
-    }, target))
+    };
+    if crate::packing::detect_upx_pe(&info.format, info.entry, &info.sections, bytes) {
+        warning(&mut info.warnings, crate::packing::UPX_PACKED_WARNING);
+    }
+    Ok((info, target))
 }
 
 impl LoadedProgram {
@@ -228,6 +233,9 @@ impl LoadedProgram {
             return Err("Executable grew beyond the 128 MiB prototype limit while reading.".into());
         }
         let (mut info, target) = metadata_with_target(path, &bytes)?;
+        // This flag comes only from the freshly parsed immutable image, never a
+        // saved project's warnings or cached analysis.
+        let upx_packed = crate::packing::has_upx_warning(&info);
         if target.name == "AArch64" {
             warning(
                 &mut info.warnings,
@@ -278,6 +286,7 @@ impl LoadedProgram {
             snapshot,
             pe_ranges,
             pe_imports,
+            upx_packed,
             info,
         })
     }
@@ -294,6 +303,7 @@ impl LoadedProgram {
                 )?,
             }),
             Request::Decompile { address } => {
+                self.check_unpacked()?;
                 self.check_code(address)?;
                 self.resolve_import_thunks(address)?;
                 let (mut text, mut mappings) =
@@ -317,6 +327,7 @@ impl LoadedProgram {
                 })
             }
             Request::Discover => {
+                self.check_unpacked()?;
                 if self.target.name == "AArch64" {
                     self.discover_aarch64()?;
                 } else {
@@ -348,10 +359,18 @@ impl LoadedProgram {
                 let bytes = read_virtual(&self.snapshot, &self.info.sections, address, length)?;
                 Ok(Response::Bytes { address, bytes })
             }
-            Request::Strings => self.strings(),
+            Request::Strings => self.strings(MIN_STRING_LENGTH),
+            Request::StringsWithOptions { minimum_length } => self.strings(minimum_length),
             Request::Crypto => self.crypto(),
             Request::Open { .. } => Err("Open is handled by the worker.".into()),
         }
+    }
+
+    fn check_unpacked(&self) -> Result<(), String> {
+        if self.upx_packed {
+            return Err(crate::packing::UPX_ANALYSIS_ERROR.into());
+        }
+        Ok(())
     }
 
     fn discover_aarch64(&mut self) -> Result<(), String> {
@@ -543,71 +562,8 @@ impl LoadedProgram {
             .map_err(engine_error)
     }
 
-    fn strings(&mut self) -> Result<Response, String> {
-        let mut strings = Vec::new();
-        let mut scanned = 0u64;
-        let mut truncated = false;
-        for section in &self.info.sections {
-            let size = section.file_size.min(MAX_SCAN_BYTES - scanned);
-            if size < section.file_size {
-                truncated = true;
-            }
-            if size == 0 {
-                continue;
-            }
-            let mut ascii = StringRun::default();
-            // Both parities are scanned: packed UTF-16 strings need not be aligned.
-            let mut wide = [StringRun::default(), StringRun::default()];
-            let mut previous = None;
-            let mut offset = 0u64;
-            while offset < size {
-                let count = (size - offset).min(SCAN_CHUNK as u64) as usize;
-                let start = (section.file_offset + offset) as usize;
-                let chunk = self
-                    .snapshot
-                    .get(start..start + count)
-                    .ok_or("Section extends past immutable image snapshot")?;
-                for (index, &byte) in chunk.iter().enumerate() {
-                    let address = section.address + offset + index as u64;
-                    ascii.feed(
-                        printable(byte).then_some(byte as char),
-                        address,
-                        "ASCII",
-                        &mut strings,
-                    );
-                    if let Some(low) = previous {
-                        let start = address - 1;
-                        wide[(start & 1) as usize].feed(
-                            (byte == 0 && printable(low)).then_some(low as char),
-                            start,
-                            "UTF-16LE",
-                            &mut strings,
-                        );
-                    }
-                    previous = Some(byte);
-                    if strings.len() >= MAX_RESULTS {
-                        strings.truncate(MAX_RESULTS);
-                        return Ok(Response::Strings {
-                            strings,
-                            truncated: true,
-                        });
-                    }
-                }
-                offset += count as u64;
-            }
-            ascii.flush("ASCII", &mut strings);
-            for run in &mut wide {
-                run.flush("UTF-16LE", &mut strings);
-            }
-            scanned += size;
-            if strings.len() >= MAX_RESULTS {
-                strings.truncate(MAX_RESULTS);
-                truncated = true;
-                break;
-            }
-        }
-        strings.sort_by_key(|s| s.address);
-        Ok(Response::Strings { strings, truncated })
+    fn strings(&mut self, minimum_length: usize) -> Result<Response, String> {
+        scan_strings(&self.snapshot, &self.info.sections, minimum_length)
     }
 
     fn crypto(&mut self) -> Result<Response, String> {
@@ -745,14 +701,116 @@ fn printable(byte: u8) -> bool {
     byte.is_ascii_graphic() || matches!(byte, b' ' | b'\t' | b'\r' | b'\n')
 }
 
-#[derive(Default)]
+/// Scan immutable mapped bytes with a bounded result preview and one extra match
+/// to distinguish an exactly full result from an actually truncated result.
+fn scan_strings(
+    snapshot: &[u8],
+    sections: &[SectionInfo],
+    minimum_length: usize,
+) -> Result<Response, String> {
+    if !(MIN_STRING_LENGTH..=MAX_STRING_MINIMUM).contains(&minimum_length) {
+        return Err(format!(
+            "Minimum string length must be between {MIN_STRING_LENGTH} and {MAX_STRING_MINIMUM}."
+        ));
+    }
+    let mut strings = Vec::new();
+    let mut scanned = 0u64;
+    let mut truncated = false;
+    'sections: for section in sections {
+        let size = section.file_size.min(MAX_SCAN_BYTES - scanned);
+        if size < section.file_size {
+            truncated = true;
+        }
+        if size == 0 {
+            continue;
+        }
+        let mut ascii = StringRun::new(minimum_length);
+        // Both parities are scanned: packed UTF-16 strings need not be aligned.
+        let mut wide = [
+            StringRun::new(minimum_length),
+            StringRun::new(minimum_length),
+        ];
+        let mut previous = None;
+        let mut offset = 0u64;
+        while offset < size {
+            let count = (size - offset).min(SCAN_CHUNK as u64) as usize;
+            let start = section
+                .file_offset
+                .checked_add(offset)
+                .and_then(|start| usize::try_from(start).ok())
+                .ok_or("Section file offset overflows")?;
+            let end = start
+                .checked_add(count)
+                .ok_or("Section file offset overflows")?;
+            let chunk = snapshot
+                .get(start..end)
+                .ok_or("Section extends past immutable image snapshot")?;
+            for (index, &byte) in chunk.iter().enumerate() {
+                let address = section
+                    .address
+                    .checked_add(offset + index as u64)
+                    .ok_or("Section virtual address overflows")?;
+                ascii.feed(
+                    printable(byte).then_some(byte as char),
+                    address,
+                    "ASCII",
+                    &mut strings,
+                );
+                if let Some(low) = previous {
+                    let start = address - 1;
+                    wide[(start & 1) as usize].feed(
+                        (byte == 0 && printable(low)).then_some(low as char),
+                        start,
+                        "UTF-16LE",
+                        &mut strings,
+                    );
+                }
+                previous = Some(byte);
+                if strings.len() > MAX_STRING_RESULTS {
+                    truncated = true;
+                    break 'sections;
+                }
+            }
+            offset += count as u64;
+        }
+        ascii.flush("ASCII", &mut strings);
+        for run in &mut wide {
+            run.flush("UTF-16LE", &mut strings);
+        }
+        scanned += size;
+        if strings.len() > MAX_STRING_RESULTS {
+            truncated = true;
+            break;
+        }
+    }
+    strings.truncate(MAX_STRING_RESULTS);
+    strings.sort_by_key(|s| s.address);
+    Ok(Response::Strings { strings, truncated })
+}
+
 struct StringRun {
+    minimum_length: usize,
     start: u64,
     count: usize,
     text: String,
 }
 
+impl Default for StringRun {
+    fn default() -> Self {
+        Self::new(MIN_STRING_LENGTH)
+    }
+}
+
 impl StringRun {
+    fn new(minimum_length: usize) -> Self {
+        Self {
+            minimum_length,
+            start: 0,
+            count: 0,
+            text: String::new(),
+        }
+    }
+
     fn feed(
         &mut self,
         character: Option<char>,
@@ -774,7 +832,7 @@ impl StringRun {
     }
 
     fn flush(&mut self, encoding: &str, output: &mut Vec<StringEntry>) {
-        if self.count >= 4 && output.len() < MAX_RESULTS {
+        if self.count >= self.minimum_length && output.len() <= MAX_STRING_RESULTS {
             let mut text = std::mem::take(&mut self.text);
             if self.count > MAX_STRING_PREVIEW {
                 text.push('…');
@@ -1148,7 +1206,40 @@ pub(crate) mod tests {
             info,
             pe_ranges: vec![],
             pe_imports: BTreeMap::new(),
+            upx_packed: false,
         }
+    }
+
+    #[test]
+    fn packed_image_rejects_expensive_analysis_without_poisoning_other_requests() {
+        let mut loaded = raw_aarch64(0xd65f03c0u32.to_le_bytes().to_vec());
+        // Simulate the already validated packed-image flag with a tiny safe
+        // engine fixture; no real packed application or decompression is run.
+        loaded.upx_packed = true;
+        for request in [Request::Decompile { address: 0x1000 }, Request::Discover] {
+            assert_eq!(
+                loaded.handle(request).unwrap_err(),
+                crate::packing::UPX_ANALYSIS_ERROR
+            );
+        }
+        assert!(matches!(
+            loaded.handle(Request::Graph { address: 0x1000 }),
+            Ok(Response::Graph { .. })
+        ));
+        assert!(matches!(
+            loaded.handle(Request::Strings),
+            Ok(Response::Strings { .. })
+        ));
+        let Response::Bytes { bytes, .. } = loaded
+            .handle(Request::Bytes {
+                address: 0x1000,
+                length: 4,
+            })
+            .unwrap()
+        else {
+            panic!("Packed-image guard must leave byte inspection usable");
+        };
+        assert_eq!(bytes, 0xd65f03c0u32.to_le_bytes());
     }
 
     #[test]
@@ -1377,6 +1468,7 @@ pub(crate) mod tests {
             info,
             pe_ranges: vec![(0x1000, 0x1005), (0x1010, 0x1016)],
             pe_imports: symbols.imports,
+            upx_packed: false,
         };
         loaded.resolve_import_thunks(0x1000).unwrap();
         assert!(
@@ -1632,6 +1724,105 @@ pub(crate) mod tests {
         let error = LoadedProgram::open(path.to_str().unwrap()).err().unwrap();
         assert!(error.contains("128 MiB"));
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn string_minimum_filters_noise_before_the_result_budget() {
+        let mut bytes = b"abcd\0".repeat(MAX_STRING_RESULTS + 100);
+        let target_offset = bytes.len();
+        bytes.extend_from_slice(b"meaningful string\0");
+        let Response::Strings { strings, truncated } = scan_test_strings(&bytes, 6).unwrap() else {
+            panic!("Expected string results");
+        };
+        assert!(!truncated);
+        assert_eq!(strings.len(), 1);
+        assert_eq!(strings[0].address, 0x1000 + target_offset as u64);
+        assert_eq!(strings[0].text, "meaningful string");
+
+        let Response::Strings { strings, truncated } =
+            scan_test_strings(&bytes, MIN_STRING_LENGTH).unwrap()
+        else {
+            panic!("Expected legacy string results");
+        };
+        assert!(truncated);
+        assert_eq!(strings.len(), MAX_STRING_RESULTS);
+    }
+
+    #[test]
+    fn string_limit_requires_an_additional_matching_result() {
+        let mut bytes = b"token6\0".repeat(MAX_STRING_RESULTS);
+        bytes.extend_from_slice(b"abcd\0");
+        let Response::Strings { strings, truncated } = scan_test_strings(&bytes, 6).unwrap() else {
+            panic!("Expected string results");
+        };
+        assert_eq!(strings.len(), MAX_STRING_RESULTS);
+        assert!(!truncated, "Exactly the result limit is still complete");
+
+        bytes.extend_from_slice(b"one more match");
+        let Response::Strings { strings, truncated } = scan_test_strings(&bytes, 6).unwrap() else {
+            panic!("Expected string results after section-final flush");
+        };
+        assert_eq!(strings.len(), MAX_STRING_RESULTS);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn string_minimum_preserves_ascii_and_unaligned_wide_chunk_boundaries() {
+        for wide in [false, true] {
+            let start = SCAN_CHUNK - 3;
+            let mut bytes = vec![0; start];
+            for &byte in b"boundary string" {
+                bytes.push(byte);
+                if wide {
+                    bytes.push(0);
+                }
+            }
+            // Flush on the section boundary, including the odd UTF-16 parity.
+            let Response::Strings { strings, truncated } = scan_test_strings(&bytes, 6).unwrap()
+            else {
+                panic!("Expected string results");
+            };
+            assert!(!truncated);
+            assert_eq!(strings.len(), 1);
+            assert_eq!(strings[0].address, 0x1000 + start as u64);
+            assert_eq!(strings[0].text, "boundary string");
+            assert_eq!(strings[0].encoding, if wide { "UTF-16LE" } else { "ASCII" });
+        }
+    }
+
+    #[test]
+    fn string_minimum_is_bounded_and_legacy_protocol_remains_accepted() {
+        for invalid in [0, MIN_STRING_LENGTH - 1, MAX_STRING_MINIMUM + 1, usize::MAX] {
+            assert!(scan_test_strings(b"valid string", invalid).is_err());
+        }
+        assert!(scan_test_strings(b"valid string", MIN_STRING_LENGTH).is_ok());
+        assert!(scan_test_strings(b"valid string", MAX_STRING_MINIMUM).is_ok());
+        assert!(matches!(
+            serde_json::from_str::<Request>(r#"{"kind":"strings"}"#).unwrap(),
+            Request::Strings
+        ));
+        assert!(matches!(
+            serde_json::from_str::<Request>(
+                r#"{"kind":"strings_with_options","minimum_length":6}"#
+            )
+            .unwrap(),
+            Request::StringsWithOptions { minimum_length: 6 }
+        ));
+    }
+
+    fn scan_test_strings(bytes: &[u8], minimum_length: usize) -> Result<Response, String> {
+        scan_strings(
+            bytes,
+            &[SectionInfo {
+                name: "test strings".into(),
+                address: 0x1000,
+                size: bytes.len() as u64,
+                file_offset: 0,
+                file_size: bytes.len() as u64,
+                executable: false,
+            }],
+            minimum_length,
+        )
     }
 
     #[test]

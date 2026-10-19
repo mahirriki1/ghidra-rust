@@ -14,6 +14,12 @@ const ROW: f32 = 20.0;
 const PREVIEW: usize = 8;
 const MAX_BLOCKS: usize = 128;
 const MAX_EDGES: usize = 4096;
+const MIN_ZOOM: f32 = 0.0001;
+const READABLE_ZOOM: f32 = 0.85;
+const ARROWHEAD_ZOOM: f32 = 0.35;
+const HEADER_TEXT_ZOOM: f32 = 0.65;
+const ROW_TEXT_ZOOM: f32 = 0.75;
+const ROW_GAP: f32 = 100.0;
 
 struct Node {
     address: u64,
@@ -43,6 +49,7 @@ pub struct GraphCanvas {
     zoom: f32,
     pan: Vec2,
     needs_fit: bool,
+    needs_initial_view: bool,
     reveal: Option<u64>,
 }
 
@@ -72,7 +79,8 @@ impl GraphCanvas {
             layout: Layout::new(view),
             zoom: 1.0,
             pan: Vec2::ZERO,
-            needs_fit: true,
+            needs_fit: false,
+            needs_initial_view: true,
             reveal: None,
         }
     }
@@ -105,6 +113,9 @@ impl GraphCanvas {
             if ui.button("Fit").clicked() {
                 self.needs_fit = true;
             }
+            if ui.button("Entry").clicked() {
+                self.reveal = Some(self.function);
+            }
             if ui.button("−").clicked() {
                 zoom_change /= 1.2;
             }
@@ -129,24 +140,14 @@ impl GraphCanvas {
         });
         let size = ui.available_size().max(vec2(1.0, 1.0));
         let (canvas, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
-        if self.needs_fit {
+        if self.needs_initial_view {
+            self.initial_view(canvas.size());
+        } else if self.needs_fit {
             self.fit(canvas.size());
         }
         self.change_zoom(zoom_change, canvas.size() * 0.5);
-        if let Some(address) = self.reveal.take()
-            && let Some(node) = self
-                .layout
-                .nodes
-                .iter()
-                .find(|n| n.address == address || n.instruction_addresses.contains(&address))
-        {
-            let visible = Rect::from_min_max(
-                canvas.min + self.pan + node.rect.min.to_vec2() * self.zoom,
-                canvas.min + self.pan + node.rect.max.to_vec2() * self.zoom,
-            );
-            if !canvas.contains_rect(visible) {
-                self.pan += canvas.center() - visible.center();
-            }
+        if let Some(address) = self.reveal.take() {
+            self.reveal_at(address, canvas.size());
         }
 
         if response.dragged() {
@@ -187,24 +188,35 @@ impl GraphCanvas {
             }
             let stroke = Stroke::new(1.5, edge_color(edge.kind));
             for pair in points.windows(2) {
+                // Clip before making dashes: a long off-screen edge must not
+                // allocate thousands of invisible paint shapes when zoomed in.
+                let Some((start, end)) = clip_segment(pair[0], pair[1], canvas.expand(2.0)) else {
+                    continue;
+                };
                 if edge.unresolved {
-                    dashed_line(&painter, pair[0], pair[1], stroke);
+                    dashed_line(&painter, start, end, stroke);
                 } else {
-                    painter.line_segment([pair[0], pair[1]], stroke);
+                    painter.line_segment([start, end], stroke);
                 }
             }
-            if let [.., previous, tip] = points.as_slice() {
+            if self.zoom >= ARROWHEAD_ZOOM
+                && let [.., previous, tip] = points.as_slice()
+                && canvas.expand(10.0).contains(*tip)
+            {
                 let direction = (*tip - *previous).normalized();
                 let side = vec2(-direction.y, direction.x);
                 painter.line_segment([*tip, *tip - direction * 9.0 + side * 4.0], stroke);
                 painter.line_segment([*tip, *tip - direction * 9.0 - side * 4.0], stroke);
             }
-            if self.zoom >= 0.35 {
+            if self.zoom >= READABLE_ZOOM {
                 let at = screen(edge.label_position);
-                // A background keeps edge labels readable at crossings.
+                if !canvas.expand(24.0).contains(at) {
+                    continue;
+                }
+                // Labels scale with their routes, and disappear in overview.
                 let galley = painter.layout_no_wrap(
                     edge.label.clone(),
-                    FontId::monospace(11.0),
+                    FontId::monospace(11.0 * self.zoom),
                     stroke.color,
                 );
                 painter.rect_filled(
@@ -258,14 +270,17 @@ impl GraphCanvas {
             } else {
                 theme::HEADER
             };
-            painter.rect_filled(header.shrink(1.0), 0.0, header_color);
-            painter.text(
-                header.left_center() + vec2(9.0 * self.zoom, 0.0),
-                Align2::LEFT_CENTER,
-                format!("block {:x}", node.address),
-                FontId::monospace((14.0 * self.zoom).clamp(9.0, 24.0)),
-                theme::TEXT,
-            );
+            painter.rect_filled(header.shrink(self.zoom.min(1.0)), 0.0, header_color);
+            let node_painter = painter.with_clip_rect(rect.intersect(canvas));
+            if self.zoom >= HEADER_TEXT_ZOOM {
+                node_painter.text(
+                    header.left_center() + vec2(9.0 * self.zoom, 0.0),
+                    Align2::LEFT_CENTER,
+                    format!("block {:x}", node.address),
+                    FontId::monospace(14.0 * self.zoom),
+                    theme::TEXT,
+                );
+            }
             let first_row = selected
                 .and_then(|address| node.rows.iter().position(|(a, _)| *a == address))
                 .map_or(0, |index| {
@@ -273,7 +288,7 @@ impl GraphCanvas {
                         .saturating_sub(PREVIEW / 2)
                         .min(node.rows.len().saturating_sub(PREVIEW))
                 });
-            if self.zoom >= 0.45 {
+            if self.zoom >= ROW_TEXT_ZOOM {
                 for (index, (address, text)) in
                     node.rows.iter().skip(first_row).take(PREVIEW).enumerate()
                 {
@@ -287,7 +302,7 @@ impl GraphCanvas {
                     if selected == Some(*address) || related.contains(address) {
                         painter.rect_filled(row.shrink2(vec2(2.0, 0.0)), 0.0, theme::CURRENT_LINE);
                     }
-                    painter.with_clip_rect(rect.intersect(canvas)).text(
+                    node_painter.text(
                         row.left_center() + vec2(8.0 * self.zoom, 0.0),
                         Align2::LEFT_CENTER,
                         text,
@@ -296,7 +311,7 @@ impl GraphCanvas {
                     );
                 }
                 if node.remaining > 0 {
-                    painter.text(
+                    node_painter.text(
                         screen(pos2(node.rect.left() + 8.0, node.rect.bottom() - 11.0)),
                         Align2::LEFT_CENTER,
                         format!("… {} more instructions", node.remaining),
@@ -321,16 +336,55 @@ impl GraphCanvas {
         let bounds = self.layout.bounds;
         self.zoom = ((size.x - 48.0).max(1.0) / bounds.width().max(1.0))
             .min((size.y - 48.0).max(1.0) / bounds.height().max(1.0))
-            .clamp(0.08, 1.2);
+            .clamp(MIN_ZOOM, 1.2);
         self.pan = size * 0.5 - bounds.center().to_vec2() * self.zoom;
         self.needs_fit = false;
+    }
+
+    fn initial_view(&mut self, size: Vec2) {
+        self.fit(size);
+        self.needs_initial_view = false;
+        // Fit is an explicit overview action. Opening a large function should
+        // instead start at its entry with instruction text large enough to read.
+        if self.zoom < READABLE_ZOOM {
+            self.zoom = ((size.x - 48.0) / WIDTH).clamp(READABLE_ZOOM, 1.0);
+            if let Some(entry) = self
+                .layout
+                .nodes
+                .iter()
+                .find(|n| n.address == self.function)
+            {
+                self.pan = vec2(
+                    size.x * 0.5 - entry.rect.center().x * self.zoom,
+                    24.0 - entry.rect.top() * self.zoom,
+                );
+            }
+        }
+    }
+
+    fn reveal_at(&mut self, address: u64, size: Vec2) {
+        let Some(node) =
+            self.layout.nodes.iter().find(|node| {
+                node.address == address || node.instruction_addresses.contains(&address)
+            })
+        else {
+            return;
+        };
+        self.zoom = self.zoom.max(READABLE_ZOOM);
+        let visible = Rect::from_min_max(
+            Pos2::ZERO + self.pan + node.rect.min.to_vec2() * self.zoom,
+            Pos2::ZERO + self.pan + node.rect.max.to_vec2() * self.zoom,
+        );
+        if !Rect::from_min_size(Pos2::ZERO, size).contains_rect(visible) {
+            self.pan += size * 0.5 - visible.center().to_vec2();
+        }
     }
 
     fn change_zoom(&mut self, factor: f32, anchor: Vec2) {
         if !factor.is_finite() || factor <= 0.0 {
             return;
         }
-        let next = (self.zoom * factor).clamp(0.08, 2.5);
+        let next = (self.zoom * factor).clamp(MIN_ZOOM, 2.5);
         self.pan = anchor - (anchor - self.pan) * (next / self.zoom);
         self.zoom = next;
     }
@@ -343,7 +397,7 @@ impl Node {
     }
     fn hit_at(&self, point: Pos2, zoom: f32, first_row: usize) -> u64 {
         let row = (point.y - self.rect.min.y - HEADER) / ROW;
-        if zoom >= 0.45 && row >= 0.0 && row < PREVIEW as f32 {
+        if zoom >= ROW_TEXT_ZOOM && row >= 0.0 && row < PREVIEW as f32 {
             self.rows
                 .get(first_row + row.floor() as usize)
                 .map_or(self.address, |(address, _)| *address)
@@ -441,16 +495,29 @@ impl Layout {
                     remaining,
                 });
             }
-            y += row_height + 84.0;
+            y += row_height + ROW_GAP;
         }
         let positions: BTreeMap<_, _> =
             nodes.iter().map(|node| (node.address, node.rect)).collect();
+        let row_bounds: BTreeMap<_, _> = rows
+            .iter()
+            .map(|(&rank, addresses)| {
+                let bounds = addresses
+                    .iter()
+                    .map(|address| positions[address])
+                    .reduce(Rect::union)
+                    .expect("layout rows contain nodes");
+                (rank, bounds)
+            })
+            .collect();
         let mut bounds = nodes
             .iter()
             .map(|node| node.rect)
             .reduce(Rect::union)
             .unwrap_or(Rect::from_min_size(Pos2::ZERO, vec2(1.0, 1.0)));
         let mut edges = Vec::new();
+        let mut left_lanes = Vec::new();
+        let mut right_lanes = Vec::new();
         for (index, edge) in view.edges.iter().take(MAX_EDGES).enumerate() {
             let Some(source) = positions.get(&edge.source) else {
                 continue;
@@ -470,30 +537,70 @@ impl Layout {
             let (points, label, unresolved) =
                 if let Some(target) = edge.target.and_then(|address| positions.get(&address)) {
                     let end = target.center_top() + vec2(offset, 0.0);
-                    if target.top() > source.bottom() {
-                        let middle = (source.bottom() + target.top()) / 2.0 + offset * 0.3;
+                    let source_rank = ranks[&edge.source];
+                    let target_rank = ranks[&edge.target.expect("resolved target")];
+                    if target_rank == source_rank + 1 {
+                        // Only adjacent rows may use the inter-row corridor.
+                        // Routing a skipped rank this way cuts through nodes.
+                        let middle =
+                            (row_bounds[&source_rank].bottom() + target.top()) / 2.0 + offset * 0.3;
                         (
                             vec![start, pos2(start.x, middle), pos2(end.x, middle), end],
                             label.to_owned(),
                             false,
                         )
                     } else {
-                        let channel = total_width + 28.0 + (index % 8) as f32 * 15.0;
+                        let source_y = row_bounds[&source_rank].bottom() + 24.0 + offset * 0.2;
+                        let target_y = target.top() - 24.0 + offset * 0.2;
+                        let left = match edge.kind {
+                            EdgeKind::True => true,
+                            EdgeKind::False => false,
+                            _ => {
+                                let center = (source.center().x + target.center().x) * 0.5;
+                                if (center - total_width * 0.5).abs() < 1.0 {
+                                    index % 2 == 0
+                                } else {
+                                    center < total_width * 0.5
+                                }
+                            }
+                        };
+                        let lane = allocate_lane(
+                            if left {
+                                &mut left_lanes
+                            } else {
+                                &mut right_lanes
+                            },
+                            source_y,
+                            target_y,
+                        );
+                        let channel = if left {
+                            -32.0 - lane as f32 * 18.0
+                        } else {
+                            total_width + 32.0 + lane as f32 * 18.0
+                        };
+                        let backward = target_rank <= source_rank;
                         (
                             vec![
                                 start,
-                                start + vec2(0.0, 20.0),
-                                pos2(channel, start.y + 20.0),
-                                pos2(channel, end.y - 20.0),
-                                end - vec2(0.0, 20.0),
+                                pos2(start.x, source_y),
+                                pos2(channel, source_y),
+                                pos2(channel, target_y),
+                                pos2(end.x, target_y),
                                 end,
                             ],
-                            format!("{label} ↶"),
+                            if backward {
+                                format!("{label} ↶")
+                            } else {
+                                label.to_owned()
+                            },
                             false,
                         )
                     }
                 } else {
-                    let end = start + vec2(110.0, 48.0);
+                    let end = pos2(
+                        start.x + 110.0,
+                        row_bounds[&ranks[&edge.source]].bottom() + 40.0,
+                    );
                     let target = edge.target.map_or_else(
                         || "unresolved".into(),
                         |address| format!("{address:x} outside graph"),
@@ -543,6 +650,50 @@ fn crop(text: &str, limit: usize) -> String {
     } else {
         prefix
     }
+}
+
+// Reuse an outer lane only when its vertical intervals are disjoint. The old
+// modulo-eight channels stacked unrelated loops on exactly the same trunk.
+fn allocate_lane(lanes: &mut Vec<Vec<(f32, f32)>>, start: f32, end: f32) -> usize {
+    let interval = (start.min(end) - 8.0, start.max(end) + 8.0);
+    let index = lanes
+        .iter()
+        .position(|occupied| {
+            occupied
+                .iter()
+                .all(|&(min, max)| interval.1 < min || interval.0 > max)
+        })
+        .unwrap_or_else(|| {
+            lanes.push(Vec::new());
+            lanes.len() - 1
+        });
+    lanes[index].push(interval);
+    index
+}
+
+fn clip_segment(start: Pos2, end: Pos2, clip: Rect) -> Option<(Pos2, Pos2)> {
+    let delta = end - start;
+    let mut min: f32 = 0.0;
+    let mut max: f32 = 1.0;
+    for (origin, direction, lower, upper) in [
+        (start.x, delta.x, clip.left(), clip.right()),
+        (start.y, delta.y, clip.top(), clip.bottom()),
+    ] {
+        if direction.abs() <= f32::EPSILON {
+            if origin < lower || origin > upper {
+                return None;
+            }
+        } else {
+            let a = (lower - origin) / direction;
+            let b = (upper - origin) / direction;
+            min = min.max(a.min(b));
+            max = max.min(a.max(b));
+            if min > max {
+                return None;
+            }
+        }
+    }
+    Some((start + delta * min, start + delta * max))
 }
 
 fn edge_color(kind: EdgeKind) -> Color32 {
@@ -636,6 +787,182 @@ mod tests {
             calls: vec![],
             warnings: vec![],
         }
+    }
+
+    fn large_fixture() -> FunctionView {
+        let mut view = fixture();
+        view.address = 0x400000;
+        view.blocks = (0..MAX_BLOCKS)
+            .map(|index| {
+                let address = view.address + index as u64 * 0x100;
+                BasicBlock {
+                    address,
+                    instructions: (0..12)
+                        .map(|instruction| Instruction {
+                            address: address + instruction * 3,
+                            bytes: vec![0x83, 0xf8, 0x05],
+                            mnemonic: "cmp".into(),
+                            operands: "a_very_long_operand".repeat(20),
+                        })
+                        .collect(),
+                }
+            })
+            .collect();
+        view.edges = view
+            .blocks
+            .windows(2)
+            .map(|blocks| Edge {
+                source: blocks[0].address,
+                target: Some(blocks[1].address),
+                kind: EdgeKind::Branch,
+            })
+            .collect();
+        // Overlapping loop intervals must have distinct outer lanes.
+        for source in [125, 126, 127] {
+            view.edges.push(Edge {
+                source: view.blocks[source].address,
+                target: Some(view.address),
+                kind: EdgeKind::True,
+            });
+        }
+        view
+    }
+
+    fn screen_rect(graph: &GraphCanvas, rect: Rect) -> Rect {
+        Rect::from_min_max(
+            Pos2::ZERO + graph.pan + rect.min.to_vec2() * graph.zoom,
+            Pos2::ZERO + graph.pan + rect.max.to_vec2() * graph.zoom,
+        )
+    }
+
+    #[test]
+    fn large_graph_starts_at_readable_entry_and_explicit_fit_shows_entire_graph() {
+        let view = large_fixture();
+        let mut graph = GraphCanvas::new(&view);
+        let size = vec2(700.0, 720.0);
+        let viewport = Rect::from_min_size(Pos2::ZERO, size);
+        graph.initial_view(size);
+        assert!(graph.zoom >= READABLE_ZOOM);
+        let entry = graph
+            .layout
+            .nodes
+            .iter()
+            .find(|node| node.address == view.address)
+            .unwrap();
+        assert!(viewport.contains_rect(screen_rect(&graph, entry.rect)));
+        graph.fit(size);
+        assert!(graph.zoom < 0.08, "old zoom floor could not fit 128 blocks");
+        assert!(viewport.contains_rect(screen_rect(&graph, graph.layout.bounds)));
+        for node in &graph.layout.nodes {
+            assert!(viewport.contains_rect(screen_rect(&graph, node.rect)));
+        }
+    }
+
+    #[test]
+    fn overview_hides_labels_and_readable_text_is_clipped_to_its_node() {
+        let view = large_fixture();
+        let mut graph = GraphCanvas::new(&view);
+        let context = egui::Context::default();
+        let input = || egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(760.0, 900.0))),
+            ..Default::default()
+        };
+        let mut readable = context.run_ui(input(), |ui| {
+            graph.show(ui, &view, None);
+        });
+        readable.textures_delta.clear();
+        let row = readable
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) if text.galley.text().contains("cmp") => {
+                    Some((shape.clip_rect, text))
+                }
+                _ => None,
+            })
+            .expect("initial view draws readable instructions");
+        assert!(row.0.width() <= WIDTH * graph.zoom + 0.01);
+        assert!(row.1.galley.text().chars().count() <= 54);
+        graph.needs_fit = true;
+        let mut overview = context.run_ui(input(), |ui| {
+            graph.show(ui, &view, None);
+        });
+        overview.textures_delta.clear();
+        assert!(graph.zoom < HEADER_TEXT_ZOOM);
+        for shape in &overview.shapes {
+            if let egui::epaint::Shape::Text(text) = &shape.shape {
+                let text = text.galley.text();
+                assert!(!text.starts_with("block "));
+                assert!(!text.contains("cmp"));
+                assert!(!text.contains("more instructions"));
+            }
+        }
+    }
+
+    #[test]
+    fn revealing_an_instruction_from_overview_is_readable_and_one_shot() {
+        let view = large_fixture();
+        let mut graph = GraphCanvas::new(&view);
+        let context = egui::Context::default();
+        let input = || egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(760.0, 900.0))),
+            ..Default::default()
+        };
+        graph.needs_initial_view = false;
+        graph.fit(vec2(700.0, 720.0));
+        let last = view.blocks.last().unwrap();
+        graph.reveal_instruction(last.instructions[10].address);
+        let mut output = context.run_ui(input(), |ui| {
+            graph.show(ui, &view, Some(last.instructions[10].address));
+        });
+        output.textures_delta.clear();
+        assert!(graph.zoom >= READABLE_ZOOM);
+        assert!(graph.reveal.is_none());
+        assert!(output.shapes.iter().any(|shape| {
+            matches!(&shape.shape, egui::epaint::Shape::Text(text)
+                if text.galley.text().starts_with(&format!("{:08x}", last.instructions[10].address)))
+        }));
+        graph.pan += vec2(70.0, -30.0);
+        let camera = (graph.zoom, graph.pan);
+        let mut output = context.run_ui(input(), |ui| {
+            graph.show(ui, &view, Some(last.instructions[10].address));
+        });
+        output.textures_delta.clear();
+        assert_eq!((graph.zoom, graph.pan), camera);
+    }
+
+    #[test]
+    fn nonlocal_edges_have_separate_outer_lanes_and_avoid_node_interiors() {
+        let layout = Layout::new(&large_fixture());
+        let loops: Vec<_> = layout
+            .edges
+            .iter()
+            .filter(|edge| edge.label.contains('↶'))
+            .collect();
+        assert_eq!(loops.len(), 3);
+        let lanes: BTreeSet<_> = loops
+            .iter()
+            .map(|edge| edge.points[2].x.to_bits())
+            .collect();
+        assert_eq!(lanes.len(), loops.len());
+        for edge in loops {
+            for pair in edge.points.windows(2) {
+                for node in &layout.nodes {
+                    assert!(clip_segment(pair[0], pair[1], node.rect.shrink(0.1)).is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn long_edges_are_clipped_before_generating_dashes() {
+        let clip = Rect::from_min_size(pos2(10.0, 20.0), vec2(600.0, 720.0));
+        let (start, end) =
+            clip_segment(pos2(100.0, -40_000.0), pos2(100.0, 40_000.0), clip).unwrap();
+        assert!((start - pos2(100.0, clip.top())).length() < 0.01);
+        assert!((end - pos2(100.0, clip.bottom())).length() < 0.01);
+        assert!(start.distance(end) <= clip.height() + 0.01);
+        assert!(clip_segment(pos2(-10.0, -40_000.0), pos2(-10.0, 40_000.0), clip).is_none());
     }
 
     #[test]
