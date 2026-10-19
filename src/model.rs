@@ -34,8 +34,15 @@ pub const MAX_PROJECT_STRINGS: usize = 20_000;
 pub const MAX_CRYPTO_MATCHES: usize = 10_000;
 pub const MIN_STRING_LENGTH: usize = 4;
 pub const MAX_STRING_MINIMUM: usize = 64;
+/// Per request, never a cumulative session ceiling.
 pub const MAX_ANALYSIS_FUNCTIONS: usize = 128;
+/// Interrupted batches retry each affected seed individually at most once.
+pub const MAX_DISCOVERY_INTERRUPTION_ATTEMPTS: usize = 2;
+/// Sixteen worst-case JSON-escaped 256-byte names fit below 60 KiB requests.
+pub const MAX_DISCOVERY_SYNC_FUNCTIONS: usize = 16;
 pub const MAX_ANALYSIS_INSTRUCTIONS: usize = 16_384;
+/// Shared per-batch and session aggregate evidence caps. Reaching an aggregate
+/// cap marks coverage partial; seed processing can still continue.
 pub const MAX_CALL_REFERENCES: usize = 16_384;
 pub const MAX_DATA_REFERENCES: usize = 16_384;
 pub const MAX_DATA_OPERATIONS: usize = 131_072;
@@ -133,6 +140,41 @@ pub struct CallAnalysis {
     pub skipped_fallthrough_calls: usize,
     pub failed_functions: usize,
     pub partial: bool,
+}
+
+/// Parent session identity, echoed by a disposable worker. Request IDs are
+/// additionally checked by the transport and the desktop's pending request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveryBinding {
+    pub generation: u64,
+    pub epoch: u64,
+    pub revision: u64,
+    pub batch: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DiscoveryStatus {
+    Done,
+    PartialByOwnLimit,
+    Failed,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DiscoveryOutcome {
+    pub address: u64,
+    pub status: DiscoveryStatus,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DiscoveryBatch {
+    pub binding: DiscoveryBinding,
+    #[serde(deserialize_with = "crate::bounded::vec::<_, _, { MAX_FUNCTIONS }>")]
+    pub functions: Vec<FunctionInfo>,
+    pub truncated: bool,
+    pub analysis: CallAnalysis,
+    /// The examined prefix of the request's seeds; the suffix remains pending.
+    #[serde(deserialize_with = "crate::bounded::vec::<_, _, { MAX_ANALYSIS_FUNCTIONS }>")]
+    pub outcomes: Vec<DiscoveryOutcome>,
 }
 
 /// UTF-8 byte span in rendered C and its originating machine instructions.
@@ -335,14 +377,39 @@ pub struct CryptoMatch {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Request {
-    Open { path: String },
-    Graph { address: u64 },
-    Decompile { address: u64 },
+    Open {
+        path: String,
+    },
+    Graph {
+        address: u64,
+    },
+    Decompile {
+        address: u64,
+    },
     Discover,
-    Rename { address: u64, name: String },
-    Bytes { address: u64, length: usize },
+    DiscoverBatch {
+        binding: DiscoveryBinding,
+        #[serde(deserialize_with = "crate::bounded::vec::<_, _, { MAX_ANALYSIS_FUNCTIONS }>")]
+        seeds: Vec<u64>,
+    },
+    SyncFunctions {
+        #[serde(
+            deserialize_with = "crate::bounded::vec::<_, _, { MAX_DISCOVERY_SYNC_FUNCTIONS }>"
+        )]
+        functions: Vec<FunctionInfo>,
+    },
+    Rename {
+        address: u64,
+        name: String,
+    },
+    Bytes {
+        address: u64,
+        length: usize,
+    },
     Strings,
-    StringsWithOptions { minimum_length: usize },
+    StringsWithOptions {
+        minimum_length: usize,
+    },
     Crypto,
 }
 
@@ -368,6 +435,10 @@ pub enum Response {
         truncated: bool,
         analysis: CallAnalysis,
     },
+    DiscoveryBatch {
+        batch: DiscoveryBatch,
+    },
+    FunctionsSynced,
     Progress {
         progress: AnalysisProgress,
     },
