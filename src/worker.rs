@@ -163,11 +163,14 @@ mod tests {
         binary
             .write_all(&crate::analysis::tests::elf_fixture())
             .unwrap();
+        // Windows analysis intentionally denies concurrent writable handles.
+        // Retain automatic path cleanup while closing the fixture's writer.
+        let binary = binary.into_temp_path();
         let requests = [
             WorkerRequest {
                 id: 1,
                 request: Request::Open {
-                    path: binary.path().to_string_lossy().into_owned(),
+                    path: binary.to_string_lossy().into_owned(),
                 },
             },
             WorkerRequest {
@@ -193,6 +196,12 @@ mod tests {
             .filter(|line| !line.is_empty())
             .map(|line| serde_json::from_slice(line).unwrap())
             .collect();
+        assert_eq!(replies[0].id, 1);
+        assert!(
+            matches!(replies[0].response, Response::Opened { .. }),
+            "Fixture failed to open: {:?}",
+            replies[0].response
+        );
         let mut previous = None;
         let mut events = 0;
         let mut terminal = 0;
