@@ -60,6 +60,7 @@ fn protocol(
         if enforce_limits {
             crate::limits::begin_request()?;
         }
+        let request_id = request.id;
         let result =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match request.request {
                 Request::Open { path } => {
@@ -73,7 +74,15 @@ fn protocol(
                 request => loaded
                     .as_mut()
                     .ok_or_else(|| "Open a binary first.".to_string())?
-                    .handle(request),
+                    .handle_with_progress(request, &mut |progress| {
+                        send(
+                            &mut output,
+                            WorkerResponse {
+                                id: request_id,
+                                response: Response::Progress { progress },
+                            },
+                        )
+                    }),
             }));
         let response = match result {
             Ok(Ok(response)) => response,
@@ -147,6 +156,72 @@ impl Write for ResponseBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_progress_keeps_the_request_id_and_one_terminal_reply() {
+        let mut binary = tempfile::NamedTempFile::new().unwrap();
+        binary
+            .write_all(&crate::analysis::tests::elf_fixture())
+            .unwrap();
+        let requests = [
+            WorkerRequest {
+                id: 1,
+                request: Request::Open {
+                    path: binary.path().to_string_lossy().into_owned(),
+                },
+            },
+            WorkerRequest {
+                id: 2,
+                request: Request::Discover,
+            },
+            WorkerRequest {
+                id: 3,
+                request: Request::Bytes {
+                    address: 0x402000,
+                    length: 1,
+                },
+            },
+        ];
+        let input = requests
+            .iter()
+            .map(|request| format!("{}\n", serde_json::to_string(request).unwrap()))
+            .collect::<String>();
+        let mut output = Vec::new();
+        protocol(io::Cursor::new(input), &mut output, false).unwrap();
+        let replies: Vec<WorkerResponse> = output
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
+        let mut previous = None;
+        let mut events = 0;
+        let mut terminal = 0;
+        for reply in replies.iter().filter(|reply| reply.id == 2) {
+            match &reply.response {
+                Response::Progress { progress } => {
+                    assert_eq!(terminal, 0);
+                    progress.validate_after(previous.as_ref()).unwrap();
+                    previous = Some(progress.clone());
+                    events += 1;
+                }
+                Response::Functions { analysis, .. } => {
+                    terminal += 1;
+                    let progress = previous.as_ref().unwrap();
+                    assert_eq!(progress.stage, crate::model::AnalysisStage::Publish);
+                    assert_eq!(progress.decode_attempts, analysis.decode_attempts);
+                    assert_eq!(progress.functions_examined, analysis.functions_examined);
+                }
+                other => panic!("Unexpected discovery reply: {other:?}"),
+            }
+        }
+        assert_eq!(terminal, 1);
+        assert!((3..=crate::model::MAX_ANALYSIS_FUNCTIONS + 3).contains(&events));
+        assert_eq!(replies.last().unwrap().id, 3);
+        assert!(matches!(
+            replies.last().unwrap().response,
+            Response::Bytes { .. }
+        ));
+    }
 
     #[test]
     fn oversized_response_becomes_one_error_line_with_original_id() {

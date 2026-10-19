@@ -4,6 +4,18 @@ This crate is a Rust port of the Ghidra decompiler and embeds SLEIGH language fi
 from Ghidra (commit d6192cb3f9, https://github.com/NationalSecurityAgency/ghidra).
 The notice of Ghidra follows.
 
+Ghidra-derived confirmed-call analysis
+
+The native worker's bounded direct-call function discovery adapts the confirmed
+call and call-to-fallthrough exclusion rules from Ghidra's FunctionAnalyzer.java:
+https://github.com/NationalSecurityAgency/ghidra/blob/9a723ce99952771b8368329503aa589ae233e916/Ghidra/Features/Base/src/main/java/ghidra/app/plugin/core/function/FunctionAnalyzer.java
+
+Upstream revision: 9a723ce99952771b8368329503aa589ae233e916
+License: Apache License, Version 2.0 (see LICENSE).
+Rust adaptations use the desktop's immutable image model and public engine APIs,
+with explicit work budgets, session-only call references, and worker progress.
+This is separate from the pinned decompiler port and its Ghidra source revision.
+
 ----
 
 Ghidra

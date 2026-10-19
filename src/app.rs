@@ -31,6 +31,7 @@ enum Tab {
     Strings,
     Crypto,
     Decode,
+    References,
 }
 
 #[derive(Clone, Copy)]
@@ -192,6 +193,11 @@ pub struct DesktopApp {
     saved_revision: u64,
     undo: VecDeque<Edit>,
     view: Option<FunctionView>,
+    call_index: Option<crate::call_analysis::CallIndex>,
+    analysis_progress: Option<AnalysisProgress>,
+    progress_events: usize,
+    reference_focus: Option<(u64, u64)>,
+    undisplayed_call: Option<u64>,
     canvas: Option<GraphCanvas>,
     listing: Vec<Instruction>,
     decompiled: String,
@@ -267,6 +273,11 @@ impl DesktopApp {
             saved_revision: 0,
             undo: VecDeque::new(),
             view: None,
+            call_index: None,
+            analysis_progress: None,
+            progress_events: 0,
+            reference_focus: None,
+            undisplayed_call: None,
             canvas: None,
             listing: Vec::new(),
             decompiled: String::new(),
@@ -390,6 +401,9 @@ impl DesktopApp {
     }
 
     fn clear_views(&mut self) {
+        self.call_index = None;
+        self.reference_focus = None;
+        self.undisplayed_call = None;
         self.browser_dialog = None;
         self.focus_comment = false;
         self.view = None;
@@ -424,6 +438,8 @@ impl DesktopApp {
     }
 
     fn stop_worker(&mut self) {
+        self.analysis_progress = None;
+        self.progress_events = 0;
         self.client = None;
         self.pending = None;
         self.opening = None;
@@ -462,6 +478,8 @@ impl DesktopApp {
     }
 
     fn send_direct(&mut self, request: Request) {
+        self.analysis_progress = None;
+        self.progress_events = 0;
         let Some(client) = &mut self.client else {
             return;
         };
@@ -532,6 +550,8 @@ impl DesktopApp {
     }
 
     fn navigate(&mut self, address: u64, record: bool, context: &egui::Context) {
+        self.reference_focus = None;
+        self.undisplayed_call = None;
         self.selection_generation = self.selection_generation.wrapping_add(1);
         self.selected = Some(address);
         self.address = format!("{address:x}");
@@ -618,22 +638,55 @@ impl DesktopApp {
                     self.status = error;
                     break;
                 }
-                WorkerEvent::Reply(reply) => {
-                    let Some(pending) = self.pending.take() else {
-                        continue;
-                    };
-                    if pending.id != reply.id {
-                        self.stop_worker();
-                        self.status = "Worker replied with an unexpected request ID".into();
-                        break;
-                    }
-                    self.receive(pending, reply.response, context);
-                }
+                WorkerEvent::Reply(reply) => self.receive_worker_reply(*reply, context),
             }
         }
         if self.pending.is_some() {
             context.request_repaint_after(Duration::from_millis(100));
         }
+    }
+
+    fn receive_worker_reply(&mut self, reply: WorkerResponse, context: &egui::Context) {
+        let Some(pending) = &self.pending else { return };
+        if pending.id != reply.id {
+            self.stop_worker();
+            self.status = "Worker replied with an unexpected request ID".into();
+            return;
+        }
+        if let Response::Progress { progress } = reply.response {
+            // Progress never completes a request or extends its wall-time deadline.
+            self.progress_events += 1;
+            if !matches!(pending.request, Request::Discover)
+                || (self.progress_events == 1 && progress.stage != AnalysisStage::Seeds)
+                || self.progress_events > MAX_ANALYSIS_FUNCTIONS + 3
+                || progress
+                    .validate_after(self.analysis_progress.as_ref())
+                    .is_err()
+            {
+                self.stop_worker();
+                self.status = "Invalid worker analysis progress; worker stopped".into();
+                return;
+            }
+            if pending.selection == self.selection_generation && pending.revision == self.revision {
+                self.analysis_progress = Some(progress);
+            }
+            return;
+        }
+        if let Response::Functions { analysis, .. } = &reply.response
+            && self.analysis_progress.as_ref().is_none_or(|last| {
+                last.stage != AnalysisStage::Publish
+                    || last.functions_examined != analysis.functions_examined
+                    || last.decode_attempts != analysis.decode_attempts
+            })
+        {
+            self.stop_worker();
+            self.status = "Call analysis did not match its final progress; worker stopped".into();
+            return;
+        }
+        let pending = self.pending.take().expect("Checked pending request");
+        self.analysis_progress = None;
+        self.progress_events = 0;
+        self.receive(pending, reply.response, context);
     }
 
     fn receive(&mut self, pending: Pending, response: Response, context: &egui::Context) {
@@ -767,6 +820,23 @@ impl DesktopApp {
                 self.saved_analysis = false;
                 self.view = Some(view);
                 self.status = format!("Function {address:#x} ready");
+                if let Some((caller, pc)) = self.reference_focus.take()
+                    && caller == address
+                {
+                    self.select_instruction(pc);
+                    if let Some(row) = self
+                        .listing
+                        .iter()
+                        .position(|instruction| instruction.address == pc)
+                    {
+                        self.pending_listing_scroll = Some(row);
+                        if let Some(canvas) = &mut self.canvas {
+                            canvas.reveal_instruction(pc);
+                        }
+                    } else {
+                        self.undisplayed_call = Some(pc);
+                    }
+                }
                 if self.should_auto_decompile() {
                     self.schedule_request(Request::Decompile { address });
                 }
@@ -838,20 +908,38 @@ impl DesktopApp {
                 Response::Functions {
                     functions,
                     truncated,
+                    analysis,
                 },
             ) => {
+                if pending.selection != self.selection_generation
+                    || pending.revision != self.revision
+                {
+                    return;
+                }
+                let Some(info) = &self.info else { return };
+                if let Err(error) = analysis.validate(info, &functions) {
+                    self.stop_worker();
+                    self.status = format!("Invalid worker call analysis: {error}");
+                    return;
+                }
+                self.status = format!(
+                    "{} call references · {} function walks · {} decode attempts{}",
+                    analysis.references.len(),
+                    analysis.functions_examined,
+                    analysis.decode_attempts,
+                    if truncated || analysis.partial {
+                        " · partial coverage"
+                    } else {
+                        " · reachable direct calls analyzed"
+                    }
+                );
+                self.call_index = Some(crate::call_analysis::CallIndex::new(analysis));
                 self.cached_functions = false;
                 if let Some(info) = &mut self.info {
                     info.functions = functions;
                     info.functions_truncated = truncated;
                 }
                 self.rebuild_filter();
-                self.status = if truncated {
-                    "Function list limit reached; results are partial"
-                } else {
-                    "Function discovery complete"
-                }
-                .into();
             }
             (
                 Request::Rename {
@@ -1833,6 +1921,7 @@ impl DesktopApp {
                     (Tab::Strings, "Defined Strings"),
                     (Tab::Crypto, "FindCrypt"),
                     (Tab::Decode, "String Decoder"),
+                    (Tab::References, "References"),
                 ] {
                     if ui.selectable_value(&mut self.tab, tab, label).clicked() {
                         ui.close();
@@ -2155,7 +2244,7 @@ impl DesktopApp {
             .is_some_and(|info| info.functions_truncated)
         {
             ui.colored_label(theme::WARNING, "Partial function list")
-                .on_hover_text("The function list reached its 10,000-entry budget. PE entries near the program entry point are prioritized. Use Go to navigate a known address; see Analysis notes for details.");
+                .on_hover_text("Loading or discovery reached a budget or encountered incomplete flow. Known entries are retained; see References and Analysis notes for coverage.");
         }
         ui.label(RichText::new("Address       Name").monospace().weak());
         let mut navigate = None;
@@ -2454,6 +2543,145 @@ impl DesktopApp {
         }
     }
 
+    fn navigate_reference(&mut self, caller: u64, pc: u64, context: &egui::Context) {
+        self.tab = Tab::Listing;
+        self.navigate(caller, true, context);
+        self.reference_focus = Some((caller, pc));
+    }
+
+    fn references_panel(&mut self, ui: &mut egui::Ui) {
+        let context = ui.ctx().clone();
+        if ui
+            .add_enabled(
+                self.info.is_some() && self.file_job.is_none(),
+                egui::Button::new("Discover functions and calls"),
+            )
+            .clicked()
+        {
+            self.request(Request::Discover, &context);
+        }
+        let Some(index) = &self.call_index else {
+            ui.weak("Call references have not been analyzed in this session. Run discovery to compute them.");
+            return;
+        };
+        let report = &index.report;
+        ui.weak(format!(
+            "Computed this session · {} functions examined · {} decode attempts",
+            report.functions_examined, report.decode_attempts
+        ));
+        ui.weak("Direct calls only; data references and unknown indirect targets are not inferred. References are recomputed after reopening a project.");
+        if report.partial {
+            ui.colored_label(
+                theme::WARNING,
+                "Partial call coverage: limits, unresolved flow, or recovery failures.",
+            );
+        }
+        ui.weak(format!(
+            "{} unresolved calls · {} failed function walks · {} fallthrough calls excluded",
+            report.unresolved_calls, report.failed_functions, report.skipped_fallthrough_calls
+        ));
+        let Some(function) = self.view.as_ref().map(|view| view.address) else {
+            ui.label("Select a function to inspect its incoming and outgoing calls.");
+            return;
+        };
+        ui.label(RichText::new(format!("Function {function:#x}")).monospace());
+        let incoming = index
+            .incoming
+            .get(&function)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let outgoing = index
+            .outgoing
+            .get(&function)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let count = incoming.len() + outgoing.len();
+        ui.label(format!(
+            "{} incoming · {} outgoing",
+            incoming.len(),
+            outgoing.len()
+        ));
+        let name = |address| {
+            self.info
+                .as_ref()
+                .and_then(|info| {
+                    info.functions
+                        .binary_search_by_key(&address, |f| f.address)
+                        .ok()
+                        .map(|i| &info.functions[i])
+                })
+                .map(|function| {
+                    self.session
+                        .as_ref()
+                        .and_then(|s| s.annotations.get(&address))
+                        .map(|a| a.label.as_str())
+                        .filter(|n| !n.is_empty())
+                        .unwrap_or(&function.name)
+                })
+                .unwrap_or("function")
+        };
+        let mut source = None;
+        let mut target = None;
+        let row_height = ui.text_style_height(&egui::TextStyle::Body) + 6.0;
+        ScrollArea::both().id_salt("call-references").show_rows(
+            ui,
+            row_height,
+            count,
+            |ui, rows| {
+                for row in rows {
+                    let is_incoming = row < incoming.len();
+                    let reference = &report.references[if is_incoming {
+                        incoming[row]
+                    } else {
+                        outgoing[row - incoming.len()]
+                    }];
+                    ui.horizontal(|ui| {
+                        ui.weak(if is_incoming { "From" } else { "To" });
+                        if ui
+                            .button(format!(
+                                "{:x} {}",
+                                if is_incoming {
+                                    reference.caller
+                                } else {
+                                    reference.target
+                                },
+                                crop(
+                                    name(if is_incoming {
+                                        reference.caller
+                                    } else {
+                                        reference.target
+                                    }),
+                                    60
+                                )
+                            ))
+                            .clicked()
+                        {
+                            target = Some(if is_incoming {
+                                reference.caller
+                            } else {
+                                reference.target
+                            });
+                        }
+                        if ui
+                            .button(format!("at {:x}", reference.address))
+                            .on_hover_text(
+                                "Open the caller and select this decoded call instruction",
+                            )
+                            .clicked()
+                        {
+                            source = Some((reference.caller, reference.address));
+                        }
+                    });
+                }
+            },
+        );
+        if let Some((caller, pc)) = source {
+            self.navigate_reference(caller, pc, &context);
+        } else if let Some(address) = target {
+            self.navigate(address, true, &context);
+        }
+    }
+
     fn main_panel(&mut self, ui: &mut egui::Ui) {
         let title = match self.tab {
             Tab::Listing => "Listing",
@@ -2461,6 +2689,7 @@ impl DesktopApp {
             Tab::Strings => "Defined Strings",
             Tab::Crypto => "FindCrypt",
             Tab::Decode => "String Decoder",
+            Tab::References => "References",
         };
         let filename = self
             .info
@@ -2480,13 +2709,14 @@ impl DesktopApp {
                     .on_hover_text("Persisted project results. Scan again to recompute.");
             }
         });
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             for (tab, name) in [
                 (Tab::Listing, "Listing"),
                 (Tab::Graph, "Function Graph"),
                 (Tab::Strings, "Strings"),
                 (Tab::Crypto, "FindCrypt"),
                 (Tab::Decode, "Decode"),
+                (Tab::References, "References"),
             ] {
                 ui.selectable_value(&mut self.tab, tab, name);
             }
@@ -2494,6 +2724,7 @@ impl DesktopApp {
         ui.separator();
         let context = ui.ctx().clone();
         match self.tab {
+            Tab::References => self.references_panel(ui),
             Tab::Graph => {
                 let mut navigate = None;
                 if let Some(view) = &self.view {
@@ -2541,6 +2772,9 @@ impl DesktopApp {
                 }
             }
             Tab::Listing => {
+                if let Some(pc) = self.undisplayed_call {
+                    ui.colored_label(theme::WARNING, format!("Selected call {pc:#x} is outside this bounded caller graph. Use Go to inspect its address."));
+                }
                 if self.info.is_none() {
                     ui.add_space(32.0);
                     ui.heading("Code Browser");
@@ -2887,7 +3121,13 @@ impl DesktopApp {
                                 }
                                 Request::Crypto => "Scanning constants",
                             };
-                            theme::analysis_activity(ui, task, elapsed);
+                            let stage = self.analysis_progress.as_ref().map(|progress| match progress.stage {
+                                AnalysisStage::Seeds => "Seeding analysis", AnalysisStage::Calls => "Following calls", AnalysisStage::Publish => "Publishing results",
+                            }).unwrap_or(task);
+                            let activity = ui.scope(|ui| theme::analysis_activity(ui, stage, elapsed));
+                            if let Some(progress) = &self.analysis_progress {
+                                activity.response.on_hover_text(format!("{} functions examined · {} decode attempts. Total work is unknown.", progress.functions_examined, progress.decode_attempts));
+                            }
                         }
                     }
                 },
@@ -3057,6 +3297,7 @@ mod tests {
             Response::Functions {
                 functions,
                 truncated: true,
+                analysis: CallAnalysis::default(),
             },
             &egui::Context::default(),
         );
@@ -4097,6 +4338,153 @@ mod tests {
     }
 
     #[test]
+    fn progress_is_request_bound_nonterminal_and_does_not_extend_deadlines() {
+        let context = egui::Context::default();
+        let mut app = keyboard_app();
+        let started = Instant::now() - Duration::from_secs(3);
+        app.pending = Some(Pending {
+            id: 7,
+            request: Request::Discover,
+            started,
+            selection: app.selection_generation,
+            revision: app.revision,
+        });
+        for stage in [
+            AnalysisStage::Seeds,
+            AnalysisStage::Calls,
+            AnalysisStage::Publish,
+        ] {
+            app.receive_worker_reply(
+                WorkerResponse {
+                    id: 7,
+                    response: Response::Progress {
+                        progress: AnalysisProgress {
+                            stage,
+                            functions_examined: 0,
+                            decode_attempts: 0,
+                        },
+                    },
+                },
+                &context,
+            );
+            assert_eq!(app.pending.as_ref().unwrap().started, started);
+            assert!(app.call_index.is_none());
+        }
+        app.receive_worker_reply(
+            WorkerResponse {
+                id: 7,
+                response: Response::Functions {
+                    functions: app.info.as_ref().unwrap().functions.clone(),
+                    truncated: false,
+                    analysis: CallAnalysis::default(),
+                },
+            },
+            &context,
+        );
+        assert!(app.pending.is_none());
+        assert!(app.call_index.is_some());
+        assert!(app.analysis_progress.is_none());
+        app.clear_binary();
+        assert!(app.call_index.is_none());
+    }
+
+    #[test]
+    fn invalid_progress_and_stale_analysis_cannot_replace_reference_evidence() {
+        let context = egui::Context::default();
+        let mut app = keyboard_app();
+        app.pending = Some(Pending {
+            id: 7,
+            request: Request::Discover,
+            started: Instant::now(),
+            selection: 0,
+            revision: 0,
+        });
+        app.receive_worker_reply(
+            WorkerResponse {
+                id: 99,
+                response: Response::Progress {
+                    progress: AnalysisProgress {
+                        stage: AnalysisStage::Seeds,
+                        functions_examined: 0,
+                        decode_attempts: 0,
+                    },
+                },
+            },
+            &context,
+        );
+        assert!(app.pending.is_none());
+        assert!(app.status.contains("unexpected request ID"));
+        app.pending = Some(Pending {
+            id: 7,
+            request: Request::Discover,
+            started: Instant::now(),
+            selection: 0,
+            revision: 0,
+        });
+        app.receive_worker_reply(
+            WorkerResponse {
+                id: 7,
+                response: Response::Progress {
+                    progress: AnalysisProgress {
+                        stage: AnalysisStage::Seeds,
+                        functions_examined: MAX_ANALYSIS_FUNCTIONS + 1,
+                        decode_attempts: 0,
+                    },
+                },
+            },
+            &context,
+        );
+        assert!(app.pending.is_none());
+        assert!(app.status.contains("Invalid worker analysis progress"));
+        let pending = Pending {
+            id: 7,
+            request: Request::Discover,
+            started: Instant::now(),
+            selection: 0,
+            revision: 0,
+        };
+        app.revision += 1;
+        app.receive(
+            pending,
+            Response::Functions {
+                functions: vec![],
+                truncated: false,
+                analysis: CallAnalysis::default(),
+            },
+            &context,
+        );
+        assert!(app.call_index.is_none());
+        assert_eq!(app.info.as_ref().unwrap().functions.len(), 2);
+    }
+
+    #[test]
+    fn reference_source_navigation_selects_once_and_explains_display_omissions() {
+        let context = egui::Context::default();
+        for pc in [0x1004, 0x104c] {
+            let mut app = semantic_app();
+            let view = app.view.clone().unwrap();
+            app.auto_decompile = false;
+            app.navigate_reference(0x1000, pc, &context);
+            assert!(app.semantic.mappings.is_empty());
+            assert!(app.view.is_none());
+            let pending = Pending {
+                id: 1,
+                request: Request::Graph { address: 0x1000 },
+                started: Instant::now(),
+                selection: app.selection_generation,
+                revision: app.revision,
+            };
+            app.receive(pending, Response::Graph { view }, &context);
+            assert_eq!(app.selected, Some(pc));
+            assert!(app.semantic.addresses.contains(&pc));
+            assert_eq!(app.pending_listing_scroll, (pc == 0x1004).then_some(1));
+            assert_eq!(app.undisplayed_call, (pc == 0x104c).then_some(pc));
+            assert!(app.reference_focus.is_none());
+            assert!(app.tab == Tab::Listing);
+        }
+    }
+
+    #[test]
     fn empty_desktop_and_all_tabs_render_without_a_worker() {
         let context = egui::Context::default();
         theme::install(&context);
@@ -4108,6 +4496,7 @@ mod tests {
             Tab::Strings,
             Tab::Crypto,
             Tab::Decode,
+            Tab::References,
         ] {
             app.tab = tab;
             let mut output = context.run_ui(egui::RawInput::default(), |ui| app.draw(ui));

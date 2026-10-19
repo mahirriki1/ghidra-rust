@@ -17,6 +17,10 @@ fn request(worker: &mut WorkerClient, request: Request) -> Response {
         match worker.poll() {
             Some(WorkerEvent::Reply(reply)) => {
                 assert_eq!(reply.id, id);
+                if let Response::Progress { progress } = &reply.response {
+                    progress.validate_after(None).unwrap();
+                    continue;
+                }
                 return reply.response;
             }
             Some(WorkerEvent::Failed(error)) => panic!("Windows worker failed: {error}"),

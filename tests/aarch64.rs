@@ -18,6 +18,10 @@ fn request(worker: &mut WorkerClient, request: Request) -> Response {
         match worker.poll() {
             Some(WorkerEvent::Reply(reply)) => {
                 assert_eq!(reply.id, id);
+                if let Response::Progress { progress } = &reply.response {
+                    progress.validate_after(None).unwrap();
+                    continue;
+                }
                 return reply.response;
             }
             Some(WorkerEvent::Failed(error)) => panic!("Contained worker failed: {error}"),
@@ -112,6 +116,23 @@ fn contained_aarch64_workers_analyze_elf_pe_macho_and_reopen_projects() {
                 info.functions
             );
         }
+        let Response::Functions {
+            functions,
+            analysis,
+            ..
+        } = request(&mut worker, Request::Discover)
+        else {
+            panic!("Expected symbol-bearing discovery");
+        };
+        analysis.validate(&info, &functions).unwrap();
+        assert!(
+            analysis
+                .references
+                .iter()
+                .any(|reference| reference.address == base + 8 && reference.target == base + 48)
+        );
+        assert_eq!(analysis.unresolved_calls, 1);
+        assert!(analysis.partial);
         let protection = worker.protection().bind_snapshot(&info).unwrap();
         let entry = graph(&mut worker, base);
         let pcs: BTreeSet<_> = entry
@@ -281,9 +302,24 @@ fn stripped_aarch64_discovery_follows_real_calls_in_all_containers() {
         assert_eq!(info.functions.len(), 1);
         assert_eq!(graph(&mut worker, base).calls[0].target, Some(base + 48));
         let response = request(&mut worker, Request::Discover);
-        let Response::Functions { functions, .. } = response else {
+        let Response::Functions {
+            functions,
+            analysis,
+            ..
+        } = response
+        else {
             panic!("Discover functions: {response:?}");
         };
+        analysis.validate(&info, &functions).unwrap();
+        assert_eq!(
+            analysis.references,
+            vec![ghidra_rust::model::CallReference {
+                caller: base,
+                address: base + 8,
+                target: base + 48,
+            }]
+        );
+        assert_eq!(analysis.functions_examined, 2);
         assert!(functions.iter().any(|f| f.address == base + 48));
         let sum = graph(&mut worker, base + 48);
         decompile(&mut worker, base + 48, &info, &sum);

@@ -145,8 +145,9 @@ navigates to that function.
   point. PE exports and x64 exception-table function entries load on open, including
   stripped images. The list is capped at 10,000 entries; large PEs prioritize the
   entry point, exports, and runtime functions near entry, with a visible partial-list
-  notice. **Discover functions** explicitly runs additional engine discovery.
-  Complete function recovery is not guaranteed.
+  notice. **Discover functions** follows confirmed decoded direct calls from known
+  entries on every supported architecture, within shared work budgets. Complete
+  function recovery is not guaranteed; see [analysis coverage](docs/analysis.md).
 - Navigate a function's instruction CFG with pan, zoom, branch labels, and
   unresolved-flow markers. CFG recovery is bounded; warnings identify unsupported
   or incomplete cases such as indirect flow. Calls are displayed separately from
@@ -155,7 +156,10 @@ navigates to that function.
   complete overview with text hidden at small scales; **Entry** returns to readable
   entry code. Nonlocal and loop edges use separate routes outside the block columns.
 - Switch between the graph and listing. Read separately requested C-like
-  decompilation, inspect outgoing direct calls, and navigate by address.
+  decompilation, inspect outgoing direct calls, and navigate by address. After
+  discovery, the **References** tab shows incoming and outgoing confirmed calls
+  for the current function, with navigation to callers, callees, and call sites.
+  Its coverage is limited to the functions examined in that discovery run.
 - Scan mapped bytes for ASCII and a printable ASCII subset of UTF-16LE strings.
   The tree shows **not scanned** until a scan runs. This is not complete Unicode
   or Rust string-slice recovery. **Analysis notes** shows loading and coverage limits.
@@ -191,7 +195,9 @@ It stores function names, comments, decoded annotations, the known function list
 the current function's graph/listing and pseudocode, string/crypto scan results,
 and the selected address. It is a snapshot of these results; it does not serialize
 the upstream decompiler's complete internal database or all previously visited
-functions. The engine reopens the binary before accepting saved results.
+functions. The engine reopens the binary before accepting saved results. The
+References index is session-only; run discovery again after reopening a project.
+Saved function lists retain their saved-result provenance until recomputed.
 
 **File → Include binary in project** is enabled initially. Keeping it checked
 embeds the exact analyzed binary, so the project can move between Linux and
@@ -232,6 +238,9 @@ background threads. Lists draw visible rows and graph geometry is cached.
 Analysis jobs lasting over 200 ms show a compact animated bar at the bottom right,
 with the active task and elapsed time. It indicates activity without estimating
 a completion percentage. **Analysis → Cancel analysis** stops the worker.
+Function discovery reports Seeds, Calls, and Publish stages with function and
+decode-attempt counts. Its total remains indeterminate because following calls
+can reveal more work. Progress updates do not extend the worker deadline.
 
 Linux workers run under bubblewrap with private namespaces, no network, read-only
 `/usr`, a read-only executable, and only the selected input file exposed from the
@@ -251,6 +260,9 @@ and 128 blocks per graph, 64 KiB byte selections, bounded function/result lists,
 sidecars, and 192 MiB projects. The
 snapshot currently duplicates image bytes retained by the engine; total memory
 must be measured before making efficiency claims.
+Discovery examines at most 128 function entries and charges at most 16,384 decode
+attempts across the whole run, with a 2,048-attempt limit per function. Failed
+decodes and work omitted by display limits count against these budgets.
 
 Function-list and decompiler-text limits bound returned results, after the engine
 has constructed its internal data. They are not preallocation limits inside the
@@ -313,8 +325,9 @@ imported API prototypes, library signature matching, delay imports, and Windows
 Control Flow Guard substitutions remain incomplete. Known hexadecimal addresses remain navigable.
 The PE integration tests check named exports and recovery after exports are removed.
 
-The architecture/ABI analysis update invalidates older saved graph/decompiler
-caches when a project reopens; compatible annotations are retained. When comparing
+The architecture/ABI and confirmed-call analysis fingerprints invalidate older
+saved graph/decompiler caches when a project reopens; compatible annotations are
+retained. The project schema and JSON annotation format are unchanged. When comparing
 against a Ghidra project, compare the recorded executable SHA-256 and the selected
 function address. An installed program can change at the same path after an update.
 
