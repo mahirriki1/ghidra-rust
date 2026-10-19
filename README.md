@@ -91,11 +91,12 @@ rsvg-convert --width 256 --height 256 docs/images/ghidra-rust-logo.svg -o docs/i
 
 The window icon is separate from Windows executable-file icon resources.
 
-The default appearance combines compact Graphite controls with Ghidra's classic
-layout: charcoal provider headers, solid dark analysis views, restrained rounding
-and blue hover/focus accents, and colored listing columns. Decompiled code uses
-Ghidra's dark syntax palette for keywords, types, comments, constants/strings,
-and identifiers. Highlighting is lexical; semantic
+The default Carbon appearance keeps Ghidra's classic layout in a dense,
+near-black style: editor-style pane tabs, underlined view switchers, soft
+borderless controls, and the dragon's orange as the selection and focus accent.
+Listing columns and graph blocks are colored, with slightly rounded blocks.
+Decompiled code uses a One Dark-style palette for keywords, types, function
+names, comments, constants/strings, and identifiers. Highlighting is lexical; semantic
 roles such as parameters versus globals require richer engine token information.
 Text is tokenized when a new result arrives and visible lines are drawn from cached
 spans. The cache is capped at 65,536 spans; unusually dense results fall back to
@@ -133,6 +134,10 @@ counterpart; the app does not invent one. Double-clicking a known call still
 navigates to that function.
 
 ![Selected CFG instruction and corresponding pseudocode](docs/images/desktop-selection-sync.png)
+
+The README screenshots are captured from the native desktop built with
+`--features capture`; `src/capture.rs` documents the environment variables that
+open a function, select an instruction, and write one frame.
 
 ## Current workflow
 
