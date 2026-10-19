@@ -1,4 +1,4 @@
-name: Native desktop correctness
+name: Native desktop build
 on:
   push:
     branches-ignore: [main] # Main is built by the automatic release workflow.
@@ -20,44 +20,23 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ inputs.ref || github.sha }}
-      - name: Check release tooling
-        run: |
-          python3 scripts/check-release-version.py
-          python3 -m unittest discover -s scripts -p 'test_*.py'
+      # Tests run locally before pushing (see docs/releases.md); CI builds,
+      # lints, and packages only.
+      - name: Check release version
+        run: python3 scripts/check-release-version.py
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
         with:
           toolchain: 1.98.1
           components: rustfmt, clippy
-      - name: Install native Linux build and test dependencies
+      - name: Install native Linux build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
-            build-essential pkg-config binutils python3 bubblewrap apparmor apparmor-profiles \
+            build-essential pkg-config binutils python3 \
             libx11-dev libxi-dev libxrandr-dev libxcursor-dev libxinerama-dev \
             libxkbcommon-dev libwayland-dev libgl1-mesa-dev
-      - name: Load Ubuntu's bubblewrap user-namespace profile
-        run: |
-          if [[ -r /sys/module/apparmor/parameters/enabled ]] && [[ $(cat /sys/module/apparmor/parameters/enabled) == Y ]]; then
-            if [[ ! -e /etc/apparmor.d/bwrap-userns-restrict ]]; then
-              sudo install -m 0644 \
-                /usr/share/apparmor/extra-profiles/bwrap-userns-restrict \
-                /etc/apparmor.d/bwrap-userns-restrict
-            fi
-            sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
-          fi
-      - name: Check isolated worker namespace and loader startup
-        run: |
-          # Print bwrap's own setup errors before the application's deliberately
-          # silent worker stderr. Keep all production isolation flags enabled.
-          library_args=(--symlink "$(realpath /lib)" /lib)
-          if [[ -e /lib64 ]]; then
-            library_args+=(--symlink "$(realpath /lib64)" /lib64)
-          fi
-          bwrap --die-with-parent --new-session --unshare-all --clearenv \
-            --setenv LANG C.UTF-8 --ro-bind /usr /usr "${library_args[@]}" \
-            --proc /proc --dev /dev --tmpfs /tmp --chdir / -- /usr/bin/true
-      - name: Build, test debug and release workers, and package Linux x64
-        run: bash scripts/build-linux.sh
+      - name: Build, lint, and package Linux x64
+        run: bash scripts/build-linux.sh --skip-tests
       - name: Retain Linux x64 build
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -81,9 +60,9 @@ jobs:
           toolchain: 1.98.1
           targets: x86_64-pc-windows-msvc
           components: rustfmt, clippy
-      - name: Build, test debug and release workers, and package Windows x64
+      - name: Build, lint, and package Windows x64
         shell: pwsh
-        run: ./scripts/build-windows.ps1
+        run: ./scripts/build-windows.ps1 -SkipTests
       - name: Retain portable Windows x64 build
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

@@ -70,8 +70,9 @@ to analyze the original code. The app does not run or unpack input executables.
 
 ## Reproduce the Windows checks and portable ZIP
 
-With the prerequisites installed, this runs the same script as the Windows CI
-job, including compiling the original C fixture with MSVC:
+With the prerequisites installed, this runs the full local checks, including
+compiling the original C fixture with MSVC. Run it before pushing; the Windows CI
+job runs the same script with `-SkipTests`:
 
 ```powershell
 rustup run 1.98.1-x86_64-pc-windows-msvc powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-windows.ps1
@@ -95,15 +96,16 @@ redistributing the bundle. The package is unsigned. Packaging an existing releas
 build separately is possible with `scripts\package-windows.ps1`.
 
 After a successful Windows CI run, the same EXE, ZIP, and checksums are retained as
-the **ghidra-rust-windows-x64** workflow artifact. A configured workflow alone
-does not establish a passing native run. These automated tests do not exercise
-an actual OpenGL window; use the desktop check below on the intended machine.
+the **ghidra-rust-windows-x64** workflow artifact. The hosted job builds and
+packages but runs no tests, so it does not establish a passing native run. The
+local tests also do not exercise an actual OpenGL window; use the desktop check
+below on the intended machine.
 
 Local validation on Windows x64 with Rust 1.98.1 and MSVC passed the unit/UI and
 debug/release PE integration checks, and exercised the release OpenGL desktop,
 project saving, and reopening embedded saved analysis. Graphics and endpoint
-policies still vary by machine. Check the GitHub Actions run for the exact commit
-to establish its hosted build and test results.
+policies still vary by machine. The GitHub Actions run for a commit shows only
+its hosted build; Windows test results come from local runs.
 
 ## Desktop check
 
