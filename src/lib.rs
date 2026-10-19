@@ -2,6 +2,7 @@ pub mod analysis;
 pub mod app;
 mod architecture;
 pub mod brand;
+pub mod call_analysis;
 pub mod client;
 pub mod crypto;
 pub mod decode;

@@ -41,11 +41,15 @@ fixtures before ARM/Thumb can be enabled reliably.
 
 ELF/Mach-O symbols and PE exports seed the function list. Mach-O LC_MAIN file
 offsets are translated through executable sections to virtual entry addresses.
-Explicit AArch64 discovery follows genuine direct-call targets from the entry
-and known functions, with limits of 128 function graphs and roughly 16,384
-instructions (plus at most one final bounded graph). It omits guesses based on
-constants, indirect targets, and prologue patterns. Coverage is partial when these
-budgets are reached; complete function recovery is not guaranteed.
+Explicit discovery follows genuine decoded direct-call targets from the entry
+and known functions on x86, x86-64, and AArch64 across the supported containers.
+It examines at most 128 function entries with an exact shared limit of 16,384
+decode attempts and at most 2,048 attempts per function. Failed decoding and work
+omitted from the displayed graph count toward the limits. Calls to their own
+fallthrough address do not seed functions. Constants, unknown indirect targets,
+and prologue patterns do not seed functions. Coverage is partial when these
+budgets are reached; complete function recovery is not guaranteed. See
+[analysis coverage and provenance](analysis.md) for call references and progress.
 AArch64 PE does not read ARM64 unwind records to recover stripped function entries
 and does not name ADRP/LDR/BR import veneers. Export names and import slots still
 reach the decompiler. x64 PE runtime-function recovery and x86 import-thunk naming
@@ -55,7 +59,9 @@ Indirect branches, jump tables, exception flow, no-return calls, stripped import
 newer vector/ISA extensions, and platform runtime metadata can be incomplete.
 Pointer authentication and authenticated/chained fixups are not recovered. The
 existing function, graph, byte, memory, CPU, and wall-time limits apply unchanged.
-The engine revision and upstream attribution in NOTICE are unchanged.
+The engine revision remains unchanged. NOTICE separately attributes the adapted
+confirmed-call analysis algorithm; its `calls-v1` cache fingerprint invalidates
+older cached analysis without changing the project schema or annotation format.
 
 ## Regression fixtures
 

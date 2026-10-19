@@ -8,6 +8,47 @@ pub const MAX_CODE_ADDRESS_REFS: usize = 131_072;
 pub const MAX_STRING_RESULTS: usize = 10_000;
 pub const MIN_STRING_LENGTH: usize = 4;
 pub const MAX_STRING_MINIMUM: usize = 64;
+pub const MAX_ANALYSIS_FUNCTIONS: usize = 128;
+pub const MAX_ANALYSIS_INSTRUCTIONS: usize = 16_384;
+pub const MAX_CALL_REFERENCES: usize = 16_384;
+
+/// An established direct call decoded from `address` while walking `caller`.
+/// This records machine-code evidence, not a recovered source-language call.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct CallReference {
+    pub caller: u64,
+    pub address: u64,
+    pub target: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum AnalysisStage {
+    Seeds,
+    Calls,
+    Publish,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnalysisProgress {
+    pub stage: AnalysisStage,
+    pub functions_examined: usize,
+    pub decode_attempts: usize,
+}
+
+/// A fresh worker computation. References are deliberately session-only; project
+/// snapshots retain the existing function inventory with saved-result provenance.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CallAnalysis {
+    pub references: Vec<CallReference>,
+    pub functions_examined: usize,
+    /// Charged decode attempts, including failures and instructions omitted by
+    /// display limits. This is a work count, not the size of a displayed graph.
+    pub decode_attempts: usize,
+    pub unresolved_calls: usize,
+    pub skipped_fallthrough_calls: usize,
+    pub failed_functions: usize,
+    pub partial: bool,
+}
 
 /// UTF-8 byte span in rendered C and its originating machine instructions.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -180,6 +221,10 @@ pub enum Response {
     Functions {
         functions: Vec<FunctionInfo>,
         truncated: bool,
+        analysis: CallAnalysis,
+    },
+    Progress {
+        progress: AnalysisProgress,
     },
     Renamed {
         address: u64,

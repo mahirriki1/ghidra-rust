@@ -18,6 +18,10 @@ fn request(worker: &mut WorkerClient, request: Request) -> Response {
         match worker.poll() {
             Some(WorkerEvent::Reply(reply)) => {
                 assert_eq!(reply.id, id);
+                if let Response::Progress { progress } = &reply.response {
+                    progress.validate_after(None).unwrap();
+                    continue;
+                }
                 return reply.response;
             }
             Some(WorkerEvent::Failed(error)) => panic!("Sandboxed Linux worker failed: {error}"),
@@ -77,6 +81,21 @@ fn sandboxed_linux_worker_and_embedded_project_round_trip() {
     assert_eq!(
         info.sha256,
         ghidra_rust::session::fingerprint(&binary).unwrap()
+    );
+    let Response::Functions {
+        functions,
+        analysis,
+        ..
+    } = request(&mut worker, Request::Discover)
+    else {
+        panic!("Sandboxed worker did not analyze calls");
+    };
+    analysis.validate(&info, &functions).unwrap();
+    assert!(
+        analysis
+            .references
+            .iter()
+            .any(|reference| reference.target == address)
     );
     let protection = worker.protection().bind_snapshot(&info).unwrap();
     let Response::Graph { view } = request(&mut worker, Request::Graph { address }) else {
