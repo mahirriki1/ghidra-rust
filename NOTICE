@@ -16,6 +16,18 @@ Rust adaptations use the desktop's immutable image model and public engine APIs,
 with explicit work budgets, session-only call references, and worker progress.
 This is separate from the pinned decompiler port and its Ghidra source revision.
 
+Ghidra-derived direct-memory reference analysis
+
+The bounded instruction-local data-access pass adapts direct-memory reference
+rules from the COPY, LOAD and STORE cases of Ghidra's SymbolicPropogator.java:
+https://github.com/NationalSecurityAgency/ghidra/blob/9a723ce99952771b8368329503aa589ae233e916/Ghidra/Features/Base/src/main/java/ghidra/program/util/SymbolicPropogator.java
+
+Upstream revision: 9a723ce99952771b8368329503aa589ae233e916
+License: Apache License, Version 2.0 (see LICENSE).
+The Rust adaptation uses public instruction p-code, file-backed range validation,
+bounded work and session-only evidence. It omits symbolic state propagation and
+the Java Program database and retains the upstream Ghidra notices below.
+
 ----
 
 The desktop's ARM64 PE runtime-metadata reader is an independent implementation

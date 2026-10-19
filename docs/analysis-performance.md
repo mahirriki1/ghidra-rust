@@ -43,7 +43,8 @@ and wait for observed descendants to be reaped.
 
 The report contains summed RSS and PSS observations, before-start/load/retained
 result samples, maximum observed aggregates, sample/process counts, request work
-counts and result sizes. RSS can count shared pages repeatedly. PSS apportions
+counts (including data-access candidates, operations and omissions) and result
+sizes. RSS can count shared pages repeatedly. PSS apportions
 them among processes. See the [Linux kernel's `/proc` documentation](https://docs.kernel.org/filesystems/proc.html).
 Process reads are sequential, so aggregates are non-atomic estimates. Short peaks
 can be missed and changing memory can skew totals in either direction. Sampling
@@ -68,6 +69,8 @@ simulating an eight-MiB program's analysis complexity.
 The Linux worker integration test also compares direct-call source PCs and
 destinations in the original C fixture against GNU objdump. This is a limited
 independent decoder comparison, not a Ghidra differential run.
+On x86-64 it also compares the original global read/write fixture's source PCs,
+access kinds and widths against GNU objdump's resolved RIP-relative operands.
 Ghidra differential runs require a separately available built runtime; these
 tests do not build or change the read-only source checkout.
 

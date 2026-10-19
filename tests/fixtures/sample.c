@@ -25,6 +25,12 @@ const volatile unsigned char aes_sbox_prefix[64] = {
 };
 
 volatile unsigned int fixture_sink;
+volatile unsigned int reference_word = 0x12345678;
+
+NOINLINE unsigned int read_write_word(unsigned int value) {
+    reference_word ^= value;
+    return reference_word;
+}
 
 NOINLINE unsigned int branch_loop(unsigned int count) {
     unsigned int total = 0;
@@ -52,6 +58,7 @@ int main(int argc, char **argv) {
     puts(base64_message);
     puts(decoded);
     fixture_sink = branch_loop((unsigned int)argc + 5);
+    fixture_sink ^= read_write_word((unsigned int)argc);
     for (size_t index = 0; index < sizeof(aes_sbox_prefix); ++index) {
         fixture_sink += aes_sbox_prefix[index];
     }

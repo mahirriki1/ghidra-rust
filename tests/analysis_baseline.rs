@@ -386,6 +386,13 @@ fn profile_contained_analysis_client() {
                 "memory_samples": sampler.samples, "max_processes": sampler.max_processes,
                 "known_functions": functions.len(), "functions_examined": analysis.functions_examined,
                 "decode_attempts": analysis.decode_attempts, "confirmed_calls": analysis.references.len(),
+                "data_accesses": analysis.data.as_ref().map(|data| data.references.len()),
+                "data_operations_charged": analysis.data.as_ref().map(|data| data.operations_charged),
+                "data_candidates": analysis.data.as_ref().map(|data| data.accesses_examined),
+                "data_unresolved": analysis.data.as_ref().map(|data| data.unresolved_accesses),
+                "data_omitted": analysis.data.as_ref().map(|data| data.omitted_accesses),
+                "data_unsupported_instructions": analysis.data.as_ref().map(|data| data.unsupported_instructions),
+                "data_partial": analysis.data.as_ref().map(|data| data.partial),
                 "analysis_partial": analysis.partial, "graph_blocks": view.blocks.len(),
                 "pseudocode_bytes": text.len(), "semantic_ranges": mappings.len(),
             }));

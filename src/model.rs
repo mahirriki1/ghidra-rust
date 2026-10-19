@@ -11,6 +11,40 @@ pub const MAX_STRING_MINIMUM: usize = 64;
 pub const MAX_ANALYSIS_FUNCTIONS: usize = 128;
 pub const MAX_ANALYSIS_INSTRUCTIONS: usize = 16_384;
 pub const MAX_CALL_REFERENCES: usize = 16_384;
+pub const MAX_DATA_REFERENCES: usize = 16_384;
+pub const MAX_DATA_OPERATIONS: usize = 131_072;
+pub const MAX_DATA_OPERATIONS_PER_INSTRUCTION: usize = 256;
+pub const MAX_DATA_OPERATION_INPUTS: usize = 16;
+pub const MAX_DATA_ACCESS_BYTES: u32 = 64;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DataAccess {
+    Read,
+    Write,
+}
+
+/// A direct memory access established by instruction-local engine p-code.
+/// This does not classify the target as a data object or runtime pointer.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct DataReference {
+    pub function: u64,
+    pub address: u64,
+    pub target: u64,
+    pub size: u32,
+    pub access: DataAccess,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DataAnalysis {
+    pub references: Vec<DataReference>,
+    pub operations_charged: usize,
+    pub accesses_examined: usize,
+    pub unresolved_accesses: usize,
+    pub omitted_accesses: usize,
+    pub unsupported_instructions: usize,
+    pub partial: bool,
+}
 
 /// An established direct call decoded from `address` while walking `caller`.
 /// This records machine-code evidence, not a recovered source-language call.
@@ -40,6 +74,10 @@ pub struct AnalysisProgress {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct CallAnalysis {
     pub references: Vec<CallReference>,
+    /// Optional for legacy protocol replies; absent evidence is not a fresh
+    /// empty computation. Neither reference class is stored in projects.
+    #[serde(default)]
+    pub data: Option<DataAnalysis>,
     pub functions_examined: usize,
     /// Charged decode attempts, including failures and instructions omitted by
     /// display limits. This is a work count, not the size of a displayed graph.

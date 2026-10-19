@@ -159,7 +159,11 @@ navigates to that function.
   decompilation, inspect outgoing direct calls, and navigate by address. After
   discovery, the **References** tab shows incoming and outgoing confirmed calls
   for the current function, with navigation to callers, callees, and call sites.
-  Its coverage is limited to the functions examined in that discovery run.
+  **Data accesses** shows instruction-local direct reads and writes, including
+  x86 memory operands and ARM64 literal loads. Open a source instruction or load
+  the accessed bytes into Decode; filter by an exact target address to find its
+  accesses. Computed register addresses are unresolved. Coverage is limited to
+  the functions examined in that discovery run.
 - Scan mapped bytes for ASCII and a printable ASCII subset of UTF-16LE strings.
   The tree shows **not scanned** until a scan runs. This is not complete Unicode
   or Rust string-slice recovery. **Analysis notes** shows loading and coverage limits.

@@ -36,6 +36,35 @@ Conventional UPX PE detection still prevents discovery and decompilation of the
 packed stub. Listing, CFG, strings, and byte inspection remain available. The
 desktop neither unpacks nor executes the input.
 
+## Direct data accesses
+
+The same discovery walk inspects already decoded instruction p-code for direct
+memory reads and writes. It records genuine memory-space input/output operands
+(including x86 absolute/RIP-relative accesses) and literal-address `LOAD`/`STORE`
+operations (including ARM64 literal loads). Read-modify-write operations retain
+both access kinds. Source function, instruction PC, target, width and access kind
+are retained; no additional instruction decode or image-byte copy is required.
+
+This pass does not propagate values through registers or temporaries, including
+between operations of one instruction. `LEA`, `ADR` and `ADRP` address formation
+alone creates no memory reference. An `ADRP; LDR` pair, pointer chasing, unknown
+register addresses and jump tables require later analysis. Internal p-code
+branches, processor-specific user operations and unsupported semantics omit the
+whole instruction with partial coverage. Control-flow operands are excluded.
+This is memory-access evidence, not data-object or pointer classification.
+
+Targets must fit the selected ABI and their entire 1–64-byte access must lie in
+one validated file-backed section. Executable literal pools are accepted; zero
+fill, unmapped addresses, cross-section ranges and overflowing arithmetic are
+omitted. Instruction and function sources must be known file-backed executable
+addresses with the architecture's alignment.
+
+The shared pass budget charges at most 131,072 p-code operations, with at most
+256 per instruction and 16 inputs per operation. At most 16,384 access candidates
+are inspected, including unresolved, omitted and duplicate candidates before
+deduplication. Budget or unsupported-instruction omissions mark coverage partial.
+These limits supplement the existing function, decode and worker resource limits.
+
 ## References and progress
 
 After discovery, the middle pane's **References** tab shows incoming and outgoing
@@ -45,6 +74,17 @@ still selects its exact address and shows an explicit notice; use **Go to** to
 inspect that address separately. Incoming references cover only the functions examined
 in the current discovery run; an empty list does not prove that no caller exists.
 
+The **Data accesses** selector shows accesses from the displayed function or
+accesses beginning at an exact hexadecimal target address. This exact-start
+filter does not search for accesses whose interior overlaps that address. Source
+buttons select the genuine instruction PC, including the explicit display-limit
+notice when necessary. Target buttons request only the accessed bytes in
+**Decode**; they do not create functions or invented semantic mappings. Byte
+inspection preserves code selection and function history; Decode displays its
+own source address. A delayed byte reply cannot replace a newer selection or
+force a switch from a newer tab.
+Rows are virtualized and the incoming/outgoing indexes are built once per result.
+
 The reference index is computed for the current session and is not serialized in
 `.grproj` files. Reopening a project requires another discovery run to rebuild it.
 The existing saved function inventory keeps its saved-result provenance; a
@@ -53,7 +93,14 @@ fingerprint, together with `arm64pe-v1`, invalidates older cached analysis while
 preserving compatible annotations. The project schema and JSON annotation format
 remain unchanged.
 
-The worker reports **Seeds**, **Calls**, and **Publish** stages with the number of
+Data references are also session-only and do not change persisted function,
+graph or decompiler results, so this increment keeps the existing fingerprint.
+Legacy replies without a data report are shown as not analyzed, not as a fresh
+empty result. Work counters, sorted/unique evidence, source ownership and complete
+mapped target extents are validated before adoption.
+
+The worker reports **Seeds**, **Calls** (shown as **Analyzing references**), and
+**Publish** stages with the number of
 functions examined and decode attempts charged. The total remains indeterminate:
 following a confirmed call can reveal more work. These counts are work measures,
 not completion percentages. Cancellation still terminates the disposable worker,
@@ -108,11 +155,19 @@ The Rust adaptation uses the desktop's existing instruction recovery, bounded
 queues, explicit result provenance, and public engine APIs. Attribution is
 retained in [NOTICE](../NOTICE).
 
+The direct-memory `COPY`/`LOAD`/`STORE` reference rules adapt a bounded subset of
+[Ghidra SymbolicPropogator.java](https://github.com/NationalSecurityAgency/ghidra/blob/9a723ce99952771b8368329503aa589ae233e916/Ghidra/Features/Base/src/main/java/ghidra/program/util/SymbolicPropogator.java)
+at the same revision and license. The original Java pass propagates symbolic
+state and uses the Program database; this adaptation does neither. Other direct
+memory operands use the public engine's p-code semantics. Original x86 and ARM64
+instruction fixtures test positive evidence and deliberate non-recovery, and real
+contained workers cover ARM64 literal accesses in ELF, PE and Mach-O.
+
 The pinned `ghidra-decompiler` revision remains
 `268c3a406d8d964bc00ae2ead4d3e1e1373aaa27`; its recorded Ghidra base is
 `d6192cb3f9`. Ghidra's Java `AutoAnalysisManager` and `Analyzer` framework depend
-on its Program database and event system. This increment adapts one useful
-algorithm into the native worker; it does not port that framework or add a Java
+on its Program database and event system. These increments adapt selected
+algorithms into the native worker; they do not port that framework or add a Java
 or Python runtime dependency.
 
 The ARM64 PE metadata reader is an independent implementation of
