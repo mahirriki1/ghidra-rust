@@ -8,8 +8,8 @@ use ghidra_decompiler::program::Program;
 use ghidra_decompiler::types::TypeMetatype;
 use ghidra_decompiler::varnode::Varnode;
 
-use crate::model::SectionInfo;
-use crate::pe::{MAX_FUNCTIONS, MAX_IMPORTS, MAX_NAME_BYTES, PeMetadata};
+use crate::model::{MAX_FUNCTIONS, SectionInfo};
+use crate::pe::{MAX_IMPORTS, MAX_NAME_BYTES, PeMetadata};
 
 pub(crate) const MAX_THUNK_TARGETS: usize = 2048;
 

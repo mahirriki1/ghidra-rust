@@ -29,8 +29,18 @@ work omitted by display limits, so it cannot be exceeded by a final function wal
 ARM64 import-veneer confirmation during discovery charges three attempts per
 eligible candidate against this same shared budget, before calling the engine.
 The call-reference collection is also capped at 16,384 entries. Coverage is marked
-partial when work limits or recovery failures prevent a complete walk. The known
-function list retains its existing 10,000-entry cap.
+partial when work limits or recovery failures prevent a complete walk.
+
+The known-function inventory is a separate, larger budget: at most 262,144
+entries, 256 bytes per name, and 8 MiB of JSON-escaped names in total, so the
+largest inventory plus both reference classes fits the 32 MiB worker reply.
+Each retained function costs roughly 1.2 KiB across the worker and desktop
+processes; see [analysis measurements](analysis-performance.md#large-function-inventories).
+Entries beyond either budget are omitted and the list is marked partial. Open
+admits the entry point first and then engine symbols in address order (PE images
+prioritize exports and runtime starts nearest the entry before that). Discovery
+replies also reserve the callers that own published evidence. Raising the
+inventory does not widen the 128-function discovery walk.
 
 Conventional UPX PE detection still prevents discovery and decompilation of the
 packed stub. Listing, CFG, strings, and byte inspection remain available. The
@@ -125,7 +135,7 @@ Directory storage is capped at 8 MiB and 500,000 records. An additional shared
 8 MiB inspection budget covers all full unwind records, including repeated
 references and failed reads. Code lengths, alignment, version, storage extents,
 epilog indices and opcode boundaries are validated. Unordered tables and groups
-of overlapping regions are omitted. The existing 10,000-function inventory cap
+of overlapping regions are omitted. The shared 262,144-function inventory cap
 and entry/export/nearest-runtime-start priority remain in effect.
 
 At established entries or confirmed direct-call targets, a bounded recognizer

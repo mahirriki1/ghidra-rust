@@ -7,7 +7,7 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 
-const MAX_RESPONSE: usize = 16 * 1024 * 1024;
+const MAX_RESPONSE: usize = 40 * 1024 * 1024;
 
 pub enum WorkerEvent {
     Reply(Box<WorkerResponse>),
@@ -305,7 +305,7 @@ fn bounded_line(reader: &mut impl BufRead, limit: usize) -> Result<Option<Vec<u8
         let end = buffer.iter().position(|&byte| byte == b'\n');
         let count = end.map_or(buffer.len(), |end| end + 1);
         if count > limit.saturating_sub(line.len()) {
-            return Err("Worker response exceeded the 16 MiB limit".into());
+            return Err("Worker response exceeded the 40 MiB limit".into());
         }
         line.extend_from_slice(&buffer[..count]);
         reader.consume(count);

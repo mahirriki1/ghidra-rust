@@ -750,6 +750,13 @@ impl DesktopApp {
                 let Some(opening) = self.opening.take() else {
                     return;
                 };
+                if let Err(error) =
+                    validate_functions(&info.functions, MAX_FUNCTION_NAME_BYTES, true)
+                {
+                    self.stop_worker();
+                    self.status = format!("Invalid worker function inventory: {error}");
+                    return;
+                }
                 let protection = match self
                     .client
                     .as_ref()
@@ -1006,11 +1013,11 @@ impl DesktopApp {
             ) if address == expected => {
                 self.applied_names.insert(address, name.clone());
                 if let Some(info) = &mut self.info
-                    && let Some(function) = info
+                    && let Ok(index) = info
                         .functions
-                        .iter_mut()
-                        .find(|function| function.address == address)
+                        .binary_search_by_key(&address, |function| function.address)
                 {
+                    let function = &mut info.functions[index];
                     function.name = name;
                 }
                 self.rebuild_filter();
@@ -1093,6 +1100,9 @@ impl DesktopApp {
 
     fn rebuild_filter(&mut self) {
         let filter = self.function_filter.to_lowercase();
+        // Inventories can hold 262,144 entries; format addresses only for
+        // queries that could match one.
+        let hex = filter.bytes().all(|byte| byte.is_ascii_hexdigit());
         self.filtered_functions = self
             .info
             .as_ref()
@@ -1110,7 +1120,7 @@ impl DesktopApp {
                             .unwrap_or(&function.name);
                         filter.is_empty()
                             || label.to_lowercase().contains(&filter)
-                            || format!("{:x}", function.address).contains(&filter)
+                            || (hex && format!("{:x}", function.address).contains(&filter))
                     })
                     .map(|(index, _)| index)
                     .collect()
@@ -1662,10 +1672,7 @@ impl DesktopApp {
         else {
             return;
         };
-        let function = info
-            .functions
-            .iter()
-            .find(|function| function.address == address);
+        let function = function_at(&info.functions, address);
         let text = session
             .annotations
             .get(&address)
@@ -2177,8 +2184,7 @@ impl DesktopApp {
                                             .selectable_label(false, crop(&annotation.label, 100))
                                             .clicked()
                                         {
-                                            if info.functions.iter().any(|f| f.address == *address)
-                                            {
+                                            if function_at(&info.functions, *address).is_some() {
                                                 function = Some(*address);
                                             } else {
                                                 read = Some((*address, 128));
@@ -2361,16 +2367,11 @@ impl DesktopApp {
     fn decompiler_call_target(&self, name: &str) -> Option<u64> {
         let view = self.view.as_ref()?;
         let info = self.info.as_ref()?;
-        let mut targets = info
-            .functions
+        let mut targets = view
+            .calls
             .iter()
-            .filter(|function| {
-                function.name == name
-                    && view
-                        .calls
-                        .iter()
-                        .any(|call| call.target == Some(function.address))
-            })
+            .filter_map(|call| function_at(&info.functions, call.target?))
+            .filter(|function| function.name == name)
             .map(|function| function.address);
         let first = targets.next()?;
         // A text-only decompiler response cannot disambiguate same-name callees.
@@ -2409,7 +2410,7 @@ impl DesktopApp {
             let function = self
                 .info
                 .as_ref()
-                .and_then(|info| info.functions.iter().find(|f| f.address == view.address));
+                .and_then(|info| function_at(&info.functions, view.address));
             let name = function.map(|f| f.name.as_str()).unwrap_or("function");
             let response = ui.label(
                 RichText::new(format!("{}  ·  {:x}", crop(name, 100), view.address))
@@ -2533,13 +2534,7 @@ impl DesktopApp {
             self.name_edit = self
                 .view
                 .as_ref()
-                .and_then(|view| {
-                    self.info
-                        .as_ref()?
-                        .functions
-                        .iter()
-                        .find(|function| function.address == view.address)
-                })
+                .and_then(|view| function_at(&self.info.as_ref()?.functions, view.address))
                 .map(|function| function.name.clone())
                 .unwrap_or_default();
         }
@@ -2965,7 +2960,7 @@ impl DesktopApp {
                     let name = self
                         .info
                         .as_ref()
-                        .and_then(|info| info.functions.iter().find(|f| f.address == view.address))
+                        .and_then(|info| function_at(&info.functions, view.address))
                         .map(|f| f.name.as_str())
                         .unwrap_or("function");
                     ui.label(

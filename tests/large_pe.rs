@@ -3,7 +3,7 @@
 #![cfg(any(windows, target_os = "linux"))]
 
 use ghidra_rust::client::{WorkerClient, WorkerEvent};
-use ghidra_rust::model::{Request, Response};
+use ghidra_rust::model::{MAX_FUNCTIONS, Request, Response};
 use ghidra_rust::project::ProjectData;
 use ghidra_rust::session::Session;
 use std::path::{Path, PathBuf};
@@ -53,7 +53,7 @@ fn large_pe_metadata_analysis_and_project_round_trip() {
     };
     assert_eq!(info.format, "PE");
     assert_eq!(info.sha256, hash);
-    assert!(info.functions.len() > 1 && info.functions.len() <= 10_000);
+    assert!(info.functions.len() > 1 && info.functions.len() <= MAX_FUNCTIONS);
     eprintln!(
         "Opened large PE in {:?}: {} functions, partial={}",
         started.elapsed(),

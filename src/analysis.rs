@@ -18,7 +18,7 @@ const MAX_INSTRUCTIONS: usize = 2048;
 const MAX_BLOCKS: usize = 128;
 const MAX_BYTES: usize = 64 * 1024;
 const MAX_SCAN_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_RESULTS: usize = 10_000;
+const MAX_CRYPTO_RESULTS: usize = 10_000;
 const SCAN_CHUNK: usize = 256 * 1024;
 const MAX_STRING_PREVIEW: usize = 512;
 const MAX_IMAGE_BYTES: u64 = 128 * 1024 * 1024;
@@ -190,7 +190,7 @@ fn metadata_with_target(
         path: path.to_string_lossy().into_owned(), architecture: target.name.into(), format: format.into(),
         sha256: format!("{:x}", Sha256::digest(bytes)), source_identity: None,
         entry, file_len: bytes.len() as u64, sections, functions: Vec::new(), functions_truncated: false,
-        warnings: vec!["Prototype analysis: symbols and supported PE function metadata load immediately; deeper function discovery is explicit. Optimized C++/Rust types and source reconstruction are incomplete.".into(), "Function lists are capped at 10,000 entries and names at 256 bytes in this prototype.".into()],
+        warnings: vec!["Prototype analysis: symbols and supported PE function metadata load immediately; deeper function discovery is explicit. Optimized C++/Rust types and source reconstruction are incomplete.".into(), format!("Function lists are capped at {MAX_FUNCTIONS} entries, {} MiB of names, and {MAX_FUNCTION_NAME_BYTES} bytes per name in this prototype.", MAX_FUNCTION_NAME_JSON_BYTES >> 20)],
     };
     if crate::packing::detect_upx_pe(&info.format, info.entry, &info.sections, bytes) {
         warning(&mut info.warnings, crate::packing::UPX_PACKED_WARNING);
@@ -262,7 +262,7 @@ impl LoadedProgram {
             pe_ranges = pe.function_ranges;
             pe_imports = pe.imports;
         }
-        info.functions = function_list(&program, &mut info)?;
+        info.functions = function_list(&program, &mut info, &BTreeSet::new())?;
         if !upx_packed && target.name == "AArch64" && !pe_imports.is_empty() {
             let targets = info
                 .functions
@@ -283,7 +283,7 @@ impl LoadedProgram {
                     "ARM64 PE import-veneer naming on open is limited to the first 2,048 established function entries; discovery and selected-function analysis can name additional confirmed targets.",
                 );
             }
-            info.functions = function_list(&program, &mut info)?;
+            info.functions = function_list(&program, &mut info, &BTreeSet::new())?;
         }
         if !info.entry.is_multiple_of(target.instruction_alignment)
             || !executable(
@@ -352,9 +352,23 @@ impl LoadedProgram {
                 self.check_unpacked()?;
                 // Selected-function analysis can materialize and name a callee
                 // since the last published inventory. Preserve those names.
-                self.info.functions = function_list(&self.program, &mut self.info)?;
+                self.info.functions =
+                    function_list(&self.program, &mut self.info, &BTreeSet::new())?;
                 let analysis = self.discover_calls(progress)?;
-                self.info.functions = function_list(&self.program, &mut self.info)?;
+                // Evidence owners must survive inventory admission so every
+                // published reference has its caller in the same reply.
+                let owners = analysis
+                    .references
+                    .iter()
+                    .map(|reference| reference.caller)
+                    .chain(
+                        analysis
+                            .data
+                            .iter()
+                            .flat_map(|data| data.references.iter().map(|r| r.function)),
+                    )
+                    .collect();
+                self.info.functions = function_list(&self.program, &mut self.info, &owners)?;
                 Ok(Response::Functions {
                     functions: self.info.functions.clone(),
                     truncated: self.info.functions_truncated || analysis.partial,
@@ -374,7 +388,8 @@ impl LoadedProgram {
                     .set_function_name(address, &name)
                     .map_err(engine_error)?;
                 self.synchronize_function_name(address, &name)?;
-                self.info.functions = function_list(&self.program, &mut self.info)?;
+                self.info.functions =
+                    function_list(&self.program, &mut self.info, &BTreeSet::new())?;
                 Ok(Response::Renamed { address, name })
             }
             Request::Bytes { address, length } => {
@@ -439,6 +454,11 @@ impl LoadedProgram {
             .map(|f| (f.address, f.name.clone()))
             .collect();
         report.partial |= known.len() > MAX_ANALYSIS_FUNCTIONS;
+        let mut name_bytes = known
+            .values()
+            .map(|name| json_escaped_len(name))
+            .fold(0usize, usize::saturating_add)
+            .min(MAX_FUNCTION_NAME_JSON_BYTES);
         let mut pending = VecDeque::new();
         let mut scheduled = BTreeSet::new();
         if self.check_code(self.info.entry).is_ok() {
@@ -460,20 +480,13 @@ impl LoadedProgram {
                 break;
             }
             report.functions_examined += 1;
-            let functions: Vec<_> = known
-                .iter()
-                .map(|(&address, name)| FunctionInfo {
-                    address,
-                    name: name.clone(),
-                })
-                .collect();
             let available =
                 (MAX_ANALYSIS_INSTRUCTIONS - report.decode_attempts).min(MAX_INSTRUCTIONS);
             let mut remaining = available;
             let recovered = recover_graph_budgeted(
                 &self.program,
                 &self.info.sections,
-                &functions,
+                &|candidate| known.contains_key(&candidate),
                 address,
                 &self.pe_ranges,
                 &mut remaining,
@@ -485,11 +498,15 @@ impl LoadedProgram {
                     report.partial |= recovered.partial;
                     // Failed decoding must not materialize a new engine function.
                     if !known.contains_key(&address) {
-                        if known.len() < MAX_RESULTS {
-                            let name = format!("FUN_{address:08x}");
+                        let name = format!("FUN_{address:08x}");
+                        let bytes = json_escaped_len(&name);
+                        if known.len() < MAX_FUNCTIONS
+                            && bytes <= MAX_FUNCTION_NAME_JSON_BYTES - name_bytes
+                        {
                             self.program
                                 .set_function_name(address, &name)
                                 .map_err(engine_error)?;
+                            name_bytes += bytes;
                             known.insert(address, name);
                         } else {
                             report.partial = true;
@@ -529,7 +546,7 @@ impl LoadedProgram {
                             continue;
                         }
                         references.insert(reference);
-                        if scheduled.len() < MAX_RESULTS && scheduled.insert(target) {
+                        if scheduled.len() < MAX_FUNCTIONS && scheduled.insert(target) {
                             pending.push_back(target);
                         } else if !scheduled.contains(&target) {
                             report.partial = true;
@@ -728,7 +745,7 @@ impl LoadedProgram {
                     .snapshot
                     .get(file_start..file_end)
                     .ok_or("Section extends past immutable image snapshot")?;
-                let chunk_limit = MAX_RESULTS.min(crate::crypto::MAX_MATCHES);
+                let chunk_limit = MAX_CRYPTO_RESULTS.min(crate::crypto::MAX_MATCHES);
                 let found = crate::crypto::scan_region(chunk, base, chunk_limit);
                 let chunk_limited = found.len() >= chunk_limit;
                 // Matches fully contained in the preceding overlap were already reported.
@@ -739,8 +756,8 @@ impl LoadedProgram {
                         matches.push(hit);
                     }
                 }
-                if matches.len() >= MAX_RESULTS || chunk_limited {
-                    matches.truncate(MAX_RESULTS);
+                if matches.len() >= MAX_CRYPTO_RESULTS || chunk_limited {
+                    matches.truncate(MAX_CRYPTO_RESULTS);
                     return Ok(Response::Crypto {
                         matches,
                         truncated: true,
@@ -755,43 +772,71 @@ impl LoadedProgram {
     }
 }
 
-fn function_list(program: &Program, info: &mut BinaryInfo) -> Result<Vec<FunctionInfo>, String> {
+/// Publishes the engine inventory within the shared count and escaped-name
+/// budgets. The entry and `required` addresses (owners of evidence in the same
+/// reply) are admitted first; remaining entries follow engine address order.
+fn function_list(
+    program: &Program,
+    info: &mut BinaryInfo,
+    required: &BTreeSet<u64>,
+) -> Result<Vec<FunctionInfo>, String> {
     let alignment = crate::architecture::instruction_alignment(program.language_id());
     let code_entry = |address: u64| {
         address.is_multiple_of(alignment) && executable(&info.sections, address, alignment as usize)
     };
-    let mut entries = program
+    let entries: Vec<_> = program
         .functions()
         .map_err(engine_error)?
         .into_iter()
-        .filter(|f| code_entry(f.address));
-    let mut functions: Vec<_> = entries
-        .by_ref()
-        .take(MAX_RESULTS)
+        .filter(|f| code_entry(f.address))
         .map(|f| FunctionInfo {
             address: f.address,
             name: bounded_name(&f.name),
         })
         .collect();
-    let truncated = entries.next().is_some();
-    if code_entry(info.entry) && !functions.iter().any(|f| f.address == info.entry) {
-        if functions.len() == MAX_RESULTS {
-            functions.pop();
-            info.functions_truncated = true;
+    let mut admitted = BTreeMap::new();
+    let mut name_bytes = 0usize;
+    let mut truncated = false;
+    let mut admit = |function: FunctionInfo, admitted: &mut BTreeMap<u64, String>| {
+        if admitted.contains_key(&function.address) {
+            return;
         }
-        functions.push(FunctionInfo {
-            address: info.entry,
-            name: "entry".into(),
-        });
+        let bytes = json_escaped_len(&function.name);
+        if admitted.len() < MAX_FUNCTIONS && bytes <= MAX_FUNCTION_NAME_JSON_BYTES - name_bytes {
+            name_bytes += bytes;
+            admitted.insert(function.address, function.name);
+        } else {
+            truncated = true;
+        }
+    };
+    if code_entry(info.entry) {
+        let name = entries
+            .iter()
+            .find(|f| f.address == info.entry)
+            .map_or_else(|| "entry".into(), |f| f.name.clone());
+        admit(
+            FunctionInfo {
+                address: info.entry,
+                name,
+            },
+            &mut admitted,
+        );
     }
-    functions.sort_by_key(|f| f.address);
-    functions.dedup_by_key(|f| f.address);
+    let (first, rest): (Vec<_>, Vec<_>) = entries
+        .into_iter()
+        .partition(|f| required.contains(&f.address));
+    for function in first.into_iter().chain(rest) {
+        admit(function, &mut admitted);
+    }
     info.functions_truncated |= truncated;
-    Ok(functions)
+    Ok(admitted
+        .into_iter()
+        .map(|(address, name)| FunctionInfo { address, name })
+        .collect())
 }
 
 fn bounded_name(name: &str) -> String {
-    let mut end = name.len().min(256);
+    let mut end = name.len().min(MAX_FUNCTION_NAME_BYTES);
     while !name.is_char_boundary(end) {
         end -= 1;
     }
@@ -1011,6 +1056,7 @@ fn recover_graph_with_ranges(
     recover_graph_counted(program, sections, functions, entry, pe_ranges).map(|(view, _)| view)
 }
 
+/// `functions` must be ordered by address, as every published inventory is.
 fn recover_graph_counted(
     program: &Program,
     sections: &[SectionInfo],
@@ -1018,11 +1064,14 @@ fn recover_graph_counted(
     entry: u64,
     pe_ranges: &[(u64, u64)],
 ) -> Result<(FunctionView, usize), String> {
+    if !functions.is_sorted_by_key(|function| function.address) {
+        return Err("Function inventory is not ordered by address".into());
+    }
     let mut remaining = MAX_INSTRUCTIONS;
     let recovered = recover_graph_budgeted(
         program,
         sections,
-        functions,
+        &|address| function_at(functions, address).is_some(),
         entry,
         pe_ranges,
         &mut remaining,
@@ -1040,7 +1089,7 @@ struct GraphRecovery {
 fn recover_graph_budgeted(
     program: &Program,
     sections: &[SectionInfo],
-    functions: &[FunctionInfo],
+    is_function: &dyn Fn(u64) -> bool,
     entry: u64,
     pe_ranges: &[(u64, u64)],
     remaining: &mut usize,
@@ -1057,11 +1106,6 @@ fn recover_graph_budgeted(
             "{entry:#x} is outside file-backed executable sections."
         ));
     }
-    let other_entries: BTreeSet<_> = functions
-        .iter()
-        .map(|f| f.address)
-        .filter(|a| *a != entry)
-        .collect();
     let mut pending = VecDeque::from([entry]);
     let mut visited = BTreeSet::new();
     let mut nodes = BTreeMap::<u64, Decoded>::new();
@@ -1088,7 +1132,7 @@ fn recover_graph_budgeted(
             );
             continue;
         }
-        if other_entries.contains(&address)
+        if (address != entry && is_function(address))
             || (address != entry
                 && pe_ranges
                     .binary_search_by_key(&address, |range| range.0)
@@ -1416,6 +1460,55 @@ pub(crate) mod tests {
         loaded
     }
 
+    fn bulk_functions(loaded: &mut LoadedProgram, names: impl Iterator<Item = (u64, String)>) {
+        let metadata = crate::pe::PeMetadata {
+            functions: names.collect(),
+            ..Default::default()
+        };
+        crate::pe_symbols::register(&mut loaded.program, &metadata, 8).unwrap();
+    }
+
+    #[test]
+    fn full_inventory_reserves_entry_and_evidence_owners() {
+        let mut loaded = raw_x86(vec![0xc3; MAX_FUNCTIONS + 8]);
+        bulk_functions(
+            &mut loaded,
+            (0..MAX_FUNCTIONS as u64).map(|i| (0x1008 + i, format!("FUN_{:x}", 0x1008 + i))),
+        );
+        loaded.program.set_function_name(0x1001, "owner").unwrap();
+        let owners = BTreeSet::from([0x1001]);
+        let functions = function_list(&loaded.program, &mut loaded.info, &owners).unwrap();
+        assert_eq!(functions.len(), MAX_FUNCTIONS);
+        assert_eq!(functions[0].address, 0x1000);
+        assert_eq!(functions[0].name, "entry");
+        assert_eq!(functions[1].name, "owner");
+        assert!(loaded.info.functions_truncated);
+        // Address order admits the lowest remaining entries; two are omitted.
+        assert_eq!(
+            functions.last().unwrap().address,
+            0x1008 + MAX_FUNCTIONS as u64 - 3
+        );
+        validate_functions(&functions, MAX_FUNCTION_NAME_BYTES, true).unwrap();
+    }
+
+    #[test]
+    fn inventory_names_respect_the_escaped_byte_budget() {
+        let count = MAX_FUNCTION_NAME_JSON_BYTES / 250 + 16;
+        let mut loaded = raw_x86(vec![0xc3; count + 8]);
+        // Quotes double when escaped: 125 of them cost 250 bytes.
+        bulk_functions(
+            &mut loaded,
+            (0..count as u64).map(|i| (0x1008 + i, format!("{}{i:x}", "\"".repeat(125)))),
+        );
+        let functions = function_list(&loaded.program, &mut loaded.info, &BTreeSet::new()).unwrap();
+        assert!(loaded.info.functions_truncated);
+        assert!(functions.len() < count);
+        let escaped: usize = functions.iter().map(|f| json_escaped_len(&f.name)).sum();
+        assert!(escaped <= MAX_FUNCTION_NAME_JSON_BYTES);
+        assert!(escaped > MAX_FUNCTION_NAME_JSON_BYTES - 512);
+        validate_functions(&functions, MAX_FUNCTION_NAME_BYTES, true).unwrap();
+    }
+
     fn discover(loaded: &mut LoadedProgram) -> (Vec<FunctionInfo>, CallAnalysis) {
         let Response::Functions {
             functions,
@@ -1445,7 +1538,8 @@ pub(crate) mod tests {
             .program
             .set_function_name(0x1000, "root_name")
             .unwrap();
-        loaded.info.functions = function_list(&loaded.program, &mut loaded.info).unwrap();
+        loaded.info.functions =
+            function_list(&loaded.program, &mut loaded.info, &BTreeSet::new()).unwrap();
         let (functions, report) = discover(&mut loaded);
         assert_eq!(functions.len(), 2);
         assert_eq!(functions[0].name, "root_name");
@@ -1537,7 +1631,8 @@ pub(crate) mod tests {
                 )
                 .unwrap();
         }
-        loaded.info.functions = function_list(&loaded.program, &mut loaded.info).unwrap();
+        loaded.info.functions =
+            function_list(&loaded.program, &mut loaded.info, &BTreeSet::new()).unwrap();
         let mut events: Vec<AnalysisProgress> = Vec::new();
         let Response::Functions { analysis, .. } = loaded
             .handle_with_progress(Request::Discover, &mut |event| {
@@ -1654,7 +1749,8 @@ pub(crate) mod tests {
                 .set_function_name(0x1000 + index * 4, &format!("original_{index}"))
                 .unwrap();
         }
-        loaded.info.functions = function_list(&loaded.program, &mut loaded.info).unwrap();
+        loaded.info.functions =
+            function_list(&loaded.program, &mut loaded.info, &BTreeSet::new()).unwrap();
         let Response::Functions {
             functions,
             truncated,
@@ -1832,7 +1928,7 @@ pub(crate) mod tests {
             functions_truncated: false,
             warnings: vec![],
         };
-        info.functions = function_list(&program, &mut info).unwrap();
+        info.functions = function_list(&program, &mut info, &BTreeSet::new()).unwrap();
         let mut loaded = LoadedProgram {
             target: crate::architecture::Target::for_image(
                 &object::File::parse(elf_fixture().as_slice()).unwrap(),

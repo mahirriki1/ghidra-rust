@@ -6,6 +6,15 @@ pub const MAX_CODE_MAPPINGS: usize = 32_768;
 pub const MAX_MAPPING_ADDRESSES: usize = 64;
 pub const MAX_CODE_ADDRESS_REFS: usize = 131_072;
 pub const MAX_STRING_RESULTS: usize = 10_000;
+/// Function inventory ceiling shared by loaders, worker replies, projects, and
+/// reference validation. Large x64 PEs near the 128 MiB input limit can carry
+/// over 260,000 runtime functions. Discovery has its own smaller work budgets.
+pub const MAX_FUNCTIONS: usize = 262_144;
+pub const MAX_FUNCTION_NAME_BYTES: usize = 256;
+/// Total JSON-escaped bytes of all inventory names, excluding quotation marks.
+/// With 43 bytes per entry for structure and 20-digit addresses, a full
+/// inventory serializes to at most 43 * 262_144 + 8 MiB + 1 bytes (19.7 MB).
+pub const MAX_FUNCTION_NAME_JSON_BYTES: usize = 8 * 1024 * 1024;
 pub const MIN_STRING_LENGTH: usize = 4;
 pub const MAX_STRING_MINIMUM: usize = 64;
 pub const MAX_ANALYSIS_FUNCTIONS: usize = 128;
@@ -100,6 +109,54 @@ pub struct CodeMapping {
 pub struct FunctionInfo {
     pub address: u64,
     pub name: String,
+}
+
+/// Bytes `serde_json` emits for `text` inside a string literal, excluding quotes.
+pub fn json_escaped_len(text: &str) -> usize {
+    text.chars()
+        .map(|c| match c {
+            '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+            c if (c as u32) < 0x20 => 6,
+            c => c.len_utf8(),
+        })
+        .sum()
+}
+
+/// Exact lookup in an inventory validated by [`validate_functions`].
+pub fn function_at(functions: &[FunctionInfo], address: u64) -> Option<&FunctionInfo> {
+    functions
+        .binary_search_by_key(&address, |function| function.address)
+        .ok()
+        .map(|index| &functions[index])
+}
+
+/// Count, ordering, and name bounds that make [`function_at`] valid. Worker
+/// inventories also respect the aggregate escaped-name budget; legacy projects
+/// pass `max_name_bytes` matching their original, larger per-name bound.
+pub fn validate_functions(
+    functions: &[FunctionInfo],
+    max_name_bytes: usize,
+    name_budget: bool,
+) -> Result<(), String> {
+    if functions.len() > MAX_FUNCTIONS {
+        return Err(format!(
+            "Function inventory exceeds the {MAX_FUNCTIONS}-entry limit"
+        ));
+    }
+    let mut escaped = 0usize;
+    for (index, function) in functions.iter().enumerate() {
+        if index > 0 && functions[index - 1].address >= function.address {
+            return Err("Function inventory is not strictly ordered by address".into());
+        }
+        if function.name.len() > max_name_bytes {
+            return Err("Function name exceeds its length limit".into());
+        }
+        escaped = escaped.saturating_add(json_escaped_len(&function.name));
+    }
+    if name_budget && escaped > MAX_FUNCTION_NAME_JSON_BYTES {
+        return Err("Function names exceed the inventory byte budget".into());
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -295,4 +352,51 @@ pub struct WorkerRequest {
 pub struct WorkerResponse {
     pub id: u64,
     pub response: Response,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn escaped_length_matches_serde_json() {
+        for text in [
+            "",
+            "plain",
+            "q\"b\\",
+            "\n\r\t\u{8}\u{c}",
+            "\u{0}\u{1f}\u{7f}",
+            "é漢🦀",
+        ] {
+            assert_eq!(
+                json_escaped_len(text) + 2,
+                serde_json::to_string(text).unwrap().len(),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn inventory_validation_requires_order_count_and_budget() {
+        let function = |address, name: &str| FunctionInfo {
+            address,
+            name: name.into(),
+        };
+        let ordered = vec![function(1, "a"), function(2, "b")];
+        validate_functions(&ordered, 1, true).unwrap();
+        assert_eq!(function_at(&ordered, 2).unwrap().name, "b");
+        assert!(function_at(&ordered, 3).is_none());
+        assert!(validate_functions(&[function(2, "b"), function(1, "a")], 1, true).is_err());
+        assert!(validate_functions(&[function(1, "a"), function(1, "b")], 1, true).is_err());
+        assert!(validate_functions(&[function(1, "ab")], 1, true).is_err());
+        let long = "\u{1}".repeat(MAX_FUNCTION_NAME_BYTES);
+        let count = MAX_FUNCTION_NAME_JSON_BYTES / json_escaped_len(&long) + 1;
+        let heavy: Vec<_> = (0..count as u64).map(|a| function(a, &long)).collect();
+        assert!(validate_functions(&heavy, MAX_FUNCTION_NAME_BYTES, true).is_err());
+        validate_functions(&heavy, MAX_FUNCTION_NAME_BYTES, false).unwrap();
+        let many: Vec<_> = (0..=MAX_FUNCTIONS as u64)
+            .map(|a| function(a, ""))
+            .collect();
+        assert!(validate_functions(&many, 1, false).is_err());
+    }
 }
