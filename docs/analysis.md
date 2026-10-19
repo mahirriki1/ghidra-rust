@@ -132,3 +132,5 @@ No speed or memory improvement over Ghidra is claimed. Comparisons must measure
 end-to-end time and total memory, including workers and duplicated image bytes,
 using the same executable hash and comparable analysis scope. Native platform
 validation must be reported separately from the architecture of the input image.
+See [analysis measurements](analysis-performance.md) for the opt-in Linux
+client/worker baseline and its explicit scope limits.

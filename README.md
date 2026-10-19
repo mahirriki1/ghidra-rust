@@ -260,6 +260,8 @@ and 128 blocks per graph, 64 KiB byte selections, bounded function/result lists,
 sidecars, and 192 MiB projects. The
 snapshot currently duplicates image bytes retained by the engine; total memory
 must be measured before making efficiency claims.
+An opt-in [analysis measurement harness](docs/analysis-performance.md) records
+client/worker timings and process-tree memory; its scope excludes the native GUI.
 Discovery examines at most 128 function entries and charges at most 16,384 decode
 attempts across the whole run, with a 2,048-attempt limit per function. Failed
 decodes and work omitted by display limits count against these budgets.
@@ -289,7 +291,8 @@ cargo clippy --all-targets --locked -- -D warnings
 cargo build --release --locked
 ```
 
-Linux process integration tests compile the small original C fixture using GCC.
+Linux process integration tests compile the small original C fixture using GCC
+and compare confirmed direct calls with GNU objdump from binutils.
 Unit tests cover architecture/ABI selection, real x86 CFG behavior,
 malformed/bounded requests, immutable image reads, decoding, signature detection,
 session identity/write protection, and GUI components rendered without a display.
