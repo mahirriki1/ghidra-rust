@@ -143,9 +143,10 @@ navigates to that function.
   See [architecture coverage and limits](docs/architectures.md).
 - Browse/filter known functions; start at `main` when found, otherwise the entry
   point. PE exports and supported x64/ARM64 exception-table function entries load
-  on open, including stripped images. The list is capped at 10,000 entries; large PEs prioritize the
-  entry point, exports, and runtime functions near entry, with a visible partial-list
-  notice. **Discover functions** follows confirmed decoded direct calls from known
+  on open, including stripped images. The list is capped at 262,144 entries and
+  8 MiB of names; large PEs prioritize the entry point, exports, and runtime
+  functions near entry, with a visible partial-list notice. Projects containing
+  more than 10,000 functions cannot be opened by releases before this limit. **Discover functions** follows confirmed decoded direct calls from known
   entries on every supported architecture, within shared work budgets. Complete
   function recovery is not guaranteed; see [analysis coverage](docs/analysis.md).
 - Navigate a function's instruction CFG with pan, zoom, branch labels, and
@@ -258,10 +259,10 @@ per-request CPU watchdog. Windows jobs do not isolate filesystem/network access.
 Other non-Linux process sandboxing has not been implemented.
 
 Prototype resource limits include 128 MiB input files, 2,048 recovered instructions
-and 128 blocks per graph, 64 KiB byte selections, bounded function/result lists,
+and 128 blocks per graph, 64 KiB byte selections, a 262,144-entry function inventory, bounded result lists,
 64 MiB scanned data, 2 MiB decompiler text, 32,768 semantic ranges with at most
 64 instruction addresses each and 131,072 total address references, 8 MiB annotation
-sidecars, and 192 MiB projects. The
+sidecars, and 224 MiB projects. The
 snapshot currently duplicates image bytes retained by the engine; total memory
 must be measured before making efficiency claims.
 An opt-in [analysis measurement harness](docs/analysis-performance.md) records

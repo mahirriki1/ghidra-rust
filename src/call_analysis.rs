@@ -33,10 +33,11 @@ impl CallAnalysis {
                 > MAX_CALL_REFERENCES
             || self.references.len() + self.unresolved_calls + self.skipped_fallthrough_calls
                 > self.decode_attempts
-            || functions.len() > crate::pe::MAX_FUNCTIONS
+            || functions.len() > MAX_FUNCTIONS
         {
             return Err("Call analysis exceeds its work or result bounds".into());
         }
+        validate_functions(functions, MAX_FUNCTION_NAME_BYTES, true)?;
         let alignment = if info.architecture == "AArch64" { 4 } else { 1 };
         let valid = |address: u64| {
             let section = info

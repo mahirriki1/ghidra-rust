@@ -1,11 +1,10 @@
 //! Bounded, file-backed PE metadata recovery. This does not execute or decode code.
 use std::collections::BTreeMap;
 
-use crate::model::SectionInfo;
+use crate::model::{MAX_FUNCTIONS, SectionInfo};
 
 mod arm64;
 
-pub(crate) const MAX_FUNCTIONS: usize = 10_000;
 pub(crate) const MAX_IMPORTS: usize = 10_000;
 const MAX_TABLE_ENTRIES: u32 = 500_000;
 const MAX_DIRECTORY_BYTES: u32 = 8 * 1024 * 1024;
@@ -32,7 +31,7 @@ impl PeMetadata {
             self.functions.insert(address, name);
         } else {
             self.functions_truncated = true;
-            self.warn("PE function metadata is limited to 10,000 functions; additional entries were omitted.");
+            self.warn(&format!("PE function metadata is limited to {MAX_FUNCTIONS} functions; additional entries were omitted."));
         }
     }
 }
@@ -624,33 +623,36 @@ mod tests {
         let (mut bytes, mut sections) = fixture(true);
         let count = MAX_FUNCTIONS + 100;
         let table_size = count * 12;
-        bytes.resize(0x11000 + table_size + 0xa0, 0);
+        let text_size = (count * 4).next_multiple_of(0x10000);
+        let table_offset = 0x1000 + text_size;
+        let table_rva = 0x20000 + text_size as u32;
+        bytes.resize(table_offset + table_size + 0xa0, 0);
         sections[0].file_offset = 0x1000;
-        sections[0].file_size = 0x10000;
-        sections[0].size = 0x10000;
-        sections[1].address = 0x1_4002_0000;
-        sections[1].file_offset = 0x11000;
+        sections[0].file_size = text_size as u64;
+        sections[0].size = text_size as u64;
+        sections[1].address = 0x1_4000_0000 + u64::from(table_rva);
+        sections[1].file_offset = table_offset as u64;
         sections[1].file_size = (table_size + 0xa0) as u64;
         sections[1].size = (table_size + 0xa0) as u64;
         put32(&mut bytes, 0x98 + 112, 0);
         put32(&mut bytes, 0x98 + 112 + 8, 0);
-        put32(&mut bytes, 0x98 + 112 + 24, 0x20000);
+        put32(&mut bytes, 0x98 + 112 + 24, table_rva);
         put32(&mut bytes, 0x98 + 112 + 28, table_size as u32);
         let entry_rva = 0x1000 + (count as u32 - 1) * 4;
         put32(&mut bytes, 0x98 + 16, entry_rva);
         for index in 0..count {
             let begin = 0x1000 + index as u32 * 4;
-            put32(&mut bytes, 0x11000 + index * 12, begin);
-            put32(&mut bytes, 0x11000 + index * 12 + 4, begin + 4);
+            put32(&mut bytes, table_offset + index * 12, begin);
+            put32(&mut bytes, table_offset + index * 12 + 4, begin + 4);
             put32(
                 &mut bytes,
-                0x11000 + index * 12 + 8,
-                0x20000 + table_size as u32,
+                table_offset + index * 12 + 8,
+                table_rva + table_size as u32,
             );
         }
-        bytes[0x11000 + table_size] = 1;
-        let export_rva = 0x20000 + table_size as u32 + 0x20;
-        let export_offset = 0x11000 + table_size + 0x20;
+        bytes[table_offset + table_size] = 1;
+        let export_rva = table_rva + table_size as u32 + 0x20;
+        let export_offset = table_offset + table_size + 0x20;
         put32(&mut bytes, 0x98 + 112, export_rva);
         put32(&mut bytes, 0x98 + 116, 0x80);
         for (offset, value) in [

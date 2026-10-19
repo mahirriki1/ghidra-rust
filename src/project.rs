@@ -4,6 +4,7 @@
 //! the exact analyzed input. The decompiler's internal database is rebuilt on open.
 use crate::model::{
     BinaryInfo, CodeMapping, CryptoMatch, FunctionView, MAX_DECOMPILED_BYTES, StringEntry,
+    validate_functions,
 };
 use crate::selection::validate_mappings;
 use crate::session::{self, BinaryProtection, Session};
@@ -19,10 +20,12 @@ use std::time::{Duration, Instant};
 
 const APPLICATION_ID: i64 = 0x4752504a; // GRPJ
 const VERSION: i64 = 1;
-pub const ENGINE_FINGERPRINT: &str = "ghidra-rust-project-v1-mapping-v1-pe-v1-aarch64-v1-calls-v1-arm64pe-v1:268c3a406d8d964bc00ae2ead4d3e1e1373aaa27";
+pub const ENGINE_FINGERPRINT: &str = "ghidra-rust-project-v1-mapping-v1-pe-v1-aarch64-v1-calls-v1-arm64pe-v1-inventory-v2:268c3a406d8d964bc00ae2ead4d3e1e1373aaa27";
 const MAX_BINARY: usize = 128 * 1024 * 1024;
-const MAX_BODY: usize = 16 * 1024 * 1024;
-const MAX_PROJECT: u64 = 192 * 1024 * 1024;
+const MAX_BODY: usize = 48 * 1024 * 1024;
+const MAX_PROJECT: u64 = 224 * 1024 * 1024;
+/// A full function inventory uses about 1.3 million metadata nodes.
+const MAX_JSON_NODES: usize = 3_000_000;
 const SCHEMA: &str = "CREATE TABLE project_data (key TEXT NOT NULL, value BLOB NOT NULL)";
 
 #[derive(Clone, Debug)]
@@ -331,7 +334,9 @@ impl ProjectData {
         if let Some(address) = self.selected_address {
             mapped(&self.info, address)?;
         }
-        bounded(self.info.functions.len(), 10_000, "Function count")?;
+        // Legacy projects allowed 4 KiB names; keep accepting them. Ordering is
+        // required for exact inventory lookups after adoption.
+        validate_functions(&self.info.functions, 4096, false)?;
         bounded(self.info.sections.len(), 4096, "Section count")?;
         bounded(self.info.warnings.len(), 128, "Warning count")?;
         bounded(self.strings.len(), 20_000, "String count")?;
@@ -366,7 +371,6 @@ impl ProjectData {
             bounded(section.name.len(), 4096, "Section name")?;
         }
         for function in &self.info.functions {
-            bounded(function.name.len(), 4096, "Function name")?;
             mapped(&self.info, function.address)?;
         }
         for string in &self.strings {
@@ -843,9 +847,11 @@ fn check_json_budget(bytes: &[u8]) -> Result<(), String> {
         }
     }
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
-    Seed(&mut Budget { nodes: 1_000_000 })
-        .deserialize(&mut deserializer)
-        .map_err(|e| format!("Invalid project metadata: {e}"))?;
+    Seed(&mut Budget {
+        nodes: MAX_JSON_NODES,
+    })
+    .deserialize(&mut deserializer)
+    .map_err(|e| format!("Invalid project metadata: {e}"))?;
     deserializer
         .end()
         .map_err(|e| format!("Invalid project metadata: {e}"))
@@ -1151,7 +1157,7 @@ mod tests {
         assert!(data.save(&path, &protection, true).is_err());
         assert_eq!(fs::read(&path).unwrap(), original);
         assert!(
-            check_json_budget(format!("[{}]", vec!["0"; 1_000_001].join(",")).as_bytes())
+            check_json_budget(format!("[{}]", vec!["0"; MAX_JSON_NODES + 1].join(",")).as_bytes())
                 .unwrap_err()
                 .contains("budget")
         );

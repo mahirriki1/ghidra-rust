@@ -230,7 +230,7 @@ impl DataAnalysis {
             || operation_limit.is_none_or(|limit| self.operations_charged > limit)
             || access_limit.is_none_or(|limit| self.accesses_examined > limit)
             || (!self.partial && self.unsupported_instructions != 0)
-            || functions.len() > crate::pe::MAX_FUNCTIONS
+            || functions.len() > MAX_FUNCTIONS
             || info.sections.len() > 4096
         {
             return Err("Data analysis exceeds its work or result bounds".into());

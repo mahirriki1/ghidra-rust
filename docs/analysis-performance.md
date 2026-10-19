@@ -57,6 +57,23 @@ identify the measured configuration. The client process and allocator persist
 across repetitions; workers are fresh. Retained client memory and filesystem
 caches can affect later rows. Keep all repetitions when reporting results.
 
+## Large function inventories
+
+The opt-in `tests/large_pe.rs` run (`GHIDRA_RUST_TEST_LARGE_PE`) was sampled with
+an ad hoc `/proc` process-tree sampler on Linux x64 (WSL2) against a trusted
+82 MB x64 PE whose exception table holds 261,509 runtime functions. The run
+includes Open, one decompilation, a string scan, and embedded project
+save/reopen in the test client; only the inventory limit changed between rows.
+
+| Inventory limit | Functions listed | Peak summed RSS | Largest process RSS |
+| --- | --- | --- | --- |
+| 10,000 | 10,000 | 610 MiB | 353 MiB |
+| 100,000 | 100,000 | 721 MiB | 419 MiB |
+| 262,144 | 261,540 (complete) | 913 MiB | 542 MiB |
+
+That is about 1.2 KiB per retained function across worker and client. These
+are single-host observations of a test client, not desktop GUI memory.
+
 ## Limits and comparison
 
 This baseline has no native window or rendering loop. Its client is a test
