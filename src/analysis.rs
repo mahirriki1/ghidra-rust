@@ -447,6 +447,9 @@ impl LoadedProgram {
             &space_name,
             self.target.pointer_bytes as u32,
         );
+        if self.target.name == "AArch64" {
+            data = data.with_propagation();
+        }
         let mut known: BTreeMap<_, _> = self
             .info
             .functions
@@ -1106,6 +1109,9 @@ fn recover_graph_budgeted(
             "{entry:#x} is outside file-backed executable sections."
         ));
     }
+    if let Some(data) = data.as_mut() {
+        data.begin_function();
+    }
     let mut pending = VecDeque::from([entry]);
     let mut visited = BTreeSet::new();
     let mut nodes = BTreeMap::<u64, Decoded>::new();
@@ -1316,6 +1322,9 @@ fn recover_graph_budgeted(
             &mut warnings,
             "Some recovered instructions are omitted by graph limits or ambiguous block boundaries.",
         );
+    }
+    if let Some(data) = data.as_mut() {
+        data.propagate(entry, blocks.iter());
     }
     let partial = !warnings.is_empty();
     warning(

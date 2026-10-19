@@ -25,6 +25,10 @@ pub const MAX_DATA_OPERATIONS: usize = 131_072;
 pub const MAX_DATA_OPERATIONS_PER_INSTRUCTION: usize = 256;
 pub const MAX_DATA_OPERATION_INPUTS: usize = 16;
 pub const MAX_DATA_ACCESS_BYTES: u32 = 64;
+/// Compact p-code operations retained per function for block-local propagation.
+pub const MAX_DATA_RETAINED_OPERATIONS: usize = 16_384;
+/// Register/unique byte ranges with known constant values at any point.
+pub const MAX_DATA_TRACKED_VALUES: usize = 128;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -33,7 +37,19 @@ pub enum DataAccess {
     Write,
 }
 
-/// A direct memory access established by instruction-local engine p-code.
+/// How a data reference's pointer was established.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DataProvenance {
+    /// The accessing instruction's own p-code yields a constant pointer.
+    #[default]
+    InstructionLocal,
+    /// The pointer depends on register constants established by earlier
+    /// instructions of the same basic block (AArch64 only).
+    Propagated,
+}
+
+/// A direct memory access established from engine p-code.
 /// This does not classify the target as a data object or runtime pointer.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct DataReference {
@@ -42,6 +58,9 @@ pub struct DataReference {
     pub target: u64,
     pub size: u32,
     pub access: DataAccess,
+    /// Absent in replies from earlier workers, which were instruction-local only.
+    #[serde(default)]
+    pub provenance: DataProvenance,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

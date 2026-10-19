@@ -237,6 +237,7 @@ mod tests {
                     target: 0x1080,
                     size: 4,
                     access: DataAccess::Read,
+                    provenance: DataProvenance::InstructionLocal,
                 },
                 DataReference {
                     function: 0x1000,
@@ -244,6 +245,7 @@ mod tests {
                     target: 0x1080,
                     size: 4,
                     access: DataAccess::Write,
+                    provenance: DataProvenance::InstructionLocal,
                 },
                 DataReference {
                     function: 0x1040,
@@ -251,6 +253,7 @@ mod tests {
                     target: 0x1082,
                     size: 2,
                     access: DataAccess::Read,
+                    provenance: DataProvenance::InstructionLocal,
                 },
             ],
             operations_charged: 3,

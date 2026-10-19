@@ -183,6 +183,7 @@ mod tests {
             target: u64::MAX,
             size: u32::MAX,
             access: DataAccess::Write,
+            provenance: DataProvenance::InstructionLocal,
         };
         let full = |n| usize::MAX - n;
         let analysis = CallAnalysis {

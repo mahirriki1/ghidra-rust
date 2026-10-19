@@ -2640,7 +2640,7 @@ impl DesktopApp {
             data.operations_charged,
             data.accesses_examined
         ));
-        ui.weak("Direct memory reads/writes in examined functions. Computed register addresses and address-only values are outside this pass. Recomputed after project reopen.");
+        ui.weak("Direct memory reads/writes in examined functions. AArch64 register constants are propagated only within a basic block; address-only values and loaded pointers are outside this pass. Recomputed after project reopen.");
         if data.partial || index.report.partial {
             ui.colored_label(theme::WARNING, "Partial access coverage: work limits, unsupported instructions or incomplete function walks.");
         }
@@ -2690,6 +2690,9 @@ impl DesktopApp {
                 let reference = &data.references[rows[row]];
                 ui.horizontal(|ui| {
                     ui.weak(match reference.access { DataAccess::Read => "Read", DataAccess::Write => "Write" });
+                    if reference.provenance == DataProvenance::Propagated {
+                        ui.weak("propagated").on_hover_text("Pointer built from register constants set earlier in the same basic block");
+                    }
                     ui.monospace(format!("{}B", reference.size));
                     if ui.button(format!("{:x}", reference.target))
                         .on_hover_text("Load exactly the accessed bytes into Decode").clicked() {
@@ -3608,6 +3611,7 @@ mod tests {
                     target: 0x1080,
                     size: 4,
                     access: DataAccess::Read,
+                    provenance: DataProvenance::InstructionLocal,
                 }],
                 operations_charged: 1,
                 accesses_examined: 1,
