@@ -2186,13 +2186,13 @@ impl DesktopApp {
             .default_size(tree_height)
             .min_size(100.0)
             .resizable(true)
-            .frame(theme::view_frame())
+            .frame(theme::inner_frame())
             .show(ui, |ui| {
                 ui.set_min_height(ui.available_height());
                 theme::dock_header(ui, "Program", false, |ui| {if self.cached_functions || self.cached_strings || self.cached_crypto {ui.weak("Saved analysis").on_hover_text("Some tree results were loaded from the project. Recompute the corresponding analysis to verify them.");}});
                 ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.program_tree, false, "Symbol Tree");
-                    ui.selectable_value(&mut self.program_tree, true, "Program Trees");
+                    theme::tab(ui, &mut self.program_tree, false, "Symbol Tree");
+                    theme::tab(ui, &mut self.program_tree, true, "Program Trees");
                 });
                 ui.separator();
                 self.symbol_tree(ui);
@@ -2985,7 +2985,7 @@ impl DesktopApp {
                 (Tab::Decode, "Decode"),
                 (Tab::References, "References"),
             ] {
-                ui.selectable_value(&mut self.tab, tab, name);
+                theme::tab(ui, &mut self.tab, tab, name);
             }
         });
         ui.separator();
@@ -3345,8 +3345,12 @@ impl DesktopApp {
                 self.request_intent(Intent::Quit, &context);
             }
         }
-        egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
-        egui::Panel::bottom("status").show(ui, |ui| {
+        egui::Panel::top("toolbar")
+            .frame(theme::toolbar_frame(ui.style()))
+            .show(ui, |ui| self.toolbar(ui));
+        egui::Panel::bottom("status")
+            .frame(theme::status_frame(ui.style()))
+            .show(ui, |ui| {
             egui::Sides::new().shrink_left().wrap().show(
                 ui,
                 |ui| {
@@ -3440,6 +3444,46 @@ impl DesktopApp {
 impl eframe::App for DesktopApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.draw(ui);
+        #[cfg(feature = "capture")]
+        self.capture_tick(ui.ctx());
+    }
+}
+
+#[cfg(feature = "capture")]
+impl DesktopApp {
+    fn capture_tick(&mut self, context: &egui::Context) {
+        use std::sync::{Mutex, OnceLock};
+        static CAPTURE: OnceLock<Mutex<Option<crate::capture::Capture>>> = OnceLock::new();
+        let mut guard = CAPTURE
+            .get_or_init(|| Mutex::new(crate::capture::Capture::from_env()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(capture) = guard.as_mut() else {
+            return;
+        };
+        let busy = self.pending.is_some()
+            || self.opening.is_some()
+            || !self.queue.is_empty()
+            || self.file_job.is_some()
+            || self.info.is_none();
+        if !busy && let Some(address) = capture.goto.take() {
+            if capture.graph {
+                self.tab = Tab::Graph;
+            }
+            self.navigate(address, true, context);
+            return;
+        }
+        if !busy
+            && self.view.is_some()
+            && let Some(address) = capture.select.take()
+        {
+            self.select_instruction(address);
+            if let Some(canvas) = &mut self.canvas {
+                canvas.reveal_instruction(address);
+            }
+            return;
+        }
+        capture.tick(context, !busy);
     }
 }
 
