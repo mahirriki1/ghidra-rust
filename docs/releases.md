@@ -39,8 +39,11 @@ rustup run 1.98.1-x86_64-pc-windows-msvc powershell -NoProfile -ExecutionPolicy 
 ```
 
 Both scripts check formatting, unit tests, strict Clippy, the release build, and
-the real release worker integration test before packaging. They write the
-following files under `target/dist` (or `CARGO_TARGET_DIR/dist`):
+the real release worker integration test before packaging. **Run them locally and
+confirm the tests pass before pushing:** GitHub Actions runs the same scripts with
+`--skip-tests` (Linux) or `-SkipTests` (Windows), so hosted runs only check
+formatting and Clippy, build, and package. They write the following files under
+`target/dist` (or `CARGO_TARGET_DIR/dist`):
 
 | Platform | Direct executable | Complete distribution |
 | --- | --- | --- |
@@ -72,12 +75,13 @@ before shipping to another machine.
 
 The **Automatic main release** workflow runs for every push to `main`, including
 merged pull requests. It prepares the next patch version (for example, `v0.0.4`,
-then `v0.0.5`), builds and tests Linux and Windows, verifies the complete package
+then `v0.0.5`), builds Linux and Windows, verifies the complete package
 set and checksums, and publishes a GitHub Release with automatically generated
 GitHub update notes, merged pull requests, and contributors. Notes also list up to
 100 direct commit summaries since the previous published version, so updates made
 without a pull request are included. The release links its exact source commit,
-native build/test run, and the full GitHub change comparison.
+native build run, and the full GitHub change comparison. The release does not
+run tests; anything merged to main must already have passed them locally.
 
 Version allocation uses the highest existing `vX.Y.Z` tag and the version in
 `Cargo.toml`. An intentional higher version in the manifest is respected; otherwise
@@ -150,5 +154,6 @@ are resource controls rather than a filesystem/network sandbox.
 The packages are unsigned. Checksums detect changes when obtained through a
 trusted channel, but do not authenticate the publisher. Automatic publication
 does not sign the packages. A configured
-workflow is not evidence of a successful hosted run; inspect the actual jobs and
-their test results for the tagged commit.
+workflow is not evidence of a successful hosted run; inspect the actual jobs for
+the tagged commit. Hosted jobs do not run tests, so record local test results
+for each platform you validated.
