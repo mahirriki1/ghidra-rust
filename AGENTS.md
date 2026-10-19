@@ -30,6 +30,8 @@ the relevant source modules before changing behavior. Follow more specific
 - `src/architecture.rs`: supported architecture/ABI selection and validation.
 - `src/analysis.rs`: loading, immutable image snapshots, instruction/CFG recovery,
   function discovery, and analysis requests.
+- `src/call_analysis.rs`, `data_analysis.rs`: bounded reference validation/indexes
+  and instruction-local direct memory-access evidence.
 - `src/packing.rs`: conservative packed-image diagnostics; detected conventional
   UPX PE stubs skip expensive decompilation/discovery while retaining inspection.
 - `src/decompile.rs`: semantic emission through public engine APIs, including

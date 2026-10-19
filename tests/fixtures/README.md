@@ -48,6 +48,8 @@ the production WorkerClient/bubblewrap test in debug and release. The latter
 requires working unprivileged namespaces and tests the host's loader layout,
 Unicode paths, analysis mappings, and embedded project replacement/reopening.
 It fails if sandbox startup fails; it does not substitute an unrestricted worker.
+On the original linked C fixture, the Linux integration also compares confirmed
+call instruction addresses and direct destinations with GNU objdump from binutils.
 
 For an optional large-PE check, copy a trusted executable beneath ignored
 `target/local-input`, set `GHIDRA_RUST_TEST_LARGE_PE` to that copy, and run
@@ -81,3 +83,10 @@ and platform validation limits.
 "Could not recover jumptable" warning is expected there; this fixture contains
 no actual jump table. Its call-like pseudocode fallback does not establish a call
 target. The instruction graph retains an unresolved jump instead.
+
+`arm64-pe.S` adds original metadata-only functions, a fragment, a caller, and a
+conventional import veneer. `common::arm64_pe_metadata` embeds these in a stripped
+PE with original synthetic packed/full runtime records and a named IAT slot.
+The contained worker regression verifies isolated function recovery, excludes
+the fragment as independent function evidence, names the confirmed import call,
+retains an unresolved register branch, and checks unchanged input bytes/hash.

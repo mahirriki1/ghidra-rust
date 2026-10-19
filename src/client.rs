@@ -4,10 +4,12 @@ use crate::session::BinaryProtection;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 
-const MAX_RESPONSE: usize = 16 * 1024 * 1024;
+/// The worker's largest encoded reply plus its newline.
+const MAX_RESPONSE: usize = crate::model::MAX_REPLY_BYTES + 1;
 
 pub enum WorkerEvent {
     Reply(Box<WorkerResponse>),
@@ -21,6 +23,8 @@ pub struct WorkerClient {
     input: ChildStdin,
     events: Receiver<WorkerEvent>,
     next_id: u64,
+    /// Highest request id written; replies may only answer sent requests.
+    sent: Arc<AtomicU64>,
     binary_path: PathBuf,
     protection: BinaryProtection,
     source_lease: Option<Arc<dyn Send + Sync>>,
@@ -65,12 +69,23 @@ impl WorkerClient {
         let (sender, events) = mpsc::sync_channel(8);
         let display_path = binary_path.to_string_lossy().into_owned();
         let reader_protection = protection.clone();
+        let sent = Arc::new(AtomicU64::new(0));
+        let reader_sent = sent.clone();
         std::thread::Builder::new()
             .name("analysis-responses".into())
             .spawn(move || {
                 let mut reader = BufReader::new(output);
+                let mut answered = 0;
                 loop {
-                    let event = match bounded_line(&mut reader, MAX_RESPONSE) {
+                    let event = match bounded_line(&mut reader, MAX_RESPONSE).and_then(|line| {
+                        match line {
+                            Some(line) => {
+                                check_reply_order(&line, &reader_sent, &mut answered)?;
+                                Ok(Some(line))
+                            }
+                            None => Ok(None),
+                        }
+                    }) {
                         Ok(Some(line)) => match serde_json::from_slice::<WorkerResponse>(&line) {
                             Ok(mut reply) => {
                                 // The sandbox sees only /input/binary. Keep the
@@ -116,6 +131,7 @@ impl WorkerClient {
             input,
             events,
             next_id: 0,
+            sent,
             binary_path,
             protection,
             source_lease: None,
@@ -158,6 +174,8 @@ impl WorkerClient {
             return Err("Request is too large".into());
         }
         bytes.push(b'\n');
+        // Publish before writing so the reader never sees an unsent reply id.
+        self.sent.store(self.next_id, Ordering::Release);
         self.input
             .write_all(&bytes)
             .map_err(|e| format!("Worker input failed: {e}"))?;
@@ -289,6 +307,21 @@ impl Drop for WorkerClient {
     }
 }
 
+/// Shape-checks a reply before serde buffers it, and admits at most one
+/// terminal reply per sent request, in order. Progress replies are small and
+/// must belong to an unanswered request. This bounds how many large replies a
+/// misbehaving worker can queue.
+fn check_reply_order(line: &[u8], sent: &AtomicU64, answered: &mut u64) -> Result<(), String> {
+    let shape = crate::bounded::check_reply(line)?;
+    if shape.id <= *answered || shape.id > sent.load(Ordering::Acquire) {
+        return Err("Worker reply does not answer a pending request".into());
+    }
+    if shape.kind != "progress" {
+        *answered = shape.id;
+    }
+    Ok(())
+}
+
 fn bounded_line(reader: &mut impl BufRead, limit: usize) -> Result<Option<Vec<u8>>, String> {
     let mut line = Vec::new();
     loop {
@@ -305,7 +338,7 @@ fn bounded_line(reader: &mut impl BufRead, limit: usize) -> Result<Option<Vec<u8
         let end = buffer.iter().position(|&byte| byte == b'\n');
         let count = end.map_or(buffer.len(), |end| end + 1);
         if count > limit.saturating_sub(line.len()) {
-            return Err("Worker response exceeded the 16 MiB limit".into());
+            return Err("Worker response exceeded the 32 MiB limit".into());
         }
         line.extend_from_slice(&buffer[..count]);
         reader.consume(count);
@@ -318,6 +351,27 @@ fn bounded_line(reader: &mut impl BufRead, limit: usize) -> Result<Option<Vec<u8
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replies_must_answer_sent_requests_once_and_in_order() {
+        let sent = AtomicU64::new(2);
+        let mut answered = 0;
+        let reply = |id: u64, kind: &str| {
+            format!(r#"{{"id":{id},"response":{{"kind":"{kind}","message":"x"}}}}"#)
+        };
+        let progress = |id: u64| {
+            format!(
+                r#"{{"id":{id},"response":{{"kind":"progress","progress":{{"stage":"Calls","functions_examined":0,"decode_attempts":0}}}}}}"#
+            )
+        };
+        let mut check = |line: String| check_reply_order(line.as_bytes(), &sent, &mut answered);
+        assert!(check(progress(1)).is_ok());
+        assert!(check(reply(1, "error")).is_ok());
+        assert!(check(reply(1, "error")).is_err(), "second terminal reply");
+        assert!(check(progress(1)).is_err(), "progress after completion");
+        assert!(check(reply(3, "error")).is_err(), "unsent request");
+        assert!(check(reply(2, "error")).is_ok());
+    }
     #[test]
     fn response_framing_preserves_messages_and_rejects_unbounded_or_partial_output() {
         let mut input = std::io::Cursor::new(b"one\ntwo\n".as_slice());

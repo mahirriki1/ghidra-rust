@@ -126,7 +126,7 @@ to establish its hosted build and test results.
 PE export names and x64 exception-table function entries now load automatically.
 The fixture should list `branch_loop`; its integration test also removes exports
 from a private copy to verify recovery of stripped functions. For large images,
-the 10,000-function list prioritizes the entry point, exports, and nearby runtime
+the 262,144-function list prioritizes the entry point, exports, and nearby runtime
 functions and displays **Partial function list**. **G** accepts a known function's
 hexadecimal virtual address. Open **Analysis notes** for coverage limits.
 

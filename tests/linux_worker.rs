@@ -2,10 +2,11 @@
 #![cfg(target_os = "linux")]
 
 use ghidra_rust::client::{WorkerClient, WorkerEvent};
-use ghidra_rust::model::{Request, Response};
+use ghidra_rust::model::{CallAnalysis, DataAccess, Request, Response};
 use ghidra_rust::project::ProjectData;
 use ghidra_rust::session::{Annotation, Session};
 use object::{Object, ObjectSymbol};
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
@@ -18,6 +19,10 @@ fn request(worker: &mut WorkerClient, request: Request) -> Response {
         match worker.poll() {
             Some(WorkerEvent::Reply(reply)) => {
                 assert_eq!(reply.id, id);
+                if let Response::Progress { progress } = &reply.response {
+                    progress.validate_after(None).unwrap();
+                    continue;
+                }
                 return reply.response;
             }
             Some(WorkerEvent::Failed(error)) => panic!("Sandboxed Linux worker failed: {error}"),
@@ -27,6 +32,128 @@ fn request(worker: &mut WorkerClient, request: Request) -> Response {
             None => std::thread::sleep(Duration::from_millis(10)),
         }
     }
+}
+
+// Differential check on our original linked C fixture only. GNU objdump is an
+// independent decoder; compare real call instruction PCs and destinations,
+// without treating disassembly text as semantic GUI mappings.
+fn compare_fixture_calls(binary: &Path, image: &object::File<'_>, analysis: &CallAnalysis) {
+    for name in ["main", "branch_loop", "decode_xor"] {
+        let caller = image
+            .symbols()
+            .find(|symbol| symbol.name().ok() == Some(name))
+            .unwrap()
+            .address();
+        let output = Command::new("objdump")
+            .arg("--no-show-raw-insn")
+            .arg(format!("--disassemble={name}"))
+            .arg(binary)
+            .output()
+            .expect("Linux differential tests require GNU objdump (binutils)");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            text.contains(&format!("<{name}>:")),
+            "Missing objdump function {name}"
+        );
+        let expected: BTreeSet<_> = text
+            .lines()
+            .filter_map(|line| {
+                let (pc, instruction) = line.trim().split_once(':')?;
+                let pc = u64::from_str_radix(pc, 16).ok()?;
+                let mut fields = instruction.split_whitespace();
+                if !matches!(fields.next()?, "call" | "callq" | "bl") {
+                    return None;
+                }
+                let destination = fields.next()?;
+                if destination.starts_with('*') {
+                    return None;
+                }
+                Some((
+                    pc,
+                    u64::from_str_radix(destination, 16).expect("Direct objdump call target"),
+                ))
+            })
+            .collect();
+        let actual: BTreeSet<_> = analysis
+            .references
+            .iter()
+            .filter(|reference| reference.caller == caller)
+            .map(|reference| (reference.address, reference.target))
+            .collect();
+        assert_eq!(
+            actual, expected,
+            "Confirmed calls differ from GNU objdump in {name}"
+        );
+        if name == "main" {
+            assert!(!expected.is_empty());
+        }
+    }
+}
+
+// Limited differential on the original x86-64 fixture: objdump annotates each
+// RIP-relative access with its resolved target. The fixture deliberately uses
+// 32-bit MOVs, so operand position determines read/write without a general
+// disassembly-text reference heuristic in the application.
+fn compare_fixture_data(binary: &Path, owner: u64, target: u64, analysis: &CallAnalysis) {
+    let output = Command::new("objdump")
+        .args(["--no-show-raw-insn", "--disassemble=read_write_word"])
+        .arg(binary)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    let mut expected = BTreeSet::new();
+    for line in text
+        .lines()
+        .filter(|line| line.contains("<reference_word>"))
+    {
+        let (pc, instruction) = line.trim().split_once(':').unwrap();
+        let (operation, comment) = instruction.split_once('#').unwrap();
+        let (mnemonic, operands) = operation.trim().split_once(char::is_whitespace).unwrap();
+        assert_eq!(mnemonic, "mov");
+        assert_eq!(
+            u64::from_str_radix(comment.split_whitespace().next().unwrap(), 16).unwrap(),
+            target
+        );
+        let (source, destination) = operands.split_once(',').unwrap();
+        let access = if source.contains("(%rip)") {
+            assert_eq!(destination.trim(), "%eax");
+            DataAccess::Read
+        } else {
+            assert_eq!(source.trim(), "%eax");
+            assert!(destination.contains("(%rip)"));
+            DataAccess::Write
+        };
+        expected.insert((u64::from_str_radix(pc, 16).unwrap(), 4, access));
+    }
+    assert!(
+        expected
+            .iter()
+            .any(|(_, _, access)| *access == DataAccess::Read)
+    );
+    assert!(
+        expected
+            .iter()
+            .any(|(_, _, access)| *access == DataAccess::Write)
+    );
+    let actual = analysis
+        .data
+        .as_ref()
+        .unwrap()
+        .references
+        .iter()
+        .filter(|reference| reference.function == owner && reference.target == target)
+        .map(|reference| (reference.address, reference.size, reference.access))
+        .collect();
+    assert_eq!(
+        expected, actual,
+        "Data-access PCs, widths or kinds differ from GNU objdump"
+    );
 }
 
 #[test]
@@ -77,6 +204,49 @@ fn sandboxed_linux_worker_and_embedded_project_round_trip() {
     assert_eq!(
         info.sha256,
         ghidra_rust::session::fingerprint(&binary).unwrap()
+    );
+    let Response::Functions {
+        functions,
+        analysis,
+        ..
+    } = request(&mut worker, Request::Discover)
+    else {
+        panic!("Sandboxed worker did not analyze calls");
+    };
+    analysis.validate(&info, &functions).unwrap();
+    compare_fixture_calls(&binary, &image, &analysis);
+    let owner = image
+        .symbols()
+        .find(|symbol| symbol.name().ok() == Some("read_write_word"))
+        .unwrap()
+        .address();
+    let target = image
+        .symbols()
+        .find(|symbol| symbol.name().ok() == Some("reference_word"))
+        .unwrap()
+        .address();
+    let data = analysis.data.as_ref().expect("Fresh data-access analysis");
+    if info.architecture == "x86-64" {
+        compare_fixture_data(&binary, owner, target, &analysis);
+    }
+    for access in [DataAccess::Read, DataAccess::Write]
+        .into_iter()
+        .filter(|_| matches!(info.architecture.as_str(), "x86" | "x86-64"))
+    {
+        assert!(
+            data.references
+                .iter()
+                .any(|reference| reference.function == owner
+                    && reference.target == target
+                    && reference.size == 4
+                    && reference.access == access)
+        );
+    }
+    assert!(
+        analysis
+            .references
+            .iter()
+            .any(|reference| reference.target == address)
     );
     let protection = worker.protection().bind_snapshot(&info).unwrap();
     let Response::Graph { view } = request(&mut worker, Request::Graph { address }) else {

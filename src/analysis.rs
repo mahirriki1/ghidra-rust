@@ -16,14 +16,12 @@ use crate::model::*;
 
 const MAX_INSTRUCTIONS: usize = 2048;
 const MAX_BLOCKS: usize = 128;
-const MAX_BYTES: usize = 64 * 1024;
+const MAX_BYTES: usize = MAX_BYTE_READ;
 const MAX_SCAN_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_RESULTS: usize = 10_000;
+const MAX_CRYPTO_RESULTS: usize = 10_000;
 const SCAN_CHUNK: usize = 256 * 1024;
 const MAX_STRING_PREVIEW: usize = 512;
 const MAX_IMAGE_BYTES: u64 = 128 * 1024 * 1024;
-const MAX_DISCOVERY_FUNCTIONS: usize = 128;
-const MAX_DISCOVERY_INSTRUCTIONS: usize = 16_384;
 
 pub struct LoadedProgram {
     program: Program,
@@ -192,7 +190,7 @@ fn metadata_with_target(
         path: path.to_string_lossy().into_owned(), architecture: target.name.into(), format: format.into(),
         sha256: format!("{:x}", Sha256::digest(bytes)), source_identity: None,
         entry, file_len: bytes.len() as u64, sections, functions: Vec::new(), functions_truncated: false,
-        warnings: vec!["Prototype analysis: symbols and supported PE function metadata load immediately; deeper function discovery is explicit. Optimized C++/Rust types and source reconstruction are incomplete.".into(), "Function lists are capped at 10,000 entries and names at 256 bytes in this prototype.".into()],
+        warnings: vec!["Prototype analysis: symbols and supported PE function metadata load immediately; deeper function discovery is explicit. Optimized C++/Rust types and source reconstruction are incomplete.".into(), format!("Function lists are capped at {MAX_FUNCTIONS} entries, {} MiB of names, and {MAX_FUNCTION_NAME_BYTES} bytes per name in this prototype.", MAX_FUNCTION_NAME_JSON_BYTES >> 20)],
     };
     if crate::packing::detect_upx_pe(&info.format, info.entry, &info.sections, bytes) {
         warning(&mut info.warnings, crate::packing::UPX_PACKED_WARNING);
@@ -241,12 +239,6 @@ impl LoadedProgram {
                 &mut info.warnings,
                 "AArch64 analysis is experimental: indirect branches, jump tables, exception flow, and newer ISA extensions may be incomplete.",
             );
-            if info.format == "PE" {
-                warning(
-                    &mut info.warnings,
-                    "AArch64 PE loads exports and import slots; ARM64 unwind function recovery and import-veneer naming are not implemented.",
-                );
-            }
         }
         info.source_identity = FileIdentity::from_file(&file);
         let snapshot = Arc::from(bytes.as_slice());
@@ -270,7 +262,29 @@ impl LoadedProgram {
             pe_ranges = pe.function_ranges;
             pe_imports = pe.imports;
         }
-        info.functions = function_list(&program, &mut info)?;
+        info.functions = function_list(&program, &mut info, &BTreeSet::new())?;
+        if !upx_packed && target.name == "AArch64" && !pe_imports.is_empty() {
+            let targets = info
+                .functions
+                .iter()
+                .map(|function| function.address)
+                .take(crate::pe_symbols::MAX_THUNK_TARGETS)
+                .collect();
+            crate::pe_symbols::register_aarch64_import_thunks(
+                &mut program,
+                &pe_imports,
+                &snapshot,
+                &info.sections,
+                &targets,
+            )?;
+            if info.functions.len() > crate::pe_symbols::MAX_THUNK_TARGETS {
+                warning(
+                    &mut info.warnings,
+                    "ARM64 PE import-veneer naming on open is limited to the first 2,048 established function entries; discovery and selected-function analysis can name additional confirmed targets.",
+                );
+            }
+            info.functions = function_list(&program, &mut info, &BTreeSet::new())?;
+        }
         if !info.entry.is_multiple_of(target.instruction_alignment)
             || !executable(
                 &info.sections,
@@ -292,6 +306,14 @@ impl LoadedProgram {
     }
 
     pub fn handle(&mut self, request: Request) -> Result<Response, String> {
+        self.handle_with_progress(request, &mut |_| Ok(()))
+    }
+
+    pub(crate) fn handle_with_progress(
+        &mut self,
+        request: Request,
+        progress: &mut dyn FnMut(AnalysisProgress) -> Result<(), String>,
+    ) -> Result<Response, String> {
         match request {
             Request::Graph { address } => Ok(Response::Graph {
                 view: recover_graph_with_ranges(
@@ -328,15 +350,29 @@ impl LoadedProgram {
             }
             Request::Discover => {
                 self.check_unpacked()?;
-                if self.target.name == "AArch64" {
-                    self.discover_aarch64()?;
-                } else {
-                    self.program.discover_functions().map_err(engine_error)?;
-                }
-                self.info.functions = function_list(&self.program, &mut self.info)?;
+                // Selected-function analysis can materialize and name a callee
+                // since the last published inventory. Preserve those names.
+                self.info.functions =
+                    function_list(&self.program, &mut self.info, &BTreeSet::new())?;
+                let analysis = self.discover_calls(progress)?;
+                // Evidence owners must survive inventory admission so every
+                // published reference has its caller in the same reply.
+                let owners = analysis
+                    .references
+                    .iter()
+                    .map(|reference| reference.caller)
+                    .chain(
+                        analysis
+                            .data
+                            .iter()
+                            .flat_map(|data| data.references.iter().map(|r| r.function)),
+                    )
+                    .collect();
+                self.info.functions = function_list(&self.program, &mut self.info, &owners)?;
                 Ok(Response::Functions {
                     functions: self.info.functions.clone(),
-                    truncated: self.info.functions_truncated,
+                    truncated: self.info.functions_truncated || analysis.partial,
+                    analysis,
                 })
             }
             Request::Rename { address, name } => {
@@ -352,7 +388,8 @@ impl LoadedProgram {
                     .set_function_name(address, &name)
                     .map_err(engine_error)?;
                 self.synchronize_function_name(address, &name)?;
-                self.info.functions = function_list(&self.program, &mut self.info)?;
+                self.info.functions =
+                    function_list(&self.program, &mut self.info, &BTreeSet::new())?;
                 Ok(Response::Renamed { address, name })
             }
             Request::Bytes { address, length } => {
@@ -373,74 +410,186 @@ impl LoadedProgram {
         Ok(())
     }
 
-    fn discover_aarch64(&mut self) -> Result<(), String> {
-        // The pinned engine's discovery uses the raw Mach-O LC_MAIN offset and
-        // skips call discovery when function symbols exist. Walk our bounded CFG
-        // instead, and register only genuine direct-call targets through public
-        // APIs. Never guess function entries from constants or instruction text.
+    fn discover_calls(
+        &mut self,
+        progress: &mut dyn FnMut(AnalysisProgress) -> Result<(), String>,
+    ) -> Result<CallAnalysis, String> {
+        // Adapted from Ghidra FunctionAnalyzer's established-call rule and its
+        // fallthrough-call exclusion. See NOTICE and docs/analysis.md. Decode
+        // through public pinned-engine APIs; never promote arbitrary constants.
+        let mut report = CallAnalysis {
+            partial: self.info.functions_truncated,
+            ..Default::default()
+        };
+        let emit =
+            |stage,
+             report: &CallAnalysis,
+             progress: &mut dyn FnMut(AnalysisProgress) -> Result<(), String>| {
+                progress(AnalysisProgress {
+                    stage,
+                    functions_examined: report.functions_examined,
+                    decode_attempts: report.decode_attempts,
+                })
+            };
+        emit(AnalysisStage::Seeds, &report, progress)?;
+        let space = self
+            .program
+            .architecture()
+            .manager
+            .get_default_data_space()
+            .ok_or("Missing default data space during reference analysis")?;
+        if space.get_word_size() != 1 {
+            return Err("Data references require a byte-addressed memory space".into());
+        }
+        let space_name = space.get_name().to_owned();
+        let mut data = crate::data_analysis::DataCollector::new(
+            &self.info.sections,
+            &space_name,
+            self.target.pointer_bytes as u32,
+        );
+        if self.target.name == "AArch64" {
+            data = data.with_propagation();
+        }
         let mut known: BTreeMap<_, _> = self
             .info
             .functions
             .iter()
-            .map(|function| (function.address, function.name.clone()))
+            .map(|f| (f.address, f.name.clone()))
             .collect();
-        self.info.functions_truncated |= known.len() > MAX_DISCOVERY_FUNCTIONS;
+        report.partial |= known.len() > MAX_ANALYSIS_FUNCTIONS;
+        let mut name_bytes = known
+            .values()
+            .map(|name| json_escaped_len(name))
+            .fold(0usize, usize::saturating_add)
+            .min(MAX_FUNCTION_NAME_JSON_BYTES);
         let mut pending = VecDeque::new();
+        let mut scheduled = BTreeSet::new();
         if self.check_code(self.info.entry).is_ok() {
+            scheduled.insert(self.info.entry);
             pending.push_back(self.info.entry);
         }
-        pending.extend(known.keys().copied().take(MAX_DISCOVERY_FUNCTIONS));
-        let mut visited = BTreeSet::new();
-        let mut instructions = 0;
-        while let Some(address) = pending.pop_front() {
-            if visited.contains(&address) {
-                continue;
-            }
-            if visited.len() >= MAX_DISCOVERY_FUNCTIONS
-                || instructions >= MAX_DISCOVERY_INSTRUCTIONS
-            {
-                self.info.functions_truncated = true;
-                break;
-            }
-            visited.insert(address);
-            let functions: Vec<_> = known
-                .iter()
-                .map(|(&address, name)| FunctionInfo {
-                    address,
-                    name: name.clone(),
-                })
-                .collect();
-            let Ok((view, decoded_count)) =
-                recover_graph_counted(&self.program, &self.info.sections, &functions, address, &[])
-            else {
-                self.info.functions_truncated = true;
-                continue;
-            };
-            instructions += decoded_count;
-            self.info.functions_truncated |=
-                decoded_count >= MAX_INSTRUCTIONS || view.blocks.len() >= MAX_BLOCKS;
-            for target in view.calls.iter().filter_map(|call| call.target) {
-                if self.check_code(target).is_err() {
-                    continue;
-                }
-                let has_capacity = known.len() < MAX_RESULTS;
-                if let std::collections::btree_map::Entry::Vacant(entry) = known.entry(target) {
-                    if !has_capacity {
-                        self.info.functions_truncated = true;
-                        continue;
-                    }
-                    let name = format!("FUN_{target:08x}");
-                    self.program
-                        .set_function_name(target, &name)
-                        .map_err(engine_error)?;
-                    entry.insert(name);
-                }
-                if !visited.contains(&target) {
-                    pending.push_back(target);
-                }
+        for &address in known.keys().take(MAX_ANALYSIS_FUNCTIONS) {
+            if scheduled.insert(address) {
+                pending.push_back(address);
             }
         }
-        Ok(())
+        let mut references = BTreeSet::new();
+        emit(AnalysisStage::Calls, &report, progress)?;
+        while let Some(address) = pending.pop_front() {
+            if report.functions_examined == MAX_ANALYSIS_FUNCTIONS
+                || report.decode_attempts == MAX_ANALYSIS_INSTRUCTIONS
+            {
+                report.partial = true;
+                break;
+            }
+            report.functions_examined += 1;
+            let available =
+                (MAX_ANALYSIS_INSTRUCTIONS - report.decode_attempts).min(MAX_INSTRUCTIONS);
+            let mut remaining = available;
+            let recovered = recover_graph_budgeted(
+                &self.program,
+                &self.info.sections,
+                &|candidate| known.contains_key(&candidate),
+                address,
+                &self.pe_ranges,
+                &mut remaining,
+                Some(&mut data),
+            );
+            report.decode_attempts += available - remaining;
+            match recovered {
+                Ok(recovered) => {
+                    report.partial |= recovered.partial;
+                    // Failed decoding must not materialize a new engine function.
+                    if !known.contains_key(&address) {
+                        let name = format!("FUN_{address:08x}");
+                        let bytes = json_escaped_len(&name);
+                        if known.len() < MAX_FUNCTIONS
+                            && bytes <= MAX_FUNCTION_NAME_JSON_BYTES - name_bytes
+                        {
+                            self.program
+                                .set_function_name(address, &name)
+                                .map_err(engine_error)?;
+                            name_bytes += bytes;
+                            known.insert(address, name);
+                        } else {
+                            report.partial = true;
+                            continue;
+                        }
+                    }
+                    for (call, fallthrough) in recovered.calls {
+                        if references.len()
+                            + report.unresolved_calls
+                            + report.skipped_fallthrough_calls
+                            >= MAX_CALL_REFERENCES
+                        {
+                            report.partial = true;
+                            break;
+                        }
+                        let Some(target) = call
+                            .target
+                            .filter(|target| self.check_code(*target).is_ok())
+                        else {
+                            report.unresolved_calls += 1;
+                            report.partial = true;
+                            continue;
+                        };
+                        if target == fallthrough {
+                            report.skipped_fallthrough_calls += 1;
+                            continue;
+                        }
+                        let reference = CallReference {
+                            caller: address,
+                            address: call.address,
+                            target,
+                        };
+                        if references.len() == MAX_CALL_REFERENCES
+                            && !references.contains(&reference)
+                        {
+                            report.partial = true;
+                            continue;
+                        }
+                        references.insert(reference);
+                        if scheduled.len() < MAX_FUNCTIONS && scheduled.insert(target) {
+                            pending.push_back(target);
+                        } else if !scheduled.contains(&target) {
+                            report.partial = true;
+                        }
+                    }
+                }
+                Err(_) => {
+                    report.failed_functions += 1;
+                    report.partial = true;
+                }
+            }
+            emit(AnalysisStage::Calls, &report, progress)?;
+        }
+        report.references = references.into_iter().collect();
+        report.data = Some(data.finish());
+        if self.target.name == "AArch64" && !self.pe_imports.is_empty() {
+            let targets: BTreeSet<_> = report
+                .references
+                .iter()
+                .map(|reference| reference.target)
+                .chain(known.keys().copied())
+                .collect();
+            report.partial |= targets.len() > crate::pe_symbols::MAX_THUNK_TARGETS;
+            let targets = targets
+                .into_iter()
+                .take(crate::pe_symbols::MAX_THUNK_TARGETS)
+                .collect();
+            let mut remaining = MAX_ANALYSIS_INSTRUCTIONS - report.decode_attempts;
+            report.partial |= !crate::pe_symbols::register_aarch64_import_thunks_budgeted(
+                &mut self.program,
+                &self.pe_imports,
+                &self.snapshot,
+                &self.info.sections,
+                &targets,
+                &mut remaining,
+            )?;
+            report.decode_attempts = MAX_ANALYSIS_INSTRUCTIONS - remaining;
+        }
+        emit(AnalysisStage::Publish, &report, progress)?;
+        Ok(report)
     }
 
     fn check_code(&self, address: u64) -> Result<(), String> {
@@ -464,13 +613,12 @@ impl LoadedProgram {
     }
 
     fn resolve_import_thunks(&mut self, entry: u64) -> Result<(), String> {
-        // This recognizer decodes x86 FF /4 import jumps, not AArch64 ADRP/LDR/BR veneers.
-        if self.target.name == "AArch64" || self.pe_imports.is_empty() {
+        if self.pe_imports.is_empty() {
             return Ok(());
         }
         let mut pending = VecDeque::from([entry]);
         let mut visited = BTreeSet::new();
-        let mut targets = BTreeSet::new();
+        let mut targets = BTreeSet::from([entry]);
         // The decompiler can follow a tail branch into another known function.
         // Resolve imports from those exact CFG call targets as well, with a
         // fixed work budget. Never treat arbitrary byte matches as code entries.
@@ -507,6 +655,15 @@ impl LoadedProgram {
                     pending.push_back(target);
                 }
             }
+        }
+        if self.target.name == "AArch64" {
+            return crate::pe_symbols::register_aarch64_import_thunks(
+                &mut self.program,
+                &self.pe_imports,
+                &self.snapshot,
+                &self.info.sections,
+                &targets,
+            );
         }
         crate::pe_symbols::register_import_thunks(
             &mut self.program,
@@ -591,7 +748,7 @@ impl LoadedProgram {
                     .snapshot
                     .get(file_start..file_end)
                     .ok_or("Section extends past immutable image snapshot")?;
-                let chunk_limit = MAX_RESULTS.min(crate::crypto::MAX_MATCHES);
+                let chunk_limit = MAX_CRYPTO_RESULTS.min(crate::crypto::MAX_MATCHES);
                 let found = crate::crypto::scan_region(chunk, base, chunk_limit);
                 let chunk_limited = found.len() >= chunk_limit;
                 // Matches fully contained in the preceding overlap were already reported.
@@ -602,8 +759,8 @@ impl LoadedProgram {
                         matches.push(hit);
                     }
                 }
-                if matches.len() >= MAX_RESULTS || chunk_limited {
-                    matches.truncate(MAX_RESULTS);
+                if matches.len() >= MAX_CRYPTO_RESULTS || chunk_limited {
+                    matches.truncate(MAX_CRYPTO_RESULTS);
                     return Ok(Response::Crypto {
                         matches,
                         truncated: true,
@@ -618,43 +775,71 @@ impl LoadedProgram {
     }
 }
 
-fn function_list(program: &Program, info: &mut BinaryInfo) -> Result<Vec<FunctionInfo>, String> {
+/// Publishes the engine inventory within the shared count and escaped-name
+/// budgets. The entry and `required` addresses (owners of evidence in the same
+/// reply) are admitted first; remaining entries follow engine address order.
+fn function_list(
+    program: &Program,
+    info: &mut BinaryInfo,
+    required: &BTreeSet<u64>,
+) -> Result<Vec<FunctionInfo>, String> {
     let alignment = crate::architecture::instruction_alignment(program.language_id());
     let code_entry = |address: u64| {
         address.is_multiple_of(alignment) && executable(&info.sections, address, alignment as usize)
     };
-    let mut entries = program
+    let entries: Vec<_> = program
         .functions()
         .map_err(engine_error)?
         .into_iter()
-        .filter(|f| code_entry(f.address));
-    let mut functions: Vec<_> = entries
-        .by_ref()
-        .take(MAX_RESULTS)
+        .filter(|f| code_entry(f.address))
         .map(|f| FunctionInfo {
             address: f.address,
             name: bounded_name(&f.name),
         })
         .collect();
-    let truncated = entries.next().is_some();
-    if code_entry(info.entry) && !functions.iter().any(|f| f.address == info.entry) {
-        if functions.len() == MAX_RESULTS {
-            functions.pop();
-            info.functions_truncated = true;
+    let mut admitted = BTreeMap::new();
+    let mut name_bytes = 0usize;
+    let mut truncated = false;
+    let mut admit = |function: FunctionInfo, admitted: &mut BTreeMap<u64, String>| {
+        if admitted.contains_key(&function.address) {
+            return;
         }
-        functions.push(FunctionInfo {
-            address: info.entry,
-            name: "entry".into(),
-        });
+        let bytes = json_escaped_len(&function.name);
+        if admitted.len() < MAX_FUNCTIONS && bytes <= MAX_FUNCTION_NAME_JSON_BYTES - name_bytes {
+            name_bytes += bytes;
+            admitted.insert(function.address, function.name);
+        } else {
+            truncated = true;
+        }
+    };
+    if code_entry(info.entry) {
+        let name = entries
+            .iter()
+            .find(|f| f.address == info.entry)
+            .map_or_else(|| "entry".into(), |f| f.name.clone());
+        admit(
+            FunctionInfo {
+                address: info.entry,
+                name,
+            },
+            &mut admitted,
+        );
     }
-    functions.sort_by_key(|f| f.address);
-    functions.dedup_by_key(|f| f.address);
+    let (first, rest): (Vec<_>, Vec<_>) = entries
+        .into_iter()
+        .partition(|f| required.contains(&f.address));
+    for function in first.into_iter().chain(rest) {
+        admit(function, &mut admitted);
+    }
     info.functions_truncated |= truncated;
-    Ok(functions)
+    Ok(admitted
+        .into_iter()
+        .map(|(address, name)| FunctionInfo { address, name })
+        .collect())
 }
 
 fn bounded_name(name: &str) -> String {
-    let mut end = name.len().min(256);
+    let mut end = name.len().min(MAX_FUNCTION_NAME_BYTES);
     while !name.is_char_boundary(end) {
         end -= 1;
     }
@@ -874,6 +1059,7 @@ fn recover_graph_with_ranges(
     recover_graph_counted(program, sections, functions, entry, pe_ranges).map(|(view, _)| view)
 }
 
+/// `functions` must be ordered by address, as every published inventory is.
 fn recover_graph_counted(
     program: &Program,
     sections: &[SectionInfo],
@@ -881,6 +1067,37 @@ fn recover_graph_counted(
     entry: u64,
     pe_ranges: &[(u64, u64)],
 ) -> Result<(FunctionView, usize), String> {
+    if !functions.is_sorted_by_key(|function| function.address) {
+        return Err("Function inventory is not ordered by address".into());
+    }
+    let mut remaining = MAX_INSTRUCTIONS;
+    let recovered = recover_graph_budgeted(
+        program,
+        sections,
+        &|address| function_at(functions, address).is_some(),
+        entry,
+        pe_ranges,
+        &mut remaining,
+        None,
+    )?;
+    Ok((recovered.view, MAX_INSTRUCTIONS - remaining))
+}
+
+struct GraphRecovery {
+    view: FunctionView,
+    calls: Vec<(CallSite, u64)>,
+    partial: bool,
+}
+
+fn recover_graph_budgeted(
+    program: &Program,
+    sections: &[SectionInfo],
+    is_function: &dyn Fn(u64) -> bool,
+    entry: u64,
+    pe_ranges: &[(u64, u64)],
+    remaining: &mut usize,
+    mut data: Option<&mut crate::data_analysis::DataCollector<'_>>,
+) -> Result<GraphRecovery, String> {
     let alignment = crate::architecture::instruction_alignment(program.language_id());
     if !entry.is_multiple_of(alignment) {
         return Err(format!(
@@ -892,25 +1109,24 @@ fn recover_graph_counted(
             "{entry:#x} is outside file-backed executable sections."
         ));
     }
-    let other_entries: BTreeSet<_> = functions
-        .iter()
-        .map(|f| f.address)
-        .filter(|a| *a != entry)
-        .collect();
+    if let Some(data) = data.as_mut() {
+        data.begin_function();
+    }
     let mut pending = VecDeque::from([entry]);
     let mut visited = BTreeSet::new();
     let mut nodes = BTreeMap::<u64, Decoded>::new();
     let mut leaders = BTreeSet::from([entry]);
     let mut warnings = Vec::new();
     let mut calls = Vec::new();
+    let mut call_evidence = Vec::new();
     while let Some(address) = pending.pop_front() {
         if !visited.insert(address) {
             continue;
         }
-        if nodes.len() >= MAX_INSTRUCTIONS {
+        if *remaining == 0 {
             warning(
                 &mut warnings,
-                "Graph limited to 2048 instructions; recovery is incomplete.",
+                "Instruction work budget reached; recovery is incomplete.",
             );
             break;
         }
@@ -922,7 +1138,7 @@ fn recover_graph_counted(
             );
             continue;
         }
-        if other_entries.contains(&address)
+        if (address != entry && is_function(address))
             || (address != entry
                 && pe_ranges
                     .binary_search_by_key(&address, |range| range.0)
@@ -930,7 +1146,7 @@ fn recover_graph_counted(
         {
             warning(
                 &mut warnings,
-                "A path reaches another known function entry; displayed as an external/tail exit.",
+                "A path reaches another known function entry or PE runtime-region start; displayed as an external/tail exit.",
             );
             continue;
         }
@@ -944,6 +1160,9 @@ fn recover_graph_counted(
             );
             continue;
         }
+        // Charge failures as well as successful decodes; shared discovery work
+        // must never grow past its budget when hostile bytes fail to decode.
+        *remaining -= 1;
         let instruction = match program.disassemble(address, 1).map_err(engine_error) {
             Ok(mut instructions) if !instructions.is_empty() => instructions.remove(0),
             Ok(_) => {
@@ -961,7 +1180,8 @@ fn recover_graph_counted(
                 continue;
             }
         };
-        if instruction.length == 0
+        if instruction.address != address
+            || instruction.length == 0
             || (alignment == 4 && instruction.length != 4)
             || !executable(sections, address, instruction.length)
         {
@@ -995,14 +1215,24 @@ fn recover_graph_counted(
                 continue;
             }
         };
-        if pcode.length != instruction.length {
+        if pcode.address != address || pcode.length != instruction.length {
             warning(
                 &mut warnings,
                 format!("Instruction/p-code length mismatch at {address:#x}."),
             );
             continue;
         }
+        if let Some(data) = data.as_mut() {
+            data.inspect(entry, &pcode);
+        }
+        let call_start = calls.len();
         let (next, terminal) = flow(&pcode, next_address, &mut calls, &mut warnings);
+        call_evidence.extend(
+            calls[call_start..]
+                .iter()
+                .cloned()
+                .map(|call| (call, next_address)),
+        );
         for (target, _) in &next {
             if let Some(target) = target {
                 if terminal {
@@ -1093,20 +1323,25 @@ fn recover_graph_counted(
             "Some recovered instructions are omitted by graph limits or ambiguous block boundaries.",
         );
     }
+    if let Some(data) = data.as_mut() {
+        data.propagate(entry, blocks.iter());
+    }
+    let partial = !warnings.is_empty();
     warning(
         &mut warnings,
         "CFG uses bounded static instruction flow; indirect jump tables, exceptions, and no-return calls may be incomplete.",
     );
-    Ok((
-        FunctionView {
+    Ok(GraphRecovery {
+        view: FunctionView {
             address: entry,
             blocks,
             edges,
             calls,
             warnings,
         },
-        nodes.len(),
-    ))
+        calls: call_evidence,
+        partial,
+    })
 }
 
 fn flow(
@@ -1117,6 +1352,7 @@ fn flow(
 ) -> (Vec<(Option<u64>, EdgeKind)>, bool) {
     let mut transfer = None;
     let mut internal = false;
+    let call_start = calls.len();
     for operation in &code.operations {
         let direct = operation
             .inputs
@@ -1124,14 +1360,23 @@ fn flow(
             .filter(|v| v.space == "ram")
             .map(|v| v.offset);
         match operation.opcode {
-            OpCode::Call | OpCode::Callind => calls.push(CallSite {
-                address: code.address,
-                target: if operation.opcode == OpCode::Call {
-                    direct
-                } else {
-                    None
-                },
-            }),
+            OpCode::Call | OpCode::Callind => {
+                if calls.len() >= MAX_INSTRUCTIONS {
+                    warning(
+                        warnings,
+                        "Call-site budget reached; recovery is incomplete.",
+                    );
+                    continue;
+                }
+                calls.push(CallSite {
+                    address: code.address,
+                    target: if operation.opcode == OpCode::Call {
+                        direct
+                    } else {
+                        None
+                    },
+                });
+            }
             OpCode::Branch | OpCode::Cbranch => {
                 if operation.inputs.first().is_some_and(|v| v.space == "const") {
                     internal = true;
@@ -1166,7 +1411,8 @@ fn flow(
             _ => {}
         }
     }
-    if internal {
+    if internal || calls.len() > call_start + 1 {
+        calls.truncate(call_start);
         warning(
             warnings,
             format!(
@@ -1210,12 +1456,224 @@ pub(crate) mod tests {
         }
     }
 
+    fn raw_x86(bytes: Vec<u8>) -> LoadedProgram {
+        let mut loaded = raw_aarch64(bytes.clone());
+        loaded.target = crate::architecture::Target {
+            name: "x86-64",
+            language: "x86:LE:64:default:gcc",
+            pointer_bytes: 8,
+            instruction_alignment: 1,
+        };
+        loaded.info.architecture = "x86-64".into();
+        loaded.program = Program::from_raw_bytes(bytes, loaded.target.language, 0x1000).unwrap();
+        loaded
+    }
+
+    fn bulk_functions(loaded: &mut LoadedProgram, names: impl Iterator<Item = (u64, String)>) {
+        let metadata = crate::pe::PeMetadata {
+            functions: names.collect(),
+            ..Default::default()
+        };
+        crate::pe_symbols::register(&mut loaded.program, &metadata, 8).unwrap();
+    }
+
+    #[test]
+    fn full_inventory_reserves_entry_and_evidence_owners() {
+        let mut loaded = raw_x86(vec![0xc3; MAX_FUNCTIONS + 8]);
+        bulk_functions(
+            &mut loaded,
+            (0..MAX_FUNCTIONS as u64).map(|i| (0x1008 + i, format!("FUN_{:x}", 0x1008 + i))),
+        );
+        loaded.program.set_function_name(0x1001, "owner").unwrap();
+        let owners = BTreeSet::from([0x1001]);
+        let functions = function_list(&loaded.program, &mut loaded.info, &owners).unwrap();
+        assert_eq!(functions.len(), MAX_FUNCTIONS);
+        assert_eq!(functions[0].address, 0x1000);
+        assert_eq!(functions[0].name, "entry");
+        assert_eq!(functions[1].name, "owner");
+        assert!(loaded.info.functions_truncated);
+        // Address order admits the lowest remaining entries; two are omitted.
+        assert_eq!(
+            functions.last().unwrap().address,
+            0x1008 + MAX_FUNCTIONS as u64 - 3
+        );
+        validate_functions(&functions, MAX_FUNCTION_NAME_BYTES, true).unwrap();
+    }
+
+    #[test]
+    fn inventory_names_respect_the_escaped_byte_budget() {
+        let count = MAX_FUNCTION_NAME_JSON_BYTES / 250 + 16;
+        let mut loaded = raw_x86(vec![0xc3; count + 8]);
+        // Quotes double when escaped: 125 of them cost 250 bytes.
+        bulk_functions(
+            &mut loaded,
+            (0..count as u64).map(|i| (0x1008 + i, format!("{}{i:x}", "\"".repeat(125)))),
+        );
+        let functions = function_list(&loaded.program, &mut loaded.info, &BTreeSet::new()).unwrap();
+        assert!(loaded.info.functions_truncated);
+        assert!(functions.len() < count);
+        let escaped: usize = functions.iter().map(|f| json_escaped_len(&f.name)).sum();
+        assert!(escaped <= MAX_FUNCTION_NAME_JSON_BYTES);
+        assert!(escaped > MAX_FUNCTION_NAME_JSON_BYTES - 512);
+        validate_functions(&functions, MAX_FUNCTION_NAME_BYTES, true).unwrap();
+    }
+
+    fn discover(loaded: &mut LoadedProgram) -> (Vec<FunctionInfo>, CallAnalysis) {
+        let Response::Functions {
+            functions,
+            analysis,
+            ..
+        } = loaded.handle(Request::Discover).unwrap()
+        else {
+            panic!("Expected discovery")
+        };
+        analysis.validate(&loaded.info, &functions).unwrap();
+        (functions, analysis)
+    }
+
+    #[test]
+    fn confirmed_calls_discover_with_symbols_preserve_names_and_stop_cycles() {
+        let mut bytes = vec![0xcc; 0x50];
+        bytes[..16].copy_from_slice(&[
+            0xe8, 0x1b, 0, 0, 0, // call 1020
+            0xe8, 0x16, 0, 0, 0, // call 1020 from another site
+            0xb8, 0x40, 0x10, 0, 0, // numeric value 1040 is not a function seed
+            0xc3,
+        ]);
+        bytes[0x20..0x26].copy_from_slice(&[0xe8, 0xdb, 0xff, 0xff, 0xff, 0xc3]); // call root; ret
+        bytes[0x40] = 0xc3;
+        let mut loaded = raw_x86(bytes);
+        loaded
+            .program
+            .set_function_name(0x1000, "root_name")
+            .unwrap();
+        loaded.info.functions =
+            function_list(&loaded.program, &mut loaded.info, &BTreeSet::new()).unwrap();
+        let (functions, report) = discover(&mut loaded);
+        assert_eq!(functions.len(), 2);
+        assert_eq!(functions[0].name, "root_name");
+        assert_eq!(functions[1].address, 0x1020);
+        assert_eq!(report.functions_examined, 2);
+        assert_eq!(
+            report.references,
+            vec![
+                CallReference {
+                    caller: 0x1000,
+                    address: 0x1000,
+                    target: 0x1020
+                },
+                CallReference {
+                    caller: 0x1000,
+                    address: 0x1005,
+                    target: 0x1020
+                },
+                CallReference {
+                    caller: 0x1020,
+                    address: 0x1020,
+                    target: 0x1000
+                },
+            ]
+        );
+        let (_, repeated) = discover(&mut loaded);
+        assert_eq!(repeated.references, report.references);
+    }
+
+    #[test]
+    fn calls_to_fallthrough_do_not_split_functions_and_indirect_calls_stay_unknown() {
+        let mut loaded = raw_x86(vec![0xe8, 0, 0, 0, 0, 0x58, 0xff, 0xd0, 0xc3]);
+        let (functions, report) = discover(&mut loaded);
+        assert_eq!(functions.len(), 1);
+        assert_eq!(functions[0].address, 0x1000);
+        assert!(report.references.is_empty());
+        // The x86 SLEIGH language emits a branch for call-to-next-PC already.
+        assert_eq!(report.skipped_fallthrough_calls, 0);
+        assert_eq!(report.unresolved_calls, 1);
+        assert!(report.partial);
+    }
+
+    #[test]
+    fn failed_decode_is_charged_and_does_not_create_a_function() {
+        let mut bytes = vec![0xcc; 0x21];
+        bytes[..6].copy_from_slice(&[0xe8, 0x1b, 0, 0, 0, 0xc3]); // call 1020; ret
+        bytes[0x20] = 0xe8; // Truncated call at the actual target.
+        let mut loaded = raw_x86(bytes);
+        let (functions, report) = discover(&mut loaded);
+        assert_eq!(functions.len(), 1);
+        assert!(
+            loaded
+                .program
+                .functions()
+                .unwrap()
+                .iter()
+                .all(|f| f.address != 0x1020)
+        );
+        assert_eq!(report.decode_attempts, 3);
+        assert_eq!(report.failed_functions, 1);
+        assert!(report.partial);
+    }
+
+    #[test]
+    fn aarch64_call_to_fallthrough_is_not_a_function_candidate() {
+        let mut bytes = 0x94000001u32.to_le_bytes().to_vec(); // BL next PC
+        bytes.extend_from_slice(&0xd65f03c0u32.to_le_bytes());
+        let mut loaded = raw_aarch64(bytes);
+        let (functions, report) = discover(&mut loaded);
+        assert_eq!(functions.len(), 1);
+        assert!(report.references.is_empty());
+        assert_eq!(report.skipped_fallthrough_calls, 1);
+    }
+
+    #[test]
+    fn discovery_has_an_exact_shared_decode_budget_and_monotonic_progress() {
+        let stride = MAX_INSTRUCTIONS + 1;
+        let mut bytes = vec![0x90; stride * 9];
+        for function in 0..9 {
+            bytes[(function + 1) * stride - 1] = 0xc3;
+        }
+        let mut loaded = raw_x86(bytes);
+        for function in 0..9 {
+            loaded
+                .program
+                .set_function_name(
+                    0x1000 + (function * stride) as u64,
+                    &format!("seed_{function}"),
+                )
+                .unwrap();
+        }
+        loaded.info.functions =
+            function_list(&loaded.program, &mut loaded.info, &BTreeSet::new()).unwrap();
+        let mut events: Vec<AnalysisProgress> = Vec::new();
+        let Response::Functions { analysis, .. } = loaded
+            .handle_with_progress(Request::Discover, &mut |event| {
+                event.validate_after(events.last()).unwrap();
+                events.push(event);
+                Ok(())
+            })
+            .unwrap()
+        else {
+            panic!("Expected discovery")
+        };
+        assert_eq!(analysis.decode_attempts, MAX_ANALYSIS_INSTRUCTIONS);
+        assert_eq!(analysis.functions_examined, 8);
+        assert!(analysis.partial);
+        assert_eq!(events.first().unwrap().stage, AnalysisStage::Seeds);
+        assert_eq!(events.last().unwrap().stage, AnalysisStage::Publish);
+        assert!(events.len() <= MAX_ANALYSIS_FUNCTIONS + 3);
+    }
+
     #[test]
     fn packed_image_rejects_expensive_analysis_without_poisoning_other_requests() {
         let mut loaded = raw_aarch64(0xd65f03c0u32.to_le_bytes().to_vec());
         // Simulate the already validated packed-image flag with a tiny safe
         // engine fixture; no real packed application or decompression is run.
         loaded.upx_packed = true;
+        assert!(
+            loaded
+                .handle_with_progress(Request::Discover, &mut |_| panic!(
+                    "Packed input must be rejected before progress/work"
+                ))
+                .is_err()
+        );
         for request in [Request::Decompile { address: 0x1000 }, Request::Discover] {
             assert_eq!(
                 loaded.handle(request).unwrap_err(),
@@ -1272,6 +1730,26 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn call_evidence_survives_display_block_limits() {
+        let mut bytes = 0x14000001u32.to_le_bytes().repeat(140);
+        bytes.extend_from_slice(&0x94000002u32.to_le_bytes()); // BL helper, after the display cutoff
+        bytes.extend_from_slice(&0xd65f03c0u32.to_le_bytes());
+        bytes.extend_from_slice(&0xd65f03c0u32.to_le_bytes()); // helper
+        let mut loaded = raw_aarch64(bytes);
+        let (_, report) = discover(&mut loaded);
+        assert_eq!(
+            report.references,
+            vec![CallReference {
+                caller: 0x1000,
+                address: 0x1000 + 140 * 4,
+                target: 0x1000 + 142 * 4
+            }]
+        );
+        assert!(report.partial);
+        assert!(report.decode_attempts > 128);
+    }
+
+    #[test]
     fn aarch64_discovery_reports_unvisited_seeds_without_losing_known_names() {
         let mut loaded = raw_aarch64(0xd65f03c0u32.to_le_bytes().repeat(130));
         for index in 0..130 {
@@ -1280,10 +1758,12 @@ pub(crate) mod tests {
                 .set_function_name(0x1000 + index * 4, &format!("original_{index}"))
                 .unwrap();
         }
-        loaded.info.functions = function_list(&loaded.program, &mut loaded.info).unwrap();
+        loaded.info.functions =
+            function_list(&loaded.program, &mut loaded.info, &BTreeSet::new()).unwrap();
         let Response::Functions {
             functions,
             truncated,
+            ..
         } = loaded.handle(Request::Discover).unwrap()
         else {
             panic!("Expected function list");
@@ -1457,7 +1937,7 @@ pub(crate) mod tests {
             functions_truncated: false,
             warnings: vec![],
         };
-        info.functions = function_list(&program, &mut info).unwrap();
+        info.functions = function_list(&program, &mut info, &BTreeSet::new()).unwrap();
         let mut loaded = LoadedProgram {
             target: crate::architecture::Target::for_image(
                 &object::File::parse(elf_fixture().as_slice()).unwrap(),

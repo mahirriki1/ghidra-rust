@@ -3,7 +3,9 @@
 mod common;
 
 use ghidra_rust::client::{WorkerClient, WorkerEvent};
-use ghidra_rust::model::{BinaryInfo, CodeMapping, EdgeKind, FunctionView, Request, Response};
+use ghidra_rust::model::{
+    BinaryInfo, CodeMapping, DataProvenance, EdgeKind, FunctionView, Request, Response,
+};
 use ghidra_rust::project::ProjectData;
 use ghidra_rust::session::{Annotation, Session};
 use std::collections::BTreeSet;
@@ -18,6 +20,10 @@ fn request(worker: &mut WorkerClient, request: Request) -> Response {
         match worker.poll() {
             Some(WorkerEvent::Reply(reply)) => {
                 assert_eq!(reply.id, id);
+                if let Response::Progress { progress } = &reply.response {
+                    progress.validate_after(None).unwrap();
+                    continue;
+                }
                 return reply.response;
             }
             Some(WorkerEvent::Failed(error)) => panic!("Contained worker failed: {error}"),
@@ -31,6 +37,109 @@ fn graph(worker: &mut WorkerClient, address: u64) -> FunctionView {
     match request(worker, Request::Graph { address }) {
         Response::Graph { view } => view,
         other => panic!("Expected CFG at {address:#x}, got {other:?}"),
+    }
+}
+
+#[test]
+fn contained_data_accesses_use_literal_reads_and_block_local_propagation() {
+    let source = include_str!("fixtures/aarch64-data.S");
+    let words: Vec<_> = source
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix(".inst 0x"))
+        .flat_map(|value| {
+            u32::from_str_radix(value.split_whitespace().next().unwrap(), 16)
+                .unwrap()
+                .to_le_bytes()
+        })
+        .collect();
+    let literal = source
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(".quad 0x"))
+        .map(|value| {
+            u64::from_str_radix(value.split_whitespace().next().unwrap(), 16)
+                .unwrap()
+                .to_le_bytes()
+        })
+        .unwrap();
+    for (format, (mut bytes, base), code_offset) in [
+        ("ELF", common::elf(true), 0x100),
+        ("PE", common::pe(), 0x200),
+        ("Mach-O", common::macho(), 0x1000),
+    ] {
+        bytes[code_offset..code_offset + words.len()].copy_from_slice(&words);
+        bytes[code_offset + 32..code_offset + 40].copy_from_slice(&literal);
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("original literal fixture");
+        std::fs::write(&binary, &bytes).unwrap();
+        let mut worker = WorkerClient::start_using_executable(
+            eframe::egui::Context::default(),
+            &binary,
+            Path::new(env!("CARGO_BIN_EXE_ghidra-rust")),
+        )
+        .unwrap();
+        let Response::Opened { info } = request(
+            &mut worker,
+            Request::Open {
+                path: binary.to_string_lossy().into_owned(),
+            },
+        ) else {
+            panic!("Open {format}");
+        };
+        let (functions, analysis) = match request(&mut worker, Request::Discover) {
+            Response::Functions {
+                functions,
+                analysis,
+                ..
+            } => (functions, analysis),
+            other => panic!("Discover {format}: {other:?}"),
+        };
+        analysis.validate(&info, &functions).unwrap();
+        let data = analysis.data.unwrap();
+        let read = |address, provenance| ghidra_rust::model::DataReference {
+            function: base,
+            address,
+            target: base + 32,
+            size: 8,
+            access: ghidra_rust::model::DataAccess::Read,
+            provenance,
+        };
+        let fixture: Vec<_> = data
+            .references
+            .iter()
+            .filter(|reference| reference.function == base)
+            .cloned()
+            .collect();
+        assert_eq!(
+            fixture,
+            [
+                read(base, DataProvenance::InstructionLocal),
+                read(base + 16, DataProvenance::Propagated),
+            ],
+            "{format}"
+        );
+        // The load after the call stays unresolved.
+        assert!(data.unresolved_accesses >= 1);
+        assert!(
+            !functions
+                .iter()
+                .any(|function| function.address == base + 32)
+        );
+        let Response::Bytes {
+            address,
+            bytes: read,
+        } = request(
+            &mut worker,
+            Request::Bytes {
+                address: base + 32,
+                length: 8,
+            },
+        )
+        else {
+            panic!("Read {format} literal bytes");
+        };
+        assert_eq!(address, base + 32);
+        assert_eq!(read, literal);
+        assert_eq!(std::fs::read(&binary).unwrap(), bytes);
     }
 }
 
@@ -112,6 +221,23 @@ fn contained_aarch64_workers_analyze_elf_pe_macho_and_reopen_projects() {
                 info.functions
             );
         }
+        let Response::Functions {
+            functions,
+            analysis,
+            ..
+        } = request(&mut worker, Request::Discover)
+        else {
+            panic!("Expected symbol-bearing discovery");
+        };
+        analysis.validate(&info, &functions).unwrap();
+        assert!(
+            analysis
+                .references
+                .iter()
+                .any(|reference| reference.address == base + 8 && reference.target == base + 48)
+        );
+        assert_eq!(analysis.unresolved_calls, 1);
+        assert!(analysis.partial);
         let protection = worker.protection().bind_snapshot(&info).unwrap();
         let entry = graph(&mut worker, base);
         let pcs: BTreeSet<_> = entry
@@ -281,9 +407,24 @@ fn stripped_aarch64_discovery_follows_real_calls_in_all_containers() {
         assert_eq!(info.functions.len(), 1);
         assert_eq!(graph(&mut worker, base).calls[0].target, Some(base + 48));
         let response = request(&mut worker, Request::Discover);
-        let Response::Functions { functions, .. } = response else {
+        let Response::Functions {
+            functions,
+            analysis,
+            ..
+        } = response
+        else {
             panic!("Discover functions: {response:?}");
         };
+        analysis.validate(&info, &functions).unwrap();
+        assert_eq!(
+            analysis.references,
+            vec![ghidra_rust::model::CallReference {
+                caller: base,
+                address: base + 8,
+                target: base + 48,
+            }]
+        );
+        assert_eq!(analysis.functions_examined, 2);
         assert!(functions.iter().any(|f| f.address == base + 48));
         let sum = graph(&mut worker, base + 48);
         decompile(&mut worker, base + 48, &info, &sum);
@@ -348,4 +489,100 @@ fn aarch64_rejects_unaligned_entries_and_truncated_instructions() {
         !graph(&mut worker, base + 48).blocks.is_empty(),
         "Bad requests must not poison the worker"
     );
+}
+
+#[test]
+fn stripped_arm64_pe_recovers_unwind_entries_and_names_confirmed_import_veneers() {
+    let (bytes, base) = common::arm64_pe_metadata();
+    let directory = tempfile::tempdir().unwrap();
+    let binary = directory.path().join("original stripped ARM64 PE");
+    std::fs::write(&binary, &bytes).unwrap();
+    let mut worker = WorkerClient::start_using_executable(
+        eframe::egui::Context::default(),
+        &binary,
+        Path::new(env!("CARGO_BIN_EXE_ghidra-rust")),
+    )
+    .unwrap();
+    let Response::Opened { info } = request(
+        &mut worker,
+        Request::Open {
+            path: binary.to_string_lossy().into_owned(),
+        },
+    ) else {
+        panic!("Expected stripped ARM64 PE");
+    };
+    assert_eq!(
+        info.functions
+            .iter()
+            .map(|function| function.address)
+            .collect::<Vec<_>>(),
+        [base, base + 0x80, base + 0xa0]
+    );
+    assert!(info.functions_truncated); // Fragment ownership remains incomplete.
+    assert!(
+        info.warnings
+            .iter()
+            .any(|warning| warning.contains("fragment records"))
+    );
+    let isolated = graph(&mut worker, base + 0x80);
+    let (text, _) = decompile(&mut worker, base + 0x80, &info, &isolated);
+    assert!(text.contains('7'), "{text}");
+    let caller = graph(&mut worker, base + 0xa0);
+    let (text, _) = decompile(&mut worker, base + 0xa0, &info, &caller);
+    assert!(text.contains("fixture_import"), "{text}");
+    let Response::Functions {
+        functions,
+        analysis,
+        ..
+    } = request(&mut worker, Request::Discover)
+    else {
+        panic!("Expected discovery report");
+    };
+    analysis.validate(&info, &functions).unwrap();
+    // 26 CFG instruction attempts plus three veneer-confirmation attempts.
+    assert_eq!(analysis.decode_attempts, 29);
+    assert!(
+        functions
+            .iter()
+            .any(|function| function.address == base + 0xc0 && function.name == "fixture_import")
+    );
+    assert!(
+        functions
+            .iter()
+            .any(|function| function.address == base + 48)
+    );
+    assert!(
+        !functions
+            .iter()
+            .any(|function| function.address == base + 0x90)
+    );
+    assert!(
+        analysis
+            .references
+            .iter()
+            .any(|reference| reference.caller == base + 0xa0
+                && reference.address == base + 0xa8
+                && reference.target == base + 0xc0)
+    );
+    let veneer = graph(&mut worker, base + 0xc0);
+    assert_eq!(
+        veneer
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .count(),
+        3
+    );
+    assert!(
+        veneer
+            .edges
+            .iter()
+            .any(|edge| edge.kind == EdgeKind::Unknown && edge.target.is_none())
+    );
+    assert!(veneer.calls.is_empty());
+    assert_eq!(
+        info.sha256,
+        ghidra_rust::session::fingerprint(&binary).unwrap()
+    );
+    assert_eq!(std::fs::read(&binary).unwrap(), bytes);
 }
