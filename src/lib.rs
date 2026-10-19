@@ -12,12 +12,14 @@ pub mod graph;
 pub mod highlight;
 pub mod limits;
 pub mod model;
+pub mod packing;
 mod pe;
 mod pe_symbols;
 pub mod project;
 pub mod selection;
 pub mod session;
 pub mod theme;
+pub mod window_chrome;
 #[cfg(windows)]
 pub mod windows;
 pub mod worker;

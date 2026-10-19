@@ -76,6 +76,8 @@ on the left, the Listing or Function Graph in the middle, and the Decompiler on
 the right. Long instruction rows stay on one line with horizontal scrolling.
 Annotation editing opens in a separate tool window. File selection is built into
 the app and does not require a desktop file-dialog portal.
+On Windows, window controls share the menu row: drag its empty space to move the
+window, double-click it to maximize/restore, or drag an edge to resize.
 
 The rust-orange dragon is the current project logo, shared by the native window
 icon, README, and a small mark immediately before **File** in the menu bar. The
@@ -149,11 +151,18 @@ navigates to that function.
   unresolved-flow markers. CFG recovery is bounded; warnings identify unsupported
   or incomplete cases such as indirect flow. Calls are displayed separately from
   intra-function branches.
+  Large graphs open around the entry block at a readable scale. **Fit** shows the
+  complete overview with text hidden at small scales; **Entry** returns to readable
+  entry code. Nonlocal and loop edges use separate routes outside the block columns.
 - Switch between the graph and listing. Read separately requested C-like
   decompilation, inspect outgoing direct calls, and navigate by address.
 - Scan mapped bytes for ASCII and a printable ASCII subset of UTF-16LE strings.
   The tree shows **not scanned** until a scan runs. This is not complete Unicode
   or Rust string-slice recovery. **Analysis notes** shows loading and coverage limits.
+  The Strings tab defaults to six characters and accepts a minimum from 4 to 64.
+  This minimum applies before the 10,000-result cap; the text filter searches only
+  loaded results. Increase the minimum and rescan when short-string noise fills the
+  result budget. A partial scan is explicitly marked; the 64 MiB scan budget remains.
 - Use **Decode** for selected memory or pasted text/hex: UTF-8, UTF-16LE/BE,
   standard padded Base64, hex, or XOR. XOR keys use explicit `hex:` or `text:`
   prefixes. Common-decoding suggestions are heuristics and require analyst review.
@@ -164,6 +173,16 @@ navigates to that function.
 - Save a `.grproj` project, or export/import the existing versioned JSON annotation
   sidecars. Both are bound to the binary's SHA-256. The app does not patch binaries
   or write Ghidra/IDA project databases.
+
+Conventional UPX-packed PE files, including the standard Rufus 4.15 executable,
+contain an unpacker stub and compressed application code. The loader shows a
+packed-image notice and disables decompilation/function discovery for detected
+images because analyzing the stub can exhaust the worker's memory budget.
+Listing, CFG, string scans, and byte inspection remain available, but compressed
+bytes do not reveal the original functions or strings. Unpack a separate copy
+with UPX, for example `upx -d -o unpacked.exe original.exe`, then open that copy.
+The desktop does not unpack or execute the input. Detection covers the conventional
+UPX PE layout, not every packer or modified stub.
 
 ## Project files
 
