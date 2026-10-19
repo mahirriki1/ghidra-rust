@@ -354,7 +354,7 @@ impl LoadedProgram {
                 // since the last published inventory. Preserve those names.
                 self.info.functions =
                     function_list(&self.program, &mut self.info, &BTreeSet::new())?;
-                let analysis = self.discover_calls(progress)?;
+                let (analysis, _) = self.discover_calls(None, progress)?;
                 // Evidence owners must survive inventory admission so every
                 // published reference has its caller in the same reply.
                 let owners = analysis
@@ -374,6 +374,55 @@ impl LoadedProgram {
                     truncated: self.info.functions_truncated || analysis.partial,
                     analysis,
                 })
+            }
+            Request::DiscoverBatch { binding, seeds } => {
+                self.check_unpacked()?;
+                if seeds.is_empty()
+                    || seeds.len() > MAX_ANALYSIS_FUNCTIONS
+                    || seeds.iter().copied().collect::<BTreeSet<_>>().len() != seeds.len()
+                {
+                    return Err("Invalid discovery seed batch".into());
+                }
+                for &address in &seeds {
+                    self.check_code(address)?;
+                }
+                let (analysis, outcomes) = self.discover_calls(Some(&seeds), progress)?;
+                let owners = outcomes.iter().map(|outcome| outcome.address).collect();
+                self.info.functions = function_list(&self.program, &mut self.info, &owners)?;
+                Ok(Response::DiscoveryBatch {
+                    batch: DiscoveryBatch {
+                        binding,
+                        functions: self.info.functions.clone(),
+                        truncated: self.info.functions_truncated,
+                        analysis,
+                        outcomes,
+                    },
+                })
+            }
+            Request::SyncFunctions { functions } => {
+                validate_functions(&functions, MAX_FUNCTION_NAME_BYTES, true)?;
+                if functions.len() > MAX_DISCOVERY_SYNC_FUNCTIONS {
+                    return Err("Oversized function synchronization".into());
+                }
+                // Validate the entire request before touching the engine. The
+                // inventory admission routine retains its shared name/count caps.
+                for function in &functions {
+                    self.check_code(function.address)?;
+                }
+                if functions.iter().all(|function| {
+                    function_at(&self.info.functions, function.address)
+                        .is_some_and(|current| current.name == function.name)
+                }) {
+                    return Ok(Response::FunctionsSynced);
+                }
+                for function in functions {
+                    self.program
+                        .set_function_name(function.address, &function.name)
+                        .map_err(engine_error)?;
+                }
+                self.info.functions =
+                    function_list(&self.program, &mut self.info, &BTreeSet::new())?;
+                Ok(Response::FunctionsSynced)
             }
             Request::Rename { address, name } => {
                 self.check_code(address)?;
@@ -412,8 +461,9 @@ impl LoadedProgram {
 
     fn discover_calls(
         &mut self,
+        seeds: Option<&[u64]>,
         progress: &mut dyn FnMut(AnalysisProgress) -> Result<(), String>,
-    ) -> Result<CallAnalysis, String> {
+    ) -> Result<(CallAnalysis, Vec<DiscoveryOutcome>), String> {
         // Adapted from Ghidra FunctionAnalyzer's established-call rule and its
         // fallthrough-call exclusion. See NOTICE and docs/analysis.md. Decode
         // through public pinned-engine APIs; never promote arbitrary constants.
@@ -456,7 +506,7 @@ impl LoadedProgram {
             .iter()
             .map(|f| (f.address, f.name.clone()))
             .collect();
-        report.partial |= known.len() > MAX_ANALYSIS_FUNCTIONS;
+        report.partial |= seeds.is_none() && known.len() > MAX_ANALYSIS_FUNCTIONS;
         let mut name_bytes = known
             .values()
             .map(|name| json_escaped_len(name))
@@ -464,22 +514,32 @@ impl LoadedProgram {
             .min(MAX_FUNCTION_NAME_JSON_BYTES);
         let mut pending = VecDeque::new();
         let mut scheduled = BTreeSet::new();
-        if self.check_code(self.info.entry).is_ok() {
-            scheduled.insert(self.info.entry);
-            pending.push_back(self.info.entry);
-        }
-        for &address in known.keys().take(MAX_ANALYSIS_FUNCTIONS) {
-            if scheduled.insert(address) {
-                pending.push_back(address);
+        if let Some(seeds) = seeds {
+            pending.extend(seeds.iter().copied());
+            scheduled.extend(seeds.iter().copied());
+        } else {
+            if self.check_code(self.info.entry).is_ok() {
+                scheduled.insert(self.info.entry);
+                pending.push_back(self.info.entry);
+            }
+            for &address in known.keys().take(MAX_ANALYSIS_FUNCTIONS) {
+                if scheduled.insert(address) {
+                    pending.push_back(address);
+                }
             }
         }
+        let mut outcomes = Vec::new();
         let mut references = BTreeSet::new();
         emit(AnalysisStage::Calls, &report, progress)?;
         while let Some(address) = pending.pop_front() {
             if report.functions_examined == MAX_ANALYSIS_FUNCTIONS
                 || report.decode_attempts == MAX_ANALYSIS_INSTRUCTIONS
+                || seeds.is_some()
+                    && MAX_ANALYSIS_INSTRUCTIONS - report.decode_attempts < MAX_INSTRUCTIONS
             {
-                report.partial = true;
+                // Leave unstarted seeds pending. A batch limit is not a limit
+                // on this function's own walk or cumulative session coverage.
+                report.partial |= seeds.is_none();
                 break;
             }
             report.functions_examined += 1;
@@ -499,6 +559,14 @@ impl LoadedProgram {
             match recovered {
                 Ok(recovered) => {
                     report.partial |= recovered.partial;
+                    outcomes.push(DiscoveryOutcome {
+                        address,
+                        status: if recovered.partial {
+                            DiscoveryStatus::PartialByOwnLimit
+                        } else {
+                            DiscoveryStatus::Done
+                        },
+                    });
                     // Failed decoding must not materialize a new engine function.
                     if !known.contains_key(&address) {
                         let name = format!("FUN_{address:08x}");
@@ -549,7 +617,9 @@ impl LoadedProgram {
                             continue;
                         }
                         references.insert(reference);
-                        if scheduled.len() < MAX_FUNCTIONS && scheduled.insert(target) {
+                        if seeds.is_some() {
+                            // Confirmed targets are queued by the parent for a later batch.
+                        } else if scheduled.len() < MAX_FUNCTIONS && scheduled.insert(target) {
                             pending.push_back(target);
                         } else if !scheduled.contains(&target) {
                             report.partial = true;
@@ -558,6 +628,10 @@ impl LoadedProgram {
                 }
                 Err(_) => {
                     report.failed_functions += 1;
+                    outcomes.push(DiscoveryOutcome {
+                        address,
+                        status: DiscoveryStatus::Failed,
+                    });
                     report.partial = true;
                 }
             }
@@ -570,7 +644,11 @@ impl LoadedProgram {
                 .references
                 .iter()
                 .map(|reference| reference.target)
-                .chain(known.keys().copied())
+                .chain(if seeds.is_some() {
+                    outcomes.iter().map(|o| o.address).collect::<Vec<_>>()
+                } else {
+                    known.keys().copied().collect()
+                })
                 .collect();
             report.partial |= targets.len() > crate::pe_symbols::MAX_THUNK_TARGETS;
             let targets = targets
@@ -589,7 +667,7 @@ impl LoadedProgram {
             report.decode_attempts = MAX_ANALYSIS_INSTRUCTIONS - remaining;
         }
         emit(AnalysisStage::Publish, &report, progress)?;
-        Ok(report)
+        Ok((report, outcomes))
     }
 
     fn check_code(&self, address: u64) -> Result<(), String> {

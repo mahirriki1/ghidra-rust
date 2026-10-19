@@ -109,6 +109,34 @@ fn shortcut(event: &egui::Event) -> Option<Shortcut> {
     None
 }
 
+fn info_without_functions(info: &BinaryInfo) -> BinaryInfo {
+    BinaryInfo {
+        path: String::new(),
+        architecture: info.architecture.clone(),
+        format: info.format.clone(),
+        entry: info.entry,
+        file_len: info.file_len,
+        sha256: info.sha256.clone(),
+        source_identity: info.source_identity,
+        sections: info.sections.clone(),
+        functions: vec![],
+        functions_truncated: info.functions_truncated,
+        warnings: vec![],
+    }
+}
+
+struct DiscoveryPublication {
+    functions: Vec<FunctionInfo>,
+    truncated: bool,
+    index: crate::call_analysis::CallIndex,
+}
+
+struct DiscoveryUpdate {
+    generation: u64,
+    state: crate::discovery::Discovery,
+    publication: Result<Option<DiscoveryPublication>, String>,
+}
+
 struct Pending {
     id: u64,
     request: Request,
@@ -205,6 +233,13 @@ pub struct DesktopApp {
     undo: VecDeque<Edit>,
     view: Option<FunctionView>,
     call_index: Option<crate::call_analysis::CallIndex>,
+    discovery: Option<crate::discovery::Discovery>,
+    discovery_job: Option<Receiver<DiscoveryUpdate>>,
+    discovery_running: bool,
+    discovery_summary: Option<String>,
+    worker_epoch: u64,
+    discovery_sync: Option<usize>,
+    discovery_bytes: Option<(Request, RequestOrigin)>,
     reference_data: bool,
     reference_target: Option<u64>,
     reference_query: String,
@@ -295,6 +330,13 @@ impl DesktopApp {
             undo: VecDeque::new(),
             view: None,
             call_index: None,
+            discovery: None,
+            discovery_job: None,
+            discovery_running: false,
+            discovery_summary: None,
+            worker_epoch: 0,
+            discovery_sync: None,
+            discovery_bytes: None,
             reference_data: false,
             reference_target: None,
             reference_query: String::new(),
@@ -429,6 +471,12 @@ impl DesktopApp {
     }
 
     fn clear_views(&mut self) {
+        self.discovery = None;
+        self.discovery_job = None;
+        self.discovery_running = false;
+        self.discovery_summary = None;
+        self.discovery_sync = None;
+        self.discovery_bytes = None;
         self.call_index = None;
         self.reference_data = false;
         self.reference_target = None;
@@ -471,6 +519,13 @@ impl DesktopApp {
     }
 
     fn stop_worker(&mut self) {
+        self.discovery_running = false;
+        self.discovery_sync = None;
+        self.discovery_bytes = None;
+        if let Some(state) = &mut self.discovery {
+            state.interrupt();
+        }
+        self.update_discovery_summary();
         self.analysis_progress = None;
         self.progress_events = 0;
         self.client = None;
@@ -495,6 +550,7 @@ impl DesktopApp {
                 if preserve && let Some(binary) = &self.project_binary {
                     client.retain_source(std::sync::Arc::new(binary.clone()));
                 }
+                self.worker_epoch = self.worker_epoch.wrapping_add(1);
                 self.client = Some(client);
                 self.opening = Some(Opening {
                     path: path.clone(),
@@ -546,6 +602,18 @@ impl DesktopApp {
             }
             return;
         }
+        if matches!(request, Request::Discover) {
+            if self
+                .info
+                .as_ref()
+                .is_some_and(crate::packing::has_upx_warning)
+            {
+                self.status = crate::packing::UPX_ANALYSIS_ERROR.into();
+                return;
+            }
+            self.start_discovery(context);
+            return;
+        }
         if matches!(request, Request::Decompile { .. } | Request::Discover)
             && self
                 .info
@@ -555,9 +623,35 @@ impl DesktopApp {
             self.status = crate::packing::UPX_ANALYSIS_ERROR.into();
             return;
         }
+        if self.discovery_job.is_some()
+            || self.pending.as_ref().is_some_and(|pending| {
+                matches!(
+                    pending.request,
+                    Request::DiscoverBatch { .. } | Request::SyncFunctions { .. }
+                )
+            })
+        {
+            // Interactive work runs between bounded batches. Keep only the
+            // newest navigation requests, and bound queued user actions.
+            if matches!(request, Request::Bytes { .. }) {
+                self.discovery_bytes = Some((request, self.request_origin()));
+                return;
+            }
+            if matches!(request, Request::Graph { .. }) {
+                self.queue.retain(|queued| {
+                    !matches!(queued, Request::Graph { .. } | Request::Decompile { .. })
+                });
+            }
+            if self.queue.len() < HISTORY_LIMIT {
+                self.queue.push_back(request);
+            }
+            return;
+        }
         if self.client.is_none() || self.pending.is_some() {
             if let Some(path) = self.binary_path.clone() {
+                let continue_discovery = self.discovery_running;
                 self.start_open(path, true, Some(request), context);
+                self.discovery_running = continue_discovery && self.client.is_some();
             }
         } else {
             self.schedule_request(request);
@@ -565,6 +659,10 @@ impl DesktopApp {
     }
 
     fn schedule_request(&mut self, request: Request) {
+        if matches!(request, Request::Discover) {
+            self.discovery_running = true;
+            return;
+        }
         let address = match &request {
             Request::Graph { address } | Request::Decompile { address } => Some(*address),
             _ => None,
@@ -681,7 +779,148 @@ impl DesktopApp {
         }
     }
 
+    fn update_discovery_summary(&mut self) {
+        if let Some(state) = &self.discovery {
+            self.discovery_summary = Some(format!(
+                "Discovery: {} examined · {} remaining · {} batches · {} failed · {}{}",
+                state.report.functions_examined,
+                state.remaining(),
+                state.batches,
+                state.report.failed_functions,
+                if state.partial() {
+                    "partial coverage"
+                } else {
+                    "complete seed coverage"
+                },
+                if self.discovery_running {
+                    " · running"
+                } else if state.remaining() != 0 {
+                    " · paused"
+                } else {
+                    ""
+                },
+            ));
+        }
+    }
+
+    fn start_discovery(&mut self, context: &egui::Context) {
+        let Some(info) = &self.info else { return };
+        if self.discovery.is_none() && self.discovery_job.is_none() {
+            // Only copy addresses here; queue construction, validation and all
+            // reference sorting/indexing happen in parent background jobs.
+            let seeds: Vec<_> = info.functions.iter().map(|f| f.address).collect();
+            let entry = crate::discovery::valid_seed(info, info.entry).then_some(info.entry);
+            let partial = info.functions_truncated;
+            let generation = self.generation;
+            let (sender, receiver) = mpsc::sync_channel(1);
+            self.discovery_job = Some(receiver);
+            let context = context.clone();
+            std::thread::spawn(move || {
+                let state = crate::discovery::Discovery::new(entry, seeds, partial);
+                let _ = sender.send(DiscoveryUpdate {
+                    generation,
+                    state,
+                    publication: Ok(None),
+                });
+                context.request_repaint();
+            });
+        }
+        if self.client.is_none()
+            && self.opening.is_none()
+            && let Some(path) = self.binary_path.clone()
+        {
+            self.start_open(path, true, Some(Request::Discover), context);
+        }
+        self.discovery_running = self.client.is_some();
+        self.update_discovery_summary();
+    }
+
+    fn poll_discovery(&mut self, _context: &egui::Context) {
+        let Some(job) = &self.discovery_job else {
+            return;
+        };
+        let update = match job.try_recv() {
+            Ok(update) => update,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                self.discovery_job = None;
+                self.discovery_running = false;
+                self.status = "Discovery adoption job failed".into();
+                return;
+            }
+        };
+        self.discovery_job = None;
+        if update.generation != self.generation {
+            return;
+        }
+        self.discovery = Some(update.state);
+        match update.publication {
+            Ok(Some(publication)) => {
+                self.call_index = Some(publication.index);
+                if let Some(info) = &mut self.info {
+                    info.functions = publication.functions;
+                    info.functions_truncated = publication.truncated;
+                }
+                self.cached_functions &= self
+                    .discovery
+                    .as_ref()
+                    .is_some_and(|state| state.remaining() != 0);
+                self.rebuild_filter();
+                self.status = "Discovery batch committed".into();
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.stop_worker();
+                self.status = format!("Invalid discovery batch: {error}");
+            }
+        }
+        self.update_discovery_summary();
+    }
+
+    fn pump_discovery(&mut self, _context: &egui::Context) {
+        if !self.discovery_running
+            || self.discovery_job.is_some()
+            || self.pending.is_some()
+            || self.opening.is_some()
+            || !self.queue.is_empty()
+            || self.discovery_bytes.is_some()
+            || self.client.is_none()
+        {
+            return;
+        }
+        if let Some(cursor) = self.discovery_sync {
+            let Some(info) = &self.info else { return };
+            if cursor < info.functions.len() {
+                let end = (cursor + MAX_DISCOVERY_SYNC_FUNCTIONS).min(info.functions.len());
+                let mut functions = info.functions[cursor..end].to_vec();
+                for function in &mut functions {
+                    // UI annotation labels can be longer than inventory names.
+                    let mut end = function.name.len().min(MAX_FUNCTION_NAME_BYTES);
+                    while !function.name.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    function.name.truncate(end);
+                }
+                self.discovery_sync = Some(end);
+                self.send_direct(Request::SyncFunctions { functions });
+                return;
+            }
+            self.discovery_sync = None;
+        }
+        let Some(state) = &mut self.discovery else {
+            return;
+        };
+        if let Some(request) = state.begin(self.generation, self.worker_epoch, self.revision) {
+            self.send_direct(request);
+        } else if state.remaining() == 0 {
+            self.discovery_running = false;
+            self.status = "Discovery seed queue exhausted".into();
+        }
+        self.update_discovery_summary();
+    }
+
     fn poll_worker(&mut self, context: &egui::Context) {
+        self.poll_discovery(context);
         if self
             .pending
             .as_ref()
@@ -706,7 +945,9 @@ impl DesktopApp {
                 WorkerEvent::Reply(reply) => self.receive_worker_reply(*reply, context),
             }
         }
-        if self.pending.is_some() {
+        self.dispatch_queued();
+        self.pump_discovery(context);
+        if self.pending.is_some() || self.discovery_job.is_some() {
             context.request_repaint_after(Duration::from_millis(100));
         }
     }
@@ -721,8 +962,10 @@ impl DesktopApp {
         if let Response::Progress { progress } = reply.response {
             // Progress never completes a request or extends its wall-time deadline.
             self.progress_events += 1;
-            if !matches!(pending.request, Request::Discover)
-                || (self.progress_events == 1 && progress.stage != AnalysisStage::Seeds)
+            if !matches!(
+                pending.request,
+                Request::Discover | Request::DiscoverBatch { .. }
+            ) || (self.progress_events == 1 && progress.stage != AnalysisStage::Seeds)
                 || self.progress_events > MAX_ANALYSIS_FUNCTIONS + 3
                 || progress
                     .validate_after(self.analysis_progress.as_ref())
@@ -732,12 +975,20 @@ impl DesktopApp {
                 self.status = "Invalid worker analysis progress; worker stopped".into();
                 return;
             }
-            if pending.selection == self.selection_generation && pending.revision == self.revision {
+            if matches!(pending.request, Request::DiscoverBatch { .. })
+                || pending.selection == self.selection_generation
+                    && pending.revision == self.revision
+            {
                 self.analysis_progress = Some(progress);
             }
             return;
         }
-        if let Response::Functions { analysis, .. } = &reply.response
+        let final_analysis = match &reply.response {
+            Response::Functions { analysis, .. } => Some(analysis),
+            Response::DiscoveryBatch { batch } => Some(&batch.analysis),
+            _ => None,
+        };
+        if let Some(analysis) = final_analysis
             && self.analysis_progress.as_ref().is_none_or(|last| {
                 last.stage != AnalysisStage::Publish
                     || last.functions_examined != analysis.functions_examined
@@ -840,6 +1091,15 @@ impl DesktopApp {
                 {
                     info.path = previous.path.clone();
                 }
+                if opening.preserve
+                    && let Some(previous) = &mut self.info
+                {
+                    info.functions = std::mem::take(&mut previous.functions);
+                    info.functions_truncated = previous.functions_truncated;
+                    self.discovery_sync = Some(0);
+                } else if project.is_some() {
+                    self.discovery_sync = Some(0);
+                }
                 if let Some(session) = &self.session {
                     for function in &mut info.functions {
                         if let Some(annotation) = session.annotations.get(&function.address)
@@ -867,7 +1127,11 @@ impl DesktopApp {
                 if let Some(project) = project {
                     self.restore_project(*project, context);
                 } else if let Some(request) = opening.follow {
-                    self.schedule_open_follow(request, opening.follow_origin);
+                    if matches!(request, Request::Discover) {
+                        self.start_discovery(context);
+                    } else {
+                        self.schedule_open_follow(request, opening.follow_origin);
+                    }
                 } else {
                     self.navigate(first, true, context);
                 }
@@ -972,6 +1236,47 @@ impl DesktopApp {
                         .collect();
                     self.status = "Ready".into();
                 }
+            }
+            (Request::SyncFunctions { .. }, Response::FunctionsSynced) => {}
+            (Request::DiscoverBatch { binding, .. }, Response::DiscoveryBatch { batch }) => {
+                if batch.binding != binding
+                    || binding.generation != self.generation
+                    || binding.epoch != self.worker_epoch
+                {
+                    self.stop_worker();
+                    self.status = "Stale discovery reply rejected".into();
+                    return;
+                }
+                let Some(state) = self.discovery.take() else {
+                    self.stop_worker();
+                    self.status = "Unexpected discovery batch".into();
+                    return;
+                };
+                let Some(info) = &self.info else { return };
+                // Evidence depends on immutable bytes, not selection or renamed
+                // display labels. The batch must echo the revision it was sent
+                // with; current annotations are applied after atomic adoption.
+                let validation = info_without_functions(info);
+                let generation = self.generation;
+                let (sender, receiver) = mpsc::sync_channel(1);
+                self.discovery_job = Some(receiver);
+                let context = context.clone();
+                std::thread::spawn(move || {
+                    let mut state = state;
+                    let publication = state.commit(&validation, &batch).map(|()| {
+                        Some(DiscoveryPublication {
+                            functions: batch.functions,
+                            truncated: batch.truncated,
+                            index: crate::call_analysis::CallIndex::new(state.snapshot()),
+                        })
+                    });
+                    let _ = sender.send(DiscoveryUpdate {
+                        generation,
+                        state,
+                        publication,
+                    });
+                    context.request_repaint();
+                });
             }
             (
                 Request::Discover,
@@ -1105,10 +1410,24 @@ impl DesktopApp {
                 self.status = "Unexpected worker response; worker stopped".into();
             }
         }
+        self.dispatch_queued();
+    }
+
+    fn dispatch_queued(&mut self) {
+        // Publish the batch inventory before processing renames/navigation, so
+        // an older batch cannot overwrite a newer acknowledged function name.
+        if self.discovery_job.is_some() {
+            return;
+        }
         if self.pending.is_none()
             && let Some(request) = self.queue.pop_front()
         {
-            self.send_direct(request);
+            self.schedule_request(request);
+        }
+        if self.pending.is_none()
+            && let Some((request, origin)) = self.discovery_bytes.take()
+        {
+            self.schedule_open_follow(request, origin);
         }
     }
 
@@ -2105,7 +2424,7 @@ impl DesktopApp {
                     }
                 });
                 if ui
-                    .add_enabled(self.pending.is_some(), egui::Button::new("Cancel analysis"))
+                    .add_enabled(self.pending.is_some() || self.discovery_running || self.discovery_job.is_some(), egui::Button::new("Cancel analysis"))
                     .clicked()
                 {
                     self.stop_worker();
@@ -2819,6 +3138,9 @@ impl DesktopApp {
         {
             self.request(Request::Discover, &context);
         }
+        if let Some(summary) = &self.discovery_summary {
+            ui.weak(summary);
+        }
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.reference_data, false, "Calls");
             ui.selectable_value(&mut self.reference_data, true, "Data accesses");
@@ -3359,6 +3681,7 @@ impl DesktopApp {
                             ui.spinner();
                         }
                         ui.label(&self.status);
+                        if let Some(summary) = &self.discovery_summary { ui.weak(summary); }
                         if let Some(info) = &self.info {
                             ui.weak(format!(
                                 "{} · {} · {} bytes",
@@ -3384,7 +3707,8 @@ impl DesktopApp {
                                 Request::Open { .. } => "Opening binary",
                                 Request::Graph { .. } => "Building graph",
                                 Request::Decompile { .. } => "Decompiling",
-                                Request::Discover => "Discovering functions",
+                                Request::Discover | Request::DiscoverBatch { .. } => "Discovering functions",
+                                Request::SyncFunctions { .. } => "Restoring function context",
                                 Request::Rename { .. } => "Renaming function",
                                 Request::Bytes { .. } => "Reading bytes",
                                 Request::Strings | Request::StringsWithOptions { .. } => {
@@ -4883,6 +5207,124 @@ mod tests {
         let output = frame(&mut app);
         assert!(!output.shapes.iter().any(|shape| matches!(&shape.shape,
             egui::epaint::Shape::Text(text) if text.galley.text().contains("Decompiling ·"))));
+    }
+
+    #[test]
+    fn byte_reads_queued_during_discovery_keep_the_original_selection_binding() {
+        let context = egui::Context::default();
+        let mut app = keyboard_app();
+        let binding = DiscoveryBinding {
+            generation: app.generation,
+            epoch: 1,
+            revision: app.revision,
+            batch: 1,
+        };
+        app.pending = Some(Pending {
+            id: 7,
+            request: Request::DiscoverBatch {
+                binding,
+                seeds: vec![0x1000],
+            },
+            started: Instant::now(),
+            selection: app.selection_generation,
+            revision: app.revision,
+            byte_origin: (app.selected, app.tab),
+        });
+        app.request(
+            Request::Bytes {
+                address: 0x1000,
+                length: 4,
+            },
+            &context,
+        );
+        let (request, origin) = app.discovery_bytes.take().unwrap();
+        app.selection_generation += 1;
+        app.pending = None;
+        app.schedule_open_follow(request, origin);
+        assert!(
+            app.pending.is_none(),
+            "A stale queued read must not be rebound to the new selection"
+        );
+        assert!(app.queue.is_empty());
+    }
+
+    #[test]
+    fn navigation_between_batches_keeps_and_adopts_program_wide_results() {
+        let context = egui::Context::default();
+        let mut app = keyboard_app();
+        app.worker_epoch = 3;
+        app.discovery_running = true;
+        let info = app.info.as_ref().unwrap();
+        let mut state = crate::discovery::Discovery::new(
+            Some(info.entry),
+            info.functions.iter().map(|f| f.address),
+            false,
+        );
+        let request = state
+            .begin(app.generation, app.worker_epoch, app.revision)
+            .unwrap();
+        let Request::DiscoverBatch { binding, seeds } = &request else {
+            panic!()
+        };
+        let batch = DiscoveryBatch {
+            binding: *binding,
+            functions: info.functions.clone(),
+            truncated: false,
+            outcomes: seeds
+                .iter()
+                .map(|&address| DiscoveryOutcome {
+                    address,
+                    status: DiscoveryStatus::Done,
+                })
+                .collect(),
+            analysis: CallAnalysis {
+                functions_examined: seeds.len(),
+                decode_attempts: seeds.len(),
+                references: vec![CallReference {
+                    caller: 0x1000,
+                    address: 0x1000,
+                    target: 0x1040,
+                }],
+                ..Default::default()
+            },
+        };
+        app.discovery = Some(state);
+        app.call_index = Some(crate::call_analysis::CallIndex::new(CallAnalysis::default()));
+        app.pending = Some(Pending {
+            id: 7,
+            request,
+            started: Instant::now(),
+            selection: app.selection_generation,
+            revision: app.revision,
+            byte_origin: (app.selected, app.tab),
+        });
+        app.navigate(0x1040, true, &context);
+        assert!(matches!(
+            app.queue.front(),
+            Some(Request::Graph { address: 0x1040 })
+        ));
+        assert!(app.discovery_running);
+        assert!(app.call_index.is_some());
+        let pending = app.pending.take().unwrap();
+        app.receive(pending, Response::DiscoveryBatch { batch }, &context);
+        // Cancellation after a terminal reply keeps this completed batch even
+        // if its background validation has not yet been adopted by the UI.
+        app.stop_worker();
+        let started = Instant::now();
+        while app.discovery_job.is_some() {
+            assert!(started.elapsed() < Duration::from_secs(5));
+            app.poll_discovery(&context);
+            std::thread::yield_now();
+        }
+        assert_eq!(app.discovery.as_ref().unwrap().batches, 1);
+        assert_eq!(app.call_index.as_ref().unwrap().report.references.len(), 1);
+        assert!(!app.discovery_running);
+        assert!(
+            app.discovery_summary
+                .as_ref()
+                .unwrap()
+                .contains("2 examined")
+        );
     }
 
     #[test]

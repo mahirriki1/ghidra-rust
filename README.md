@@ -152,9 +152,12 @@ open a function, select an instruction, and write one frame.
   on open, including stripped images. The list is capped at 262,144 entries and
   8 MiB of names; large PEs prioritize the entry point, exports, and runtime
   functions near entry, with a visible partial-list notice. Projects containing
-  more than 10,000 functions cannot be opened by releases before this limit. **Discover functions** follows confirmed decoded direct calls from known
-  entries on every supported architecture, within shared work budgets. Complete
-  function recovery is not guaranteed; see [analysis coverage](docs/analysis.md).
+  more than 10,000 functions cannot be opened by releases before this limit.
+  **Discover functions** follows confirmed decoded direct calls from known entries
+  on every supported architecture in resumable bounded batches. Discover starts or
+  continues a parent-owned session queue containing the entry point and all
+  admitted known functions, then newly confirmed callees. Complete function
+  recovery is not guaranteed; see [analysis coverage](docs/analysis.md).
 - Navigate a function's instruction CFG with pan, zoom, branch labels, and
   unresolved-flow markers. CFG recovery is bounded; warnings identify unsupported
   or incomplete cases such as indirect flow. Calls are displayed separately from
@@ -172,7 +175,8 @@ open a function, select an instruction, and write one frame.
   source instruction or load the accessed bytes into Decode; filter by an exact
   target address to find its accesses. Other register addresses, loaded
   pointers, and values carried across branches or calls are unresolved. Coverage
-  is limited to the functions examined in that discovery run.
+  is limited to the functions examined in committed discovery batches in this
+  session.
 - Scan mapped bytes for ASCII and a printable ASCII subset of UTF-16LE strings.
   The tree shows **not scanned** until a scan runs. This is not complete Unicode
   or Rust string-slice recovery. **Analysis notes** shows loading and coverage limits.
@@ -251,9 +255,14 @@ background threads. Lists draw visible rows and graph geometry is cached.
 Analysis jobs lasting over 200 ms show a compact animated bar at the bottom right,
 with the active task and elapsed time. It indicates activity without estimating
 a completion percentage. **Analysis → Cancel analysis** stops the worker.
-Function discovery reports Seeds, Calls, and Publish stages with function and
-decode-attempt counts. Its total remains indeterminate because following calls
-can reveal more work. Progress updates do not extend the worker deadline.
+Function discovery reports cumulative examined/remaining function counts, committed
+batches, and partial or complete seed coverage. Each batch also reports Seeds,
+Calls, and Publish stages with decode-attempt counts. Its total can grow as calls
+reveal more work. Interactive requests take priority between batches. Cancel keeps
+committed references and the remaining queue; Discover resumes after reopening
+the disposable worker and replaying function context through bounded requests.
+Interrupted seeds retry individually at most once, then remain failed. Progress
+updates do not extend the worker deadline.
 
 Linux workers run under bubblewrap with private namespaces, no network, read-only
 `/usr`, a read-only executable, and only the selected input file exposed from the
@@ -279,9 +288,14 @@ snapshot currently duplicates image bytes retained by the engine; total memory
 must be measured before making efficiency claims.
 An opt-in [analysis measurement harness](docs/analysis-performance.md) records
 client/worker timings and process-tree memory; its scope excludes the native GUI.
-Discovery examines at most 128 function entries and charges at most 16,384 decode
-attempts across the whole run, with a 2,048-attempt limit per function. Failed
-decodes and work omitted by display limits count against these budgets.
+Each discovery batch examines at most 128 function entries and charges at most
+16,384 decode attempts, with a 2,048-attempt limit per function. There is no
+128-function cumulative ceiling: batches continue across the admitted inventory.
+Call and data reference aggregates are each capped at 16,384 unique entries;
+reaching a cap visibly marks coverage partial. A limited or failed function walk
+is terminal for this session. Discovery queues and references remain session-only
+and are rebuilt after project reopen. Failed decodes and work omitted by display
+limits count against these budgets.
 
 Function-list and decompiler-text limits bound returned results, after the engine
 has constructed its internal data. They are not preallocation limits inside the
