@@ -417,6 +417,21 @@ impl LoadedProgram {
                 })
             };
         emit(AnalysisStage::Seeds, &report, progress)?;
+        let space = self
+            .program
+            .architecture()
+            .manager
+            .get_default_data_space()
+            .ok_or("Missing default data space during reference analysis")?;
+        if space.get_word_size() != 1 {
+            return Err("Data references require a byte-addressed memory space".into());
+        }
+        let space_name = space.get_name().to_owned();
+        let mut data = crate::data_analysis::DataCollector::new(
+            &self.info.sections,
+            &space_name,
+            self.target.pointer_bytes as u32,
+        );
         let mut known: BTreeMap<_, _> = self
             .info
             .functions
@@ -462,6 +477,7 @@ impl LoadedProgram {
                 address,
                 &self.pe_ranges,
                 &mut remaining,
+                Some(&mut data),
             );
             report.decode_attempts += available - remaining;
             match recovered {
@@ -528,6 +544,7 @@ impl LoadedProgram {
             emit(AnalysisStage::Calls, &report, progress)?;
         }
         report.references = references.into_iter().collect();
+        report.data = Some(data.finish());
         if self.target.name == "AArch64" && !self.pe_imports.is_empty() {
             let targets: BTreeSet<_> = report
                 .references
@@ -1009,6 +1026,7 @@ fn recover_graph_counted(
         entry,
         pe_ranges,
         &mut remaining,
+        None,
     )?;
     Ok((recovered.view, MAX_INSTRUCTIONS - remaining))
 }
@@ -1026,6 +1044,7 @@ fn recover_graph_budgeted(
     entry: u64,
     pe_ranges: &[(u64, u64)],
     remaining: &mut usize,
+    mut data: Option<&mut crate::data_analysis::DataCollector<'_>>,
 ) -> Result<GraphRecovery, String> {
     let alignment = crate::architecture::instruction_alignment(program.language_id());
     if !entry.is_multiple_of(alignment) {
@@ -1152,6 +1171,9 @@ fn recover_graph_budgeted(
                 format!("Instruction/p-code length mismatch at {address:#x}."),
             );
             continue;
+        }
+        if let Some(data) = data.as_mut() {
+            data.inspect(entry, &pcode);
         }
         let call_start = calls.len();
         let (next, terminal) = flow(&pcode, next_address, &mut calls, &mut warnings);

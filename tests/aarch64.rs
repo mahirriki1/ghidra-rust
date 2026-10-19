@@ -38,6 +38,97 @@ fn graph(worker: &mut WorkerClient, address: u64) -> FunctionView {
     }
 }
 
+#[test]
+fn contained_data_accesses_use_genuine_literal_reads_without_register_propagation() {
+    let source = include_str!("fixtures/aarch64-data.S");
+    let words: Vec<_> = source
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix(".inst 0x"))
+        .flat_map(|value| {
+            u32::from_str_radix(value.split_whitespace().next().unwrap(), 16)
+                .unwrap()
+                .to_le_bytes()
+        })
+        .collect();
+    let literal = source
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(".quad 0x"))
+        .map(|value| {
+            u64::from_str_radix(value.split_whitespace().next().unwrap(), 16)
+                .unwrap()
+                .to_le_bytes()
+        })
+        .unwrap();
+    for (format, (mut bytes, base), code_offset) in [
+        ("ELF", common::elf(true), 0x100),
+        ("PE", common::pe(), 0x200),
+        ("Mach-O", common::macho(), 0x1000),
+    ] {
+        bytes[code_offset..code_offset + words.len()].copy_from_slice(&words);
+        bytes[code_offset + 32..code_offset + 40].copy_from_slice(&literal);
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("original literal fixture");
+        std::fs::write(&binary, &bytes).unwrap();
+        let mut worker = WorkerClient::start_using_executable(
+            eframe::egui::Context::default(),
+            &binary,
+            Path::new(env!("CARGO_BIN_EXE_ghidra-rust")),
+        )
+        .unwrap();
+        let Response::Opened { info } = request(
+            &mut worker,
+            Request::Open {
+                path: binary.to_string_lossy().into_owned(),
+            },
+        ) else {
+            panic!("Open {format}");
+        };
+        let Response::Functions {
+            functions,
+            analysis,
+            ..
+        } = request(&mut worker, Request::Discover)
+        else {
+            panic!("Discover {format}");
+        };
+        analysis.validate(&info, &functions).unwrap();
+        let data = analysis.data.unwrap();
+        assert_eq!(
+            data.references,
+            [ghidra_rust::model::DataReference {
+                function: base,
+                address: base,
+                target: base + 32,
+                size: 8,
+                access: ghidra_rust::model::DataAccess::Read,
+            }],
+            "{format}"
+        );
+        assert!(data.unresolved_accesses >= 1);
+        assert!(
+            !functions
+                .iter()
+                .any(|function| function.address == base + 32)
+        );
+        let Response::Bytes {
+            address,
+            bytes: read,
+        } = request(
+            &mut worker,
+            Request::Bytes {
+                address: base + 32,
+                length: 8,
+            },
+        )
+        else {
+            panic!("Read {format} literal bytes");
+        };
+        assert_eq!(address, base + 32);
+        assert_eq!(read, literal);
+        assert_eq!(std::fs::read(&binary).unwrap(), bytes);
+    }
+}
+
 fn decompile(
     worker: &mut WorkerClient,
     address: u64,

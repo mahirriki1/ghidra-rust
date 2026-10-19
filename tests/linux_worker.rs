@@ -2,7 +2,7 @@
 #![cfg(target_os = "linux")]
 
 use ghidra_rust::client::{WorkerClient, WorkerEvent};
-use ghidra_rust::model::{CallAnalysis, Request, Response};
+use ghidra_rust::model::{CallAnalysis, DataAccess, Request, Response};
 use ghidra_rust::project::ProjectData;
 use ghidra_rust::session::{Annotation, Session};
 use object::{Object, ObjectSymbol};
@@ -95,6 +95,67 @@ fn compare_fixture_calls(binary: &Path, image: &object::File<'_>, analysis: &Cal
     }
 }
 
+// Limited differential on the original x86-64 fixture: objdump annotates each
+// RIP-relative access with its resolved target. The fixture deliberately uses
+// 32-bit MOVs, so operand position determines read/write without a general
+// disassembly-text reference heuristic in the application.
+fn compare_fixture_data(binary: &Path, owner: u64, target: u64, analysis: &CallAnalysis) {
+    let output = Command::new("objdump")
+        .args(["--no-show-raw-insn", "--disassemble=read_write_word"])
+        .arg(binary)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    let mut expected = BTreeSet::new();
+    for line in text
+        .lines()
+        .filter(|line| line.contains("<reference_word>"))
+    {
+        let (pc, instruction) = line.trim().split_once(':').unwrap();
+        let (operation, comment) = instruction.split_once('#').unwrap();
+        let (mnemonic, operands) = operation.trim().split_once(char::is_whitespace).unwrap();
+        assert_eq!(mnemonic, "mov");
+        assert_eq!(
+            u64::from_str_radix(comment.split_whitespace().next().unwrap(), 16).unwrap(),
+            target
+        );
+        let (source, destination) = operands.split_once(',').unwrap();
+        let access = if source.contains("(%rip)") {
+            assert_eq!(destination.trim(), "%eax");
+            DataAccess::Read
+        } else {
+            assert_eq!(source.trim(), "%eax");
+            assert!(destination.contains("(%rip)"));
+            DataAccess::Write
+        };
+        expected.insert((u64::from_str_radix(pc, 16).unwrap(), 4, access));
+    }
+    assert!(
+        expected
+            .iter()
+            .any(|(_, _, access)| *access == DataAccess::Read)
+    );
+    assert!(
+        expected
+            .iter()
+            .any(|(_, _, access)| *access == DataAccess::Write)
+    );
+    let actual = analysis
+        .data
+        .as_ref()
+        .unwrap()
+        .references
+        .iter()
+        .filter(|reference| reference.function == owner && reference.target == target)
+        .map(|reference| (reference.address, reference.size, reference.access))
+        .collect();
+    assert_eq!(
+        expected, actual,
+        "Data-access PCs, widths or kinds differ from GNU objdump"
+    );
+}
+
 #[test]
 fn sandboxed_linux_worker_and_embedded_project_round_trip() {
     let directory = tempfile::Builder::new()
@@ -154,6 +215,33 @@ fn sandboxed_linux_worker_and_embedded_project_round_trip() {
     };
     analysis.validate(&info, &functions).unwrap();
     compare_fixture_calls(&binary, &image, &analysis);
+    let owner = image
+        .symbols()
+        .find(|symbol| symbol.name().ok() == Some("read_write_word"))
+        .unwrap()
+        .address();
+    let target = image
+        .symbols()
+        .find(|symbol| symbol.name().ok() == Some("reference_word"))
+        .unwrap()
+        .address();
+    let data = analysis.data.as_ref().expect("Fresh data-access analysis");
+    if info.architecture == "x86-64" {
+        compare_fixture_data(&binary, owner, target, &analysis);
+    }
+    for access in [DataAccess::Read, DataAccess::Write]
+        .into_iter()
+        .filter(|_| matches!(info.architecture.as_str(), "x86" | "x86-64"))
+    {
+        assert!(
+            data.references
+                .iter()
+                .any(|reference| reference.function == owner
+                    && reference.target == target
+                    && reference.size == 4
+                    && reference.access == access)
+        );
+    }
     assert!(
         analysis
             .references

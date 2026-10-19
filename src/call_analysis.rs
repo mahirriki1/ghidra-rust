@@ -1,4 +1,4 @@
-//! Validation and indexed navigation of bounded worker call evidence.
+//! Validation and indexed navigation of bounded worker reference evidence.
 use std::collections::BTreeMap;
 
 use crate::model::*;
@@ -73,6 +73,9 @@ impl CallAnalysis {
                 return Err("Invalid call evidence addresses, ordering, or duplicates".into());
             }
         }
+        if let Some(data) = &self.data {
+            data.validate(info, functions, self.decode_attempts)?;
+        }
         Ok(())
     }
 }
@@ -82,6 +85,8 @@ pub(crate) struct CallIndex {
     pub report: CallAnalysis,
     pub incoming: BTreeMap<u64, Vec<usize>>,
     pub outgoing: BTreeMap<u64, Vec<usize>>,
+    pub data_incoming: BTreeMap<u64, Vec<usize>>,
+    pub data_outgoing: BTreeMap<u64, Vec<usize>>,
 }
 
 impl CallIndex {
@@ -92,10 +97,26 @@ impl CallIndex {
             incoming.entry(reference.target).or_default().push(index);
             outgoing.entry(reference.caller).or_default().push(index);
         }
+        let mut data_incoming: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
+        let mut data_outgoing: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
+        if let Some(data) = &report.data {
+            for (index, reference) in data.references.iter().enumerate() {
+                data_incoming
+                    .entry(reference.target)
+                    .or_default()
+                    .push(index);
+                data_outgoing
+                    .entry(reference.function)
+                    .or_default()
+                    .push(index);
+            }
+        }
         Self {
             report,
             incoming,
             outgoing,
+            data_incoming,
+            data_outgoing,
         }
     }
 }
@@ -202,5 +223,46 @@ mod tests {
         assert_eq!(index.incoming[&0x1040], vec![0, 1]);
         assert_eq!(index.outgoing[&0x1000], vec![0, 1]);
         assert!(!index.incoming.contains_key(&0x1000));
+    }
+
+    #[test]
+    fn data_indexes_keep_access_kind_and_exact_start_separate_from_calls() {
+        let (info, mut report) = fixture();
+        report.data = Some(DataAnalysis {
+            references: vec![
+                DataReference {
+                    function: 0x1000,
+                    address: 0x1004,
+                    target: 0x1080,
+                    size: 4,
+                    access: DataAccess::Read,
+                },
+                DataReference {
+                    function: 0x1000,
+                    address: 0x1004,
+                    target: 0x1080,
+                    size: 4,
+                    access: DataAccess::Write,
+                },
+                DataReference {
+                    function: 0x1040,
+                    address: 0x1044,
+                    target: 0x1082,
+                    size: 2,
+                    access: DataAccess::Read,
+                },
+            ],
+            operations_charged: 3,
+            accesses_examined: 3,
+            ..Default::default()
+        });
+        report.validate(&info, &info.functions).unwrap();
+        let index = CallIndex::new(report);
+        assert_eq!(index.data_incoming[&0x1080], vec![0, 1]);
+        assert_eq!(index.data_incoming[&0x1082], vec![2]);
+        assert!(!index.data_incoming.contains_key(&0x1081));
+        assert_eq!(index.data_outgoing[&0x1000], vec![0, 1]);
+        assert_eq!(index.data_outgoing[&0x1040], vec![2]);
+        assert_eq!(index.incoming[&0x1040], vec![0]);
     }
 }

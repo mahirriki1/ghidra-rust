@@ -5,6 +5,7 @@ pub mod brand;
 pub mod call_analysis;
 pub mod client;
 pub mod crypto;
+pub mod data_analysis;
 pub mod decode;
 pub mod decoder_ui;
 pub mod decompile;
