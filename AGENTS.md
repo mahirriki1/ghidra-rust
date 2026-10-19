@@ -114,13 +114,15 @@ cargo build --release --locked
 ```
 
 For Rust behavior changes, add focused regression coverage where useful and run
-the applicable checks above. Do not add tests that merely mirror implementation.
+the applicable checks above. Tests run locally only: GitHub Actions builds, lints,
+and packages without running them (`--skip-tests`/`-SkipTests`), so run the
+tests before every push and report which platforms actually ran them. Do not add tests that merely mirror implementation.
 For documentation-only edits, check paths and factual accuracy without rebuilding
 the application. Do not discard or regenerate `Cargo.lock` unnecessarily.
 
-Linux worker integration tests compile the C fixture using GCC. Windows CI
-compiles it into PE and sets `GHIDRA_RUST_TEST_PE` for `tests/windows_worker.rs`;
-without that variable the PE integration test skips locally. Cross-compilation
+Linux worker integration tests compile the C fixture using GCC.
+`scripts/build-windows.ps1` compiles it into PE and sets `GHIDRA_RUST_TEST_PE` for
+`tests/windows_worker.rs`; without that variable the PE integration test skips. Cross-compilation
 checks are not evidence that the native Windows GUI or worker was run.
 
 For GUI changes, exercise the native desktop with the safe fixture when a display

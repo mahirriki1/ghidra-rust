@@ -1,7 +1,9 @@
 # Run from PowerShell on Windows with Rust/MSVC tools installed. No downloads or
-# system configuration changes are performed by this script.
+# system configuration changes are performed by this script. Tests run by
+# default; run them locally before pushing. GitHub CI passes -SkipTests and
+# only builds, lints, and packages.
 [CmdletBinding()]
-param()
+param([switch]$SkipTests)
 
 $ErrorActionPreference = 'Stop'
 if ([Environment]::OSVersion.Platform -ne 'Win32NT') {
@@ -30,28 +32,34 @@ try {
     $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
     if ($LASTEXITCODE -ne 0 -or !$vs) { throw 'An x64 MSVC C++ toolchain is required.' }
     $vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
-    $fixture = Join-Path $fixtureDir 'sample.exe'
-    $source = Join-Path $root 'tests\fixtures\sample.c'
-    # Keep all compiler/linker products out of the source tree. Disable
-    # incremental-link thunks so exported functions point at their actual code.
-    & cmd.exe /d /c "`"$vcvars`" && cl /nologo /Od /Zi /Fo`"$fixtureDir\sample.obj`" /Fd`"$fixtureDir\compiler.pdb`" /Fe`"$fixture`" `"$source`" /link /INCREMENTAL:NO /PDB:`"$fixtureDir\sample.pdb`" /EXPORT:branch_loop /EXPORT:base64_message /EXPORT:aes_sbox_prefix"
-    if ($LASTEXITCODE -ne 0) { throw 'Building the original PE fixture failed.' }
-    $env:GHIDRA_RUST_TEST_PE = $fixture
+    if (!$SkipTests) {
+        $fixture = Join-Path $fixtureDir 'sample.exe'
+        $source = Join-Path $root 'tests\fixtures\sample.c'
+        # Keep all compiler/linker products out of the source tree. Disable
+        # incremental-link thunks so exported functions point at their actual code.
+        & cmd.exe /d /c "`"$vcvars`" && cl /nologo /Od /Zi /Fo`"$fixtureDir\sample.obj`" /Fd`"$fixtureDir\compiler.pdb`" /Fe`"$fixture`" `"$source`" /link /INCREMENTAL:NO /PDB:`"$fixtureDir\sample.pdb`" /EXPORT:branch_loop /EXPORT:base64_message /EXPORT:aes_sbox_prefix"
+        if ($LASTEXITCODE -ne 0) { throw 'Building the original PE fixture failed.' }
+        $env:GHIDRA_RUST_TEST_PE = $fixture
+    }
 
     & cargo fmt --all --check
     if ($LASTEXITCODE -ne 0) { throw 'Formatting check failed.' }
-    & cargo test --locked --target $target
-    if ($LASTEXITCODE -ne 0) { throw 'Windows tests failed.' }
+    if (!$SkipTests) {
+        & cargo test --locked --target $target
+        if ($LASTEXITCODE -ne 0) { throw 'Windows tests failed.' }
+    }
     & cargo clippy --workspace --all-targets --locked --target $target -- -D warnings
     if ($LASTEXITCODE -ne 0) { throw 'Windows Clippy check failed.' }
     & cargo build --release --locked --target $target
     if ($LASTEXITCODE -ne 0) { throw 'Windows release build failed.' }
-    # The release EXE uses the Windows GUI subsystem. Test its inherited worker
-    # pipes explicitly; the debug/console-subsystem test cannot establish this.
-    & cargo test --release --locked --target $target --test windows_worker
-    if ($LASTEXITCODE -ne 0) { throw 'Windows release worker/project test failed.' }
-    & cargo test --release --locked --target $target --test aarch64
-    if ($LASTEXITCODE -ne 0) { throw 'AArch64 release worker/project test failed.' }
+    if (!$SkipTests) {
+        # The release EXE uses the Windows GUI subsystem. Test its inherited worker
+        # pipes explicitly; the debug/console-subsystem test cannot establish this.
+        & cargo test --release --locked --target $target --test windows_worker
+        if ($LASTEXITCODE -ne 0) { throw 'Windows release worker/project test failed.' }
+        & cargo test --release --locked --target $target --test aarch64
+        if ($LASTEXITCODE -ne 0) { throw 'AArch64 release worker/project test failed.' }
+    }
     & "$PSScriptRoot\package-windows.ps1"
 } finally {
     $env:GHIDRA_RUST_TEST_PE = $previousFixture

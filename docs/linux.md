@@ -65,8 +65,8 @@ sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
 This uses Ubuntu's scoped policy and leaves the global user-namespace restriction
 enabled. See [Ubuntu's security explanation](https://discourse.ubuntu.com/t/understanding-apparmor-user-namespace-restriction/58007)
 and [profile packaging announcement](https://lists.ubuntu.com/archives/noble-changes/2024-September/041745.html).
-The Linux CI job loads that same profile and checks namespace/loader startup with
-visible diagnostics before running the production worker tests.
+Load it before running the worker tests locally; the hosted Linux build job
+does not run tests and does not need it.
 
 ## Build and desktop check
 
