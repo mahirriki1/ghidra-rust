@@ -15,6 +15,23 @@ pub const MAX_FUNCTION_NAME_BYTES: usize = 256;
 /// With 43 bytes per entry for structure and 20-digit addresses, a full
 /// inventory serializes to at most 43 * 262_144 + 8 MiB + 1 bytes (19.7 MB).
 pub const MAX_FUNCTION_NAME_JSON_BYTES: usize = 8 * 1024 * 1024;
+/// Largest encoded worker reply, excluding its newline. Fits the largest
+/// function inventory (19.7 MB) with either both reference classes (about
+/// 4.1 MB) or worst-case section metadata (6.8 MB).
+pub const MAX_REPLY_BYTES: usize = 32 * 1024 * 1024;
+/// Largest byte range one `Bytes` request may read.
+pub const MAX_BYTE_READ: usize = 64 * 1024;
+/// Deserialization caps for collections shared by worker replies and projects.
+/// Tighter semantic limits are validated after decoding.
+pub const MAX_SECTIONS: usize = 4096;
+pub const MAX_WARNINGS: usize = 128;
+pub const MAX_GRAPH_BLOCKS: usize = 128;
+pub const MAX_GRAPH_EDGES: usize = 4096;
+pub const MAX_GRAPH_CALLS: usize = 2048;
+pub const MAX_GRAPH_INSTRUCTIONS: usize = 2048;
+pub const MAX_INSTRUCTION_BYTES: usize = 32;
+pub const MAX_PROJECT_STRINGS: usize = 20_000;
+pub const MAX_CRYPTO_MATCHES: usize = 10_000;
 pub const MIN_STRING_LENGTH: usize = 4;
 pub const MAX_STRING_MINIMUM: usize = 64;
 pub const MAX_ANALYSIS_FUNCTIONS: usize = 128;
@@ -65,6 +82,7 @@ pub struct DataReference {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct DataAnalysis {
+    #[serde(deserialize_with = "crate::bounded::vec::<_, _, { MAX_DATA_REFERENCES }>")]
     pub references: Vec<DataReference>,
     pub operations_charged: usize,
     pub accesses_examined: usize,
@@ -101,6 +119,7 @@ pub struct AnalysisProgress {
 /// snapshots retain the existing function inventory with saved-result provenance.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct CallAnalysis {
+    #[serde(deserialize_with = "crate::bounded::vec::<_, _, { MAX_CALL_REFERENCES }>")]
     pub references: Vec<CallReference>,
     /// Optional for legacy protocol replies; absent evidence is not a fresh
     /// empty computation. Neither reference class is stored in projects.
@@ -121,6 +140,7 @@ pub struct CallAnalysis {
 pub struct CodeMapping {
     pub start: usize,
     pub end: usize,
+    #[serde(deserialize_with = "crate::bounded::vec::<_, _, { MAX_MAPPING_ADDRESSES }>")]
     pub addresses: Vec<u64>,
 }
 
@@ -237,16 +257,20 @@ pub struct BinaryInfo {
     pub file_len: u64,
     pub sha256: String,
     pub source_identity: Option<FileIdentity>,
+    #[serde(deserialize_with = "crate::bounded::vec::<_, _, { MAX_SECTIONS }>")]
     pub sections: Vec<SectionInfo>,
+    #[serde(deserialize_with = "crate::bounded::vec::<_, _, { MAX_FUNCTIONS }>")]
     pub functions: Vec<FunctionInfo>,
     #[serde(default)]
     pub functions_truncated: bool,
+    #[serde(deserialize_with = "crate::bounded::vec::<_, _, { MAX_WARNINGS }>")]
     pub warnings: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Instruction {
     pub address: u64,
+    #[serde(deserialize_with = "crate::bounded::vec::<_, _, { MAX_INSTRUCTION_BYTES }>")]
     pub bytes: Vec<u8>,
     pub mnemonic: String,
     pub operands: String,
@@ -255,6 +279,7 @@ pub struct Instruction {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BasicBlock {
     pub address: u64,
+    #[serde(deserialize_with = "crate::bounded::vec::<_, _, { MAX_GRAPH_INSTRUCTIONS }>")]
     pub instructions: Vec<Instruction>,
 }
 
@@ -282,9 +307,13 @@ pub struct CallSite {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FunctionView {
     pub address: u64,
+    #[serde(deserialize_with = "crate::bounded::vec::<_, _, { MAX_GRAPH_BLOCKS }>")]
     pub blocks: Vec<BasicBlock>,
+    #[serde(deserialize_with = "crate::bounded::vec::<_, _, { MAX_GRAPH_EDGES }>")]
     pub edges: Vec<Edge>,
+    #[serde(deserialize_with = "crate::bounded::vec::<_, _, { MAX_GRAPH_CALLS }>")]
     pub calls: Vec<CallSite>,
+    #[serde(deserialize_with = "crate::bounded::vec::<_, _, { MAX_WARNINGS }>")]
     pub warnings: Vec<String>,
 }
 
@@ -330,9 +359,11 @@ pub enum Response {
         address: u64,
         text: String,
         #[serde(default)]
+        #[serde(deserialize_with = "crate::bounded::vec::<_, _, { MAX_CODE_MAPPINGS }>")]
         mappings: Vec<CodeMapping>,
     },
     Functions {
+        #[serde(deserialize_with = "crate::bounded::vec::<_, _, { MAX_FUNCTIONS }>")]
         functions: Vec<FunctionInfo>,
         truncated: bool,
         analysis: CallAnalysis,
@@ -346,13 +377,16 @@ pub enum Response {
     },
     Bytes {
         address: u64,
+        #[serde(deserialize_with = "crate::bounded::vec::<_, _, { MAX_BYTE_READ }>")]
         bytes: Vec<u8>,
     },
     Strings {
+        #[serde(deserialize_with = "crate::bounded::vec::<_, _, { MAX_PROJECT_STRINGS }>")]
         strings: Vec<StringEntry>,
         truncated: bool,
     },
     Crypto {
+        #[serde(deserialize_with = "crate::bounded::vec::<_, _, { MAX_CRYPTO_MATCHES }>")]
         matches: Vec<CryptoMatch>,
         truncated: bool,
     },

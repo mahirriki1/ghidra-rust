@@ -264,7 +264,11 @@ Prototype resource limits include 128 MiB input files, 2,048 recovered instructi
 and 128 blocks per graph, 64 KiB byte selections, a 262,144-entry function inventory, bounded result lists,
 64 MiB scanned data, 2 MiB decompiler text, 32,768 semantic ranges with at most
 64 instruction addresses each and 131,072 total address references, 8 MiB annotation
-sidecars, and 224 MiB projects. The
+sidecars, and 224 MiB projects. Project and worker-reply collections are capped
+while parsing, worker replies are shape-checked and must answer a sent request
+before they are decoded, and saved addresses are checked with indexed section
+lookups. These bound the cost of hostile files and replies; they do not isolate
+project parsing. The
 snapshot currently duplicates image bytes retained by the engine; total memory
 must be measured before making efficiency claims.
 An opt-in [analysis measurement harness](docs/analysis-performance.md) records

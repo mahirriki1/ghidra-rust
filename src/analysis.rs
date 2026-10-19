@@ -16,7 +16,7 @@ use crate::model::*;
 
 const MAX_INSTRUCTIONS: usize = 2048;
 const MAX_BLOCKS: usize = 128;
-const MAX_BYTES: usize = 64 * 1024;
+const MAX_BYTES: usize = MAX_BYTE_READ;
 const MAX_SCAN_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_CRYPTO_RESULTS: usize = 10_000;
 const SCAN_CHUNK: usize = 256 * 1024;
