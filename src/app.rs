@@ -212,6 +212,8 @@ pub struct DesktopApp {
     function_filter: String,
     filtered_functions: Vec<usize>,
     string_filter: String,
+    string_minimum: usize,
+    strings_minimum_used: Option<usize>,
     strings: Vec<StringEntry>,
     strings_truncated: bool,
     strings_scanned: bool,
@@ -285,6 +287,8 @@ impl DesktopApp {
             function_filter: String::new(),
             filtered_functions: Vec::new(),
             string_filter: String::new(),
+            string_minimum: 6,
+            strings_minimum_used: None,
             strings: Vec::new(),
             strings_truncated: false,
             strings_scanned: false,
@@ -403,6 +407,7 @@ impl DesktopApp {
         self.cached_strings = false;
         self.cached_crypto = false;
         self.strings.clear();
+        self.strings_minimum_used = None;
         self.strings_truncated = false;
         self.strings_scanned = false;
         self.filtered_strings.clear();
@@ -483,6 +488,15 @@ impl DesktopApp {
             if let Some(opening) = &mut self.opening {
                 opening.follow = Some(request);
             }
+            return;
+        }
+        if matches!(request, Request::Decompile { .. } | Request::Discover)
+            && self
+                .info
+                .as_ref()
+                .is_some_and(crate::packing::has_upx_warning)
+        {
+            self.status = crate::packing::UPX_ANALYSIS_ERROR.into();
             return;
         }
         if self.client.is_none() || self.pending.is_some() {
@@ -753,7 +767,7 @@ impl DesktopApp {
                 self.saved_analysis = false;
                 self.view = Some(view);
                 self.status = format!("Function {address:#x} ready");
-                if self.auto_decompile {
+                if self.should_auto_decompile() {
                     self.schedule_request(Request::Decompile { address });
                 }
             }
@@ -857,7 +871,7 @@ impl DesktopApp {
                 self.rebuild_filter();
                 self.status = "Function renamed".into();
                 if self.queue.is_empty()
-                    && self.auto_decompile
+                    && self.should_auto_decompile()
                     && self
                         .view
                         .as_ref()
@@ -877,7 +891,14 @@ impl DesktopApp {
                 self.tab = Tab::Decode;
                 self.status = "Bytes loaded into decoder".into();
             }
-            (Request::Strings, Response::Strings { strings, truncated }) => {
+            (
+                request @ (Request::Strings | Request::StringsWithOptions { .. }),
+                Response::Strings { strings, truncated },
+            ) => {
+                self.strings_minimum_used = Some(match request {
+                    Request::StringsWithOptions { minimum_length } => minimum_length,
+                    _ => MIN_STRING_LENGTH,
+                });
                 self.cached_strings = false;
                 self.strings = strings;
                 self.strings_truncated = truncated;
@@ -885,11 +906,13 @@ impl DesktopApp {
                 self.rebuild_string_filter();
                 self.tab = Tab::Strings;
                 self.status = if truncated {
-                    "String result limit reached"
+                    format!(
+                        "Showing {} string previews; raise the minimum length and rescan for fewer matches",
+                        self.strings.len()
+                    )
                 } else {
-                    "String scan complete"
-                }
-                .into();
+                    format!("String scan complete: {} results", self.strings.len())
+                };
             }
             (Request::Crypto, Response::Crypto { matches, truncated }) => {
                 self.cached_crypto = false;
@@ -940,6 +963,22 @@ impl DesktopApp {
                     .collect()
             })
             .unwrap_or_default();
+    }
+
+    fn should_auto_decompile(&self) -> bool {
+        self.auto_decompile
+            && !self
+                .info
+                .as_ref()
+                .is_some_and(crate::packing::has_upx_warning)
+    }
+
+    fn string_request(&self) -> Request {
+        Request::StringsWithOptions {
+            minimum_length: self
+                .string_minimum
+                .clamp(MIN_STRING_LENGTH, MAX_STRING_MINIMUM),
+        }
     }
 
     fn rebuild_string_filter(&mut self) {
@@ -1142,7 +1181,7 @@ impl DesktopApp {
                     })
                     .collect();
                 self.decompiled = text;
-            } else if self.auto_decompile {
+            } else if self.should_auto_decompile() {
                 self.schedule_request(Request::Decompile { address });
             }
             self.status = "Project opened — showing saved analysis; use Analysis → Refresh function to recompute".into();
@@ -1813,7 +1852,7 @@ impl DesktopApp {
                     }
                     for (label, request) in [
                         ("Discover functions", Request::Discover),
-                        ("Find strings", Request::Strings),
+                        ("Find strings", self.string_request()),
                         ("Find cryptographic constants", Request::Crypto),
                     ] {
                         if ui.button(label).clicked() {
@@ -1840,6 +1879,7 @@ impl DesktopApp {
                 ui.label("Ctrl+S: save project · Ctrl+Z: undo annotation");
                 ui.weak("Shortcuts pause while typing or using a dialog. Local-variable renaming is not yet supported.");
             });
+            crate::window_chrome::menu_bar_controls(ui);
         });
         ui.separator();
         ui.horizontal(|ui| {
@@ -1923,6 +1963,9 @@ impl DesktopApp {
         let mut scan_strings = false;
         ScrollArea::both()
             .id_salt("symbol-tree-scroll")
+            // Fill the resized dock rather than anchoring nested scrollbars to
+            // the width of whichever tree label was painted last.
+            .auto_shrink([false, false])
             .show(ui, |ui| {
                 let Some(info) = &self.info else {
                     ui.weak("No program loaded");
@@ -1943,6 +1986,7 @@ impl DesktopApp {
                             .show(ui, |ui| {
                                 ScrollArea::vertical()
                                     .id_salt("tree-function-scroll")
+                                    .auto_shrink([false, true])
                                     .max_height(180.0)
                                     .show_rows(ui, 20.0, info.functions.len(), |ui, rows| {
                                         for index in rows {
@@ -2005,15 +2049,20 @@ impl DesktopApp {
                                 } else {
                                     ScrollArea::vertical()
                                         .id_salt("tree-string-scroll")
+                                        .auto_shrink([false, true])
                                         .max_height(160.0)
                                         .show_rows(ui, 20.0, self.strings.len(), |ui, rows| {
                                             for index in rows {
                                                 let string = &self.strings[index];
                                                 if ui
-                                                    .selectable_label(
-                                                        false,
-                                                        crop(&string.text, 100),
+                                                    .add(
+                                                        egui::Button::selectable(
+                                                            false,
+                                                            crop(&string.text, 100),
+                                                        )
+                                                        .truncate(),
                                                     )
+                                                    .on_hover_text(&string.text)
                                                     .clicked()
                                                 {
                                                     let length = if string.encoding.contains("16") {
@@ -2078,7 +2127,7 @@ impl DesktopApp {
             self.request(Request::Bytes { address, length }, &context);
         }
         if scan_strings {
-            self.request(Request::Strings, &context);
+            self.request(self.string_request(), &context);
         }
     }
 
@@ -2111,11 +2160,10 @@ impl DesktopApp {
         ui.label(RichText::new("Address       Name").monospace().weak());
         let mut navigate = None;
         let row_height = ui.text_style_height(&egui::TextStyle::Body) + 6.0;
-        ScrollArea::vertical().id_salt("function-list").show_rows(
-            ui,
-            row_height,
-            self.filtered_functions.len(),
-            |ui, rows| {
+        ScrollArea::vertical()
+            .id_salt("function-list")
+            .auto_shrink([false, false])
+            .show_rows(ui, row_height, self.filtered_functions.len(), |ui, rows| {
                 if let Some(info) = &self.info {
                     for row in rows {
                         let function = &info.functions[self.filtered_functions[row]];
@@ -2150,8 +2198,7 @@ impl DesktopApp {
                         });
                     }
                 }
-            },
-        );
+            });
         if let Some(address) = navigate {
             self.navigate(address, true, ui.ctx());
         }
@@ -2225,11 +2272,19 @@ impl DesktopApp {
         }
         if self.decompiled.is_empty() {
             ui.add_space(8.0);
-            ui.weak(if self.pending.is_some() {
-                "Decompilation pending…"
+            if self
+                .info
+                .as_ref()
+                .is_some_and(crate::packing::has_upx_warning)
+            {
+                ui.colored_label(theme::WARNING, crate::packing::UPX_PACKED_WARNING);
             } else {
-                "Select a function to view its decompiled code."
-            });
+                ui.weak(if self.pending.is_some() {
+                    "Decompilation pending…"
+                } else {
+                    "Select a function to view its decompiled code."
+                });
+            }
         }
         let row = ui.text_style_height(&egui::TextStyle::Monospace);
         let mut navigate = None;
@@ -2601,16 +2656,38 @@ impl DesktopApp {
                 }
             }
             Tab::Strings => {
-                if ui
-                    .add_enabled(self.info.is_some(), egui::Button::new("Find strings"))
-                    .clicked()
-                {
-                    self.request(Request::Strings, &context);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(self.info.is_some(), egui::Button::new("Find strings"))
+                        .clicked()
+                    {
+                        self.request(self.string_request(), &context);
+                    }
+                    ui.label("Minimum characters");
+                    ui.add(
+                        egui::DragValue::new(&mut self.string_minimum)
+                            .range(MIN_STRING_LENGTH..=MAX_STRING_MINIMUM)
+                            .speed(1),
+                    );
+                });
+                if self.strings_scanned {
+                    ui.weak(format!(
+                        "{} loaded · {} visible{}",
+                        self.strings.len(),
+                        self.filtered_strings.len(),
+                        self.strings_minimum_used
+                            .map_or(String::new(), |minimum| format!(
+                                " · minimum {minimum} characters"
+                            ))
+                    ));
+                }
+                if self.strings_truncated {
+                    ui.label("Partial scan: up to 10,000 previews and 64 MiB of data. Increase the minimum length and rescan to reduce short-string noise.");
                 }
                 if ui
                     .add(
                         TextEdit::singleline(&mut self.string_filter)
-                            .hint_text("Filter strings")
+                            .hint_text("Filter loaded strings")
                             .char_limit(256),
                     )
                     .changed()
@@ -2805,7 +2882,9 @@ impl DesktopApp {
                                 Request::Discover => "Discovering functions",
                                 Request::Rename { .. } => "Renaming function",
                                 Request::Bytes { .. } => "Reading bytes",
-                                Request::Strings => "Finding strings",
+                                Request::Strings | Request::StringsWithOptions { .. } => {
+                                    "Finding strings"
+                                }
                                 Request::Crypto => "Scanning constants",
                             };
                             theme::analysis_activity(ui, task, elapsed);
@@ -2847,6 +2926,7 @@ impl DesktopApp {
         self.file_dialogs.show(&context);
         self.browser_dialog(&context);
         self.handle_shortcuts(&context);
+        crate::window_chrome::resize_borders(ui);
     }
 }
 
@@ -2907,6 +2987,56 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packed_image_skips_automatic_and_manual_expensive_analysis() {
+        let mut app = keyboard_app();
+        assert!(app.should_auto_decompile());
+        app.info
+            .as_mut()
+            .unwrap()
+            .warnings
+            .push(crate::packing::UPX_PACKED_WARNING.into());
+        assert!(!app.should_auto_decompile());
+        for request in [Request::Decompile { address: 0x1000 }, Request::Discover] {
+            app.request(request, &egui::Context::default());
+            assert_eq!(app.status, crate::packing::UPX_ANALYSIS_ERROR);
+            assert!(app.opening.is_none());
+            assert!(app.pending.is_none());
+        }
+    }
+
+    #[test]
+    fn string_options_are_applied_before_scanning_and_result_provenance_is_retained() {
+        let mut app = keyboard_app();
+        app.string_minimum = 8;
+        let request = app.string_request();
+        assert!(matches!(
+            request,
+            Request::StringsWithOptions { minimum_length: 8 }
+        ));
+        let pending = Pending {
+            id: 1,
+            request,
+            started: Instant::now(),
+            selection: app.selection_generation,
+            revision: app.revision,
+        };
+        app.string_minimum = 12;
+        app.receive(
+            pending,
+            Response::Strings {
+                strings: vec![],
+                truncated: true,
+            },
+            &egui::Context::default(),
+        );
+        assert_eq!(app.strings_minimum_used, Some(8));
+        assert!(app.strings_truncated);
+        assert!(app.status.contains("raise the minimum"));
+        app.clear_views();
+        assert_eq!(app.strings_minimum_used, None);
+    }
 
     #[test]
     fn scan_results_distinguish_partial_functions_and_unscanned_strings() {
@@ -3003,6 +3133,129 @@ mod tests {
             |ui| app.draw(ui),
         );
         output.textures_delta.clear();
+    }
+
+    #[test]
+    fn symbol_tree_scrollbars_and_rows_follow_dock_width_in_both_directions() {
+        fn frame(
+            context: &egui::Context,
+            app: &mut DesktopApp,
+            width: f32,
+            events: Vec<egui::Event>,
+        ) -> egui::FullOutput {
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1000.0, 720.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |root| {
+                    egui::Panel::left("tree-resize-test")
+                        .exact_size(width)
+                        .frame(egui::Frame::NONE)
+                        .show(root, |ui| app.symbol_tree(ui));
+                },
+            );
+            output.textures_delta.clear();
+            output
+        }
+
+        let context = egui::Context::default();
+        theme::install(&context);
+        context.all_styles_mut(|style| {
+            style.animation_time = 0.0;
+            // Solid tracks make actual scrollbar geometry observable, including
+            // when the pointer is elsewhere in this headless rendering test.
+            style.spacing.scroll = egui::style::ScrollStyle::solid();
+        });
+        let mut app = keyboard_app();
+        app.info.as_mut().unwrap().functions = (0..512)
+            .map(|index| FunctionInfo {
+                address: 0x1000 + index * 16,
+                name: format!("resize_function_{index:04}_{}", "long_name_".repeat(15)),
+            })
+            .collect();
+        app.strings_scanned = true;
+        app.strings = (0..512)
+            .map(|index| StringEntry {
+                address: 0x9000 + index * 256,
+                text: format!("resize_string_{index:04}_{}", "long_text_".repeat(15)),
+                encoding: "ASCII".into(),
+            })
+            .collect();
+        frame(&context, &mut app, 260.0, vec![]);
+        let output = frame(&context, &mut app, 260.0, vec![]);
+        let functions = text_position(&output, "Functions (512)", 0);
+        frame(&context, &mut app, 260.0, pointer_events(functions));
+        let output = frame(&context, &mut app, 260.0, vec![]);
+        let strings = text_position(&output, "Strings (512)", 0);
+        frame(&context, &mut app, 260.0, pointer_events(strings));
+
+        let mut widths = Vec::new();
+        let mut scrollbar_rights = Vec::new();
+        for width in [260.0, 430.0, 260.0] {
+            frame(&context, &mut app, width, vec![]);
+            let output = frame(&context, &mut app, width, vec![]);
+            let bars: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| {
+                    if let egui::epaint::Shape::Rect(rect) = &shape.shape {
+                        (rect.rect.height() > 100.0 && rect.rect.width() < 20.0)
+                            .then_some(rect.rect)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            assert_eq!(
+                bars.len(),
+                2,
+                "each expanded list has its own bounded scrollbar"
+            );
+            assert!((bars[0].right() - bars[1].right()).abs() < 2.0);
+            assert!(
+                bars[0].right() > width - 35.0,
+                "scrollbars follow the dock edge"
+            );
+            scrollbar_rights.push(bars[0].right());
+
+            let mut row_widths = Vec::new();
+            for prefix in ["resize_function_", "resize_string_"] {
+                let rows: Vec<_> = output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| {
+                        if let egui::epaint::Shape::Text(text) = &shape.shape {
+                            text.galley
+                                .text()
+                                .starts_with(prefix)
+                                .then_some((shape.clip_rect, &text.galley))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                assert!(!rows.is_empty(), "expanded rows are rendered");
+                assert!(rows.len() < 20, "lists remain virtualized");
+                assert!(rows.iter().all(|(_, galley)| galley.rows.len() == 1));
+                assert!(
+                    rows[0].0.right() > width - 40.0,
+                    "row clipping follows the resized viewport"
+                );
+                row_widths.push(rows[0].0.width());
+            }
+            widths.push(row_widths);
+        }
+        assert!(scrollbar_rights[1] - scrollbar_rights[0] > 150.0);
+        assert!((scrollbar_rights[2] - scrollbar_rights[0]).abs() < 2.0);
+        for ((narrow, wide), restored) in widths[0].iter().zip(&widths[1]).zip(&widths[2]) {
+            assert!(wide - narrow > 150.0);
+            assert!((restored - narrow).abs() < 2.0);
+        }
     }
 
     #[test]

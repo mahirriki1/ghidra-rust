@@ -23,11 +23,15 @@ the relevant source modules before changing behavior. Follow more specific
 - `src/app.rs`: GUI state, navigation, annotations, asynchronous jobs, and result
   adoption. `theme.rs` owns the shared dark appearance; `file_dialog.rs` owns the
   in-app chooser.
+- `src/window_chrome.rs`: Windows menu-row window controls and resize borders;
+  other platforms retain native decorations.
 - `src/client.rs`, `worker.rs`, `model.rs`: disposable worker lifecycle, bounded
   JSON transport, request/response types, and shared result limits.
 - `src/architecture.rs`: supported architecture/ABI selection and validation.
 - `src/analysis.rs`: loading, immutable image snapshots, instruction/CFG recovery,
   function discovery, and analysis requests.
+- `src/packing.rs`: conservative packed-image diagnostics; detected conventional
+  UPX PE stubs skip expensive decompilation/discovery while retaining inspection.
 - `src/decompile.rs`: semantic emission through public engine APIs, including
   restoration of the original printer/action after errors or panics.
 - `src/selection.rs`, `highlight.rs`, `graph.rs`: validated instruction/pseudocode
@@ -131,6 +135,8 @@ Report which checks actually ran and any platform validation that remains pendin
 
 ## Repository hygiene
 
+- Create or switch to a dedicated feature/fix branch before implementation edits;
+  do not commit implementation work directly to `main`.
 - Keep source, fixture source, tests, CI, current documentation, `LICENSE`,
   `NOTICE`, and the lockfile. Preserve independent signature provenance in
   `docs/crypto-signatures.md`.
