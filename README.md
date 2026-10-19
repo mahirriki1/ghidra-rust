@@ -63,8 +63,9 @@ rustup run 1.98.1-x86_64-pc-windows-msvc powershell -NoProfile -ExecutionPolicy 
 ```
 
 The standalone EXE, ZIP, and SHA-256 checksums are written under `target\dist`. Extract the ZIP and
-double-click `ghidra-rust.exe`. The Windows CI job uses this same script and retains
-the package as a workflow artifact after successful checks. See
+double-click `ghidra-rust.exe`. Run it before pushing: the Windows CI job uses
+this same script with `-SkipTests`, so it builds and packages without running
+tests, and retains the package as a workflow artifact. See
 [Windows instructions and troubleshooting](docs/windows.md) for details.
 
 Windows worker limits are resource controls, **not a security sandbox**. Use this
@@ -327,9 +328,9 @@ PE worker/project integration test in both debug and release. One ignored unit
 test is a subprocess fixture exercised by the job-lifecycle test. The release
 OpenGL GUI was launched on Windows and used to save and reopen an embedded
 project with saved listing/pseudocode. The EXE imports Windows system DLLs without
-MSVC-runtime or SQLite DLL dependencies. These are local results; consult GitHub
-Actions for hosted results for the exact commit. The Windows build script is
-shared with CI.
+MSVC-runtime or SQLite DLL dependencies. These are local results; GitHub Actions
+only builds and packages each commit without running tests. The Windows build
+script is shared with CI.
 
 PE loading supplies export names, supported x64/ARM64 runtime-function starts,
 and named import slots to the decompiler. Ordinary x86 import jump thunks reached by confirmed calls

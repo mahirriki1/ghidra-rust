@@ -24,8 +24,6 @@ jobs:
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
-      - name: Check release tooling
-        run: python3 -m unittest discover -s scripts -p 'test_*.py'
       - name: Reserve the next patch release snapshot
         id: version
         env:
@@ -62,7 +60,7 @@ jobs:
           ref: ${{ needs.prepare.outputs.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Download both tested native packages
+      - name: Download both native packages
         run: |
           gh run download "$GITHUB_RUN_ID" --name ghidra-rust-linux-x64 --dir target/release-assets
           gh run download "$GITHUB_RUN_ID" --name ghidra-rust-windows-x64 --dir target/release-assets

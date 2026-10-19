@@ -37,7 +37,8 @@ cargo test --release --locked --target x86_64-pc-windows-msvc --test windows_wor
 The Windows integration test uses the production suspended worker/job startup,
 opens the PE from Unicode paths, verifies handle identity and writer exclusion,
 requests real graph/decompiler/string results, and saves/replaces/reopens an
-embedded project. CI compiles the fixture and sets this variable.
+embedded project. `scripts/build-windows.ps1` compiles the fixture and sets this
+variable when run locally without `-SkipTests`.
 It verifies exported names reach the decompiler and that a private copy with its
 export directory removed still recovers functions from x64 runtime metadata.
 Without the variable, this integration check skips locally; Windows unit tests
