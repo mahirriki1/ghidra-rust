@@ -142,8 +142,8 @@ navigates to that function.
   objects, universal/fat Mach-O, and sectionless images are rejected.
   See [architecture coverage and limits](docs/architectures.md).
 - Browse/filter known functions; start at `main` when found, otherwise the entry
-  point. PE exports and x64 exception-table function entries load on open, including
-  stripped images. The list is capped at 10,000 entries; large PEs prioritize the
+  point. PE exports and supported x64/ARM64 exception-table function entries load
+  on open, including stripped images. The list is capped at 10,000 entries; large PEs prioritize the
   entry point, exports, and runtime functions near entry, with a visible partial-list
   notice. **Discover functions** follows confirmed decoded direct calls from known
   entries on every supported architecture, within shared work budgets. Complete
@@ -317,16 +317,19 @@ MSVC-runtime or SQLite DLL dependencies. These are local results; consult GitHub
 Actions for hosted results for the exact commit. The Windows build script is
 shared with CI.
 
-PE loading supplies export names, x64 runtime-function starts, and named import
-slots to the decompiler. Ordinary x86 import jump thunks reached by confirmed calls
-are named during bounded function analysis. AArch64 PE does not yet recover
-functions from ARM64 unwind records or name ADRP/LDR/BR import veneers. PDB types,
+PE loading supplies export names, supported x64/ARM64 runtime-function starts,
+and named import slots to the decompiler. Ordinary x86 import jump thunks reached by confirmed calls
+are named during bounded function analysis. ARM64 PE recovers primary entries
+from packed and supported full unwind records, and names exact ADRP/LDR/BR import
+veneers at established entries or confirmed call targets. Fragment records do
+not independently establish functions; parent links and unsupported unwind forms
+remain explicit omissions. See [analysis coverage](docs/analysis.md). PDB types,
 imported API prototypes, library signature matching, delay imports, and Windows
 Control Flow Guard substitutions remain incomplete. Known hexadecimal addresses remain navigable.
 The PE integration tests check named exports and recovery after exports are removed.
 
-The architecture/ABI and confirmed-call analysis fingerprints invalidate older
-saved graph/decompiler caches when a project reopens; compatible annotations are
+The architecture/ABI, confirmed-call and ARM64 PE analysis fingerprints invalidate
+older saved graph/decompiler caches when a project reopens; compatible annotations are
 retained. The project schema and JSON annotation format are unchanged. When comparing
 against a Ghidra project, compare the recorded executable SHA-256 and the selected
 function address. An installed program can change at the same path after an update.

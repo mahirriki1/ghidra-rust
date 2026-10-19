@@ -26,6 +26,8 @@ Each run examines at most 128 function entries and makes at most 16,384 decode
 attempts in total. Each function has a 2,048-attempt limit, and its displayed graph
 has at most 128 blocks. The shared limit is charged for failed decodes and decoded
 work omitted by display limits, so it cannot be exceeded by a final function walk.
+ARM64 import-veneer confirmation during discovery charges three attempts per
+eligible candidate against this same shared budget, before calling the engine.
 The call-reference collection is also capped at 16,384 entries. Coverage is marked
 partial when work limits or recovery failures prevent a complete walk. The known
 function list retains its existing 10,000-entry cap.
@@ -47,8 +49,9 @@ The reference index is computed for the current session and is not serialized in
 `.grproj` files. Reopening a project requires another discovery run to rebuild it.
 The existing saved function inventory keeps its saved-result provenance; a
 matching binary hash does not authenticate cached results. The `calls-v1` analysis
-fingerprint invalidates older cached analysis while preserving compatible
-annotations. The project schema and JSON annotation format remain unchanged.
+fingerprint, together with `arm64pe-v1`, invalidates older cached analysis while
+preserving compatible annotations. The project schema and JSON annotation format
+remain unchanged.
 
 The worker reports **Seeds**, **Calls**, and **Publish** stages with the number of
 functions examined and decode attempts charged. The total remains indeterminate:
@@ -57,6 +60,44 @@ not completion percentages. Cancellation still terminates the disposable worker,
 and progress messages do not reset CPU or wall-time deadlines. Existing binary
 identity, immutable snapshots, result validation, and platform resource controls
 continue to apply.
+
+## ARM64 PE runtime metadata and import veneers
+
+Opening a Windows ARM64 PE reads its ordered eight-byte runtime records from the
+exception directory. Normal packed records and supported version-zero full
+`.xdata` records establish primary function entries and validated file-backed
+code regions. Existing entry/export names take priority. Packed fragments and
+full records with chained phantom prologs retain regions but do not independently
+seed functions. They can still be reached through separate export or confirmed
+call evidence. Parent `.pdata` links, custom context/trap unwind codes, SVE-specific
+`save_any` forms and reserved or unsupported encodings are omitted with a partial
+coverage warning. This is metadata recovery, not stack unwinding or exception-flow
+reconstruction. Leaf functions without runtime records still require other evidence.
+
+Directory storage is capped at 8 MiB and 500,000 records. An additional shared
+8 MiB inspection budget covers all full unwind records, including repeated
+references and failed reads. Code lengths, alignment, version, storage extents,
+epilog indices and opcode boundaries are validated. Unordered tables and groups
+of overlapping regions are omitted. The existing 10,000-function inventory cap
+and entry/export/nearest-runtime-start priority remain in effect.
+
+At established entries or confirmed direct-call targets, a bounded recognizer
+names the exact `ADRP Xn; LDR Xm,[Xn,#offset]; BR Xm` veneer when its checked
+address calculation reaches a named, aligned, file-backed non-executable IAT
+slot. Engine instructions and p-code confirm the sequence. Generic generated
+function names can be promoted; meaningful names remain intact. No byte-pattern
+scan seeds functions and the on-disk IAT value is never a runtime destination.
+The independent CFG keeps the register branch unresolved. BTI-prefixed and other
+veneer shapes, delay imports, and imported prototypes remain deferred.
+
+Naming on open checks at most 2,048 known entries, with at most 6,144 engine
+instruction attempts. Selected-function decompilation checks at most eight CFGs
+with the existing 2,048-attempt per-CFG limit, then at most 2,048 veneer candidates.
+Discovery instead charges veneer instruction attempts within its shared 16,384
+limit; reaching a candidate or instruction limit marks the report partial. Stage
+counts cover discovery work and do not include loading or separately requested
+decompilation. Conventional UPX stubs remain excluded from discovery,
+decompilation and load-time veneer decoding.
 
 ## Upstream provenance and remaining work
 
@@ -74,7 +115,13 @@ on its Program database and event system. This increment adapts one useful
 algorithm into the native worker; it does not port that framework or add a Java
 or Python runtime dependency.
 
-ARM64 PE unwind metadata and ADRP/LDR/BR IAT veneer recovery remain deferred.
+The ARM64 PE metadata reader is an independent implementation of
+[Microsoft's ARM64 exception-handling format](https://learn.microsoft.com/en-us/cpp/build/arm64-exception-handling?view=msvc-170).
+It is separate from Ghidra's Java database analyzers. The import recognizer uses
+public APIs from the unchanged pinned engine. Original assembly and synthetic PE
+metadata fixtures cover isolated runtime entries, fragments, a real named import
+call and an unresolved veneer branch through production worker containment.
+
 Switch/jump-table recovery, general constant propagation, speculative operand
 references, exception flow, no-return analysis, and complete stripped-function
 recovery are not supplied by this pass. Existing engine behavior may still expose

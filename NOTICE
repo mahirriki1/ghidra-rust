@@ -18,6 +18,14 @@ This is separate from the pinned decompiler port and its Ghidra source revision.
 
 ----
 
+The desktop's ARM64 PE runtime-metadata reader is an independent implementation
+of Microsoft's documented ARM64 exception-handling binary format:
+https://learn.microsoft.com/en-us/cpp/build/arm64-exception-handling?view=msvc-170
+It is separate from Ghidra's Java auto-analysis framework. Its original synthetic
+fixtures and exact import-veneer recognizer use the pinned engine's public APIs.
+
+----
+
 Ghidra
 
 This product includes software developed at National Security Agency

@@ -385,3 +385,99 @@ fn aarch64_rejects_unaligned_entries_and_truncated_instructions() {
         "Bad requests must not poison the worker"
     );
 }
+
+#[test]
+fn stripped_arm64_pe_recovers_unwind_entries_and_names_confirmed_import_veneers() {
+    let (bytes, base) = common::arm64_pe_metadata();
+    let directory = tempfile::tempdir().unwrap();
+    let binary = directory.path().join("original stripped ARM64 PE");
+    std::fs::write(&binary, &bytes).unwrap();
+    let mut worker = WorkerClient::start_using_executable(
+        eframe::egui::Context::default(),
+        &binary,
+        Path::new(env!("CARGO_BIN_EXE_ghidra-rust")),
+    )
+    .unwrap();
+    let Response::Opened { info } = request(
+        &mut worker,
+        Request::Open {
+            path: binary.to_string_lossy().into_owned(),
+        },
+    ) else {
+        panic!("Expected stripped ARM64 PE");
+    };
+    assert_eq!(
+        info.functions
+            .iter()
+            .map(|function| function.address)
+            .collect::<Vec<_>>(),
+        [base, base + 0x80, base + 0xa0]
+    );
+    assert!(info.functions_truncated); // Fragment ownership remains incomplete.
+    assert!(
+        info.warnings
+            .iter()
+            .any(|warning| warning.contains("fragment records"))
+    );
+    let isolated = graph(&mut worker, base + 0x80);
+    let (text, _) = decompile(&mut worker, base + 0x80, &info, &isolated);
+    assert!(text.contains('7'), "{text}");
+    let caller = graph(&mut worker, base + 0xa0);
+    let (text, _) = decompile(&mut worker, base + 0xa0, &info, &caller);
+    assert!(text.contains("fixture_import"), "{text}");
+    let Response::Functions {
+        functions,
+        analysis,
+        ..
+    } = request(&mut worker, Request::Discover)
+    else {
+        panic!("Expected discovery report");
+    };
+    analysis.validate(&info, &functions).unwrap();
+    // 26 CFG instruction attempts plus three veneer-confirmation attempts.
+    assert_eq!(analysis.decode_attempts, 29);
+    assert!(
+        functions
+            .iter()
+            .any(|function| function.address == base + 0xc0 && function.name == "fixture_import")
+    );
+    assert!(
+        functions
+            .iter()
+            .any(|function| function.address == base + 48)
+    );
+    assert!(
+        !functions
+            .iter()
+            .any(|function| function.address == base + 0x90)
+    );
+    assert!(
+        analysis
+            .references
+            .iter()
+            .any(|reference| reference.caller == base + 0xa0
+                && reference.address == base + 0xa8
+                && reference.target == base + 0xc0)
+    );
+    let veneer = graph(&mut worker, base + 0xc0);
+    assert_eq!(
+        veneer
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .count(),
+        3
+    );
+    assert!(
+        veneer
+            .edges
+            .iter()
+            .any(|edge| edge.kind == EdgeKind::Unknown && edge.target.is_none())
+    );
+    assert!(veneer.calls.is_empty());
+    assert_eq!(
+        info.sha256,
+        ghidra_rust::session::fingerprint(&binary).unwrap()
+    );
+    assert_eq!(std::fs::read(&binary).unwrap(), bytes);
+}
