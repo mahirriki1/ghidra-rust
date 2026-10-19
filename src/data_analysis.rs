@@ -1,8 +1,10 @@
-//! Bounded, instruction-local memory-access evidence from public engine p-code.
+//! Bounded memory-access evidence from public engine p-code: instruction-local
+//! constant pointers, plus AArch64 block-local register-constant propagation.
 //!
-//! Adapts direct-memory reference rules from Ghidra's SymbolicPropogator.java
+//! Adapts direct-memory reference rules and constant-transfer/unknown-output
+//! rules from Ghidra's SymbolicPropogator.java
 //! (9a723ce99952771b8368329503aa589ae233e916), Apache-2.0. See NOTICE.
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ghidra_decompiler::opcodes::OpCode;
 use ghidra_decompiler::program::{InstructionPcode, PcodeOperation, PcodeVarnode};
@@ -15,6 +17,224 @@ pub(crate) struct DataCollector<'a> {
     pointer_bytes: u32,
     references: BTreeSet<DataReference>,
     report: DataAnalysis,
+    /// Compact p-code of the current function's admitted instructions, kept
+    /// only when block-local propagation is enabled. A missing address is a
+    /// barrier that clears all known values.
+    retained: Option<BTreeMap<u64, Retained>>,
+    retained_operations: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Space {
+    Const,
+    Register,
+    Unique,
+    Other,
+}
+
+#[derive(Clone, Copy)]
+struct Var {
+    space: Space,
+    offset: u64,
+    size: u32,
+}
+
+struct Op {
+    opcode: OpCode,
+    output: Option<Var>,
+    inputs: Vec<Var>,
+}
+
+/// An access counted as unresolved by [`DataCollector::inspect`]; only these
+/// may later be resolved, so each access is accounted exactly once.
+struct Unresolved {
+    operation: usize,
+    size: u32,
+    access: DataAccess,
+}
+
+struct Retained {
+    operations: Vec<Op>,
+    unresolved: Vec<Unresolved>,
+}
+
+#[derive(Clone, Copy)]
+struct Known {
+    value: u64,
+    /// Depends on a value established by an earlier instruction.
+    carried: bool,
+}
+
+fn mask(size: u32) -> u64 {
+    if size >= 8 {
+        u64::MAX
+    } else {
+        (1u64 << (size * 8)) - 1
+    }
+}
+
+/// Known little-endian values in register or unique storage, keyed by start.
+#[derive(Default)]
+struct Values {
+    entries: BTreeMap<(bool, u64), (u32, Known)>,
+    exhausted: bool,
+}
+
+impl Values {
+    fn key(var: Var) -> Option<(bool, u64)> {
+        match var.space {
+            Space::Register => Some((false, var.offset)),
+            Space::Unique => Some((true, var.offset)),
+            _ => None,
+        }
+    }
+
+    fn read(&self, var: Var) -> Option<Known> {
+        if !(1..=8).contains(&var.size) {
+            return None;
+        }
+        if var.space == Space::Const {
+            return Some(Known {
+                value: var.offset & mask(var.size),
+                carried: false,
+            });
+        }
+        let (unique, offset) = Self::key(var)?;
+        let end = offset.checked_add(u64::from(var.size))?;
+        // Only a single entry that fully contains the read can supply it.
+        let (&(space, start), &(size, known)) =
+            self.entries.range(..=(unique, offset)).next_back()?;
+        if space != unique {
+            return None;
+        }
+        let shift = offset - start;
+        (start.checked_add(u64::from(size))? >= end && shift < 8).then(|| Known {
+            value: (known.value >> (shift * 8)) & mask(var.size),
+            carried: known.carried,
+        })
+    }
+
+    fn write(&mut self, var: Var, value: Option<Known>) {
+        let Some((unique, offset)) = Self::key(var) else {
+            return;
+        };
+        let Some(end) = offset.checked_add(u64::from(var.size)) else {
+            self.entries.clear();
+            return;
+        };
+        // Invalidate every overlapping alias (for example Wn within Xn). All
+        // entries are at most eight bytes, so overlaps start within 8 bytes.
+        let overlapping: Vec<_> = self
+            .entries
+            .range((unique, offset.saturating_sub(7))..(unique, end))
+            .filter(|(key, (size, _))| key.1.saturating_add(u64::from(*size)) > offset)
+            .map(|(&key, _)| key)
+            .collect();
+        for key in overlapping {
+            self.entries.remove(&key);
+        }
+        if let Some(known) = value
+            && (1..=8).contains(&var.size)
+        {
+            if self.entries.len() >= MAX_DATA_TRACKED_VALUES {
+                self.entries.clear();
+                self.exhausted = true;
+            }
+            self.entries.insert((unique, offset), (var.size, known));
+        }
+    }
+
+    fn end_instruction(&mut self) {
+        self.entries.retain(|&(unique, _), _| !unique);
+        for (_, known) in self.entries.values_mut() {
+            known.carried = true;
+        }
+    }
+}
+
+/// Finite-width p-code arithmetic. Returns `None` for unsupported operations
+/// or malformed widths, which makes the output unknown.
+fn evaluate(op: &Op, values: &Values) -> Option<Known> {
+    use OpCode::*;
+    let output = op.output?;
+    if !(1..=8).contains(&output.size) {
+        return None;
+    }
+    let input = |index: usize| -> Option<(Var, Known)> {
+        let var = *op.inputs.get(index)?;
+        Some((var, values.read(var)?))
+    };
+    let same = |var: Var| var.size == output.size;
+    let (value, carried) = match (op.opcode, op.inputs.len()) {
+        (Copy, 1) => {
+            let (a, x) = input(0)?;
+            same(a).then_some((x.value, x.carried))?
+        }
+        (IntAdd | IntSub | IntAnd | IntOr | IntXor, 2) => {
+            let ((a, x), (b, y)) = (input(0)?, input(1)?);
+            if !same(a) || !same(b) {
+                return None;
+            }
+            let value = match op.opcode {
+                IntAdd => x.value.wrapping_add(y.value),
+                IntSub => x.value.wrapping_sub(y.value),
+                IntAnd => x.value & y.value,
+                IntOr => x.value | y.value,
+                _ => x.value ^ y.value,
+            };
+            (value, x.carried || y.carried)
+        }
+        (IntLeft | IntRight, 2) => {
+            let ((a, x), (_, y)) = (input(0)?, input(1)?);
+            if !same(a) {
+                return None;
+            }
+            // P-code shifts of at least the operand width produce zero.
+            let value = match u32::try_from(y.value)
+                .ok()
+                .and_then(|shift| (shift < output.size * 8).then_some(shift))
+            {
+                Some(shift) if op.opcode == IntLeft => x.value << shift,
+                Some(shift) => x.value >> shift,
+                None => 0,
+            };
+            (value, x.carried || y.carried)
+        }
+        (IntZext | IntSext, 1) => {
+            let (a, x) = input(0)?;
+            if a.size >= output.size {
+                return None;
+            }
+            let bits = a.size * 8;
+            let value = if op.opcode == IntSext && (x.value >> (bits - 1)) & 1 == 1 {
+                x.value | !mask(a.size)
+            } else {
+                x.value
+            };
+            (value, x.carried)
+        }
+        (Subpiece, 2) => {
+            let ((a, x), (b, y)) = (input(0)?, input(1)?);
+            if b.space != Space::Const
+                || y.value.checked_add(u64::from(output.size))? > u64::from(a.size)
+            {
+                return None;
+            }
+            (x.value >> (y.value * 8), x.carried)
+        }
+        (Piece, 2) => {
+            let ((a, x), (b, y)) = (input(0)?, input(1)?);
+            if a.size + b.size != output.size {
+                return None;
+            }
+            ((x.value << (b.size * 8)) | y.value, x.carried || y.carried)
+        }
+        _ => return None,
+    };
+    Some(Known {
+        value: value & mask(output.size),
+        carried,
+    })
 }
 
 impl<'a> DataCollector<'a> {
@@ -25,6 +245,36 @@ impl<'a> DataCollector<'a> {
             pointer_bytes,
             references: BTreeSet::new(),
             report: DataAnalysis::default(),
+            retained: None,
+            retained_operations: 0,
+        }
+    }
+
+    /// Enables AArch64 block-local propagation; other targets stay
+    /// instruction-local.
+    pub fn with_propagation(mut self) -> Self {
+        self.retained = Some(BTreeMap::new());
+        self
+    }
+
+    pub fn begin_function(&mut self) {
+        if let Some(retained) = &mut self.retained {
+            retained.clear();
+        }
+        self.retained_operations = 0;
+    }
+
+    fn var(&self, value: &PcodeVarnode) -> Var {
+        let space = match value.space.as_str() {
+            "const" => Space::Const,
+            "register" => Space::Register,
+            "unique" => Space::Unique,
+            _ => Space::Other,
+        };
+        Var {
+            space,
+            offset: value.offset,
+            size: value.size,
         }
     }
 
@@ -56,7 +306,8 @@ impl<'a> DataCollector<'a> {
             self.report.partial = true;
             return;
         }
-        for operation in &code.operations {
+        let mut unresolved = Vec::new();
+        for (index, operation) in code.operations.iter().enumerate() {
             use OpCode::*;
             match operation.opcode {
                 Call | Callind | Branch | Branchind | Cbranch | Return => continue,
@@ -73,12 +324,24 @@ impl<'a> DataCollector<'a> {
                             self.report.omitted_accesses += 1;
                         } else if pointer.space != "const" {
                             self.report.unresolved_accesses += 1;
+                            unresolved.push(Unresolved {
+                                operation: index,
+                                size,
+                                access,
+                            });
                         } else if !fits_width(pointer.offset, pointer.size)
                             || pointer.size > self.pointer_bytes
                         {
                             self.report.omitted_accesses += 1;
                         } else {
-                            self.record(function, code.address, pointer.offset, size, access);
+                            self.record(
+                                function,
+                                code.address,
+                                pointer.offset,
+                                size,
+                                access,
+                                DataProvenance::InstructionLocal,
+                            );
                         }
                     }
                     // Input zero is address-space metadata, never a value read.
@@ -96,6 +359,116 @@ impl<'a> DataCollector<'a> {
                 self.value(function, code.address, output, DataAccess::Write);
             }
         }
+        self.retain(code, unresolved);
+    }
+
+    fn retain(&mut self, code: &InstructionPcode, unresolved: Vec<Unresolved>) {
+        let Some(retained) = &self.retained else {
+            return;
+        };
+        if retained.contains_key(&code.address) {
+            return;
+        }
+        if code.operations.len() > MAX_DATA_RETAINED_OPERATIONS - self.retained_operations {
+            // The instruction becomes a barrier; later accesses stay unresolved.
+            self.report.partial = true;
+            return;
+        }
+        self.retained_operations += code.operations.len();
+        let operations = code
+            .operations
+            .iter()
+            .map(|operation| Op {
+                opcode: operation.opcode,
+                output: operation.output.as_ref().map(|output| self.var(output)),
+                inputs: operation
+                    .inputs
+                    .iter()
+                    .map(|input| self.var(input))
+                    .collect(),
+            })
+            .collect();
+        self.retained.as_mut().unwrap().insert(
+            code.address,
+            Retained {
+                operations,
+                unresolved,
+            },
+        );
+    }
+
+    /// Resolves retained accesses using register constants carried forward
+    /// within each basic block. Knowledge resets at every block start, so
+    /// joins, loops, and other predecessors never contribute values.
+    pub fn propagate<'b>(&mut self, function: u64, blocks: impl Iterator<Item = &'b BasicBlock>) {
+        let Some(mut retained) = self.retained.take() else {
+            return;
+        };
+        for block in blocks {
+            let mut values = Values::default();
+            for instruction in &block.instructions {
+                let Some(code) = retained.remove(&instruction.address) else {
+                    values = Values::default();
+                    continue;
+                };
+                self.propagate_instruction(function, instruction.address, &code, &mut values);
+            }
+        }
+        // Accesses outside displayed blocks were not given propagation.
+        if retained.values().any(|code| !code.unresolved.is_empty()) {
+            self.report.partial = true;
+        }
+        retained.clear();
+        self.retained = Some(retained);
+        self.retained_operations = 0;
+    }
+
+    fn propagate_instruction(
+        &mut self,
+        function: u64,
+        address: u64,
+        code: &Retained,
+        values: &mut Values,
+    ) {
+        let mut pending = code.unresolved.iter().peekable();
+        for (index, op) in code.operations.iter().enumerate() {
+            if let Some(access) = pending.next_if(|access| access.operation == index) {
+                let pointer = op.inputs[1];
+                if let Some(known) = values.read(pointer)
+                    && pointer.size <= self.pointer_bytes
+                {
+                    self.report.unresolved_accesses -= 1;
+                    let provenance = if known.carried {
+                        DataProvenance::Propagated
+                    } else {
+                        DataProvenance::InstructionLocal
+                    };
+                    self.record(
+                        function,
+                        address,
+                        known.value,
+                        access.size,
+                        access.access,
+                        provenance,
+                    );
+                }
+            }
+            match op.opcode {
+                // Calls may clobber any register under every supported ABI.
+                OpCode::Call | OpCode::Callind => *values = Values::default(),
+                _ => {
+                    if let Some(output) = op.output {
+                        // Loaded values are never modeled.
+                        let value = (op.opcode != OpCode::Load)
+                            .then(|| evaluate(op, values))
+                            .flatten();
+                        values.write(output, value);
+                        self.report.partial |= values.exhausted;
+                    }
+                }
+            }
+        }
+        values.end_instruction();
     }
 
     fn candidate(&mut self) -> bool {
@@ -114,14 +487,29 @@ impl<'a> DataCollector<'a> {
         }
         if self.candidate() {
             if value.space == self.data_space {
-                self.record(function, address, value.offset, value.size, access);
+                self.record(
+                    function,
+                    address,
+                    value.offset,
+                    value.size,
+                    access,
+                    DataProvenance::InstructionLocal,
+                );
             } else {
                 self.report.omitted_accesses += 1;
             }
         }
     }
 
-    fn record(&mut self, function: u64, address: u64, target: u64, size: u32, access: DataAccess) {
+    fn record(
+        &mut self,
+        function: u64,
+        address: u64,
+        target: u64,
+        size: u32,
+        access: DataAccess,
+        provenance: DataProvenance,
+    ) {
         if mapped_range(self.sections, target, size, self.pointer_bytes, false) {
             self.references.insert(DataReference {
                 function,
@@ -129,6 +517,7 @@ impl<'a> DataCollector<'a> {
                 target,
                 size,
                 access,
+                provenance,
             });
         } else {
             self.report.omitted_accesses += 1;
@@ -166,6 +555,12 @@ fn supported(operation: &PcodeOperation) -> bool {
         // semantics; accepting their operands would invent unconditional reads.
         _ => false,
     }
+}
+
+/// One logical access, regardless of how its pointer was established.
+fn same_access(a: &DataReference, b: &DataReference) -> bool {
+    (a.function, a.address, a.target, a.size, a.access)
+        == (b.function, b.address, b.target, b.size, b.access)
 }
 
 fn valid_size(size: u32) -> bool {
@@ -282,6 +677,9 @@ impl DataAnalysis {
                     false,
                 )
                 || (index > 0 && self.references[index - 1] >= *reference)
+                || (index > 0 && same_access(&self.references[index - 1], reference))
+                || (reference.provenance == DataProvenance::Propagated
+                    && info.architecture != "AArch64")
             {
                 return Err("Invalid data evidence addresses, ordering, or duplicates".into());
             }
@@ -370,6 +768,298 @@ mod tests {
             collector.inspect(0x1000, &code);
         }
         collector.finish()
+    }
+
+    /// Real AArch64 p-code for `words`, inspected in order, then propagated
+    /// over blocks given as instruction indices.
+    fn propagated(words: &[u32], blocks: &[&[usize]]) -> DataAnalysis {
+        let bytes = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        let program = Program::from_raw_bytes(bytes, "AARCH64:LE:64:v8A:default", 0x1000).unwrap();
+        let sections = sections();
+        let mut collector = DataCollector::new(&sections, "ram", 8).with_propagation();
+        collector.begin_function();
+        for code in program.pcode(0x1000, words.len()).unwrap() {
+            collector.inspect(0x1000, &code);
+        }
+        let blocks: Vec<_> = blocks
+            .iter()
+            .map(|indices| BasicBlock {
+                address: 0x1000 + 4 * indices[0] as u64,
+                instructions: indices
+                    .iter()
+                    .map(|&index| Instruction {
+                        address: 0x1000 + 4 * index as u64,
+                        bytes: words[index].to_le_bytes().to_vec(),
+                        mnemonic: String::new(),
+                        operands: String::new(),
+                    })
+                    .collect(),
+            })
+            .collect();
+        collector.propagate(0x1000, blocks.iter());
+        let report = collector.finish();
+        assert!(
+            report.references.len() + report.unresolved_accesses + report.omitted_accesses
+                <= report.accesses_examined
+        );
+        report
+    }
+
+    fn targets(report: &DataAnalysis) -> Vec<(u64, u64, u32, DataAccess, DataProvenance)> {
+        report
+            .references
+            .iter()
+            .map(|r| (r.address, r.target, r.size, r.access, r.provenance))
+            .collect()
+    }
+
+    const ADRP_X1_NEXT_PAGE: u32 = 0xb000_0001; // adrp x1, 0x2000
+    const ADD_X1_0X10: u32 = 0x9100_4021; // add x1, x1, #0x10
+    const LDR_X2_X1: u32 = 0xf940_0022; // ldr x2, [x1]
+
+    #[test]
+    fn block_local_propagation_resolves_composed_addresses() {
+        use DataAccess::*;
+        use DataProvenance::*;
+        let all = |count: usize| (0..count).collect::<Vec<_>>();
+        for (words, expected) in [
+            // adrp; add; ldr / str w2, [x1, #4]
+            (
+                vec![ADRP_X1_NEXT_PAGE, ADD_X1_0X10, LDR_X2_X1, 0xb900_0422],
+                vec![
+                    (0x1008, 0x2010, 8, Read, Propagated),
+                    (0x100c, 0x2014, 4, Write, Propagated),
+                ],
+            ),
+            // adrp; ldr x2, [x1, #8]
+            (
+                vec![ADRP_X1_NEXT_PAGE, 0xf940_0422],
+                vec![(0x1004, 0x2008, 8, Read, Propagated)],
+            ),
+            // movz x3, #0x2000; movk x3, #0, lsl #16; ldr x4, [x3, #0x18]
+            (
+                vec![0xd284_0003, 0xf2a0_0003, 0xf940_0c64],
+                vec![(0x1008, 0x2018, 8, Read, Propagated)],
+            ),
+            // adr x5, +0x100; ldrb w6, [x5]
+            (
+                vec![0x1000_0805, 0x3940_00a6],
+                vec![(0x1004, 0x1100, 1, Read, Propagated)],
+            ),
+            // A 32-bit add writes the zero-extended X register.
+            (
+                vec![ADRP_X1_NEXT_PAGE, 0x1100_4021, LDR_X2_X1],
+                vec![(0x1008, 0x2010, 8, Read, Propagated)],
+            ),
+        ] {
+            let report = propagated(&words, &[&all(words.len())]);
+            assert_eq!(targets(&report), expected, "{words:x?}");
+            assert_eq!(report.unresolved_accesses, 0, "{words:x?}");
+            assert!(!report.partial, "{words:x?}");
+        }
+    }
+
+    #[test]
+    fn calls_unknown_writes_loads_and_block_starts_reset_knowledge() {
+        for (words, blocks) in [
+            // bl; ldr: direct calls clobber registers.
+            (
+                vec![ADRP_X1_NEXT_PAGE, 0x9400_0002, LDR_X2_X1],
+                vec![vec![0, 1, 2]],
+            ),
+            // blr x8; ldr: indirect calls too.
+            (
+                vec![ADRP_X1_NEXT_PAGE, 0xd63f_0100, LDR_X2_X1],
+                vec![vec![0, 1, 2]],
+            ),
+            // mov w1, w7: an unknown write to W1 invalidates X1.
+            (
+                vec![ADRP_X1_NEXT_PAGE, 0x2a07_03e1, LDR_X2_X1],
+                vec![vec![0, 1, 2]],
+            ),
+            // ldr x1, [x1]; ldr x2, [x1]: loaded pointers are never chased.
+            (
+                vec![ADRP_X1_NEXT_PAGE, 0xf940_0021, LDR_X2_X1],
+                vec![vec![0, 1, 2]],
+            ),
+            // The load starts another block: no incoming values are reused.
+            (vec![ADRP_X1_NEXT_PAGE, LDR_X2_X1], vec![vec![0], vec![1]]),
+            // svc #0 is an unsupported user operation and acts as a barrier.
+            (
+                vec![ADRP_X1_NEXT_PAGE, 0xd400_0001, LDR_X2_X1],
+                vec![vec![0, 1, 2]],
+            ),
+        ] {
+            let blocks: Vec<_> = blocks.iter().map(Vec::as_slice).collect();
+            let report = propagated(&words, &blocks);
+            // The intermediate load may resolve; the final one must not.
+            assert!(
+                report.references.iter().all(
+                    |r| r.address != 0x1008 && (r.address != 0x1004 || words[1] == 0xf940_0021)
+                ),
+                "{words:x?}: {report:?}"
+            );
+            assert!(report.unresolved_accesses >= 1, "{words:x?}");
+        }
+    }
+
+    #[test]
+    fn propagated_targets_must_be_mapped_file_backed_ranges() {
+        // adrp x1, 0x2000; ldr x2, [x1, #0xf8] reads the last 8 file bytes.
+        let report = propagated(&[ADRP_X1_NEXT_PAGE, 0xf940_7c22], &[&[0, 1]]);
+        assert_eq!(targets(&report)[0].1, 0x20f8);
+        // #0x100 is zero-fill; adrp x1, 0x3000 is unmapped.
+        for words in [[ADRP_X1_NEXT_PAGE, 0xf940_8022], [0xd000_0001, LDR_X2_X1]] {
+            let report = propagated(&words, &[&[0, 1]]);
+            assert!(report.references.is_empty(), "{words:x?}");
+            assert_eq!(report.omitted_accesses, 1, "{words:x?}");
+            assert_eq!(report.unresolved_accesses, 0, "{words:x?}");
+        }
+    }
+
+    #[test]
+    fn retained_operation_budget_marks_partial_coverage() {
+        let sections = sections();
+        let mut collector = DataCollector::new(&sections, "ram", 8).with_propagation();
+        collector.begin_function();
+        let nop = InstructionPcode {
+            address: 0,
+            length: 4,
+            operations: vec![copy(value("const", 0, 8))],
+        };
+        for address in 0..MAX_DATA_RETAINED_OPERATIONS as u64 {
+            collector.inspect(
+                0x1000,
+                &InstructionPcode {
+                    address,
+                    ..nop.clone()
+                },
+            );
+        }
+        assert!(!collector.report.partial);
+        collector.inspect(
+            0x1000,
+            &InstructionPcode {
+                address: u64::MAX,
+                ..nop
+            },
+        );
+        assert!(collector.report.partial);
+    }
+
+    #[test]
+    fn tracked_value_budget_drops_knowledge_and_marks_partial_coverage() {
+        let sections = sections();
+        let mut collector = DataCollector::new(&sections, "ram", 8).with_propagation();
+        let mut operations = Vec::new();
+        for index in 0..=MAX_DATA_TRACKED_VALUES as u64 {
+            let mut operation = copy(value("const", 0x2000, 8));
+            operation.output = Some(value("register", index * 8, 8));
+            operations.push(operation);
+        }
+        operations.push(load(value("register", 0, 8), 8));
+        collector.inspect(0x1000, &instruction(operations));
+        collector.propagate(
+            0x1000,
+            [&BasicBlock {
+                address: 0x1000,
+                instructions: vec![Instruction {
+                    address: 0x1000,
+                    bytes: vec![0; 4],
+                    mnemonic: String::new(),
+                    operands: String::new(),
+                }],
+            }]
+            .into_iter(),
+        );
+        let report = collector.finish();
+        assert!(report.references.is_empty());
+        assert_eq!(report.unresolved_accesses, 1);
+        assert!(report.partial);
+    }
+
+    #[test]
+    fn value_tracking_uses_little_endian_aliases_and_checked_widths() {
+        let register = |offset, size| Var {
+            space: Space::Register,
+            offset,
+            size,
+        };
+        let mut values = Values::default();
+        let known = |value| {
+            Some(Known {
+                value,
+                carried: false,
+            })
+        };
+        values.write(register(0x10, 8), known(0x1122_3344_5566_7788));
+        assert_eq!(values.read(register(0x10, 4)).unwrap().value, 0x5566_7788);
+        assert_eq!(values.read(register(0x14, 2)).unwrap().value, 0x3344);
+        assert!(values.read(register(0x14, 8)).is_none());
+        values.write(register(0x10, 4), None);
+        assert!(values.read(register(0x10, 8)).is_none());
+        assert!(values.read(register(0x14, 4)).is_none());
+        values.write(register(u64::MAX, 8), known(1));
+        assert!(values.entries.is_empty());
+        for index in 0..=MAX_DATA_TRACKED_VALUES as u64 {
+            values.write(register(index * 8, 8), known(index));
+        }
+        assert!(values.entries.len() <= MAX_DATA_TRACKED_VALUES);
+        let op = |opcode, inputs: Vec<Var>, size| Op {
+            opcode,
+            output: Some(register(0x100, size)),
+            inputs,
+        };
+        let constant = |offset, size| Var {
+            space: Space::Const,
+            offset,
+            size,
+        };
+        let eval = |op: Op| evaluate(&op, &Values::default()).map(|known| known.value);
+        assert_eq!(
+            eval(op(OpCode::IntSext, vec![constant(0x80, 1)], 8)),
+            Some(u64::MAX - 0x7f)
+        );
+        assert_eq!(
+            eval(op(
+                OpCode::IntLeft,
+                vec![constant(1, 8), constant(64, 8)],
+                8
+            )),
+            Some(0)
+        );
+        assert_eq!(
+            eval(op(
+                OpCode::Subpiece,
+                vec![constant(0x1122, 2), constant(1, 4)],
+                1
+            )),
+            Some(0x11)
+        );
+        assert_eq!(
+            eval(op(
+                OpCode::Subpiece,
+                vec![constant(0x1122, 2), constant(2, 4)],
+                1
+            )),
+            None
+        );
+        assert_eq!(
+            eval(op(
+                OpCode::Piece,
+                vec![constant(0x11, 1), constant(0x22, 1)],
+                2
+            )),
+            Some(0x1122)
+        );
+        assert_eq!(
+            eval(op(OpCode::IntAdd, vec![constant(1, 4), constant(1, 8)], 8)),
+            None
+        );
+        assert_eq!(
+            eval(op(OpCode::IntMult, vec![constant(2, 8), constant(2, 8)], 8)),
+            None
+        );
     }
 
     #[test]
@@ -711,6 +1401,7 @@ mod tests {
                 target,
                 size,
                 access: DataAccess::Read,
+                provenance: DataProvenance::InstructionLocal,
             };
             assert!(invalid.validate(&info, &info.functions, 1).is_err());
         }

@@ -3,7 +3,9 @@
 mod common;
 
 use ghidra_rust::client::{WorkerClient, WorkerEvent};
-use ghidra_rust::model::{BinaryInfo, CodeMapping, EdgeKind, FunctionView, Request, Response};
+use ghidra_rust::model::{
+    BinaryInfo, CodeMapping, DataProvenance, EdgeKind, FunctionView, Request, Response,
+};
 use ghidra_rust::project::ProjectData;
 use ghidra_rust::session::{Annotation, Session};
 use std::collections::BTreeSet;
@@ -39,7 +41,7 @@ fn graph(worker: &mut WorkerClient, address: u64) -> FunctionView {
 }
 
 #[test]
-fn contained_data_accesses_use_genuine_literal_reads_without_register_propagation() {
+fn contained_data_accesses_use_literal_reads_and_block_local_propagation() {
     let source = include_str!("fixtures/aarch64-data.S");
     let words: Vec<_> = source
         .lines()
@@ -83,27 +85,39 @@ fn contained_data_accesses_use_genuine_literal_reads_without_register_propagatio
         ) else {
             panic!("Open {format}");
         };
-        let Response::Functions {
-            functions,
-            analysis,
-            ..
-        } = request(&mut worker, Request::Discover)
-        else {
-            panic!("Discover {format}");
+        let (functions, analysis) = match request(&mut worker, Request::Discover) {
+            Response::Functions {
+                functions,
+                analysis,
+                ..
+            } => (functions, analysis),
+            other => panic!("Discover {format}: {other:?}"),
         };
         analysis.validate(&info, &functions).unwrap();
         let data = analysis.data.unwrap();
+        let read = |address, provenance| ghidra_rust::model::DataReference {
+            function: base,
+            address,
+            target: base + 32,
+            size: 8,
+            access: ghidra_rust::model::DataAccess::Read,
+            provenance,
+        };
+        let fixture: Vec<_> = data
+            .references
+            .iter()
+            .filter(|reference| reference.function == base)
+            .cloned()
+            .collect();
         assert_eq!(
-            data.references,
-            [ghidra_rust::model::DataReference {
-                function: base,
-                address: base,
-                target: base + 32,
-                size: 8,
-                access: ghidra_rust::model::DataAccess::Read,
-            }],
+            fixture,
+            [
+                read(base, DataProvenance::InstructionLocal),
+                read(base + 16, DataProvenance::Propagated),
+            ],
             "{format}"
         );
+        // The load after the call stays unresolved.
         assert!(data.unresolved_accesses >= 1);
         assert!(
             !functions

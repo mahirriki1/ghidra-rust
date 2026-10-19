@@ -55,13 +55,23 @@ operations (including ARM64 literal loads). Read-modify-write operations retain
 both access kinds. Source function, instruction PC, target, width and access kind
 are retained; no additional instruction decode or image-byte copy is required.
 
-This pass does not propagate values through registers or temporaries, including
-between operations of one instruction. `LEA`, `ADR` and `ADRP` address formation
-alone creates no memory reference. An `ADRP; LDR` pair, pointer chasing, unknown
-register addresses and jump tables require later analysis. Internal p-code
-branches, processor-specific user operations and unsupported semantics omit the
-whole instruction with partial coverage. Control-flow operands are excluded.
-This is memory-access evidence, not data-object or pointer classification.
+On x86 the pass is instruction-local. On AArch64, accesses whose pointer is a
+register are revisited after the function's blocks are known, using concrete
+constants carried forward within one basic block: `ADRP`/`ADR`/`MOVZ`/`MOVK`
+results combined through `ADD`, `SUB`, `AND`, `OR`, `XOR`, shifts, extensions
+and `PIECE`/`SUBPIECE`. Such references are labeled **propagated**; literal and
+other single-instruction pointers are **instruction-local**. Knowledge is
+cleared at every block start (including single-predecessor blocks, joins and
+loop heads), at every direct or indirect call, and after unsupported or
+omitted instructions; any write invalidates overlapping register aliases such as
+`Wn` within `Xn`. Loaded values are never treated as known, so pointer chasing
+stays unresolved, and `ADRP; LDR` resolves the slot that is read, not the
+pointer stored there. Address formation alone (`LEA`, `ADR`, `ADRP`, or call
+arguments) still creates no reference. Jump tables and values carried across
+branches require later analysis. Internal p-code branches, processor-specific
+user operations and unsupported semantics omit the whole instruction with
+partial coverage. Control-flow operands are excluded. This is memory-access
+evidence, not data-object or pointer classification.
 
 Targets must fit the selected ABI and their entire 1–64-byte access must lie in
 one validated file-backed section. Executable literal pools are accepted; zero
@@ -73,6 +83,10 @@ The shared pass budget charges at most 131,072 p-code operations, with at most
 256 per instruction and 16 inputs per operation. At most 16,384 access candidates
 are inspected, including unresolved, omitted and duplicate candidates before
 deduplication. Budget or unsupported-instruction omissions mark coverage partial.
+AArch64 propagation retains at most 16,384 compact p-code operations per
+function and 128 known register/temporary values; exhausting either, or
+accesses in instructions beyond the 128-block graph limit, also marks coverage
+partial. Propagation charges no additional decode or operation budget.
 These limits supplement the existing function, decode and worker resource limits.
 
 ## References and progress
@@ -165,13 +179,17 @@ The Rust adaptation uses the desktop's existing instruction recovery, bounded
 queues, explicit result provenance, and public engine APIs. Attribution is
 retained in [NOTICE](../NOTICE).
 
-The direct-memory `COPY`/`LOAD`/`STORE` reference rules adapt a bounded subset of
+The direct-memory `COPY`/`LOAD`/`STORE` reference rules, and the constant
+transfer and unknown-output rules used for AArch64 block-local propagation,
+adapt a bounded subset of
 [Ghidra SymbolicPropogator.java](https://github.com/NationalSecurityAgency/ghidra/blob/9a723ce99952771b8368329503aa589ae233e916/Ghidra/Features/Base/src/main/java/ghidra/program/util/SymbolicPropogator.java)
 at the same revision and license. The original Java pass propagates symbolic
-state and uses the Program database; this adaptation does neither. Other direct
+state across flow and uses the Program database; this adaptation tracks only
+concrete register constants within one block and uses neither. Other direct
 memory operands use the public engine's p-code semantics. Original x86 and ARM64
 instruction fixtures test positive evidence and deliberate non-recovery, and real
-contained workers cover ARM64 literal accesses in ELF, PE and Mach-O.
+contained workers cover ARM64 literal and propagated `ADRP; ADD; LDR` accesses,
+plus a call that clobbers the base register, in ELF, PE and Mach-O.
 
 The pinned `ghidra-decompiler` revision remains
 `268c3a406d8d964bc00ae2ead4d3e1e1373aaa27`; its recorded Ghidra base is
@@ -187,7 +205,7 @@ public APIs from the unchanged pinned engine. Original assembly and synthetic PE
 metadata fixtures cover isolated runtime entries, fragments, a real named import
 call and an unresolved veneer branch through production worker containment.
 
-Switch/jump-table recovery, general constant propagation, speculative operand
+Switch/jump-table recovery, cross-block constant propagation, speculative operand
 references, exception flow, no-return analysis, and complete stripped-function
 recovery are not supplied by this pass. Existing engine behavior may still expose
 some of these constructs during decompilation; this pass does not establish
