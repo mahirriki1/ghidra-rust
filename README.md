@@ -158,6 +158,10 @@ open a function, select an instruction, and write one frame.
   continues a parent-owned session queue containing the entry point and all
   admitted known functions, then newly confirmed callees. Complete function
   recovery is not guaranteed; see [analysis coverage](docs/analysis.md).
+- Opening a binary offers to analyze it, like Ghidra: an **Analyze binary?**
+  dialog runs the checked analyses (function discovery, defined strings,
+  FindCrypt) in the background while you browse. **Analysis → Auto analyze…**
+  reopens it; see [auto analysis](docs/analysis.md#auto-analysis).
 - Navigate a function's instruction CFG with pan, zoom, branch labels, and
   unresolved-flow markers. CFG recovery is bounded; warnings identify unsupported
   or incomplete cases such as indirect flow. Calls are displayed separately from
