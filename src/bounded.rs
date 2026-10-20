@@ -121,8 +121,12 @@ fn reply_nodes(kind: &str) -> Option<usize> {
     const INSTRUCTION: usize = 9 + MAX_INSTRUCTION_BYTES;
     let nodes = match kind {
         "opened" => FUNCTION * MAX_FUNCTIONS + SECTION * MAX_SECTIONS + MAX_WARNINGS,
-        "functions" => {
-            FUNCTION * MAX_FUNCTIONS + CALL * MAX_CALL_REFERENCES + DATA * MAX_DATA_REFERENCES
+        "functions" | "discovery_batch" => {
+            FUNCTION * MAX_FUNCTIONS
+                + CALL * MAX_CALL_REFERENCES
+                + DATA * MAX_DATA_REFERENCES
+                + 5 * MAX_ANALYSIS_FUNCTIONS
+                + 16
         }
         "graph" => {
             5 * MAX_GRAPH_BLOCKS
@@ -135,7 +139,7 @@ fn reply_nodes(kind: &str) -> Option<usize> {
         "bytes" => MAX_BYTE_READ,
         "strings" => 7 * MAX_STRING_RESULTS,
         "crypto" => 9 * MAX_CRYPTO_MATCHES,
-        "progress" | "renamed" | "error" => 0,
+        "progress" | "renamed" | "error" | "functions_synced" => 0,
         _ => return None,
     };
     Some(nodes + OBJECT_SLACK)

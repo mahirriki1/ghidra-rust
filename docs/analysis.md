@@ -14,7 +14,9 @@ by symbols, PE exports, and supported PE runtime-function metadata. It decodes
 reachable instructions and adds only genuine direct-call targets in file-backed
 executable memory as new function candidates. Targets must meet the selected
 architecture's alignment requirements. A call to its own fallthrough address does
-not seed a function. Duplicate entries are examined once per run.
+not seed a function. The parent owns a deterministic session queue: entry first, then the admitted
+function inventory in its existing address order. Duplicate entries are examined
+once per session; newly confirmed callees are scheduled for later batches.
 
 Arbitrary constants, prologue byte patterns, and unresolved register targets do
 not create functions. Unknown indirect calls and branches remain unresolved.
@@ -22,14 +24,22 @@ Calls are separate from intrafunction control-flow edges. An established call
 instruction is machine-code evidence; it does not reconstruct a source-language
 function boundary or prove that all possible runtime calls have been found.
 
-Each run examines at most 128 function entries and makes at most 16,384 decode
-attempts in total. Each function has a 2,048-attempt limit, and its displayed graph
-has at most 128 blocks. The shared limit is charged for failed decodes and decoded
+Each worker batch examines at most 128 explicit function seeds and makes at most
+16,384 decode attempts. The parent continues across all admitted seeds; there is
+no 128-function cumulative ceiling. Each function has a 2,048-attempt limit,
+and its displayed graph has at most 128 blocks. The shared limit is charged for failed decodes and decoded
 work omitted by display limits, so it cannot be exceeded by a final function walk.
 ARM64 import-veneer confirmation during discovery charges three attempts per
 eligible candidate against this same shared budget, before calling the engine.
-The call-reference collection is also capped at 16,384 entries. Coverage is marked
-partial when work limits or recovery failures prevent a complete walk.
+The call-reference collection is capped at 16,384 entries per batch and in the
+session aggregate. Data references have a separate 16,384-entry aggregate cap.
+Both classes are deduplicated before atomic adoption. Reaching an aggregate cap
+marks coverage partial while seed processing continues. Coverage is also partial
+while seeds remain pending or recovery limits/failures prevent a complete walk.
+A function is pending, done, partial by its own recovery limits, or failed. A
+limited walk is terminal for the session; it does not restart on each Discover.
+A batch stops before starting a function when fewer than 2,048 decode attempts
+remain, leaving that suffix pending rather than giving it a smaller own budget.
 
 The known-function inventory is a separate, larger budget: at most 262,144
 entries, 256 bytes per name, and 8 MiB of JSON-escaped names in total, so the
@@ -39,8 +49,9 @@ processes; see [analysis measurements](analysis-performance.md#large-function-in
 Entries beyond either budget are omitted and the list is marked partial. Open
 admits the entry point first and then engine symbols in address order (PE images
 prioritize exports and runtime starts nearest the entry before that). Discovery
-replies also reserve the callers that own published evidence. Raising the
-inventory does not widen the 128-function discovery walk.
+replies also reserve the callers that own published evidence. The
+inventory bounds cumulative seed admission; the smaller function/decode budgets
+apply independently to each batch.
 
 Conventional UPX PE detection still prevents discovery and decompilation of the
 packed stub. Listing, CFG, strings, and byte inspection remain available. The
@@ -79,7 +90,7 @@ fill, unmapped addresses, cross-section ranges and overflowing arithmetic are
 omitted. Instruction and function sources must be known file-backed executable
 addresses with the architecture's alignment.
 
-The shared pass budget charges at most 131,072 p-code operations, with at most
+Each batch's shared pass budget charges at most 131,072 p-code operations, with at most
 256 per instruction and 16 inputs per operation. At most 16,384 access candidates
 are inspected, including unresolved, omitted and duplicate candidates before
 deduplication. Budget or unsupported-instruction omissions mark coverage partial.
@@ -96,7 +107,7 @@ confirmed calls for the selected function. Callers, callees, and source instruct
 addresses are navigable. A call site omitted by the caller graph's display limits
 still selects its exact address and shows an explicit notice; use **Go to** to
 inspect that address separately. Incoming references cover only the functions examined
-in the current discovery run; an empty list does not prove that no caller exists.
+in committed batches of the current session; an empty list does not prove that no caller exists.
 
 The **Data accesses** selector shows accesses from the displayed function or
 accesses beginning at an exact hexadecimal target address. This exact-start
@@ -107,9 +118,12 @@ notice when necessary. Target buttons request only the accessed bytes in
 inspection preserves code selection and function history; Decode displays its
 own source address. A delayed byte reply cannot replace a newer selection or
 force a switch from a newer tab.
-Rows are virtualized and the incoming/outgoing indexes are built once per result.
+Rows are virtualized. Batch validation, aggregate merging, and incoming/outgoing
+index construction run in a parent background job. Committed references remain
+visible during subsequent batches and navigation.
 
-The reference index is computed for the current session and is not serialized in
+The queue, per-function statuses, cumulative counters and reference index are
+session-only and are not serialized in
 `.grproj` files. Reopening a project requires another discovery run to rebuild it.
 The existing saved function inventory keeps its saved-result provenance; a
 matching binary hash does not authenticate cached results. The `calls-v1` analysis
@@ -125,10 +139,23 @@ mapped target extents are validated before adoption.
 
 The worker reports **Seeds**, **Calls** (shown as **Analyzing references**), and
 **Publish** stages with the number of
-functions examined and decode attempts charged. The total remains indeterminate:
+functions examined and decode attempts charged in that batch. The UI also shows
+cumulative functions examined, remaining seeds, committed batches, and a visible
+partial/complete indicator. The total can grow:
 following a confirmed call can reveal more work. These counts are work measures,
-not completion percentages. Cancellation still terminates the disposable worker,
-and progress messages do not reset CPU or wall-time deadlines. Existing binary
+not completion percentages. Cancel still terminates the disposable worker and pauses the run, retaining
+completed batches. Discover continues it after a worker restart. Interactive
+requests run between batches, without discarding program-wide evidence. On
+restart, inventory entries the fresh worker lacks or names differently (such as
+discovered functions and renames) are replayed in small bounded requests before
+the next batch. Interrupted seeds retry individually at most
+once; a second interruption marks them failed. Errors and timeouts pause the run
+for explicit continuation. Batch replies are bound to their request ID, worker
+epoch, binary generation, annotation revision at dispatch, and batch sequence.
+Selection changes and annotation display-name edits do not invalidate machine
+reference evidence from the immutable image. Stale/duplicate replies cannot
+double-count committed results. Progress messages do not reset CPU or wall-time
+deadlines. Existing binary
 identity, immutable snapshots, result validation, and platform resource controls
 continue to apply.
 
