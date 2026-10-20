@@ -60,6 +60,11 @@ impl Capture {
                     if let Err(error) = write_ppm(&path, &image) {
                         eprintln!("capture failed: {error}");
                     }
+                    crate::performance::event("capture_exit", 0);
+                    if let Err(error) = crate::performance::flush() {
+                        eprintln!("{error}");
+                        std::process::exit(1);
+                    }
                     std::process::exit(0);
                 }),
             ));

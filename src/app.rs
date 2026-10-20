@@ -411,6 +411,7 @@ pub struct DesktopApp {
 
 impl DesktopApp {
     pub fn new(cc: &eframe::CreationContext<'_>, initial_path: Option<PathBuf>) -> Self {
+        let _startup = crate::performance::span("gui_state_creation");
         theme::install(&cc.egui_ctx);
         Self::empty(initial_path)
     }
@@ -651,6 +652,10 @@ impl DesktopApp {
     }
 
     fn stop_worker(&mut self) {
+        crate::performance::event("worker_stop_epoch", self.worker_epoch);
+        if self.discovery_running {
+            crate::performance::event("discovery_action_interrupted", self.generation);
+        }
         self.discovery_running = false;
         self.discovery_sync = None;
         self.discovery_bytes = None;
@@ -726,6 +731,11 @@ impl DesktopApp {
         };
         match client.send(wire_request) {
             Ok(id) => {
+                let _context = crate::performance::context(id);
+                crate::performance::event("generation", self.generation);
+                crate::performance::event("epoch", self.worker_epoch);
+                crate::performance::event("selection", self.selection_generation);
+                crate::performance::event("annotation_revision", self.revision);
                 self.pending = Some(Pending {
                     id,
                     request,
@@ -873,6 +883,7 @@ impl DesktopApp {
         self.reference_focus = None;
         self.undisplayed_call = None;
         self.selection_generation = self.selection_generation.wrapping_add(1);
+        crate::performance::navigation_begin(self.selection_generation);
         self.selected = Some(address);
         self.address = format!("{address:x}");
         self.editor_address = None;
@@ -995,6 +1006,9 @@ impl DesktopApp {
 
     fn start_discovery(&mut self, context: &egui::Context) {
         let Some(info) = &self.info else { return };
+        if !self.discovery_running {
+            crate::performance::event("discovery_action_begin", self.generation);
+        }
         if self.discovery.is_none() && self.discovery_job.is_none() {
             // Saved results are display-only; a fresh run replaces them.
             if self.saved_references {
@@ -1047,6 +1061,7 @@ impl DesktopApp {
                 return;
             }
         };
+        let _install = crate::performance::span("gui_discovery_install_filter");
         self.discovery_job = None;
         if update.generation != self.generation {
             return;
@@ -1112,6 +1127,7 @@ impl DesktopApp {
         if let Some(request) = state.begin(self.generation, self.worker_epoch, self.revision) {
             self.send_direct(request);
         } else if state.remaining() == 0 {
+            crate::performance::event("discovery_action_adopted", self.generation);
             self.discovery_running = false;
             self.status = "Discovery seed queue exhausted".into();
         }
@@ -1268,6 +1284,8 @@ impl DesktopApp {
     }
 
     fn receive(&mut self, pending: Pending, response: Response, context: &egui::Context) {
+        let _trace_context = crate::performance::context(pending.id);
+        let _adoption = crate::performance::span("gui_reply_adoption");
         if let Response::Error { message } = response {
             self.stop_worker();
             self.status = crop(&message, 4096);
@@ -1424,7 +1442,9 @@ impl DesktopApp {
                     .collect();
                 self.listing.sort_by_key(|instruction| instruction.address);
                 self.listing.dedup_by_key(|instruction| instruction.address);
+                let geometry = crate::performance::span("gui_graph_geometry");
                 self.canvas = Some(GraphCanvas::new(&view));
+                geometry.finish(view.blocks.len() as u64);
                 self.cached_graph = false;
                 self.saved_analysis = false;
                 self.view = Some(view);
@@ -1511,7 +1531,9 @@ impl DesktopApp {
                     if let Some(address) = self.selected {
                         self.semantic.select_instruction(address);
                     }
+                    let highlighting = crate::performance::span("gui_highlighting");
                     self.highlighted = Some(HighlightedCode::new(&text));
+                    highlighting.finish(text.len() as u64);
                     self.saved_analysis = false;
                     self.decompiled = text;
                     let mut offset = 0;
@@ -1562,18 +1584,29 @@ impl DesktopApp {
                 let (sender, receiver) = mpsc::sync_channel(1);
                 self.discovery_job = Some(receiver);
                 let context = context.clone();
+                let scheduled = crate::performance::span("parent_adoption_schedule");
+                let trace_id = pending.id;
                 std::thread::spawn(move || {
+                    scheduled.finish(0);
+                    let _trace_context = crate::performance::context(trace_id);
                     let mut state = state;
-                    let publication = state.commit(&validation, &batch).map(|()| {
+                    let commit = crate::performance::span("parent_discovery_commit");
+                    let committed = state.commit(&validation, &batch);
+                    commit.finish(0);
+                    let publication = committed.map(|()| {
+                        let _index = crate::performance::span("parent_reference_index");
                         Some(DiscoveryPublication {
                             functions: batch.functions,
                             truncated: batch.truncated,
                             index: crate::call_analysis::CallIndex::new(state.snapshot()),
                         })
                     });
+                    let saving = crate::performance::span("parent_discovery_snapshot");
+                    let saved = Arc::new(state.save());
+                    saving.finish(0);
                     let _ = sender.send(DiscoveryUpdate {
                         generation,
-                        saved: Arc::new(state.save()),
+                        saved,
                         state,
                         publication,
                     });
@@ -4721,7 +4754,14 @@ impl DesktopApp {
 
 impl eframe::App for DesktopApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let frame = crate::performance::span("gui_frame_cpu");
         self.draw(ui);
+        crate::performance::navigation_frame(
+            self.selection_generation,
+            self.view.is_some() && matches!(self.tab, Tab::Graph | Tab::Listing),
+            !self.decompiled.is_empty(),
+        );
+        frame.finish(0);
         #[cfg(feature = "capture")]
         self.capture_tick(ui.ctx());
     }

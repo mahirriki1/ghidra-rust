@@ -110,7 +110,10 @@ impl CallAnalysis {
 }
 
 /// Constructed once on result adoption. Frames visit only visible reference rows.
-pub(crate) struct CallIndex {
+/// Derived desktop reference index. Public for the opt-in integration profiler
+/// to measure the same construction as the GUI, after validating its evidence.
+#[doc(hidden)]
+pub struct CallIndex {
     pub report: CallAnalysis,
     pub incoming: BTreeMap<u64, Vec<usize>>,
     pub outgoing: BTreeMap<u64, Vec<usize>>,
