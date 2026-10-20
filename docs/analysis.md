@@ -7,6 +7,17 @@ See [architecture coverage](architectures.md) for container and ABI restrictions
 Analyzing an AArch64 image on an x64 host does not establish native ARM-host
 desktop support.
 
+## Auto analysis
+
+Opening a binary (not a saved project) shows an **Analyze binary?** dialog, and
+**Analysis → Auto analyze…** shows the same choices later. Function discovery and
+defined strings are checked by default; FindCrypt is optional. Choices last for
+the session. Selected analyses run one at a time, only while the worker has no
+other request: strings, then FindCrypt, then discovery. Navigation preempts a
+running scan, which reruns afterwards; a failed or timed-out step is not retried.
+Automatic results do not switch the middle tab. **Analysis → Cancel analysis**
+stops the remaining steps. Packed images that disable discovery skip that step.
+
 ## Confirmed calls and functions
 
 The walk starts from the validated image entry point and known functions supplied
