@@ -19,6 +19,7 @@ use crate::highlight::HighlightedCode;
 use crate::model::*;
 use crate::project::{EmbeddedBinary, LoadedProject, ProjectData};
 use crate::selection::{SemanticSelection, validate_mappings};
+use crate::semantic::{LocalIdentity, LocalRename, SemanticInfo, TokenKind};
 use crate::session::{Annotation, BinaryProtection, Session};
 use crate::theme;
 
@@ -39,10 +40,11 @@ enum Tab {
     References,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum BrowserDialogKind {
     Rename { address: u64, function: bool },
     GoTo,
+    RenameLocal { identity: LocalIdentity },
 }
 
 struct BrowserDialog {
@@ -297,6 +299,7 @@ struct Edit {
     address: u64,
     before: Option<Annotation>,
     function_name: Option<String>,
+    local: Option<(LocalIdentity, Option<LocalRename>)>,
 }
 
 pub struct DesktopApp {
@@ -354,6 +357,9 @@ pub struct DesktopApp {
     cached_strings: bool,
     cached_crypto: bool,
     semantic: SemanticSelection,
+    semantic_info: SemanticInfo,
+    selected_local: Option<usize>,
+    decompiler_rename_context: bool,
     pending_code_scroll: Option<usize>,
     pending_comment_scroll: Option<u64>,
     pending_listing_scroll: Option<usize>,
@@ -462,6 +468,9 @@ impl DesktopApp {
             cached_strings: false,
             cached_crypto: false,
             semantic: SemanticSelection::default(),
+            semantic_info: SemanticInfo::default(),
+            selected_local: None,
+            decompiler_rename_context: false,
             pending_code_scroll: None,
             pending_comment_scroll: None,
             pending_listing_scroll: None,
@@ -607,6 +616,9 @@ impl DesktopApp {
         self.decompiled.clear();
         self.semantic.clear();
         self.comment_rows_key = None;
+        self.semantic_info = SemanticInfo::default();
+        self.selected_local = None;
+        self.decompiler_rename_context = false;
         self.pending_code_scroll = None;
         self.pending_comment_scroll = None;
         self.pending_listing_scroll = None;
@@ -694,7 +706,25 @@ impl DesktopApp {
         let Some(client) = &mut self.client else {
             return;
         };
-        match client.send(request.clone()) {
+        let wire_request = match &request {
+            Request::Decompile { address } => Request::DecompileWithLocals {
+                address: *address,
+                renames: self
+                    .session
+                    .as_ref()
+                    .map(|session| {
+                        session
+                            .local_renames
+                            .iter()
+                            .filter(|r| r.identity.function == *address)
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            },
+            _ => request.clone(),
+        };
+        match client.send(wire_request) {
             Ok(id) => {
                 self.pending = Some(Pending {
                     id,
@@ -849,6 +879,9 @@ impl DesktopApp {
         self.decompiled.clear();
         self.semantic.clear();
         self.comment_rows_key = None;
+        self.semantic_info = SemanticInfo::default();
+        self.selected_local = None;
+        self.decompiler_rename_context = false;
         self.pending_code_scroll = None;
         self.pending_comment_scroll = None;
         self.pending_listing_scroll = None;
@@ -877,6 +910,8 @@ impl DesktopApp {
 
     fn select_instruction(&mut self, address: u64) {
         self.pending_comment_scroll = Some(address);
+        self.selected_local = None;
+        self.decompiler_rename_context = false;
         self.selected = Some(address);
         self.address = format!("{address:x}");
         self.editor_address = None;
@@ -889,6 +924,11 @@ impl DesktopApp {
 
     fn select_decompiled_byte(&mut self, byte: usize) {
         self.pending_comment_scroll = None;
+        self.decompiler_rename_context = true;
+        self.selected_local = match self.semantic_info.token_at(byte).map(|t| &t.kind) {
+            Some(TokenKind::Local { local }) => *local,
+            _ => None,
+        };
         let Some(primary) = self.semantic.select_code(byte) else {
             self.semantic.addresses.clear();
             self.semantic.ranges.clear();
@@ -1417,6 +1457,7 @@ impl DesktopApp {
                     address,
                     text,
                     mappings,
+                    semantics,
                 },
             ) if address == expected => {
                 if pending.selection == self.selection_generation
@@ -1431,6 +1472,9 @@ impl DesktopApp {
                         self.decompiled.clear();
                         self.semantic.clear();
                         self.comment_rows_key = None;
+                        self.semantic_info = SemanticInfo::default();
+                        self.selected_local = None;
+                        self.decompiler_rename_context = false;
                         self.pending_code_scroll = None;
                         self.pending_comment_scroll = None;
                         self.pending_listing_scroll = None;
@@ -1453,9 +1497,15 @@ impl DesktopApp {
                         self.semantic.clear();
                         self.comment_rows_key = None;
                         self.decompiled_lines.clear();
+                        self.semantic_info = SemanticInfo::default();
+                        self.selected_local = None;
+                        self.decompiler_rename_context = false;
                         self.status = format!("Invalid decompiler source mappings: {error}");
                         return;
                     }
+                    self.semantic_info = semantics;
+                    self.selected_local = None;
+                    self.decompiler_rename_context = false;
                     self.semantic.mappings = mappings;
                     self.comment_rows_key = None;
                     if let Some(address) = self.selected {
@@ -1480,7 +1530,12 @@ impl DesktopApp {
                             .partition_point(|(_, end)| *end <= range.start)
                     });
                     self.pending_comment_scroll = self.selected;
-                    self.status = "Ready".into();
+                    self.status = self
+                        .semantic_info
+                        .warnings
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| "Ready".into());
                 }
             }
             (Request::SyncFunctions { .. }, Response::FunctionsSynced) => {}
@@ -1825,6 +1880,7 @@ impl DesktopApp {
             address,
             before,
             function_name,
+            local: None,
         });
         while self.undo.len() > HISTORY_LIMIT
             || self.undo.iter().map(edit_size).sum::<usize>() > UNDO_BYTES
@@ -1835,9 +1891,20 @@ impl DesktopApp {
     }
 
     fn undo(&mut self, context: &egui::Context) {
-        let Some(edit) = self.undo.pop_back() else {
+        let Some(mut edit) = self.undo.pop_back() else {
             return;
         };
+        if let Some((identity, before)) = edit.local.take() {
+            if let Some(session) = &mut self.session {
+                session.local_renames.retain(|r| r.identity != identity);
+                if let Some(before) = before {
+                    session.local_renames.push(before);
+                }
+                self.revision = self.revision.wrapping_add(1);
+                self.refresh_local_function(identity.function, context);
+            }
+            return;
+        }
         if let Some(session) = &mut self.session {
             match edit.before {
                 Some(annotation) => {
@@ -1900,6 +1967,7 @@ impl DesktopApp {
             view,
             decompiled: (!self.decompiled.is_empty()).then(|| self.decompiled.clone()),
             mappings: self.semantic.mappings.clone(),
+            semantics: self.semantic_info.clone(),
             strings: self.strings.clone(),
             strings_truncated: self.strings_truncated,
             crypto: self.crypto.clone(),
@@ -2001,6 +2069,7 @@ impl DesktopApp {
             self.selected = selected;
             self.address = format!("{:x}", selected.unwrap_or(address));
             if let Some(text) = data.decompiled {
+                self.semantic_info = data.semantics;
                 self.semantic.mappings = data.mappings;
                 self.comment_rows_key = None;
                 if let Some(address) = selected {
@@ -2278,6 +2347,9 @@ impl DesktopApp {
                         self.decompiled.clear();
                         self.semantic.clear();
                         self.comment_rows_key = None;
+                        self.semantic_info = SemanticInfo::default();
+                        self.selected_local = None;
+                        self.decompiler_rename_context = false;
                         self.pending_code_scroll = None;
                         self.pending_comment_scroll = None;
                         self.pending_listing_scroll = None;
@@ -2428,6 +2500,26 @@ impl DesktopApp {
     }
 
     fn begin_rename(&mut self) {
+        if self.decompiler_rename_context && self.selected_local.is_none() {
+            self.status =
+                "Local rename unsupported: select a verified local-variable token; refresh legacy pseudocode if needed".into();
+            return;
+        }
+        if let Some(local) = self
+            .selected_local
+            .and_then(|i| self.semantic_info.locals.get(i))
+        {
+            self.browser_dialog = Some(BrowserDialog {
+                kind: BrowserDialogKind::RenameLocal {
+                    identity: local.identity.clone(),
+                },
+                text: local.name.clone(),
+                error: None,
+                focus: true,
+                generation: self.generation,
+            });
+            return;
+        }
         let (Some(address), Some(info), Some(session)) = (self.selected, &self.info, &self.session)
         else {
             return;
@@ -2450,6 +2542,86 @@ impl DesktopApp {
             focus: true,
             generation: self.generation,
         });
+    }
+
+    fn rename_local(
+        &mut self,
+        identity: &LocalIdentity,
+        name: &str,
+        context: &egui::Context,
+    ) -> Result<(), String> {
+        crate::semantic::validate_name(name)?;
+        if identity.engine != crate::semantic::LOCAL_FINGERPRINT
+            || !self
+                .semantic_info
+                .locals
+                .iter()
+                .any(|v| &v.identity == identity)
+            || self
+                .view
+                .as_ref()
+                .is_none_or(|v| v.address != identity.function)
+        {
+            return Err(
+                "Local identity is no longer present; refresh and select the variable again".into(),
+            );
+        }
+        if self
+            .semantic_info
+            .locals
+            .iter()
+            .any(|v| v.identity != *identity && v.name == name)
+        {
+            return Err("Name is already used by another local variable".into());
+        }
+        let session = self.session.as_mut().ok_or("Open a binary first")?;
+        let before = session
+            .local_renames
+            .iter()
+            .find(|r| r.identity == *identity)
+            .cloned();
+        if before.as_ref().is_some_and(|r| r.name == name) {
+            return Ok(());
+        }
+        let mut updated = session.local_renames.clone();
+        updated.retain(|r| r.identity != *identity);
+        updated.push(LocalRename {
+            identity: identity.clone(),
+            name: name.into(),
+        });
+        crate::semantic::validate_renames(&updated, None)?;
+        session.local_renames = updated;
+        session.version = 2;
+        self.undo.push_back(Edit {
+            address: identity.function,
+            before: None,
+            function_name: None,
+            local: Some((identity.clone(), before)),
+        });
+        while self.undo.len() > HISTORY_LIMIT
+            || self.undo.iter().map(edit_size).sum::<usize>() > UNDO_BYTES
+        {
+            self.undo.pop_front();
+        }
+        self.revision = self.revision.wrapping_add(1);
+        self.refresh_local_function(identity.function, context);
+        Ok(())
+    }
+
+    fn refresh_local_function(&mut self, function: u64, context: &egui::Context) {
+        if self.view.as_ref().is_some_and(|v| v.address == function) {
+            self.decompiled.clear();
+            self.decompiled_lines.clear();
+            self.highlighted = None;
+            self.semantic.clear();
+            self.semantic_info = SemanticInfo::default();
+            self.selected_local = None;
+            self.decompiler_rename_context = false;
+            self.pending_code_scroll = None;
+            self.pending_comment_scroll = None;
+            self.comment_rows_key = None;
+            self.request(Request::Decompile { address: function }, context);
+        }
     }
 
     fn begin_go_to(&mut self) {
@@ -2528,6 +2700,9 @@ impl DesktopApp {
             self.decompiled.clear();
             self.semantic.clear();
             self.comment_rows_key = None;
+            self.semantic_info = SemanticInfo::default();
+            self.selected_local = None;
+            self.decompiler_rename_context = false;
             self.pending_code_scroll = None;
             self.pending_comment_scroll = None;
             self.pending_listing_scroll = None;
@@ -2614,18 +2789,22 @@ impl DesktopApp {
         let mut cancel = false;
         let modal = egui::Modal::new(egui::Id::unique("browser-command")).show(context, |ui| {
             ui.set_width(420.0);
-            let title = match dialog.kind {
+            let title = match &dialog.kind {
                 BrowserDialogKind::Rename { function: true, .. } => "Rename Function",
                 BrowserDialogKind::Rename { .. } => "Set Label",
                 BrowserDialogKind::GoTo => "Go To",
+                BrowserDialogKind::RenameLocal { .. } => "Rename Local Variable",
             };
             ui.heading(title);
-            match dialog.kind {
+            match &dialog.kind {
                 BrowserDialogKind::Rename { address, .. } => {
                     ui.label(format!("Address {address:#x}"));
                 }
                 BrowserDialogKind::GoTo => {
                     ui.label("Hexadecimal address or function/label name");
+                }
+                BrowserDialogKind::RenameLocal { identity } => {
+                    ui.label(format!("Local in function {:#x}", identity.function));
                 }
             }
             let mut output = TextEdit::singleline(&mut dialog.text)
@@ -2654,9 +2833,12 @@ impl DesktopApp {
             return;
         }
         if apply {
-            let result = match dialog.kind {
+            let result = match &dialog.kind {
                 BrowserDialogKind::Rename { address, .. } => {
-                    self.rename_at(address, &dialog.text, context)
+                    self.rename_at(*address, &dialog.text, context)
+                }
+                BrowserDialogKind::RenameLocal { identity } => {
+                    self.rename_local(identity, &dialog.text, context)
                 }
                 BrowserDialogKind::GoTo => self
                     .resolve_location(&dialog.text)
@@ -3372,21 +3554,11 @@ impl DesktopApp {
         }
     }
 
-    fn decompiler_call_target(&self, name: &str) -> Option<u64> {
-        let view = self.view.as_ref()?;
-        let info = self.info.as_ref()?;
-        let mut targets = view
-            .calls
-            .iter()
-            .filter_map(|call| function_at(&info.functions, call.target?))
-            .filter(|function| function.name == name)
-            .map(|function| function.address);
-        let first = targets.next()?;
-        // A text-only decompiler response cannot disambiguate same-name callees.
-        if targets.any(|address| address != first) {
-            return None;
+    fn decompiler_call_target(&self, byte: usize) -> Option<u64> {
+        match self.semantic_info.token_at(byte)?.kind {
+            TokenKind::Call { target } => Some(target),
+            _ => None,
         }
-        Some(first)
     }
 
     fn side_panel(&mut self, ui: &mut egui::Ui) {
@@ -3411,6 +3583,16 @@ impl DesktopApp {
                 );
             }
             ui.checkbox(&mut self.auto_decompile, "Auto");
+            if !self.semantic_info.warnings.is_empty() {
+                ui.colored_label(
+                    theme::WARNING,
+                    format!(
+                        "{} local name(s) not applied",
+                        self.semantic_info.warnings.len()
+                    ),
+                )
+                .on_hover_text(self.semantic_info.warnings.join("\n"));
+            }
             if self.saved_analysis {
                 ui.weak("Saved analysis").on_hover_text("Cached results from this project. Refresh to recompute with the analysis engine.");
             }
@@ -3456,6 +3638,7 @@ impl DesktopApp {
         let mut select_code = None;
         let mut edit_comment = None;
         let mut select_comment = None;
+        let mut rename_local_byte = None;
         let mut scroll = ScrollArea::both()
             .id_salt("decompiler-text")
             .auto_shrink([false, false]);
@@ -3543,6 +3726,7 @@ impl DesktopApp {
                         .selectable(true)
                         .wrap_mode(egui::TextWrapMode::Extend),
                 );
+                let mut pointer_byte = None;
                 if response.hovered()
                     && let Some(pointer) = context.pointer_hover_pos()
                 {
@@ -3551,22 +3735,56 @@ impl DesktopApp {
                         .char_indices()
                         .nth(cursor.index.0)
                         .map_or(visible, |(at, _)| at);
-                    if byte < visible && response.clicked() {
+                    pointer_byte = (byte < visible).then_some(start + byte);
+                    if byte < visible && (response.clicked() || response.secondary_clicked()) {
                         select_code = Some(start + byte);
                     }
                     if byte < visible
-                        && let Some(name) =
-                            highlighted.function_name_at(&self.decompiled, start + byte)
-                        && let Some(target) = self.decompiler_call_target(name)
+                        && let Some(target) = self.decompiler_call_target(start + byte)
                     {
                         let clicked = response.double_clicked();
                         response
+                            .clone()
                             .on_hover_cursor(egui::CursorIcon::PointingHand)
-                            .on_hover_text(format!("Double-click to go to {name} ({target:#x})"));
+                            .on_hover_text(format!("Double-click to go to {target:#x}"));
                         if clicked {
                             navigate = Some(target);
                         }
                     }
+                }
+                let local_token = pointer_byte
+                    .and_then(|byte| self.semantic_info.token_at(byte))
+                    .filter(|t| matches!(t.kind, TokenKind::Local { .. }))
+                    .cloned();
+                // Egui retains context menus after the pointer leaves the row.
+                let menu_id = response.id.with("local-token");
+                if response.secondary_clicked() {
+                    context.data_mut(|d| {
+                        d.insert_temp(
+                            menu_id,
+                            (self.selection_generation, self.revision, local_token),
+                        )
+                    });
+                }
+                let local_token = context
+                    .data(|d| {
+                        d.get_temp::<(u64, u64, Option<crate::semantic::SemanticToken>)>(menu_id)
+                    })
+                    .filter(|(selection, revision, _)| {
+                        *selection == self.selection_generation && *revision == self.revision
+                    })
+                    .and_then(|(_, _, token)| token);
+                if let Some(token) = local_token {
+                    response.context_menu(|ui| {
+                        if matches!(token.kind, TokenKind::Local { local: Some(_) }) {
+                            if ui.button("Rename local variable…  L").clicked() {
+                                rename_local_byte = Some(token.start);
+                                ui.close();
+                            }
+                        } else {
+                            ui.label("Renaming unsupported: no verified storage identity");
+                        }
+                    });
                 }
             }
         });
@@ -3580,8 +3798,18 @@ impl DesktopApp {
             if let Some(canvas) = &mut self.canvas {
                 canvas.reveal_instruction(address);
             }
+        } else if let Some(byte) = rename_local_byte {
+            self.select_decompiled_byte(byte);
+            self.begin_rename();
         } else if let Some(byte) = select_code {
             self.select_decompiled_byte(byte);
+            if matches!(
+                self.semantic_info.token_at(byte).map(|t| &t.kind),
+                Some(TokenKind::Local { local: None })
+            ) {
+                self.status =
+                    "Local rename unsupported: select a verified local-variable token; refresh legacy pseudocode if needed".into();
+            }
         }
     }
 
@@ -4427,7 +4655,7 @@ impl DesktopApp {
                             let task = match pending.request {
                                 Request::Open { .. } => "Opening binary",
                                 Request::Graph { .. } => "Building graph",
-                                Request::Decompile { .. } => "Decompiling",
+                                Request::Decompile { .. } | Request::DecompileWithLocals { .. } => "Decompiling",
                                 Request::Discover | Request::DiscoverBatch { .. } => {
                                     "Discovering functions"
                                 }
@@ -4564,7 +4792,14 @@ fn is_project_path(path: &std::path::Path) -> bool {
 }
 
 fn edit_size(edit: &Edit) -> usize {
-    edit.function_name.as_ref().map_or(0, String::len)
+    edit.local.as_ref().map_or(0, |(id, before)| {
+        id.engine.len()
+            + id.verification.len()
+            + 64
+            + before.as_ref().map_or(0, |r| {
+                r.name.len() + r.identity.engine.len() + r.identity.verification.len() + 64
+            })
+    }) + edit.function_name.as_ref().map_or(0, String::len)
         + edit.before.as_ref().map_or(0, |annotation| {
             annotation.label.len()
                 + annotation.comment.len()
@@ -5898,22 +6133,26 @@ mod tests {
     }
 
     #[test]
-    fn decompiler_navigation_requires_a_known_unambiguous_called_function() {
+    fn decompiler_navigation_uses_only_semantic_targets_even_with_duplicate_names() {
         let mut app = call_navigation_app("next()");
-        assert_eq!(app.decompiler_call_target("next"), Some(0x1040));
-        assert_eq!(app.decompiler_call_target("entry"), None);
-        assert_eq!(app.decompiler_call_target("missing"), None);
+        assert_eq!(app.decompiler_call_target(1), None); // Legacy text cache fails closed.
+        app.semantic_info
+            .tokens
+            .push(crate::semantic::SemanticToken {
+                start: 0,
+                end: 4,
+                kind: TokenKind::Call { target: 0x1040 },
+            });
+        assert_eq!(app.decompiler_call_target(1), Some(0x1040));
+        assert_eq!(app.decompiler_call_target(4), None);
         app.info.as_mut().unwrap().functions.push(FunctionInfo {
             address: 0x1080,
             name: "next".into(),
         });
-        app.view.as_mut().unwrap().calls.push(CallSite {
-            address: 0x1008,
-            target: Some(0x1080),
-        });
-        assert_eq!(app.decompiler_call_target("next"), None);
         app.view.as_mut().unwrap().calls.clear();
-        assert_eq!(app.decompiler_call_target("next"), None);
+        assert_eq!(app.decompiler_call_target(1), Some(0x1040));
+        app.semantic_info.tokens.clear();
+        assert_eq!(app.decompiler_call_target(1), None);
     }
 
     #[test]
@@ -5922,6 +6161,14 @@ mod tests {
         theme::install(&context);
         let source = "void entry() { next(); }";
         let mut app = call_navigation_app(source);
+        let start = source.find("next").unwrap();
+        app.semantic_info
+            .tokens
+            .push(crate::semantic::SemanticToken {
+                start,
+                end: start + 4,
+                kind: TokenKind::Call { target: 0x1040 },
+            });
         let mut output = context.run_ui(egui::RawInput::default(), |ui| app.side_panel(ui));
         let point = output
             .shapes
@@ -5969,6 +6216,180 @@ mod tests {
         }
         assert_eq!(app.selected, Some(0x1040));
         assert_eq!(app.history, [0x1000, 0x1040]);
+    }
+
+    #[test]
+    fn selected_local_rename_and_undo_share_the_annotation_history() {
+        let mut app = semantic_app();
+        let context = egui::Context::default();
+        let identity = LocalIdentity {
+            function: 0x1000,
+            engine: crate::semantic::LOCAL_FINGERPRINT.into(),
+            storage: crate::semantic::LocalStorage::Register,
+            offset: 0,
+            size: 4,
+            verification: "a".repeat(64),
+        };
+        let byte = app.decompiled.find("café").unwrap();
+        app.semantic_info
+            .locals
+            .push(crate::semantic::LocalVariable {
+                identity: identity.clone(),
+                name: "café".into(),
+            });
+        app.semantic_info
+            .tokens
+            .push(crate::semantic::SemanticToken {
+                start: byte,
+                end: byte + "café".len(),
+                kind: TokenKind::Local { local: Some(0) },
+            });
+        app.edit_annotation(
+            0x1004,
+            Annotation {
+                comment: "keep me".into(),
+                ..Default::default()
+            },
+        );
+        let original = app.decompiled.clone();
+        let original_semantics = app.semantic_info.clone();
+        // Exercise native egui pointer selection, keyboard dispatch, modal text
+        // selection/replacement, Enter application, and Ctrl+Z outside editors.
+        theme::install(&context);
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| app.side_panel(ui));
+        let point = text_position(&output, "return café", byte + 1);
+        output.textures_delta.clear();
+        let mut output = context.run_ui(
+            egui::RawInput {
+                events: pointer_events(point),
+                time: Some(1.0),
+                ..Default::default()
+            },
+            |ui| app.side_panel(ui),
+        );
+        output.textures_delta.clear();
+        assert_eq!(app.selected_local, Some(0));
+        assert_eq!(app.selected, Some(0x1004));
+        keyboard_frame(
+            &context,
+            &mut app,
+            vec![key_event(egui::Key::L, egui::Modifiers::NONE)],
+        );
+        assert!(
+            matches!(&app.browser_dialog.as_ref().unwrap().kind, BrowserDialogKind::RenameLocal { identity: selected } if selected == &identity)
+        );
+        keyboard_frame(&context, &mut app, vec![]);
+        keyboard_frame(
+            &context,
+            &mut app,
+            vec![egui::Event::Text("local_value".into())],
+        );
+        assert_eq!(app.browser_dialog.as_ref().unwrap().text, "local_value");
+        keyboard_frame(
+            &context,
+            &mut app,
+            vec![key_event(egui::Key::Enter, egui::Modifiers::NONE)],
+        );
+        assert!(app.browser_dialog.is_none());
+        assert_eq!(
+            app.session.as_ref().unwrap().local_renames[0].name,
+            "local_value"
+        );
+        assert_eq!(app.session.as_ref().unwrap().version, 2);
+        // Rendering while the replacement is pending must not reuse source rows
+        // from the old text. The returned offsets then place the same comment
+        // above the renamed statement without modifying the engine's source.
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| app.side_panel(ui));
+        output.textures_delta.clear();
+        let renamed = original.replace("café", "local_value");
+        let mut semantics = original_semantics;
+        semantics.locals[0].name = "local_value".into();
+        semantics.tokens[0].end = byte + "local_value".len();
+        app.receive(
+            Pending {
+                id: 1,
+                request: Request::Decompile { address: 0x1000 },
+                started: Instant::now(),
+                selection: app.selection_generation,
+                revision: app.revision,
+                byte_origin: (app.selected, app.tab),
+            },
+            Response::Decompiled {
+                address: 0x1000,
+                mappings: vec![CodeMapping {
+                    start: renamed.find("return").unwrap(),
+                    end: renamed.find(';').unwrap() + 1,
+                    addresses: vec![0x1004, 0x1008],
+                }],
+                text: renamed.clone(),
+                semantics,
+            },
+            &context,
+        );
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| app.side_panel(ui));
+        let rows = rendered_text(&output);
+        let comment = rows.iter().position(|row| row.contains("keep me")).unwrap();
+        let statement = rows
+            .iter()
+            .position(|row| row.contains("return local_value"))
+            .unwrap();
+        assert!(comment < statement);
+        assert_eq!(rows.iter().filter(|row| row.contains("keep me")).count(), 1);
+        assert_eq!(app.decompiled, renamed);
+        output.textures_delta.clear();
+        keyboard_frame(&context, &mut app, vec![]);
+        keyboard_frame(
+            &context,
+            &mut app,
+            vec![key_event(
+                egui::Key::Z,
+                egui::Modifiers {
+                    ctrl: true,
+                    command: true,
+                    ..Default::default()
+                },
+            )],
+        );
+        assert!(app.session.as_ref().unwrap().local_renames.is_empty());
+        assert_eq!(
+            app.session.as_ref().unwrap().annotations[&0x1004].comment,
+            "keep me"
+        );
+        keyboard_frame(
+            &context,
+            &mut app,
+            vec![egui::Event::Key {
+                key: egui::Key::Z,
+                physical_key: Some(egui::Key::Z),
+                pressed: false,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        keyboard_frame(
+            &context,
+            &mut app,
+            vec![key_event(
+                egui::Key::Z,
+                egui::Modifiers {
+                    ctrl: true,
+                    command: true,
+                    ..Default::default()
+                },
+            )],
+        );
+        assert!(
+            !app.session
+                .as_ref()
+                .unwrap()
+                .annotations
+                .contains_key(&0x1004)
+        );
+        app.decompiler_rename_context = true;
+        app.selected_local = None;
+        app.begin_rename();
+        assert!(app.browser_dialog.is_none());
+        assert!(app.status.contains("unsupported"));
     }
 
     #[test]
@@ -6038,6 +6459,7 @@ mod tests {
                 end: source.find(';').unwrap() + 1,
                 addresses: vec![0x1004],
             }],
+            semantics: Default::default(),
             strings: vec![StringEntry {
                 address: 0x1040,
                 text: "saved string".into(),
@@ -6170,6 +6592,7 @@ mod tests {
             view: None,
             decompiled: None,
             mappings: Vec::new(),
+            semantics: Default::default(),
             strings: Vec::new(),
             strings_truncated: false,
             crypto: Vec::new(),
@@ -6348,6 +6771,7 @@ mod tests {
             Response::Decompiled {
                 address: 0x1000,
                 mappings: Vec::new(),
+                semantics: Default::default(),
                 text: "stale output".into(),
             },
             &egui::Context::default(),
@@ -6873,6 +7297,7 @@ mod tests {
             Response::Decompiled {
                 address: 0x1000,
                 mappings: Vec::new(),
+                semantics: Default::default(),
                 text: text.into(),
             },
             &context,
@@ -6912,6 +7337,7 @@ mod tests {
                 Response::Decompiled {
                     address: 0x1000,
                     mappings: Vec::new(),
+                    semantics: Default::default(),
                     text,
                 },
                 &context,

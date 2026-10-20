@@ -9,11 +9,13 @@ use crate::model::{
     MAX_MAPPING_ADDRESSES, SectionInfo,
 };
 use crate::selection::ExecutableRanges;
+use crate::semantic::{LocalRename, MAX_TOKENS, SemanticInfo, SemanticToken, TokenKind};
 use ghidra_decompiler::action::{Action, ActionBase, ActionGroupList};
 use ghidra_decompiler::architecture::Architecture;
 use ghidra_decompiler::error::{Error, Result};
 use ghidra_decompiler::funcdata::Funcdata;
 use ghidra_decompiler::op::{OpId, PcodeOp};
+use ghidra_decompiler::opcodes::OpCode;
 use ghidra_decompiler::prettyprint::*;
 use ghidra_decompiler::program::Program;
 use ghidra_decompiler::space::SpaceRef;
@@ -29,6 +31,9 @@ struct Capture {
     operations: BTreeMap<OpId, u64>,
     spans: Vec<CodeMapping>,
     truncated: bool,
+    calls: BTreeMap<OpId, u64>,
+    locals: crate::local_symbols::Locals,
+    tokens: Vec<SemanticToken>,
 }
 
 type Shared = Arc<Mutex<Capture>>;
@@ -39,6 +44,7 @@ struct CaptureAction {
     returned: ReturnedAction,
     capture: Shared,
     executable: ExecutableRanges,
+    renames: Vec<LocalRename>,
 }
 
 impl CaptureAction {
@@ -82,14 +88,52 @@ impl Action for CaptureAction {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         capture.operations.clear();
+        capture.locals = crate::local_symbols::capture(data, architecture, &self.renames)?;
+        if capture.locals.variables.is_empty() && capture.locals.warnings.is_empty() {
+            capture.locals.warnings = self
+                .renames
+                .iter()
+                .map(|r| {
+                    format!(
+                        "Local rename '{}' not applied: no supported recovered identity",
+                        r.name
+                    )
+                })
+                .collect();
+        }
+        let code_space = architecture.manager.get_default_code_space();
         let mut current = data.obank.begin_alive();
         for _ in 0..MAX_CAPTURED_OPS {
             let Some(id) = current else { break };
             let operation = data.op(id);
             let address = operation.get_addr();
             let pc = address.get_offset();
-            if !address.is_invalid() && self.executable.contains(pc) {
+            if !address.is_invalid()
+                && address
+                    .get_space()
+                    .zip(code_space.as_ref())
+                    .is_some_and(|(a, b)| Arc::ptr_eq(a, b))
+                && self.executable.contains(pc)
+            {
                 capture.operations.insert(id, pc);
+            }
+            if operation.code() == OpCode::Call
+                && operation.num_input() > 0
+                && let Some(spec) = data.get_call_specs_op(id)
+            {
+                let target = data.call_spec(spec).get_entry_address();
+                if !target.is_invalid()
+                    && target
+                        .get_space()
+                        .zip(code_space.as_ref())
+                        .is_some_and(|(a, b)| Arc::ptr_eq(a, b))
+                    && code_space
+                        .as_ref()
+                        .is_some_and(|space| space.get_word_size() == 1)
+                    && self.executable.contains(target.get_offset())
+                {
+                    capture.calls.insert(id, target.get_offset());
+                }
             }
             current = data.obank.next_in_list(id, PcodeOp::INSERT_LIST);
         }
@@ -103,7 +147,17 @@ pub fn render(
     program: &mut Program,
     address: u64,
     sections: &[SectionInfo],
-) -> Result<(String, Vec<CodeMapping>)> {
+) -> Result<(String, Vec<CodeMapping>, SemanticInfo)> {
+    render_with_locals(program, address, sections, &[])
+}
+
+pub fn render_with_locals(
+    program: &mut Program,
+    address: u64,
+    sections: &[SectionInfo],
+    renames: &[LocalRename],
+) -> Result<(String, Vec<CodeMapping>, SemanticInfo)> {
+    crate::semantic::validate_renames(renames, Some(address)).map_err(Error::Lowlevel)?;
     let capture = Shared::default();
     let executable = ExecutableRanges::new(sections).map_err(Error::Lowlevel)?;
     let returned = ReturnedAction::default();
@@ -139,6 +193,7 @@ pub fn render(
             returned: Arc::clone(&returned),
             capture: Arc::clone(&capture),
             executable,
+            renames: renames.to_vec(),
         }),
     );
     let result =
@@ -163,7 +218,15 @@ pub fn render(
     if capture.truncated {
         text.push_str("\n/* Decompiler output truncated at the 2 MiB prototype limit. */\n");
     }
-    Ok((text, mappings))
+    let semantics = SemanticInfo {
+        tokens: std::mem::take(&mut capture.tokens),
+        locals: std::mem::take(&mut capture.locals.variables),
+        warnings: std::mem::take(&mut capture.locals.warnings),
+    };
+    semantics
+        .validate(&text, address, sections)
+        .map_err(Error::Lowlevel)?;
+    Ok((text, mappings, semantics))
 }
 
 struct Statement {
@@ -178,6 +241,8 @@ struct LocationEmitter {
     statements: Vec<Statement>,
     overflow_depth: usize,
     saturated: bool,
+    declarations: Vec<Option<usize>>,
+    declaration_overflow: usize,
 }
 
 impl LocationEmitter {
@@ -189,6 +254,8 @@ impl LocationEmitter {
             statements: Vec::new(),
             overflow_depth: 0,
             saturated: false,
+            declarations: Vec::new(),
+            declaration_overflow: 0,
         }
     }
     fn location(&self, mark: Option<OpMark>) -> Option<u64> {
@@ -213,6 +280,19 @@ impl LocationEmitter {
                 start,
                 end: self.text.len(),
                 addresses,
+            });
+        }
+    }
+    fn semantic_token(&self, start: usize, text: &str, kind: TokenKind) {
+        if self.text.len() - start != text.len() || text.is_empty() {
+            return;
+        }
+        let mut capture = self.capture.lock().unwrap_or_else(|e| e.into_inner());
+        if capture.tokens.len() < MAX_TOKENS {
+            capture.tokens.push(SemanticToken {
+                start,
+                end: self.text.len(),
+                kind,
             });
         }
     }
@@ -299,10 +379,33 @@ impl Emit for LocationEmitter {
         end_block(_id:i32) -> () = ();
         begin_return_type(_node:Option<VarnodeMark>) -> i32 = 0;
         end_return_type(_id:i32) -> () = ();
-        begin_var_decl(_symbol:Option<SymbolMark>) -> i32 = 0;
-        end_var_decl(_id:i32) -> () = ();
         begin_func_proto() -> i32 = 0;
         end_func_proto(_id:i32) -> () = ();
+    }
+    fn begin_var_decl(&mut self, symbol: Option<SymbolMark>) -> Result<i32> {
+        let index = symbol.and_then(|s| {
+            self.capture
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .locals
+                .symbols
+                .get(&s.id)
+                .copied()
+        });
+        if self.declaration_overflow > 0 || self.declarations.len() >= MAX_STATEMENT_DEPTH {
+            self.declaration_overflow = self.declaration_overflow.saturating_add(1);
+        } else {
+            self.declarations.push(index);
+        }
+        Ok(0)
+    }
+    fn end_var_decl(&mut self, _id: i32) -> Result<()> {
+        if self.declaration_overflow > 0 {
+            self.declaration_overflow -= 1;
+        } else {
+            self.declarations.pop();
+        }
+        Ok(())
     }
     fn begin_statement(&mut self, mark: Option<OpMark>) -> Result<i32> {
         if self.overflow_depth > 0 || self.statements.len() >= MAX_STATEMENT_DEPTH {
@@ -339,11 +442,33 @@ impl Emit for LocationEmitter {
     fn tag_variable(
         &mut self,
         text: &str,
-        _highlight: SyntaxHighlight,
-        _node: Option<VarnodeMark>,
+        highlight: SyntaxHighlight,
+        node: Option<VarnodeMark>,
         op: Option<OpMark>,
     ) -> Result<()> {
-        self.token(text, op)
+        let start = self.text.len();
+        self.token(text, op)?;
+        if matches!(
+            highlight,
+            SyntaxHighlight::VarColor | SyntaxHighlight::ParamColor
+        ) {
+            let local = match node {
+                Some(node) => self
+                    .capture
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .locals
+                    .nodes
+                    .get(&node.id)
+                    .copied(),
+                None if self.declaration_overflow == 0 => {
+                    self.declarations.last().copied().flatten()
+                }
+                None => None,
+            };
+            self.semantic_token(start, text, TokenKind::Local { local });
+        }
+        Ok(())
     }
     fn tag_op(
         &mut self,
@@ -360,7 +485,21 @@ impl Emit for LocationEmitter {
         _function: Option<&FuncMark>,
         op: Option<OpMark>,
     ) -> Result<()> {
-        self.token(text, op)
+        let start = self.text.len();
+        self.token(text, op)?;
+        // Function prototypes have no CALL op. Indirect calls never enter this map.
+        let target = op.and_then(|op| {
+            self.capture
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .calls
+                .get(&op.id)
+                .copied()
+        });
+        if let Some(target) = target {
+            self.semantic_token(start, text, TokenKind::Call { target });
+        }
+        Ok(())
     }
     fn tag_type(
         &mut self,

@@ -76,6 +76,7 @@ impl WorkerClient {
             .spawn(move || {
                 let mut reader = BufReader::new(output);
                 let mut answered = 0;
+                let mut sections = Vec::new();
                 loop {
                     let event = match bounded_line(&mut reader, MAX_RESPONSE).and_then(|line| {
                         match line {
@@ -99,6 +100,47 @@ impl WorkerClient {
                                         return;
                                     }
                                     info.path.clone_from(&display_path);
+                                    sections.clone_from(&info.sections);
+                                }
+                                if let crate::model::Response::Decompiled {
+                                    address,
+                                    text,
+                                    mappings,
+                                    semantics,
+                                } = &reply.response
+                                {
+                                    let checked = if text.len() > crate::model::MAX_DECOMPILED_BYTES
+                                    {
+                                        Err("Decompiler text exceeds limit".into())
+                                    } else {
+                                        crate::selection::validate_mappings(
+                                            text, mappings, &sections,
+                                        )
+                                        .and_then(|()| {
+                                            semantics.validate(text, *address, &sections)
+                                        })
+                                        .and_then(|()| {
+                                            if semantics.locals.iter().any(|v| {
+                                                v.identity.engine
+                                                    != crate::semantic::LOCAL_FINGERPRINT
+                                            }) {
+                                                Err("Incompatible semantic local identity".into())
+                                            } else {
+                                                Ok(())
+                                            }
+                                        })
+                                    };
+                                    if let Err(error) = checked {
+                                        if sender
+                                            .send(WorkerEvent::Failed(format!(
+                                                "Invalid decompiler reply: {error}"
+                                            )))
+                                            .is_ok()
+                                        {
+                                            ctx.request_repaint();
+                                        }
+                                        return;
+                                    }
                                 }
                                 WorkerEvent::Reply(Box::new(reply))
                             }
