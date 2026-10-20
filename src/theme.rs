@@ -39,6 +39,22 @@ const INPUT: Color32 = Color32::from_rgb(18, 19, 21);
 
 pub fn install(context: &egui::Context) {
     context.set_theme(egui::Theme::Dark);
+    // The proportional font lacks arrows such as → and ↶; fall back to the
+    // bundled monospace font instead of drawing missing-glyph boxes.
+    let mut fonts = egui::FontDefinitions::default();
+    if let Some(monospace) = fonts
+        .families
+        .get(&egui::FontFamily::Monospace)
+        .and_then(|family| family.first())
+        .cloned()
+    {
+        fonts
+            .families
+            .entry(egui::FontFamily::Proportional)
+            .or_default()
+            .push(monospace);
+    }
+    context.set_fonts(fonts);
     let mut style = egui::Style::default();
     let visuals = &mut style.visuals;
     *visuals = egui::Visuals::dark();
@@ -290,4 +306,29 @@ pub fn listing_row(
 /// Graph block corner radius at the current zoom.
 pub fn scaled_radius(zoom: f32) -> u8 {
     (f32::from(NODE_RADIUS) * zoom.min(1.5)).round() as u8
+}
+
+#[cfg(test)]
+mod tests {
+    use eframe::egui;
+
+    #[test]
+    fn interface_fonts_render_the_arrows_used_in_labels_and_graph_exits() {
+        let context = egui::Context::default();
+        super::install(&context);
+        // Fonts are loaded by the first frame.
+        context
+            .run_ui(egui::RawInput::default(), |_| {})
+            .textures_delta
+            .clear();
+        for font in [
+            egui::FontId::proportional(13.0),
+            egui::FontId::monospace(13.0),
+        ] {
+            assert!(
+                context.fonts_mut(|fonts| fonts.has_glyphs(&font, "→↶·…—")),
+                "{font:?}"
+            );
+        }
+    }
 }

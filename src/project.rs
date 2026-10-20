@@ -6,8 +6,8 @@ use crate::discovery::{DISCOVERY_FINGERPRINT, DiscoverySnapshot};
 use crate::model::{
     BinaryInfo, CodeMapping, CryptoMatch, FunctionView, MAX_CRYPTO_MATCHES, MAX_DECOMPILED_BYTES,
     MAX_GRAPH_BLOCKS, MAX_GRAPH_CALLS, MAX_GRAPH_EDGES, MAX_GRAPH_INSTRUCTIONS,
-    MAX_INSTRUCTION_BYTES, MAX_PROJECT_STRINGS, MAX_SECTIONS, MAX_WARNINGS, StringEntry,
-    validate_functions,
+    MAX_INSTRUCTION_BYTES, MAX_PROJECT_STRINGS, MAX_SECTIONS, MAX_WARNINGS, SectionInfo,
+    StringEntry, validate_functions,
 };
 use crate::selection::{MappedRanges, validate_mappings};
 use crate::session::{self, BinaryProtection, Session};
@@ -671,6 +671,25 @@ pub(crate) fn validate_crypto(crypto: &[CryptoMatch], ranges: &MappedRanges) -> 
     Ok(())
 }
 
+/// A copy of a live graph that project files can store. Saved graphs have always
+/// required mapped exit and call targets, so earlier releases can open them. Live
+/// exits into unmapped gaps, such as the fallthrough after a no-return call at
+/// the end of a section, are saved as unresolved instead of failing the save.
+pub(crate) fn persistable_view(view: &FunctionView, sections: &[SectionInfo]) -> FunctionView {
+    let mut view = view.clone();
+    // Invalid section metadata is rejected by the project validation itself.
+    if let Ok(ranges) = MappedRanges::new(sections) {
+        let edges = view.edges.iter_mut().map(|edge| &mut edge.target);
+        let calls = view.calls.iter_mut().map(|call| &mut call.target);
+        for target in edges.chain(calls) {
+            if target.is_some_and(|address| !ranges.contains(address)) {
+                *target = None;
+            }
+        }
+    }
+    view
+}
+
 /// Structural graph bounds shared by projects and worker replies. Exits and
 /// call targets may legitimately leave the displayed blocks, so only their
 /// sources are checked here.
@@ -1197,6 +1216,68 @@ mod tests {
                 .contains("pathname")
         );
         assert_eq!(fs::read(&alias).unwrap(), b"example binary");
+    }
+
+    #[test]
+    fn live_exits_into_unmapped_gaps_are_saved_as_unresolved() {
+        use crate::model::{BasicBlock, CallSite, Edge, EdgeKind, Instruction};
+        let directory = tempfile::tempdir().unwrap();
+        let (mut data, protection) = sample(directory.path());
+        let view = data.view.as_mut().unwrap();
+        view.blocks = vec![BasicBlock {
+            address: 0x1000,
+            instructions: vec![Instruction {
+                address: 0x1000,
+                bytes: vec![0xe8, 0, 0, 0, 0],
+                mnemonic: "CALL".into(),
+                operands: "0x9000".into(),
+            }],
+        }];
+        // The section ends at 0x100e: a fallthrough past it and a call outside
+        // every section are live-only targets.
+        view.edges = vec![
+            Edge {
+                source: 0x1000,
+                target: Some(0x100e),
+                kind: EdgeKind::Branch,
+            },
+            Edge {
+                source: 0x1000,
+                target: Some(0x1005),
+                kind: EdgeKind::True,
+            },
+        ];
+        view.calls = vec![
+            CallSite {
+                address: 0x1000,
+                target: Some(0x9000),
+            },
+            CallSite {
+                address: 0x1000,
+                target: Some(0x1008),
+            },
+        ];
+        let project = directory.path().join("gaps.grproj");
+        assert!(
+            data.save(&project, &protection, true)
+                .unwrap_err()
+                .contains("unmapped")
+        );
+        let live = data.view.take().unwrap();
+        data.view = Some(persistable_view(&live, &data.info.sections));
+        data.save(&project, &protection, true).unwrap();
+        let view = ProjectData::load(&project).unwrap().data.view.unwrap();
+        let edges: Vec<_> = view
+            .edges
+            .iter()
+            .map(|edge| (edge.target, edge.kind))
+            .collect();
+        assert_eq!(
+            edges,
+            [(None, EdgeKind::Branch), (Some(0x1005), EdgeKind::True)]
+        );
+        let calls: Vec<_> = view.calls.iter().map(|call| call.target).collect();
+        assert_eq!(calls, [None, Some(0x1008)]);
     }
 
     #[test]
