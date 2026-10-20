@@ -61,6 +61,8 @@ fn protocol(
             crate::limits::begin_request()?;
         }
         let request_id = request.id;
+        let _trace_context = crate::performance::context(request_id);
+        let execution = crate::performance::span(crate::performance::operation(&request.request));
         let result =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match request.request {
                 Request::Open { path } => {
@@ -100,6 +102,11 @@ fn protocol(
                 }
             }
         };
+        execution.finish(0);
+        crate::performance::event(
+            "request_result_error",
+            u64::from(matches!(response, Response::Error { .. })),
+        );
         send(
             &mut output,
             WorkerResponse {
@@ -107,6 +114,7 @@ fn protocol(
                 response,
             },
         )?;
+        crate::performance::event("request_published", request.id);
     }
     Ok(())
 }
@@ -114,6 +122,7 @@ fn protocol(
 fn send(output: &mut impl Write, response: WorkerResponse) -> Result<(), String> {
     // Encode atomically into a bounded buffer: an oversized response must not
     // publish a partial JSON line and desynchronize the parent protocol.
+    let encoding = crate::performance::span("reply_encode");
     let mut encoded = ResponseBuffer::default();
     if serde_json::to_writer(&mut encoded, &response).is_err() {
         encoded.bytes.clear();
@@ -124,6 +133,8 @@ fn send(output: &mut impl Write, response: WorkerResponse) -> Result<(), String>
         serde_json::to_writer(&mut encoded, &fallback)
             .map_err(|e| format!("Worker error response encoding failed: {e}"))?;
     }
+    encoding.finish(encoded.bytes.len() as u64);
+    let _writing = crate::performance::span("reply_write_flush");
     output
         .write_all(&encoded.bytes)
         .map_err(|e| format!("Worker output failed: {e}"))?;

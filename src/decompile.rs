@@ -82,7 +82,10 @@ impl Action for CaptureAction {
         self.inner_mut().apply(data, architecture)
     }
     fn perform(&mut self, data: &mut Funcdata, architecture: &mut Architecture) -> Result<i32> {
+        let engine = crate::performance::span("engine_action");
         let result = self.inner_mut().perform(data, architecture)?;
+        engine.finish(0);
+        let _capture = crate::performance::span("semantic_capture");
         let mut capture = self
             .capture
             .lock()
@@ -196,8 +199,10 @@ pub fn render_with_locals(
             renames: renames.to_vec(),
         }),
     );
+    let engine = crate::performance::span("engine_decompile_inclusive");
     let result =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| program.decompile(address)));
+    engine.finish(0);
     let architecture = program.architecture();
     drop(architecture.allacts.actionmap.remove(&name));
     if let Some(original_action) = returned
@@ -214,7 +219,9 @@ pub fn render_with_locals(
         .emit = original_emit;
     let mut text = result.unwrap_or_else(|payload| std::panic::resume_unwind(payload))?;
     let mut capture = capture.lock().unwrap_or_else(|error| error.into_inner());
+    let flattening = crate::performance::span("mapping_flatten");
     let mappings = flatten(std::mem::take(&mut capture.spans), &text);
+    flattening.finish(mappings.len() as u64);
     if capture.truncated {
         text.push_str("\n/* Decompiler output truncated at the 2 MiB prototype limit. */\n");
     }
@@ -223,6 +230,7 @@ pub fn render_with_locals(
         locals: std::mem::take(&mut capture.locals.variables),
         warnings: std::mem::take(&mut capture.locals.warnings),
     };
+    let _validation = crate::performance::span("semantic_validate");
     semantics
         .validate(&text, address, sections)
         .map_err(Error::Lowlevel)?;

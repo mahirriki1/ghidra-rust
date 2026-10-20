@@ -105,3 +105,139 @@ comparable pass scope/settings, native platform details, process-tree memory,
 and complete timings including each tool's startup and analysis. A separate
 desktop measurement must include the actual GUI and its workers before making
 desktop efficiency claims.
+
+## Native Windows phase tracing and desktop sampling
+
+Build the optional developer instrumentation with the pinned native MSVC
+compiler. Check both tools, since a mismatched `PATH` can select another rustc:
+
+```powershell
+$env:RUSTUP_TOOLCHAIN = '1.98.1-x86_64-pc-windows-msvc'
+cargo -V
+rustc -vV
+cargo build --release --locked --features performance --target x86_64-pc-windows-msvc
+.\scripts\measure-windows-desktop.ps1 `
+  -Executable .\target\x86_64-pc-windows-msvc\release\ghidra-rust.exe `
+  -InputBinary C:\path\to\supported-program.exe -Trace -Seconds 180
+```
+
+The script launches the actual desktop with the selected image as a data
+argument. It never launches the image. Interact with this window during sampling:
+record the analysis options and selected addresses, dismiss the first-open prompt,
+navigate A→B→A, switch Listing/Graph, exercise selection and history, and interrupt
+and resume discovery. Repeat fresh launches and retain every run, including
+failures. Avoid builds during measurements. Hashes, process identities, Windows
+version, CPU information, sample gaps and sampler overhead are recorded under a
+new `target/analysis-baseline/desktop-*` directory. Sampling ends after the duration
+or after the owned desktop and workers exit; expiry leaves the desktop open.
+
+`-Trace` sets `GHIDRA_RUST_PERF_DIR` to that new directory. With the `performance`
+feature enabled, each process creates a unique trace file exclusively; it cannot
+overwrite an existing file. The normal build has no trace writer. Records contain
+constant phase labels and numeric metrics, not binary bytes, paths, symbol names
+or decompiled text. A bounded nonblocking queue moves writes off the GUI and
+analysis threads. At most 100,000 records, including saturation and shutdown
+health, are written per process. Records report queue drops; the limit marker and shutdown
+health identify incomplete traces. Forced worker termination can lose the tail
+or leave a partial final line. Reject dropped traces for complete attribution;
+use only certified completed prefixes of interrupted worker traces as described
+below. A failure to create the requested trace fails startup; later writer failure does not alter analysis behavior and makes the trace unusable.
+Linux worker containment and its cleared environment remain unchanged; this
+feature does not make a host log directory available inside bubblewrap.
+
+Phases cover protected worker startup, read/metadata/hash/snapshot/engine load,
+inventory reconstruction and cloning, discovery CFG/decode/data collection,
+serialization and pipe writes, parent parsing/validation, discovery commit,
+reference-index/saved-snapshot construction, GUI adoption/filtering, graph
+geometry, import resolution, inclusive engine decompilation, semantic capture,
+mapping flattening and highlighting. Durations are local to each process. Join
+parent request IDs with the worker PID from `worker_start`, and retain the
+parent generation/epoch/selection/annotation-revision records. A restarted
+worker has a new PID and its own request sequence. Accumulated discovery recovery
+is a subset of discovery work; inclusive spans overlap and must not be summed
+as independent costs. Progress reply serialization is included in discovery.
+
+`navigation_frame_submission` runs from navigation dispatch through adoption and
+the matching desktop UI pass; value 1 marks pseudocode submission, value 0 a
+superseded navigation. `listing_frame_submission` marks its first graph/listing
+UI pass. These are **frame submission proxies**, not display-presentation fences.
+The initial navigation may overlap the modal analysis prompt; measure scripted
+post-prompt navigation separately. Validate these records with native observation
+or screenshots. No headless test establishes visible desktop responsiveness.
+
+The external sampler includes the launched desktop and its observed descendants
+at the exact executable path, including retiring workers. Concurrent unrelated
+instances at that path are rejected. PID plus creation
+time distinguishes process instances. Working sets may double-count shared
+pages. Private bytes measure committed private virtual memory, not resident
+memory or PSS. Reads are sequential, can miss short-lived workers/peaks, and add
+overhead. Preserve per-process samples and contemporaneous sums; do not add
+independent process peaks. Compare tracing enabled/disabled before attributing
+small differences to an optimization. Fresh-process runs do not imply cold
+filesystem caches or a comparison with Ghidra.
+
+For a repeatable native worker/client workload, compile `tests/fixtures/sample.c`
+using the MSVC flags in `scripts/build-windows.ps1`, set `GHIDRA_RUST_TEST_PE` to
+that generated PE, and run:
+
+```powershell
+cargo test --release --locked --features performance --target x86_64-pc-windows-msvc `
+  --test windows_analysis_baseline -- --ignored --nocapture --test-threads=1
+```
+
+The ignored test uses the production `WorkerClient` and Windows jobs, generated
+AArch64 ELF/PE/Mach-O images, additional original simple/branch/data/large-inventory
+cases. It checks evidence, mappings, semantic identities,
+repeated navigation and restart/replay. Raw request replies/digests, memory samples,
+parent commit/index/snapshot timings, coverage and build identities remain under
+ignored `target/analysis-baseline/windows-*`. These files can contain input paths,
+symbols and pseudocode; keep real-input reports local. This is a test client,
+not the GUI. Use the separate desktop sampler for actual GUI observations.
+
+`GHIDRA_RUST_BENCH_REPEATS` selects 1–20 repetitions (default 3).
+`GHIDRA_RUST_BENCH_INPUT` adds any supported trusted image without executing it;
+`GHIDRA_RUST_BENCH_A` and `GHIDRA_RUST_BENCH_B` optionally select two hexadecimal
+function addresses. External discovery defaults to eight batches per worker.
+`GHIDRA_RUST_BENCH_EXTERNAL_BATCHES=0` opts into exhaustion; another positive
+value explicitly caps that measurement. Reports preserve pending counts and
+partial coverage. Original/generated fixtures always run to queue exhaustion.
+A cap here controls the benchmark workload, not production analysis budgets.
+For exported native source copies without `.git`, supply
+`GHIDRA_RUST_BENCH_SOURCE_METADATA` as a JSON file recording the original Git
+revision/status and exported source hashes. `GHIDRA_RUST_BENCH_BUILD_METADATA`
+can bind the fixture compiler/version/flags record. Otherwise the harness reads
+Git metadata from its checkout and records unknown fixture compiler provenance.
+
+Normal `WorkerClient` destruction terminates its disposable worker, including on
+ordinary desktop shutdown. A missing worker `trace_health` is therefore expected.
+For worker phase attribution, use only a completed prefix ending in
+`request_published`: this marker follows the terminal reply's bounded encoding,
+pipe write and flush, and reports cumulative dropped-record count. Require the
+initial `trace_started`, zero drops and no limit marker through that prefix, plus
+a matching terminal reply independently received by the parent. Later incomplete
+requests and a truncated tail do not certify any additional work. Whole-process
+attribution still requires final health. `request_result_error` preserves failures.
+The read-only summarizer applies these conservative prefix rules:
+
+```sh
+python3 scripts/summarize-analysis-trace.py target/analysis-baseline/desktop-RUN
+```
+
+Its phase distributions include only certified prefixes or a complete process;
+it never treats a killed worker's missing lifetime tail as completed work. Check
+parent replies separately and keep the raw records when comparing results.
+
+Restart replay can expand the worker's initial inventory with newly discovered
+functions. Those entries affect CFG boundaries, so terminal coverage statuses
+can legitimately differ from the first pass even when evidence and pseudocode
+match. Reports retain both contexts and every status digest. Controlled fixtures
+enforce coverage equality when the initial inventories are equivalent; expanded
+contexts are identified explicitly. Compare before/after implementations within
+the same initial or replay context rather than equating these two workloads.
+
+A→B→A can change C and mapping offsets even with an unchanged inventory: the
+original AArch64 data fixture acquires shared global-type knowledge when its
+callee is analyzed. The harness validates each result and records every digest
+difference rather than assuming immutable engine context. Any future result
+cache must account for global types as well as function names, imports and CFG
+boundaries. Before/after comparisons must use corresponding request sequences.
