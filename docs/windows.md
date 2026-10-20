@@ -115,11 +115,17 @@ its hosted build; Windows test results come from local runs.
    results. Select an instruction and a mapped pseudocode expression in turn;
    verify the corresponding selection changes. Check navigation/history and
    rename a function with **L**.
+   Select a supported local in the Decompiler, press **L**, and rename it. Check
+   its declaration and uses, navigate away/back, then undo with **Ctrl+Z**.
+   Double-click a direct call name and return with **Alt+Left**.
 3. In Strings, find `aGVsbG8gcmV2ZXJzZXI=` and decode Base64 to `hello reverser`.
    Run FindCrypt and check the AES S-box result.
 4. Save a project to a local writable directory with **Include binary in project**
    enabled. Add a comment and save again to exercise replacement. Close the binary
-   and reopen the `.grproj`; verify annotations, saved graph/pseudocode, and
+   after checking the comment in Listing, Graph and Decompiler and filtering it
+   in **View → Annotations**. Save a local rename too; after reopening, refresh
+   the function to check that its verified name is replayed.
+   Reopen the `.grproj`; verify annotations, saved graph/pseudocode, and
    selection. If discovery ran before saving, verify References and Data accesses
    show **Saved analysis** on reopen. Run Discover to replace them with fresh
    results; **Analysis → Rediscover from scratch** starts another pass. Refresh
