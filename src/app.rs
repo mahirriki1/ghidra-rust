@@ -1814,10 +1814,14 @@ impl DesktopApp {
         ) else {
             return;
         };
+        let view = self
+            .view
+            .as_ref()
+            .map(|view| crate::project::persistable_view(view, &info.sections));
         let data = ProjectData {
             info,
             session,
-            view: self.view.clone(),
+            view,
             decompiled: (!self.decompiled.is_empty()).then(|| self.decompiled.clone()),
             mappings: self.semantic.mappings.clone(),
             strings: self.strings.clone(),
