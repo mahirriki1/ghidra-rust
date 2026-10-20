@@ -274,6 +274,36 @@ fn fixtures(directory: &Path) -> Vec<Fixture> {
             function: base + offset,
         });
     }
+    let source = directory.join("many-seeds.c");
+    let mut text = String::from("int f299(void);\nint f000(void) { return f299() + 1; }\n");
+    for n in 1..300 {
+        text.push_str(&format!("int f{n:03}(void) {{ return {n}; }}\n"));
+    }
+    text.push_str("int main(void) { return f000(); }\n");
+    fs::write(&source, text).unwrap();
+    let path = directory.join("many-seeds");
+    assert!(
+        Command::new("gcc")
+            .args(["-g", "-O0", "-fno-pie", "-no-pie", "-fno-inline"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&path)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let bytes = fs::read(&path).unwrap();
+    let image = object::File::parse(bytes.as_slice()).unwrap();
+    let function = image
+        .symbols()
+        .find(|s| s.name().ok() == Some("f000"))
+        .unwrap()
+        .address();
+    fixtures.push(Fixture {
+        name: "x86-64-ELF-300-seeds",
+        path,
+        function,
+    });
     fixtures
 }
 
@@ -323,19 +353,44 @@ fn profile_contained_analysis_client() {
                 panic!("Expected Opened");
             };
             assert_eq!(info.sha256, input_sha256);
-            let (
-                Response::Functions {
-                    functions,
-                    analysis,
-                    ..
-                },
-                discover_ms,
-                _,
-            ) = sampler.request(&mut worker, Request::Discover)
-            else {
-                panic!("Expected Functions");
-            };
-            analysis.validate(&info, &functions).unwrap();
+            let mut state = ghidra_rust::discovery::Discovery::new(
+                ghidra_rust::call_analysis::code_address(&info, info.entry).then_some(info.entry),
+                info.functions.iter().map(|f| f.address),
+                info.functions_truncated,
+            );
+            let mut functions = info.functions.clone();
+            let mut discover_ms = 0.;
+            let mut reply_bytes = 0;
+            let mut batch_metrics = Vec::new();
+            while let Some(request) = state.begin(1, 1, 0) {
+                let (Response::DiscoveryBatch { batch }, elapsed, _) =
+                    sampler.request(&mut worker, request)
+                else {
+                    panic!("Expected discovery batch");
+                };
+                reply_bytes += serde_json::to_vec(&Response::DiscoveryBatch {
+                    batch: batch.clone(),
+                })
+                .unwrap()
+                .len();
+                discover_ms += elapsed;
+                batch_metrics.push(
+                    serde_json::json!({ "functions": batch.analysis.functions_examined,
+                    "decode_attempts": batch.analysis.decode_attempts, "request_ms": elapsed,
+                    "reply_bytes": serde_json::to_vec(&batch).unwrap().len() }),
+                );
+                state.commit(&info, &batch).unwrap();
+                functions = batch.functions;
+            }
+            let analysis = state.snapshot();
+            let second_start = Instant::now();
+            assert!(
+                state.begin(1, 1, 0).is_none(),
+                "Completed seeds must not repeat"
+            );
+            let second_ms = second_start.elapsed().as_secs_f64() * 1000.;
+            let second = ghidra_rust::model::CallAnalysis::default();
+            let second_functions = &functions;
             let (Response::Graph { view }, graph_ms, _) = sampler.request(
                 &mut worker,
                 Request::Graph {
@@ -384,6 +439,10 @@ fn profile_contained_analysis_client() {
                 "observed_peak_sum_rss_kib": sampler.peak_rss_kib,
                 "observed_peak_sum_pss_kib": sampler.peak_pss_kib,
                 "memory_samples": sampler.samples, "max_processes": sampler.max_processes,
+                "new_functions": functions.iter().filter(|f| ghidra_rust::model::function_at(&info.functions, f.address).is_none()).count(),
+                "second_functions_examined": second.functions_examined, "second_decode_attempts": second.decode_attempts,
+                "second_discover_ms": second_ms, "discovery_reply_bytes": reply_bytes, "batches": batch_metrics,
+                "second_new_functions": second_functions.iter().filter(|f| ghidra_rust::model::function_at(&functions, f.address).is_none()).count(),
                 "known_functions": functions.len(), "functions_examined": analysis.functions_examined,
                 "decode_attempts": analysis.decode_attempts, "confirmed_calls": analysis.references.len(),
                 "data_accesses": analysis.data.as_ref().map(|data| data.references.len()),

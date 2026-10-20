@@ -18,15 +18,19 @@ or application command-line option.
 The test generates original x86-64 ELF and AArch64 ELF/PE/Mach-O fixtures under
 ignored `target/analysis-baseline/`. An additional ARM64 PE contains supported
 runtime records and an import veneer; an eight-MiB padded copy exercises retained
-image memory. Inputs are analyzed, never executed. Three fresh workers per
-fixture produce eighteen rows in a uniquely named JSON file in that directory.
+image memory. Inputs are analyzed, never executed. A generated original C fixture with 300
+named functions exercises inventories beyond one discovery batch. Three fresh
+workers per fixture produce twenty-one rows in a uniquely named JSON file in
+that directory.
 The input hashes are checked before and after each run. Fixtures are removed
 after worker shutdown; the JSON remains available for local comparison.
 
 ## Timing and memory scope
 
 The timed sequence includes client/context creation, protected worker startup,
-Open, Discover, Graph, Decompile, transport and result validation.
+Open, resumable Discover through queue exhaustion, a second Discover action, Graph,
+Decompile, transport and result validation. The second action must perform no
+repeated seed walks.
 Each request retains its normal deadline; progress cannot extend it. The report
 records separate request times, elapsed time through validated decompilation,
 and a separate shutdown/reaping time. Fixture compilation, builds and hashing
@@ -42,9 +46,13 @@ enumeration and shutdown accounting. The client must observe multiple processes
 and wait for observed descendants to be reaped.
 
 The report contains summed RSS and PSS observations, before-start/load/retained
-result samples, maximum observed aggregates, sample/process counts, request work
-counts (including data-access candidates, operations and omissions) and result
-sizes. RSS can count shared pages repeatedly. PSS apportions
+result samples, maximum observed aggregates, sample/process counts, per-batch
+and cumulative discovery work counts (including data-access candidates,
+operations and omissions), newly admitted functions, second-action work,
+serialized discovery reply bytes, and request latency. Discovery latency is the
+sum of worker request times; queue construction and aggregate merging are
+outside those individual timings. A second Discover after queue exhaustion
+performs no worker request. RSS can count shared pages repeatedly. PSS apportions
 them among processes. See the [Linux kernel's `/proc` documentation](https://docs.kernel.org/filesystems/proc.html).
 Process reads are sequential, so aggregates are non-atomic estimates. Short peaks
 can be missed and changing memory can skew totals in either direction. Sampling

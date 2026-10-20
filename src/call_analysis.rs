@@ -21,6 +21,25 @@ impl AnalysisProgress {
     }
 }
 
+/// An aligned instruction start inside a file-backed executable section, using
+/// indexed checked lookups. Discovery seed admission uses the same rule.
+pub fn code_address(info: &BinaryInfo, address: u64) -> bool {
+    let alignment = if info.architecture == "AArch64" { 4 } else { 1 };
+    address.is_multiple_of(alignment)
+        && info
+            .sections
+            .partition_point(|section| section.address <= address)
+            .checked_sub(1)
+            .and_then(|index| info.sections.get(index))
+            .is_some_and(|section| {
+                section.executable
+                    && address
+                        .checked_sub(section.address)
+                        .and_then(|offset| offset.checked_add(alignment))
+                        .is_some_and(|end| end <= section.file_size.min(section.size))
+            })
+}
+
 impl CallAnalysis {
     pub fn validate(&self, info: &BinaryInfo, functions: &[FunctionInfo]) -> Result<(), String> {
         if self.functions_examined > MAX_ANALYSIS_FUNCTIONS
@@ -38,22 +57,7 @@ impl CallAnalysis {
             return Err("Call analysis exceeds its work or result bounds".into());
         }
         validate_functions(functions, MAX_FUNCTION_NAME_BYTES, true)?;
-        let alignment = if info.architecture == "AArch64" { 4 } else { 1 };
-        let valid = |address: u64| {
-            let section = info
-                .sections
-                .partition_point(|section| section.address <= address)
-                .checked_sub(1)
-                .and_then(|index| info.sections.get(index));
-            address.is_multiple_of(alignment)
-                && section.is_some_and(|section| {
-                    section.executable
-                        && address
-                            .checked_sub(section.address)
-                            .and_then(|offset| offset.checked_add(alignment))
-                            .is_some_and(|end| end <= section.file_size.min(section.size))
-                })
-        };
+        let valid = |address| code_address(info, address);
         for (index, function) in functions.iter().enumerate() {
             if !valid(function.address)
                 || function.name.len() > 256
