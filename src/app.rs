@@ -182,6 +182,65 @@ struct RequestOrigin {
     byte_origin: (Option<u64>, Tab),
 }
 
+/// Analyses offered by the auto-analysis dialog; kept for the session.
+#[derive(Clone, Copy)]
+struct AnalysisOptions {
+    functions: bool,
+    strings: bool,
+    crypto: bool,
+}
+
+impl Default for AnalysisOptions {
+    fn default() -> Self {
+        Self {
+            functions: true,
+            strings: true,
+            crypto: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AnalysisStep {
+    Strings,
+    Crypto,
+    Functions,
+}
+
+impl AnalysisStep {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Strings => "defined strings",
+            Self::Crypto => "FindCrypt constants",
+            Self::Functions => "function discovery",
+        }
+    }
+
+    fn owns(self, request: &Request) -> bool {
+        matches!(
+            (self, request),
+            (
+                Self::Strings,
+                Request::Strings | Request::StringsWithOptions { .. }
+            ) | (Self::Crypto, Request::Crypto)
+        )
+    }
+}
+
+struct AnalyzePrompt {
+    generation: u64,
+    first_open: bool,
+}
+
+/// Selected analyses run one at a time whenever the worker is otherwise idle,
+/// so they never preempt navigation or each other.
+struct AnalysisPlan {
+    generation: u64,
+    steps: VecDeque<AnalysisStep>,
+    current: Option<AnalysisStep>,
+    total: usize,
+}
+
 #[derive(Clone)]
 enum Intent {
     OpenDialog,
@@ -261,6 +320,9 @@ pub struct DesktopApp {
     worker_epoch: u64,
     discovery_sync: Option<VecDeque<u64>>,
     discovery_bytes: Option<(Request, RequestOrigin)>,
+    analysis_options: AnalysisOptions,
+    analyze_prompt: Option<AnalyzePrompt>,
+    analysis_plan: Option<AnalysisPlan>,
     reference_data: bool,
     reference_target: Option<u64>,
     reference_query: String,
@@ -358,6 +420,9 @@ impl DesktopApp {
             worker_epoch: 0,
             discovery_sync: None,
             discovery_bytes: None,
+            analysis_options: AnalysisOptions::default(),
+            analyze_prompt: None,
+            analysis_plan: None,
             reference_data: false,
             reference_target: None,
             reference_query: String::new(),
@@ -498,6 +563,8 @@ impl DesktopApp {
         self.discovery_summary = None;
         self.discovery_sync = None;
         self.discovery_bytes = None;
+        self.analyze_prompt = None;
+        self.analysis_plan = None;
         self.call_index = None;
         self.reference_data = false;
         self.reference_target = None;
@@ -669,6 +736,13 @@ impl DesktopApp {
             return;
         }
         if self.client.is_none() || self.pending.is_some() {
+            // A user action preempts an automatic scan; run that scan again later.
+            if let (Some(pending), Some(plan)) = (&self.pending, &mut self.analysis_plan)
+                && let Some(step) = plan.current.filter(|step| step.owns(&pending.request))
+            {
+                plan.steps.push_front(step);
+                plan.current = None;
+            }
             if let Some(path) = self.binary_path.clone() {
                 let continue_discovery = self.discovery_running;
                 self.start_open(path, true, Some(request), context);
@@ -940,6 +1014,68 @@ impl DesktopApp {
         self.update_discovery_summary();
     }
 
+    fn start_auto_analysis(&mut self) {
+        let options = self.analysis_options;
+        let packed = self
+            .info
+            .as_ref()
+            .is_some_and(crate::packing::has_upx_warning);
+        // Short whole-image scans first; discovery may continue for many batches.
+        let steps: VecDeque<_> = [
+            (options.strings, AnalysisStep::Strings),
+            (options.crypto, AnalysisStep::Crypto),
+            (options.functions && !packed, AnalysisStep::Functions),
+        ]
+        .into_iter()
+        .filter_map(|(enabled, step)| enabled.then_some(step))
+        .collect();
+        self.analysis_plan = (!steps.is_empty()).then_some(AnalysisPlan {
+            generation: self.generation,
+            total: steps.len(),
+            steps,
+            current: None,
+        });
+    }
+
+    fn pump_analysis(&mut self, context: &egui::Context) {
+        let Some(plan) = &mut self.analysis_plan else {
+            return;
+        };
+        if plan.generation != self.generation {
+            self.analysis_plan = None;
+            return;
+        }
+        if self.pending.is_some()
+            || self.opening.is_some()
+            || !self.queue.is_empty()
+            || self.discovery_running
+            || self.discovery_job.is_some()
+            || self.discovery_bytes.is_some()
+        {
+            return;
+        }
+        // The previous step finished, failed, or was cancelled; each runs once
+        // unless a user action preempted it.
+        plan.current = plan.steps.pop_front();
+        let Some(step) = plan.current else {
+            self.analysis_plan = None;
+            self.status = "Auto analysis finished".into();
+            return;
+        };
+        let request = match step {
+            AnalysisStep::Strings => self.string_request(),
+            AnalysisStep::Crypto => Request::Crypto,
+            AnalysisStep::Functions => Request::Discover,
+        };
+        self.request(request, context);
+    }
+
+    fn automatic(&self, step: AnalysisStep) -> bool {
+        self.analysis_plan
+            .as_ref()
+            .is_some_and(|plan| plan.current == Some(step))
+    }
+
     fn poll_worker(&mut self, context: &egui::Context) {
         self.poll_discovery(context);
         if self
@@ -968,6 +1104,7 @@ impl DesktopApp {
         }
         self.dispatch_queued();
         self.pump_discovery(context);
+        self.pump_analysis(context);
         if self.pending.is_some() || self.discovery_job.is_some() {
             context.request_repaint_after(Duration::from_millis(100));
         }
@@ -1160,6 +1297,13 @@ impl DesktopApp {
                         self.schedule_open_follow(request, opening.follow_origin);
                     }
                 } else {
+                    if !opening.preserve {
+                        // Like Ghidra, offer analysis when a binary is first opened.
+                        self.analyze_prompt = Some(AnalyzePrompt {
+                            generation: self.generation,
+                            first_open: true,
+                        });
+                    }
                     self.navigate(first, true, context);
                 }
             }
@@ -1410,7 +1554,9 @@ impl DesktopApp {
                 self.strings_truncated = truncated;
                 self.strings_scanned = true;
                 self.rebuild_string_filter();
-                self.tab = Tab::Strings;
+                if !self.automatic(AnalysisStep::Strings) {
+                    self.tab = Tab::Strings;
+                }
                 self.status = if truncated {
                     format!(
                         "Showing {} string previews; raise the minimum length and rescan for fewer matches",
@@ -1424,7 +1570,9 @@ impl DesktopApp {
                 self.cached_crypto = false;
                 self.crypto = matches;
                 self.crypto_truncated = truncated;
-                self.tab = Tab::Crypto;
+                if !self.automatic(AnalysisStep::Crypto) {
+                    self.tab = Tab::Crypto;
+                }
                 self.status = if truncated {
                     "FindCrypt result limit reached"
                 } else {
@@ -2095,6 +2243,84 @@ impl DesktopApp {
         }
     }
 
+    fn analyze_window(&mut self, context: &egui::Context) {
+        let Some(prompt) = &self.analyze_prompt else {
+            return;
+        };
+        let Some(info) = self
+            .info
+            .as_ref()
+            .filter(|_| prompt.generation == self.generation)
+        else {
+            self.analyze_prompt = None;
+            return;
+        };
+        let first_open = prompt.first_open;
+        let packed = crate::packing::has_upx_warning(info);
+        let name = crop(
+            &std::path::Path::new(&info.path)
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy(),
+            60,
+        );
+        let options = &mut self.analysis_options;
+        let mut analyze = false;
+        let mut dismiss = false;
+        let modal = egui::Modal::new(egui::Id::unique("auto-analysis")).show(context, |ui| {
+            ui.set_width(440.0);
+            ui.heading(if first_open { "Analyze binary?" } else { "Auto Analysis" });
+            ui.label(if first_open {
+                format!("{name} has not been analyzed. Analyze it now?")
+            } else {
+                format!("Choose the analyses to run on {name}.")
+            });
+            ui.add_space(8.0);
+            ui.add_enabled(
+                !packed,
+                egui::Checkbox::new(&mut options.functions, "Function discovery and references"),
+            );
+            ui.weak(if packed {
+                crate::packing::UPX_ANALYSIS_ERROR
+            } else {
+                "Follows confirmed direct calls and indexes call and data references."
+            });
+            ui.checkbox(&mut options.strings, "Defined strings");
+            ui.add_enabled_ui(options.strings, |ui| {
+                ui.horizontal(|ui| {
+                    ui.weak("Minimum characters");
+                    ui.add(
+                        egui::DragValue::new(&mut self.string_minimum)
+                            .range(MIN_STRING_LENGTH..=MAX_STRING_MINIMUM)
+                            .speed(1),
+                    );
+                });
+            });
+            ui.checkbox(&mut options.crypto, "FindCrypt constants");
+            ui.weak("Heuristic matches for standardized cryptographic constants.");
+            ui.add_space(8.0);
+            ui.weak("Analysis runs in the background while you browse. Cancel it from the Analysis menu.");
+            ui.separator();
+            ui.horizontal(|ui| {
+                let selected = options.functions && !packed || options.strings || options.crypto;
+                analyze = ui.add_enabled(selected, egui::Button::new("Analyze")).clicked();
+                dismiss = ui
+                    .button(if first_open { "Not now" } else { "Cancel" })
+                    .clicked();
+            });
+        });
+        if analyze {
+            self.analyze_prompt = None;
+            self.start_auto_analysis();
+            self.pump_analysis(context);
+        } else if dismiss
+            // A stray click beside the one-time prompt should not dismiss it.
+            || modal.should_close() && context.input(|input| input.key_pressed(egui::Key::Escape))
+        {
+            self.analyze_prompt = None;
+        }
+    }
+
     fn begin_rename(&mut self) {
         let (Some(address), Some(info), Some(session)) = (self.selected, &self.info, &self.session)
         else {
@@ -2433,6 +2659,14 @@ impl DesktopApp {
             });
             ui.menu_button("Analysis", |ui| {
                 ui.add_enabled_ui(loaded, |ui| {
+                    if ui.button("Auto analyze…").clicked() {
+                        self.analyze_prompt = Some(AnalyzePrompt {
+                            generation: self.generation,
+                            first_open: false,
+                        });
+                        ui.close();
+                    }
+                    ui.separator();
                     if ui.add_enabled(self.view.is_some(), egui::Button::new("Refresh function")).clicked() {
                         if let Some(address) = self.view.as_ref().map(|view| view.address) {
                             self.navigate(address, false, &context);
@@ -2454,12 +2688,14 @@ impl DesktopApp {
                     .add_enabled(
                         self.pending.is_some()
                             || self.discovery_running
-                            || self.discovery_job.is_some(),
+                            || self.discovery_job.is_some()
+                            || self.analysis_plan.is_some(),
                         egui::Button::new("Cancel analysis"),
                     )
                     .clicked()
                 {
                     self.stop_worker();
+                    self.analysis_plan = None;
                     self.status = "Analysis cancelled".into();
                     ui.close();
                 }
@@ -3713,6 +3949,15 @@ impl DesktopApp {
                             ui.spinner();
                         }
                         ui.label(&self.status);
+                        if let Some(plan) = &self.analysis_plan {
+                            let step = plan.current.or(plan.steps.front().copied());
+                            ui.weak(format!(
+                                "Auto analysis {}/{}{}",
+                                plan.total - plan.steps.len(),
+                                plan.total,
+                                step.map_or(String::new(), |step| format!(" · {}", step.label())),
+                            ));
+                        }
                         if let Some(summary) = &self.discovery_summary {
                             ui.weak(summary);
                         }
@@ -3794,6 +4039,7 @@ impl DesktopApp {
             });
         self.annotations_open = annotations_open;
         self.unsaved_window(&context);
+        self.analyze_window(&context);
         self.file_dialogs.show(&context);
         self.browser_dialog(&context);
         self.handle_shortcuts(&context);
@@ -3821,6 +4067,8 @@ impl DesktopApp {
         let Some(capture) = guard.as_mut() else {
             return;
         };
+        // Screenshots show the browser, not the first-open analysis prompt.
+        self.analyze_prompt = None;
         let busy = self.pending.is_some()
             || self.opening.is_some()
             || !self.queue.is_empty()
@@ -5243,6 +5491,142 @@ mod tests {
         let output = frame(&mut app);
         assert!(!output.shapes.iter().any(|shape| matches!(&shape.shape,
             egui::epaint::Shape::Text(text) if text.galley.text().contains("Decompiling ·"))));
+    }
+
+    #[test]
+    fn analyze_prompt_queues_the_checked_analyses_and_skips_discovery_for_packed_images() {
+        let context = egui::Context::default();
+        theme::install(&context);
+        let frame = |app: &mut DesktopApp, events| {
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    events,
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1200.0, 800.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| app.draw(ui),
+            );
+            output.textures_delta.clear();
+            output
+        };
+        let click = |output: &egui::FullOutput, label: &str| {
+            output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Text(text) if text.galley.text() == label => {
+                        Some(text.pos + text.galley.rect.center().to_vec2())
+                    }
+                    _ => None,
+                })
+                .map(pointer_events)
+                .expect("rendered dialog control")
+        };
+        for packed in [false, true] {
+            let mut app = keyboard_app();
+            if packed {
+                app.info
+                    .as_mut()
+                    .unwrap()
+                    .warnings
+                    .push(crate::packing::UPX_PACKED_WARNING.into());
+            }
+            app.analyze_prompt = Some(AnalyzePrompt {
+                generation: app.generation,
+                first_open: true,
+            });
+            frame(&mut app, Vec::new());
+            let output = frame(&mut app, Vec::new());
+            let events = click(&output, "FindCrypt constants");
+            frame(&mut app, events);
+            let output = frame(&mut app, Vec::new());
+            let events = click(&output, "Analyze");
+            frame(&mut app, events);
+            assert!(app.analyze_prompt.is_none());
+            // Without a worker the first scan is marked current but sends nothing.
+            let plan = app.analysis_plan.as_ref().expect("analysis plan");
+            assert_eq!(plan.current, Some(AnalysisStep::Strings));
+            let expected = if packed {
+                vec![AnalysisStep::Crypto]
+            } else {
+                vec![AnalysisStep::Crypto, AnalysisStep::Functions]
+            };
+            assert_eq!(Vec::from(plan.steps.clone()), expected);
+        }
+        let mut app = keyboard_app();
+        app.analyze_prompt = Some(AnalyzePrompt {
+            generation: app.generation,
+            first_open: true,
+        });
+        frame(&mut app, Vec::new());
+        frame(&mut app, pointer_events(egui::pos2(1100.0, 700.0)));
+        let output = frame(&mut app, Vec::new());
+        assert!(
+            app.analyze_prompt.is_some(),
+            "backdrop clicks keep the prompt"
+        );
+        let events = click(&output, "Not now");
+        frame(&mut app, events);
+        assert!(app.analyze_prompt.is_none() && app.analysis_plan.is_none());
+    }
+
+    #[test]
+    fn auto_analysis_waits_for_idle_requeues_preempted_scans_and_keeps_the_tab() {
+        let context = egui::Context::default();
+        let mut app = keyboard_app();
+        let pending = |app: &DesktopApp, request| Pending {
+            id: 1,
+            request,
+            started: Instant::now(),
+            selection: app.selection_generation,
+            revision: app.revision,
+            byte_origin: (app.selected, app.tab),
+        };
+        app.start_auto_analysis();
+        app.pending = Some(pending(&app, Request::Graph { address: 0x1000 }));
+        app.pump_analysis(&context);
+        assert_eq!(app.analysis_plan.as_ref().unwrap().current, None);
+        app.pending = None;
+        app.pump_analysis(&context);
+        assert_eq!(
+            app.analysis_plan.as_ref().unwrap().current,
+            Some(AnalysisStep::Strings)
+        );
+        // Navigating restarts the busy worker; the interrupted scan runs again later.
+        app.pending = Some(pending(&app, app.string_request()));
+        app.navigate(0x1040, true, &context);
+        let plan = app.analysis_plan.as_ref().unwrap();
+        assert_eq!(plan.current, None);
+        assert_eq!(
+            Vec::from(plan.steps.clone()),
+            [AnalysisStep::Strings, AnalysisStep::Functions]
+        );
+        app.pending = None;
+        app.pump_analysis(&context);
+        app.receive(
+            pending(&app, app.string_request()),
+            Response::Strings {
+                strings: Vec::new(),
+                truncated: false,
+            },
+            &context,
+        );
+        assert!(app.strings_scanned);
+        assert!(app.tab == Tab::Listing);
+        app.pump_analysis(&context);
+        assert_eq!(
+            app.analysis_plan.as_ref().unwrap().current,
+            Some(AnalysisStep::Functions)
+        );
+        while app.discovery_job.is_some() {
+            app.poll_discovery(&context);
+        }
+        app.pump_analysis(&context);
+        assert!(app.analysis_plan.is_none());
+        assert_eq!(app.status, "Auto analysis finished");
     }
 
     #[test]
