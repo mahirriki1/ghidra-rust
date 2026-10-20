@@ -5,6 +5,7 @@
 //! `GHIDRA_RUST_CAPTURE_GOTO=<hex>` navigates once the binary is open,
 //! `GHIDRA_RUST_CAPTURE_TAB=graph` shows the function graph, and
 //! `GHIDRA_RUST_CAPTURE_SELECT=<hex>` then selects one of its instructions.
+//! The first-open analysis prompt is dismissed without analyzing.
 use eframe::egui;
 use std::io::Write;
 use std::time::{Duration, Instant};
