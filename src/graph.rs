@@ -51,6 +51,7 @@ pub struct GraphCanvas {
     needs_fit: bool,
     needs_initial_view: bool,
     reveal: Option<u64>,
+    comment_key: Option<(u64, u64)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,11 +83,29 @@ impl GraphCanvas {
             needs_fit: false,
             needs_initial_view: true,
             reveal: None,
+            comment_key: None,
         }
     }
 
     pub fn reveal_instruction(&mut self, address: u64) {
         self.reveal = Some(address);
+    }
+
+    /// Refresh only derived geometry, retaining the user's camera and pending
+    /// reveal. Previews are bounded and cached by the app's annotation revision.
+    pub fn set_comments(
+        &mut self,
+        view: &FunctionView,
+        key: (u64, u64),
+        comments: &BTreeMap<u64, String>,
+    ) {
+        if self.function != view.address {
+            *self = Self::new(view);
+        }
+        if self.comment_key != Some(key) {
+            self.layout = Layout::with_comments(view, comments);
+            self.comment_key = Some(key);
+        }
     }
 
     pub fn show(
@@ -318,14 +337,18 @@ impl GraphCanvas {
                         Align2::LEFT_CENTER,
                         text,
                         FontId::monospace(12.0 * self.zoom),
-                        theme::TEXT,
+                        if text.starts_with("; ") {
+                            theme::SYNTAX_COMMENT
+                        } else {
+                            theme::TEXT
+                        },
                     );
                 }
                 if node.remaining > 0 {
                     node_painter.text(
                         screen(pos2(node.rect.left() + 8.0, node.rect.bottom() - 11.0)),
                         Align2::LEFT_CENTER,
-                        format!("… {} more instructions", node.remaining),
+                        format!("… {} more rows", node.remaining),
                         FontId::monospace(11.0 * self.zoom),
                         theme::MUTED,
                     );
@@ -420,6 +443,10 @@ impl Node {
 
 impl Layout {
     fn new(view: &FunctionView) -> Self {
+        Self::with_comments(view, &BTreeMap::new())
+    }
+
+    fn with_comments(view: &FunctionView, comments: &BTreeMap<u64, String>) -> Self {
         let mut blocks: BTreeMap<_, _> = BTreeMap::new();
         for block in view.blocks.iter().take(MAX_BLOCKS) {
             blocks.entry(block.address).or_insert(block);
@@ -465,9 +492,15 @@ impl Layout {
             let row_width = addresses.len() as f32 * (WIDTH + 60.0) - 60.0;
             for (column, address) in addresses.iter().enumerate() {
                 let block = blocks[address];
-                let remaining = block.instructions.len().saturating_sub(PREVIEW);
+                let display_rows = block.instructions.len()
+                    + block
+                        .instructions
+                        .iter()
+                        .filter(|i| comments.contains_key(&i.address))
+                        .count();
+                let remaining = display_rows.saturating_sub(PREVIEW);
                 let height = HEADER
-                    + block.instructions.len().min(PREVIEW) as f32 * ROW
+                    + display_rows.min(PREVIEW) as f32 * ROW
                     + if remaining > 0 { 23.0 } else { 8.0 };
                 row_height = row_height.max(height);
                 let rect = Rect::from_min_size(
@@ -488,8 +521,8 @@ impl Layout {
                     rows: block
                         .instructions
                         .iter()
-                        .map(|instruction| {
-                            (
+                        .flat_map(|instruction| {
+                            let mut rows = vec![(
                                 instruction.address,
                                 crop(
                                     &format!(
@@ -500,7 +533,17 @@ impl Layout {
                                     ),
                                     53,
                                 ),
-                            )
+                            )];
+                            if let Some(comment) = comments.get(&instruction.address) {
+                                rows.push((
+                                    instruction.address,
+                                    format!(
+                                        "; {}",
+                                        crate::annotation_display::preview(comment, 53)
+                                    ),
+                                ));
+                            }
+                            rows
                         })
                         .collect(),
                     remaining,
@@ -1078,5 +1121,64 @@ mod tests {
         });
         output.textures_delta.clear();
         assert_eq!(camera, (graph.zoom, graph.pan));
+    }
+
+    #[test]
+    fn graph_comment_rows_keep_exact_address_hits_and_update_without_resetting_camera() {
+        let view = fixture();
+        let address = view.address + 3;
+        let mut graph = GraphCanvas::new(&view);
+        let context = egui::Context::default();
+        let mut comments = BTreeMap::from([(address, "branch comment */ literal".into())]);
+        graph.set_comments(&view, (1, 1), &comments);
+        // Keep the entry on screen at readable scale for an actual paint check.
+        graph.zoom = 1.0;
+        graph.pan = vec2(5.0, 5.0);
+        graph.needs_initial_view = false;
+        let node = graph
+            .layout
+            .nodes
+            .iter()
+            .find(|n| n.address == view.address)
+            .unwrap();
+        assert_eq!(
+            node.rows[2],
+            (address, "; branch comment */ literal".into())
+        );
+        assert_eq!(
+            node.hit_at(node.rect.min + vec2(10.0, HEADER + 2.5 * ROW), 1.0, 0),
+            address
+        );
+        let camera = (graph.zoom, graph.pan);
+        // Center the entry for the paint check; fixture layout has several columns.
+        graph.pan = vec2(5.0, 5.0) - node.rect.min.to_vec2();
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| {
+            graph.show(ui, &view, Some(address));
+        });
+        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+            egui::epaint::Shape::Text(text) if text.galley.text().contains("branch comment */ literal"))));
+        output.textures_delta.clear();
+        graph.pan = camera.1;
+        comments.insert(address, "edited".into());
+        graph.set_comments(&view, (1, 2), &comments);
+        assert_eq!((graph.zoom, graph.pan), camera);
+        assert!(
+            graph
+                .layout
+                .nodes
+                .iter()
+                .flat_map(|n| &n.rows)
+                .any(|(pc, text)| *pc == address && text == "; edited")
+        );
+        comments.clear();
+        graph.set_comments(&view, (1, 3), &comments);
+        assert!(
+            !graph
+                .layout
+                .nodes
+                .iter()
+                .flat_map(|n| &n.rows)
+                .any(|(_, text)| text.starts_with("; "))
+        );
     }
 }

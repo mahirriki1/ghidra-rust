@@ -133,6 +133,18 @@ unmapped declarations, and results outside the bounded graph can have no visible
 counterpart; the app does not invent one. Double-clicking a known call still
 navigates to that function.
 
+Address comments appear beside instructions in the Listing and on their own rows
+in the Function Graph. The Decompiler shows each comment once above a genuinely
+mapped statement; function-entry comments appear at the top. Comments for
+instructions without visible pseudocode remain under **Comments without visible
+code**. Long comments use single-line previews: double-click a decompiler comment,
+use an instruction's context menu, or press **;** to read and edit the full text.
+**Annotate** (also **View → Annotations**) opens a filterable browser of addresses,
+labels, and comments. Click an address to jump, or **Edit** to open its comment;
+Back/Forward returns to the exact instruction. A known function context is retained
+when the address has been observed in its graph or decompiled code. Data annotations
+open the bytes in Decode rather than treating their addresses as functions.
+
 ![Selected CFG instruction and corresponding pseudocode](docs/images/desktop-selection-sync.png)
 
 The README screenshots are captured from the native desktop built with

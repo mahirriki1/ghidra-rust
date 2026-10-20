@@ -1,4 +1,5 @@
 pub mod analysis;
+mod annotation_display;
 pub mod app;
 mod architecture;
 mod bounded;
