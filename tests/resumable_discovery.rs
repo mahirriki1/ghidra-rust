@@ -1,6 +1,7 @@
 //! Continuation through real contained worker restarts; original generated code.
 #[allow(dead_code)]
 mod common;
+mod inventory;
 use ghidra_rust::client::{WorkerClient, WorkerEvent};
 use ghidra_rust::discovery::{Discovery, Status};
 use ghidra_rust::model::*;
@@ -89,10 +90,15 @@ fn all_known_seeds_survive_cancel_restart_and_interactive_requests() {
         .len()
             < 60 * 1024
     );
-    let Response::DiscoveryBatch { batch: first } = request(&mut worker, first) else {
+    let mut inventory = inventory::Inventory::default();
+    let first = inventory.bind(first);
+    let Response::DiscoveryBatch { batch: mut reply } = request(&mut worker, first.clone()) else {
         panic!()
     };
-    state.commit(&info, &first).unwrap();
+    inventory
+        .commit(&mut state, &info, &first, &mut reply)
+        .unwrap();
+    let first_functions = inventory.functions().to_vec();
     assert!(!state.report.references.is_empty());
     let committed = state.report.references.clone();
     let abandoned = state.begin(1, 1, 0).unwrap();
@@ -102,7 +108,7 @@ fn all_known_seeds_survive_cancel_restart_and_interactive_requests() {
     let mut worker = self::worker(&path);
     let reopened = open(&mut worker, &path);
     assert_eq!(info.sha256, reopened.sha256);
-    for functions in first.functions.chunks(MAX_DISCOVERY_SYNC_FUNCTIONS) {
+    for functions in first_functions.chunks(MAX_DISCOVERY_SYNC_FUNCTIONS) {
         assert!(matches!(
             request(
                 &mut worker,
@@ -123,11 +129,18 @@ fn all_known_seeds_survive_cancel_restart_and_interactive_requests() {
         ),
         Response::Bytes { .. }
     ));
+    let mut unchanged = 0;
     while let Some(batch) = state.begin(1, 2, 0) {
-        let Response::DiscoveryBatch { batch } = request(&mut worker, batch) else {
+        let batch = inventory.bind(batch);
+        let Response::DiscoveryBatch { batch: mut reply } = request(&mut worker, batch.clone())
+        else {
             panic!()
         };
-        state.commit(&info, &batch).unwrap();
+        unchanged += usize::from(
+            !inventory
+                .commit(&mut state, &info, &batch, &mut reply)
+                .unwrap(),
+        );
     }
     for function in &info.functions {
         assert!(matches!(
@@ -137,7 +150,10 @@ fn all_known_seeds_survive_cancel_restart_and_interactive_requests() {
     }
     assert!(state.batches > 2);
     assert_eq!(state.remaining(), 0);
-    assert_eq!(state.report.functions_examined, first.functions.len());
+    assert_eq!(state.report.functions_examined, first_functions.len());
+    // The replacement worker's first reply carries its inventory; replays
+    // that leave it unchanged then send no rows.
+    assert!(unchanged > 0 && unchanged < state.batches);
     assert!(
         committed
             .iter()
@@ -162,19 +178,23 @@ fn confirmed_callees_are_scheduled_in_later_batches_on_stripped_image() {
         info.functions.iter().map(|f| f.address),
         false,
     );
-    let Response::DiscoveryBatch { batch: first } =
-        request(&mut worker, state.begin(1, 1, 0).unwrap())
-    else {
+    let mut inventory = inventory::Inventory::default();
+    let first = inventory.bind(state.begin(1, 1, 0).unwrap());
+    let Response::DiscoveryBatch { batch: mut reply } = request(&mut worker, first.clone()) else {
         panic!()
     };
-    assert_eq!(first.analysis.functions_examined, 1);
-    state.commit(&info, &first).unwrap();
+    assert_eq!(reply.analysis.functions_examined, 1);
+    inventory
+        .commit(&mut state, &info, &first, &mut reply)
+        .unwrap();
     assert_eq!(state.status(base + 48), Some(Status::Pending));
-    let Response::DiscoveryBatch { batch } = request(&mut worker, state.begin(1, 1, 0).unwrap())
-    else {
+    let second = inventory.bind(state.begin(1, 1, 0).unwrap());
+    let Response::DiscoveryBatch { batch: mut reply } = request(&mut worker, second.clone()) else {
         panic!()
     };
-    state.commit(&info, &batch).unwrap();
+    inventory
+        .commit(&mut state, &info, &second, &mut reply)
+        .unwrap();
     assert!(matches!(
         state.status(base + 48),
         Some(Status::Done | Status::PartialByOwnLimit)

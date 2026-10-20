@@ -12,6 +12,7 @@
 #![cfg(windows)]
 #![recursion_limit = "256"]
 mod common;
+mod inventory;
 
 use ghidra_rust::call_analysis::{CallIndex, code_address};
 use ghidra_rust::client::{WorkerClient, WorkerEvent};
@@ -915,6 +916,7 @@ fn discover(
     );
     let new_ms = milliseconds(start);
     let mut functions = info.functions.clone();
+    let mut adopted = inventory::Inventory::default();
     let mut index = CallIndex::new(CallAnalysis::default());
     let mut timings = Vec::new();
     loop {
@@ -935,12 +937,17 @@ fn discover(
             state.batches < MAX_FUNCTIONS,
             "Discovery failed to make bounded seed progress"
         );
-        let Response::DiscoveryBatch { batch } = sampler.request(worker, request, "discover")
+        let request = adopted.bind(request);
+        let Response::DiscoveryBatch { mut batch } =
+            sampler.request(worker, request.clone(), "discover")
         else {
             panic!("Expected bounded discovery reply");
         };
         let start = Instant::now();
-        state.commit(info, &batch).unwrap();
+        // The desktop's adoption: reconstruct the inventory, then commit.
+        let changed = adopted
+            .commit(&mut state, info, &request, &mut batch)
+            .unwrap();
         let commit_ms = milliseconds(start);
         let start = Instant::now();
         let snapshot = state.snapshot();
@@ -954,8 +961,8 @@ fn discover(
         let saved = state.save();
         let save_ms = milliseconds(start);
         saved.validate(info).unwrap();
-        functions = batch.functions;
-        let row = json!({ "batch": state.batches, "begin_ms": begin_ms,
+        functions = adopted.functions().to_vec();
+        let row = json!({ "batch": state.batches, "begin_ms": begin_ms, "inventory_changed": changed,
             "commit_ms": commit_ms, "snapshot_ms": snapshot_ms,
             "index_ms": index_ms, "save_ms": save_ms,
             "remaining": state.remaining(), "examined": batch.analysis.functions_examined,

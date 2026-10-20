@@ -34,6 +34,14 @@ pub struct LoadedProgram {
     pe_imports: BTreeMap<u64, String>,
     upx_packed: bool,
     pub info: BinaryInfo,
+    inventory: crate::inventory::Inventory,
+}
+
+/// Engine functions a discovery pass named, and whether it changed the engine
+/// in ways it cannot enumerate.
+struct Discovered {
+    added: Vec<FunctionInfo>,
+    opaque: bool,
 }
 
 fn engine_error(error: ghidra_decompiler::error::Error) -> String {
@@ -273,7 +281,9 @@ impl LoadedProgram {
             pe_ranges = pe.function_ranges;
             pe_imports = pe.imports;
         }
-        info.functions = function_list(&program, &mut info, &BTreeSet::new())?;
+        let (functions, mut rejected) = select_functions(&program, &info, &BTreeSet::new())?;
+        info.functions_truncated |= rejected;
+        info.functions = functions;
         if !upx_packed && target.name == "AArch64" && !pe_imports.is_empty() {
             let targets = info
                 .functions
@@ -294,8 +304,13 @@ impl LoadedProgram {
                     "ARM64 PE import-veneer naming on open is limited to the first 2,048 established function entries; discovery and selected-function analysis can name additional confirmed targets.",
                 );
             }
-            info.functions = function_list(&program, &mut info, &BTreeSet::new())?;
+            let functions;
+            (functions, rejected) = select_functions(&program, &info, &BTreeSet::new())?;
+            info.functions_truncated |= rejected;
+            info.functions = functions;
         }
+        let mut inventory = crate::inventory::Inventory::default();
+        inventory.certify(&info.functions, !rejected);
         if !info.entry.is_multiple_of(target.instruction_alignment)
             || !executable(
                 &info.sections,
@@ -313,6 +328,7 @@ impl LoadedProgram {
             pe_imports,
             upx_packed,
             info,
+            inventory,
         })
     }
 
@@ -328,6 +344,8 @@ impl LoadedProgram {
         crate::semantic::validate_renames(renames, Some(address))?;
         self.check_unpacked()?;
         self.check_code(address)?;
+        // Import resolution and the engine can name or create functions.
+        self.inventory.take_certificate(&self.info.functions);
         let imports = crate::performance::span("decompile_import_resolution");
         self.resolve_import_thunks(address)?;
         imports.finish(0);
@@ -378,9 +396,9 @@ impl LoadedProgram {
                 self.check_unpacked()?;
                 // Selected-function analysis can materialize and name a callee
                 // since the last published inventory. Preserve those names.
-                self.info.functions =
-                    function_list(&self.program, &mut self.info, &BTreeSet::new())?;
-                let (analysis, _) = self.discover_calls(None, progress)?;
+                self.rebuild_inventory(&BTreeSet::new())?;
+                self.inventory.take_certificate(&self.info.functions);
+                let (analysis, _, _) = self.discover_calls(None, progress)?;
                 // Evidence owners must survive inventory admission so every
                 // published reference has its caller in the same reply.
                 let owners = analysis
@@ -394,14 +412,18 @@ impl LoadedProgram {
                             .flat_map(|data| data.references.iter().map(|r| r.function)),
                     )
                     .collect();
-                self.info.functions = function_list(&self.program, &mut self.info, &owners)?;
+                self.rebuild_inventory(&owners)?;
                 Ok(Response::Functions {
                     functions: self.info.functions.clone(),
                     truncated: self.info.functions_truncated || analysis.partial,
                     analysis,
                 })
             }
-            Request::DiscoverBatch { binding, seeds } => {
+            Request::DiscoverBatch {
+                binding,
+                inventory_base,
+                seeds,
+            } => {
                 self.check_unpacked()?;
                 if seeds.is_empty()
                     || seeds.len() > MAX_ANALYSIS_FUNCTIONS
@@ -412,16 +434,36 @@ impl LoadedProgram {
                 for &address in &seeds {
                     self.check_code(address)?;
                 }
-                let (analysis, outcomes) = self.discover_calls(Some(&seeds), progress)?;
+                #[cfg(debug_assertions)]
+                let truncated_before = self.info.functions_truncated;
+                let certificate = self.inventory.take_certificate(&self.info.functions);
+                let (analysis, outcomes, discovered) =
+                    self.discover_calls(Some(&seeds), progress)?;
                 let owners = outcomes.iter().map(|outcome| outcome.address).collect();
-                self.info.functions = function_list(&self.program, &mut self.info, &owners)?;
-                let cloning = crate::performance::span("inventory_clone");
-                let functions = self.info.functions.clone();
-                cloning.finish(functions.len() as u64);
+                self.update_batch_inventory(certificate, &owners, discovered)?;
+                #[cfg(debug_assertions)]
+                {
+                    // The full selection remains the oracle for every shortcut.
+                    let (expected, rejected) =
+                        select_functions(&self.program, &self.info, &owners)?;
+                    assert_eq!(self.info.functions, expected, "inventory shortcut diverged");
+                    assert_eq!(self.info.functions_truncated, truncated_before || rejected);
+                }
+                let publishing = crate::performance::span("inventory_publish");
+                let inventory = self
+                    .inventory
+                    .publish(inventory_base, &self.info.functions)?;
+                publishing.finish(match &inventory {
+                    InventoryChange::Unchanged { .. } => 0,
+                    InventoryChange::Delta {
+                        upserts, removals, ..
+                    } => (upserts.len() + removals.len()) as u64,
+                    InventoryChange::Replace { functions, .. } => functions.len() as u64,
+                });
                 Ok(Response::DiscoveryBatch {
                     batch: DiscoveryBatch {
                         binding,
-                        functions,
+                        inventory,
                         truncated: self.info.functions_truncated,
                         analysis,
                         outcomes,
@@ -444,13 +486,13 @@ impl LoadedProgram {
                 }) {
                     return Ok(Response::FunctionsSynced);
                 }
+                self.inventory.take_certificate(&self.info.functions);
                 for function in functions {
                     self.program
                         .set_function_name(function.address, &function.name)
                         .map_err(engine_error)?;
                 }
-                self.info.functions =
-                    function_list(&self.program, &mut self.info, &BTreeSet::new())?;
+                self.rebuild_inventory(&BTreeSet::new())?;
                 Ok(Response::FunctionsSynced)
             }
             Request::Rename { address, name } => {
@@ -462,12 +504,12 @@ impl LoadedProgram {
                             .into(),
                     );
                 }
+                self.inventory.take_certificate(&self.info.functions);
                 self.program
                     .set_function_name(address, &name)
                     .map_err(engine_error)?;
                 self.synchronize_function_name(address, &name)?;
-                self.info.functions =
-                    function_list(&self.program, &mut self.info, &BTreeSet::new())?;
+                self.rebuild_inventory(&BTreeSet::new())?;
                 Ok(Response::Renamed { address, name })
             }
             Request::Bytes { address, length } => {
@@ -478,6 +520,87 @@ impl LoadedProgram {
             Request::StringsWithOptions { minimum_length } => self.strings(minimum_length),
             Request::Crypto => self.crypto(),
             Request::Open { .. } => Err("Open is handled by the worker.".into()),
+        }
+    }
+
+    /// Replaces the inventory, journaling the change for the next publication.
+    fn set_inventory(&mut self, functions: Vec<FunctionInfo>) {
+        self.inventory.record(&self.info.functions, &functions);
+        self.info.functions = functions;
+    }
+
+    /// [`function_list`] for `required` owners, certifying ordinary selections.
+    fn rebuild_inventory(&mut self, required: &BTreeSet<u64>) -> Result<(), String> {
+        let (functions, rejected) = select_functions(&self.program, &self.info, required)?;
+        self.info.functions_truncated |= rejected;
+        self.set_inventory(functions);
+        // When every candidate fits, owner priority cannot change the selection.
+        if required.is_empty() || !rejected {
+            self.inventory.certify(&self.info.functions, !rejected);
+        }
+        Ok(())
+    }
+
+    /// Brings the inventory to `function_list(required)` after a batch. A
+    /// certificate taken before the batch proves when no rebuild is needed:
+    /// promoting already admitted owners leaves a greedy selection unchanged,
+    /// and functions the batch named join a selection that admitted everything
+    /// because discovery only names them within the same budgets.
+    fn update_batch_inventory(
+        &mut self,
+        certificate: Option<bool>,
+        required: &BTreeSet<u64>,
+        discovered: Discovered,
+    ) -> Result<(), String> {
+        let owned = |functions: &[FunctionInfo]| {
+            required
+                .iter()
+                .all(|&address| function_at(functions, address).is_some())
+        };
+        match certificate {
+            Some(complete) if !discovered.opaque && discovered.added.is_empty() => {
+                if complete || owned(&self.info.functions) {
+                    crate::performance::event("inventory_reused", 0);
+                    self.inventory.certify(&self.info.functions, complete);
+                    Ok(())
+                } else {
+                    self.rebuild_inventory(required)
+                }
+            }
+            Some(true) if !discovered.opaque => {
+                crate::performance::event("inventory_extended", discovered.added.len() as u64);
+                let mut added = discovered.added;
+                added.sort_unstable_by_key(|function| function.address);
+                for function in &added {
+                    self.inventory.insert(function);
+                }
+                let current = std::mem::take(&mut self.info.functions);
+                let mut merged = Vec::with_capacity(current.len() + added.len());
+                let mut added = added.into_iter().peekable();
+                for function in current {
+                    while let Some(new) = added.next_if(|new| new.address < function.address) {
+                        merged.push(new);
+                    }
+                    merged.push(function);
+                }
+                merged.extend(added);
+                self.info.functions = merged;
+                self.inventory.certify(&self.info.functions, true);
+                Ok(())
+            }
+            _ => {
+                // Establish the ordinary selection, which serves any owners it admits.
+                let (functions, rejected) =
+                    select_functions(&self.program, &self.info, &BTreeSet::new())?;
+                if !rejected || owned(&functions) {
+                    self.info.functions_truncated |= rejected;
+                    self.set_inventory(functions);
+                    self.inventory.certify(&self.info.functions, !rejected);
+                    Ok(())
+                } else {
+                    self.rebuild_inventory(required)
+                }
+            }
         }
     }
 
@@ -492,7 +615,7 @@ impl LoadedProgram {
         &mut self,
         seeds: Option<&[u64]>,
         progress: &mut dyn FnMut(AnalysisProgress) -> Result<(), String>,
-    ) -> Result<(CallAnalysis, Vec<DiscoveryOutcome>), String> {
+    ) -> Result<(CallAnalysis, Vec<DiscoveryOutcome>, Discovered), String> {
         let _discovery = crate::performance::span("discovery_decode_cfg_data_admission");
         // Adapted from Ghidra FunctionAnalyzer's established-call rule and its
         // fallthrough-call exclusion. See NOTICE and docs/analysis.md. Decode
@@ -530,16 +653,18 @@ impl LoadedProgram {
         if self.target.name == "AArch64" {
             data = data.with_propagation();
         }
-        let mut known: BTreeMap<_, _> = self
-            .info
-            .functions
+        // The published inventory plus functions this pass names. Borrowed, so a
+        // batch does not copy every name of a large inventory.
+        let published = &self.info.functions;
+        let mut added = BTreeMap::new();
+        let mut opaque = false;
+        let known = |added: &BTreeMap<u64, String>, address| {
+            added.contains_key(&address) || function_at(published, address).is_some()
+        };
+        report.partial |= seeds.is_none() && published.len() > MAX_ANALYSIS_FUNCTIONS;
+        let mut name_bytes = published
             .iter()
-            .map(|f| (f.address, f.name.clone()))
-            .collect();
-        report.partial |= seeds.is_none() && known.len() > MAX_ANALYSIS_FUNCTIONS;
-        let mut name_bytes = known
-            .values()
-            .map(|name| json_escaped_len(name))
+            .map(|function| json_escaped_len(&function.name))
             .fold(0usize, usize::saturating_add)
             .min(MAX_FUNCTION_NAME_JSON_BYTES);
         let mut pending = VecDeque::new();
@@ -552,7 +677,11 @@ impl LoadedProgram {
                 scheduled.insert(self.info.entry);
                 pending.push_back(self.info.entry);
             }
-            for &address in known.keys().take(MAX_ANALYSIS_FUNCTIONS) {
+            for address in published
+                .iter()
+                .map(|function| function.address)
+                .take(MAX_ANALYSIS_FUNCTIONS)
+            {
                 if scheduled.insert(address) {
                     pending.push_back(address);
                 }
@@ -581,7 +710,7 @@ impl LoadedProgram {
                 recover_graph_budgeted(
                     &self.program,
                     &self.info.sections,
-                    &|candidate| known.contains_key(&candidate),
+                    &|candidate| known(&added, candidate),
                     address,
                     &self.pe_ranges,
                     &mut remaining,
@@ -601,17 +730,17 @@ impl LoadedProgram {
                         },
                     });
                     // Failed decoding must not materialize a new engine function.
-                    if !known.contains_key(&address) {
+                    if !known(&added, address) {
                         let name = format!("FUN_{address:08x}");
                         let bytes = json_escaped_len(&name);
-                        if known.len() < MAX_FUNCTIONS
+                        if published.len() + added.len() < MAX_FUNCTIONS
                             && bytes <= MAX_FUNCTION_NAME_JSON_BYTES - name_bytes
                         {
                             self.program
                                 .set_function_name(address, &name)
                                 .map_err(engine_error)?;
                             name_bytes += bytes;
-                            known.insert(address, name);
+                            added.insert(address, name);
                         } else {
                             report.partial = true;
                             continue;
@@ -680,7 +809,11 @@ impl LoadedProgram {
                 .chain(if seeds.is_some() {
                     outcomes.iter().map(|o| o.address).collect::<Vec<_>>()
                 } else {
-                    known.keys().copied().collect()
+                    published
+                        .iter()
+                        .map(|function| function.address)
+                        .chain(added.keys().copied())
+                        .collect()
                 })
                 .collect();
             report.partial |= targets.len() > crate::pe_symbols::MAX_THUNK_TARGETS;
@@ -689,6 +822,8 @@ impl LoadedProgram {
                 .take(crate::pe_symbols::MAX_THUNK_TARGETS)
                 .collect();
             let mut remaining = MAX_ANALYSIS_INSTRUCTIONS - report.decode_attempts;
+            // Import promotion renames engine functions without enumerating them.
+            opaque = true;
             report.partial |= !crate::pe_symbols::register_aarch64_import_thunks_budgeted(
                 &mut self.program,
                 &self.pe_imports,
@@ -700,7 +835,11 @@ impl LoadedProgram {
             report.decode_attempts = MAX_ANALYSIS_INSTRUCTIONS - remaining;
         }
         emit(AnalysisStage::Publish, &report, progress)?;
-        Ok((report, outcomes))
+        let added = added
+            .into_iter()
+            .map(|(address, name)| FunctionInfo { address, name })
+            .collect();
+        Ok((report, outcomes, Discovered { added, opaque }))
     }
 
     fn check_code(&self, address: u64) -> Result<(), String> {
@@ -889,11 +1028,25 @@ impl LoadedProgram {
 /// Publishes the engine inventory within the shared count and escaped-name
 /// budgets. The entry and `required` addresses (owners of evidence in the same
 /// reply) are admitted first; remaining entries follow engine address order.
+#[cfg(test)]
 fn function_list(
     program: &Program,
     info: &mut BinaryInfo,
     required: &BTreeSet<u64>,
 ) -> Result<Vec<FunctionInfo>, String> {
+    let (functions, rejected) = select_functions(program, info, required)?;
+    info.functions_truncated |= rejected;
+    Ok(functions)
+}
+
+/// The published inventory for the engine's functions: the entry first, then
+/// `required` owners, then the rest, each admitted while the count and name
+/// budgets allow. Also reports whether any candidate was rejected.
+fn select_functions(
+    program: &Program,
+    info: &BinaryInfo,
+    required: &BTreeSet<u64>,
+) -> Result<(Vec<FunctionInfo>, bool), String> {
     let _inventory = crate::performance::span("inventory_rebuild");
     let alignment = crate::architecture::instruction_alignment(program.language_id());
     let code_entry = |address: u64| {
@@ -943,11 +1096,13 @@ fn function_list(
     for function in first.into_iter().chain(rest) {
         admit(function, &mut admitted);
     }
-    info.functions_truncated |= truncated;
-    Ok(admitted
-        .into_iter()
-        .map(|(address, name)| FunctionInfo { address, name })
-        .collect())
+    Ok((
+        admitted
+            .into_iter()
+            .map(|(address, name)| FunctionInfo { address, name })
+            .collect(),
+        truncated,
+    ))
 }
 
 fn bounded_name(name: &str) -> String {
@@ -1565,6 +1720,7 @@ pub(crate) mod tests {
             pe_ranges: vec![],
             pe_imports: BTreeMap::new(),
             upx_packed: false,
+            inventory: Default::default(),
         }
     }
 
@@ -1888,6 +2044,87 @@ pub(crate) mod tests {
         assert!(functions.iter().any(|f| f.name == "original_129"));
     }
 
+    #[test]
+    fn discovery_batches_publish_reconstructable_inventory_changes() {
+        let mut bytes = vec![0xcc; 0x50];
+        bytes[..6].copy_from_slice(&[0xe8, 0x1b, 0, 0, 0, 0xc3]); // call 1020; ret
+        bytes[0x20] = 0xc3;
+        bytes[0x40] = 0xc3;
+        let mut loaded = raw_x86(bytes);
+        for (address, name) in [(0x1000, "root"), (0x1040, "leaf")] {
+            loaded.program.set_function_name(address, name).unwrap();
+        }
+        loaded.rebuild_inventory(&BTreeSet::new()).unwrap();
+        let mut adopted: Option<(u64, Vec<FunctionInfo>)> = None;
+        let mut batch = |loaded: &mut LoadedProgram, base: Option<u64>, seed: u64| {
+            let binding = DiscoveryBinding {
+                generation: 1,
+                epoch: 1,
+                revision: 0,
+                batch: seed,
+            };
+            let Response::DiscoveryBatch { batch } = loaded
+                .handle(Request::DiscoverBatch {
+                    binding,
+                    inventory_base: base,
+                    seeds: vec![seed],
+                })
+                .unwrap()
+            else {
+                panic!("Expected a discovery batch");
+            };
+            let change = batch.inventory;
+            let revision = change.revision();
+            let previous = adopted
+                .as_ref()
+                .filter(|(adopted, _)| Some(*adopted) == base)
+                .map(|(revision, functions)| (*revision, functions.as_slice()));
+            if let Some(functions) = change.clone().apply(previous).unwrap() {
+                adopted = Some((revision, functions));
+            }
+            assert_eq!(adopted.as_ref().unwrap().1, loaded.info.functions);
+            change
+        };
+        assert!(matches!(
+            batch(&mut loaded, None, 0x1000),
+            InventoryChange::Replace { revision: 1, .. }
+        ));
+        // The confirmed callee is named by discovery and sent as one new row.
+        let InventoryChange::Delta {
+            upserts, removals, ..
+        } = batch(&mut loaded, Some(1), 0x1020)
+        else {
+            panic!("Expected the named callee as a delta");
+        };
+        assert_eq!(upserts.len(), 1);
+        assert_eq!(upserts[0].name, "FUN_00001020");
+        assert!(removals.is_empty());
+        assert!(matches!(
+            batch(&mut loaded, Some(2), 0x1040),
+            InventoryChange::Unchanged { revision: 2 }
+        ));
+        loaded
+            .handle(Request::Rename {
+                address: 0x1040,
+                name: "renamed_leaf".into(),
+            })
+            .unwrap();
+        let InventoryChange::Delta { upserts, .. } = batch(&mut loaded, Some(2), 0x1000) else {
+            panic!("Expected the rename as a delta");
+        };
+        assert_eq!(upserts.len(), 1);
+        assert_eq!(upserts[0].name, "renamed_leaf");
+        // Engine work outside discovery invalidates the shortcut, not correctness.
+        loaded
+            .handle(Request::Decompile { address: 0x1000 })
+            .unwrap();
+        let current = batch(&mut loaded, Some(3), 0x1040).revision();
+        assert!(matches!(
+            batch(&mut loaded, Some(current - 1), 0x1040),
+            InventoryChange::Replace { .. }
+        ));
+    }
+
     pub(crate) fn elf_fixture() -> Vec<u8> {
         fn put16(bytes: &mut [u8], offset: usize, value: u16) {
             bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
@@ -2061,6 +2298,7 @@ pub(crate) mod tests {
             pe_ranges: vec![(0x1000, 0x1005), (0x1010, 0x1016)],
             pe_imports: symbols.imports,
             upx_packed: false,
+            inventory: Default::default(),
         };
         loaded.resolve_import_thunks(0x1000).unwrap();
         assert!(

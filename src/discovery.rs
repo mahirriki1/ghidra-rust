@@ -1,6 +1,7 @@
 //! Parent-owned continuation. Projects store committed results as a
 //! display-only snapshot; continuation state itself is never persisted.
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -112,6 +113,81 @@ impl DiscoverySnapshot {
     }
 }
 
+/// A complete worker function inventory accepted as evidence owners, shared
+/// between adoption jobs and identified by worker epoch and revision.
+#[derive(Clone, Debug)]
+pub struct WorkerInventory {
+    functions: Arc<Vec<FunctionInfo>>,
+    epoch: u64,
+    revision: u64,
+    /// Data-evidence owner checks were applied, as for replies carrying data.
+    data_checked: bool,
+}
+
+impl WorkerInventory {
+    pub fn functions(&self) -> &[FunctionInfo] {
+        &self.functions
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// The inventory a batch reply describes. `base` is the last inventory
+    /// adopted from this worker epoch, if any, and `requested` the revision the
+    /// request named. Changed inventories are validated in full; an unchanged
+    /// one shares the already validated base. `data` applies the extra owner
+    /// checks for a reply carrying data evidence. Also reports whether rows changed.
+    pub fn adopt(
+        info: &BinaryInfo,
+        base: Option<&Self>,
+        requested: Option<u64>,
+        epoch: u64,
+        change: InventoryChange,
+        data: bool,
+    ) -> Result<(Self, bool), String> {
+        let base = base.filter(|base| base.epoch == epoch);
+        let revision = change.revision();
+        if base.is_some_and(|base| {
+            revision < base.revision
+                || revision == base.revision && !matches!(change, InventoryChange::Unchanged { .. })
+        }) {
+            return Err("Worker inventory revision moved backwards".into());
+        }
+        let previous = base
+            .filter(|base| requested == Some(base.revision))
+            .map(|base| (base.revision, base.functions()));
+        match change.apply(previous)? {
+            None => {
+                let mut base = base
+                    .cloned()
+                    .ok_or("Unchanged inventory has no adopted base")?;
+                if data && !base.data_checked {
+                    crate::data_analysis::validate_inventory(info, base.functions())?;
+                    base.data_checked = true;
+                }
+                Ok((base, false))
+            }
+            Some(functions) => {
+                crate::call_analysis::validate_inventory(info, &functions, data)?;
+                Ok((
+                    Self {
+                        functions: Arc::new(functions),
+                        epoch,
+                        revision,
+                        data_checked: data,
+                    },
+                    true,
+                ))
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
     Pending,
@@ -132,6 +208,8 @@ pub struct Discovery {
     pending: VecDeque<u64>,
     flight: Option<(DiscoveryBinding, Vec<u64>)>,
     sequence: u64,
+    /// Worker epoch and inventory revision whose addresses are all admitted.
+    admitted: Option<(u64, u64)>,
     pub batches: usize,
     pub report: CallAnalysis,
     pub capped: bool,
@@ -201,7 +279,11 @@ impl Discovery {
             batch: self.sequence,
         };
         self.flight = Some((binding, seeds.clone()));
-        Some(Request::DiscoverBatch { binding, seeds })
+        Some(Request::DiscoverBatch {
+            binding,
+            inventory_base: None,
+            seeds,
+        })
     }
 
     /// Dropping the in-flight computation never drops committed evidence. Retry
@@ -224,7 +306,13 @@ impl Discovery {
 
     /// Validate everything before changing any committed counters or evidence.
     /// Runs on the parent's background adoption job, never the GUI thread.
-    pub fn commit(&mut self, info: &BinaryInfo, batch: &DiscoveryBatch) -> Result<(), String> {
+    /// `inventory` is the complete worker inventory the batch produced.
+    pub fn commit(
+        &mut self,
+        info: &BinaryInfo,
+        batch: &DiscoveryBatch,
+        inventory: &WorkerInventory,
+    ) -> Result<(), String> {
         let (binding, seeds) = self
             .flight
             .as_ref()
@@ -232,7 +320,11 @@ impl Discovery {
         if *binding != batch.binding {
             return Err("Stale discovery batch binding".into());
         }
-        batch.analysis.validate(info, &batch.functions)?;
+        if inventory.revision != batch.inventory.revision() {
+            return Err("Discovery batch does not match its inventory".into());
+        }
+        let functions = inventory.functions();
+        batch.analysis.validate_evidence(info, functions)?;
         if batch.outcomes.len() != batch.analysis.functions_examined
             || batch.outcomes.is_empty()
             || batch.outcomes.len() > seeds.len()
@@ -287,8 +379,14 @@ impl Discovery {
         for reference in &batch.analysis.references {
             self.admit(reference.target);
         }
-        for function in &batch.functions {
-            self.admit(function.address);
+        // Entries are never removed, so an inventory admitted by an earlier
+        // commit only repeats no-ops and the sticky cap.
+        let key = (inventory.epoch, inventory.revision);
+        if self.admitted != Some(key) {
+            for function in functions {
+                self.admit(function.address);
+            }
+            self.admitted = Some(key);
         }
         self.batches += 1;
         let report = &mut self.report;
@@ -323,6 +421,36 @@ impl Discovery {
         Ok(())
     }
 
+    /// Reconstructs a batch reply's complete inventory from `base`, the last
+    /// inventory adopted from that worker, then commits the batch. `requested`
+    /// is the revision the request named. Shared by the desktop's adoption job
+    /// and integration tests. Also reports whether the inventory rows changed.
+    pub fn commit_reply(
+        &mut self,
+        info: &BinaryInfo,
+        base: Option<&WorkerInventory>,
+        requested: Option<u64>,
+        batch: &mut DiscoveryBatch,
+    ) -> Result<(WorkerInventory, bool), String> {
+        let revision = batch.inventory.revision();
+        let change = std::mem::replace(
+            &mut batch.inventory,
+            InventoryChange::Unchanged { revision },
+        );
+        let adoption = crate::performance::span("parent_inventory_adopt");
+        let (inventory, changed) = WorkerInventory::adopt(
+            info,
+            base,
+            requested,
+            batch.binding.epoch,
+            change,
+            batch.analysis.data.is_some(),
+        )?;
+        adoption.finish(u64::from(changed));
+        self.commit(info, batch, &inventory)?;
+        Ok((inventory, changed))
+    }
+
     pub fn snapshot(&self) -> CallAnalysis {
         let mut report = self.report.clone();
         report.partial = self.partial();
@@ -352,6 +480,18 @@ impl Discovery {
         }
         saved
     }
+}
+
+/// Test helper: adopts a batch carrying a complete inventory and commits it.
+#[cfg(test)]
+pub(crate) fn commit_replacement(
+    state: &mut Discovery,
+    info: &BinaryInfo,
+    batch: &DiscoveryBatch,
+) -> Result<(), String> {
+    state
+        .commit_reply(info, None, None, &mut batch.clone())
+        .map(|_| ())
 }
 
 fn merge<T: Ord + Clone>(destination: &mut Vec<T>, source: &[T], cap: usize, capped: &mut bool) {
@@ -400,12 +540,15 @@ mod tests {
     }
 
     fn batch(request: Request, info: &BinaryInfo) -> DiscoveryBatch {
-        let Request::DiscoverBatch { binding, seeds } = request else {
+        let Request::DiscoverBatch { binding, seeds, .. } = request else {
             panic!()
         };
         DiscoveryBatch {
             binding,
-            functions: info.functions.clone(),
+            inventory: InventoryChange::Replace {
+                revision: binding.batch,
+                functions: info.functions.clone(),
+            },
             truncated: false,
             outcomes: seeds
                 .iter()
@@ -436,9 +579,9 @@ mod tests {
             address: info.entry,
             target: 0x9000,
         });
-        state.commit(&info, &first).unwrap();
+        commit_replacement(&mut state, &info, &first).unwrap();
         while let Some(request) = state.begin(1, 1, 0) {
-            state.commit(&info, &batch(request, &info)).unwrap();
+            commit_replacement(&mut state, &info, &batch(request, &info)).unwrap();
         }
         assert_eq!(state.report.functions_examined, 301);
         assert_eq!(
@@ -459,20 +602,20 @@ mod tests {
             false,
         );
         let first = batch(state.begin(1, 1, 0).unwrap(), &info);
-        state.commit(&info, &first).unwrap();
+        commit_replacement(&mut state, &info, &first).unwrap();
         let abandoned = batch(state.begin(1, 1, 0).unwrap(), &info);
         state.interrupt();
         assert_eq!(state.report.functions_examined, 128);
         let retry = batch(state.begin(1, 2, 0).unwrap(), &info);
         assert_eq!(retry.outcomes.len(), 1, "isolate interrupted seeds");
-        assert!(state.commit(&info, &abandoned).is_err());
+        assert!(commit_replacement(&mut state, &info, &abandoned).is_err());
         state.interrupt();
         assert_eq!(
             state.status(retry.outcomes[0].address),
             Some(Status::Failed)
         );
         while let Some(request) = state.begin(1, 3, 0) {
-            state.commit(&info, &batch(request, &info)).unwrap();
+            commit_replacement(&mut state, &info, &batch(request, &info)).unwrap();
         }
         assert_eq!(state.report.functions_examined, 139);
         assert!(state.partial());
@@ -493,12 +636,12 @@ mod tests {
                 3 => invalid.outcomes[0].address += 1,
                 _ => invalid.analysis.functions_examined = MAX_ANALYSIS_FUNCTIONS + 1,
             }
-            assert!(state.commit(&info, &invalid).is_err());
+            assert!(commit_replacement(&mut state, &info, &invalid).is_err());
             assert_eq!(state.report.functions_examined, 0);
             assert_eq!(state.remaining(), 1);
         }
-        state.commit(&info, &first).unwrap();
-        assert!(state.commit(&info, &first).is_err());
+        commit_replacement(&mut state, &info, &first).unwrap();
+        assert!(commit_replacement(&mut state, &info, &first).is_err());
         assert_eq!(state.report.functions_examined, 1);
     }
 
@@ -515,14 +658,14 @@ mod tests {
         first.outcomes[0].status = DiscoveryStatus::PartialByOwnLimit;
         first.analysis.functions_examined = 1;
         first.analysis.partial = true;
-        state.commit(&info, &first).unwrap();
+        commit_replacement(&mut state, &info, &first).unwrap();
         assert_eq!(state.status(info.entry), Some(Status::PartialByOwnLimit));
         let request = state.begin(1, 1, 0).unwrap();
         let Request::DiscoverBatch { seeds, .. } = &request else {
             panic!()
         };
         assert_eq!(seeds, &[0x1010, 0x1020]);
-        state.commit(&info, &batch(request, &info)).unwrap();
+        commit_replacement(&mut state, &info, &batch(request, &info)).unwrap();
         assert_eq!(state.remaining(), 0);
         assert!(state.partial());
         assert!(state.begin(1, 1, 0).is_none());
@@ -558,7 +701,7 @@ mod tests {
             accesses_examined: MAX_DATA_REFERENCES,
             ..Default::default()
         });
-        state.commit(&info, &first).unwrap();
+        commit_replacement(&mut state, &info, &first).unwrap();
         let mut second = batch(state.begin(1, 1, 0).unwrap(), &info);
         second.analysis.data = Some(DataAnalysis {
             references: vec![DataReference {
@@ -578,7 +721,7 @@ mod tests {
             address: 0x1010,
             target: info.entry,
         });
-        state.commit(&info, &second).unwrap();
+        commit_replacement(&mut state, &info, &second).unwrap();
         assert!(state.capped);
         assert!(state.partial());
         assert_eq!(state.report.references.len(), MAX_CALL_REFERENCES);
@@ -633,7 +776,7 @@ mod tests {
             accesses_examined: 1,
             ..Default::default()
         });
-        state.commit(&info, &first).unwrap();
+        commit_replacement(&mut state, &info, &first).unwrap();
         // Two interruptions fail the next seed without a batch examining it.
         state.begin(1, 1, 0).unwrap();
         state.interrupt();

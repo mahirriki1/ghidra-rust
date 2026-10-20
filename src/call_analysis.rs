@@ -40,23 +40,50 @@ pub fn code_address(info: &BinaryInfo, address: u64) -> bool {
             })
 }
 
+/// A worker function inventory as reference evidence owners. `data` adds the
+/// data-analysis instruction checks applied when a reply carries data evidence.
+pub fn validate_inventory(
+    info: &BinaryInfo,
+    functions: &[FunctionInfo],
+    data: bool,
+) -> Result<(), String> {
+    if functions.len() > MAX_FUNCTIONS {
+        return Err("Call analysis exceeds its work or result bounds".into());
+    }
+    validate_functions(functions, MAX_FUNCTION_NAME_BYTES, true)?;
+    let valid = |address| code_address(info, address);
+    for (index, function) in functions.iter().enumerate() {
+        if !valid(function.address)
+            || function.name.len() > 256
+            || (index > 0 && functions[index - 1].address >= function.address)
+        {
+            return Err("Invalid analysis function inventory".into());
+        }
+    }
+    if data {
+        crate::data_analysis::validate_inventory(info, functions)?;
+    }
+    Ok(())
+}
+
 impl CallAnalysis {
     pub fn validate(&self, info: &BinaryInfo, functions: &[FunctionInfo]) -> Result<(), String> {
+        validate_inventory(info, functions, self.data.is_some())?;
+        self.validate_evidence(info, functions)
+    }
+
+    /// Bounds and ownership of this reply's evidence, for `functions` already
+    /// accepted by [`validate_inventory`] with at least the same strictness.
+    pub fn validate_evidence(
+        &self,
+        info: &BinaryInfo,
+        functions: &[FunctionInfo],
+    ) -> Result<(), String> {
         if !self.work_within(1)
             || self.failed_functions > self.functions_examined
             || functions.len() > MAX_FUNCTIONS
         {
             return Err("Call analysis exceeds its work or result bounds".into());
-        }
-        validate_functions(functions, MAX_FUNCTION_NAME_BYTES, true)?;
-        let valid = |address| code_address(info, address);
-        for (index, function) in functions.iter().enumerate() {
-            if !valid(function.address)
-                || function.name.len() > 256
-                || (index > 0 && functions[index - 1].address >= function.address)
-            {
-                return Err("Invalid analysis function inventory".into());
-            }
         }
         self.validate_references(info, |caller| {
             functions
@@ -64,7 +91,7 @@ impl CallAnalysis {
                 .is_ok()
         })?;
         if let Some(data) = &self.data {
-            data.validate(info, functions, self.decode_attempts)?;
+            data.validate_evidence(info, functions, self.decode_attempts)?;
         }
         Ok(())
     }
