@@ -1,5 +1,4 @@
 //! Continuation through real contained worker restarts; original generated code.
-#![cfg(target_os = "linux")]
 #[allow(dead_code)]
 mod common;
 use ghidra_rust::client::{WorkerClient, WorkerEvent};
@@ -49,6 +48,8 @@ fn open(worker: &mut WorkerClient, path: &Path) -> BinaryInfo {
     info
 }
 
+// Compiles its many-function fixture with GCC.
+#[cfg(target_os = "linux")]
 #[test]
 fn all_known_seeds_survive_cancel_restart_and_interactive_requests() {
     let dir = tempfile::tempdir().unwrap();
