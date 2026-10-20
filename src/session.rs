@@ -14,9 +14,9 @@ use crate::model::{BinaryInfo, FileIdentity, SectionInfo};
 
 const SESSION_VERSION: u32 = 1;
 pub(crate) const MAX_SESSION_BYTES: u64 = 8 * 1024 * 1024;
-const MAX_ANNOTATIONS: usize = 10_000;
+pub(crate) const MAX_ANNOTATIONS: usize = 10_000;
 const MAX_LABEL_BYTES: usize = 256;
-const MAX_COMMENT_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_COMMENT_BYTES: usize = 64 * 1024;
 const MAX_DECODED_PER_ANNOTATION: usize = 32;
 const MAX_DECODED_TEXT_BYTES: usize = 256 * 1024;
 const MAX_DECODED_SOURCE_BYTES: usize = 64 * 1024;

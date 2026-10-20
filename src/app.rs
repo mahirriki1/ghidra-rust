@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, RichText, ScrollArea, TextEdit};
 
+use crate::annotation_display::{AnnotationBrowser, CodeRow, CommentRows};
 use crate::client::{WorkerClient, WorkerEvent};
 use crate::decoder_ui::{DecoderAction, DecoderPanel};
 use crate::discovery::DiscoverySnapshot;
@@ -354,6 +355,7 @@ pub struct DesktopApp {
     cached_crypto: bool,
     semantic: SemanticSelection,
     pending_code_scroll: Option<usize>,
+    pending_comment_scroll: Option<u64>,
     pending_listing_scroll: Option<usize>,
     auto_decompile: bool,
     selected: Option<u64>,
@@ -381,6 +383,11 @@ pub struct DesktopApp {
     address: String,
     name_edit: String,
     comment_edit: String,
+    annotation_browser: AnnotationBrowser,
+    comment_rows: CommentRows,
+    comment_rows_key: Option<(u64, u64, u64)>,
+    /// Only exact PCs observed in a recovered CFG or genuine print mapping.
+    comment_owners: BTreeMap<u64, u64>,
     editor_address: Option<u64>,
     decoder: DecoderPanel,
     status: String,
@@ -456,6 +463,7 @@ impl DesktopApp {
             cached_crypto: false,
             semantic: SemanticSelection::default(),
             pending_code_scroll: None,
+            pending_comment_scroll: None,
             pending_listing_scroll: None,
             auto_decompile: true,
             selected: None,
@@ -480,6 +488,10 @@ impl DesktopApp {
             address: String::new(),
             name_edit: String::new(),
             comment_edit: String::new(),
+            annotation_browser: AnnotationBrowser::default(),
+            comment_rows: CommentRows::default(),
+            comment_rows_key: None,
+            comment_owners: BTreeMap::new(),
             editor_address: None,
             decoder: DecoderPanel::default(),
             status: "Open a binary to begin".into(),
@@ -594,7 +606,9 @@ impl DesktopApp {
         self.listing.clear();
         self.decompiled.clear();
         self.semantic.clear();
+        self.comment_rows_key = None;
         self.pending_code_scroll = None;
+        self.pending_comment_scroll = None;
         self.pending_listing_scroll = None;
         self.highlighted = None;
         self.saved_analysis = false;
@@ -615,6 +629,8 @@ impl DesktopApp {
         self.name_edit.clear();
         self.comment_edit.clear();
         self.history.clear();
+        self.comment_owners.clear();
+        self.annotation_browser = AnnotationBrowser::default();
         self.history_index = 0;
         self.filtered_functions.clear();
         self.filter_keys.clear();
@@ -832,7 +848,9 @@ impl DesktopApp {
         self.editor_address = None;
         self.decompiled.clear();
         self.semantic.clear();
+        self.comment_rows_key = None;
         self.pending_code_scroll = None;
+        self.pending_comment_scroll = None;
         self.pending_listing_scroll = None;
         self.highlighted = None;
         self.saved_analysis = false;
@@ -858,6 +876,7 @@ impl DesktopApp {
     }
 
     fn select_instruction(&mut self, address: u64) {
+        self.pending_comment_scroll = Some(address);
         self.selected = Some(address);
         self.address = format!("{address:x}");
         self.editor_address = None;
@@ -869,10 +888,12 @@ impl DesktopApp {
     }
 
     fn select_decompiled_byte(&mut self, byte: usize) {
+        self.pending_comment_scroll = None;
         let Some(primary) = self.semantic.select_code(byte) else {
             self.semantic.addresses.clear();
             self.semantic.ranges.clear();
             self.pending_code_scroll = None;
+            self.pending_comment_scroll = None;
             self.pending_listing_scroll = None;
             self.status = "This source location has no machine instruction mapping".into();
             return;
@@ -1367,6 +1388,7 @@ impl DesktopApp {
                 self.cached_graph = false;
                 self.saved_analysis = false;
                 self.view = Some(view);
+                self.comment_rows_key = None;
                 self.status = format!("Function {address:#x} ready");
                 if let Some((caller, pc)) = self.reference_focus.take()
                     && caller == address
@@ -1408,7 +1430,9 @@ impl DesktopApp {
                         self.stop_worker();
                         self.decompiled.clear();
                         self.semantic.clear();
+                        self.comment_rows_key = None;
                         self.pending_code_scroll = None;
+                        self.pending_comment_scroll = None;
                         self.pending_listing_scroll = None;
                         self.decompiled_lines.clear();
                         self.highlighted = None;
@@ -1427,10 +1451,13 @@ impl DesktopApp {
                         self.decompiled.clear();
                         self.highlighted = None;
                         self.semantic.clear();
+                        self.comment_rows_key = None;
+                        self.decompiled_lines.clear();
                         self.status = format!("Invalid decompiler source mappings: {error}");
                         return;
                     }
                     self.semantic.mappings = mappings;
+                    self.comment_rows_key = None;
                     if let Some(address) = self.selected {
                         self.semantic.select_instruction(address);
                     }
@@ -1448,6 +1475,11 @@ impl DesktopApp {
                             range
                         })
                         .collect();
+                    self.pending_code_scroll = self.semantic.ranges.first().map(|range| {
+                        self.decompiled_lines
+                            .partition_point(|(_, end)| *end <= range.start)
+                    });
+                    self.pending_comment_scroll = self.selected;
                     self.status = "Ready".into();
                 }
             }
@@ -1961,6 +1993,7 @@ impl DesktopApp {
             self.listing.dedup_by_key(|i| i.address);
             self.canvas = Some(GraphCanvas::new(&view));
             self.view = Some(view);
+            self.comment_rows_key = None;
             self.saved_analysis = true;
             self.cached_graph = true;
             self.history.push(address);
@@ -1969,6 +2002,7 @@ impl DesktopApp {
             self.address = format!("{:x}", selected.unwrap_or(address));
             if let Some(text) = data.decompiled {
                 self.semantic.mappings = data.mappings;
+                self.comment_rows_key = None;
                 if let Some(address) = selected {
                     self.semantic.select_instruction(address);
                 }
@@ -2243,7 +2277,9 @@ impl DesktopApp {
                         self.applied_names.clear();
                         self.decompiled.clear();
                         self.semantic.clear();
+                        self.comment_rows_key = None;
                         self.pending_code_scroll = None;
+                        self.pending_comment_scroll = None;
                         self.pending_listing_scroll = None;
                         self.highlighted = None;
                         self.decompiled_lines.clear();
@@ -2491,7 +2527,9 @@ impl DesktopApp {
         if function {
             self.decompiled.clear();
             self.semantic.clear();
+            self.comment_rows_key = None;
             self.pending_code_scroll = None;
+            self.pending_comment_scroll = None;
             self.pending_listing_scroll = None;
             self.decompiled_lines.clear();
             self.highlighted = None;
@@ -2516,7 +2554,7 @@ impl DesktopApp {
         } else {
             return;
         }
-        self.navigate(self.history[self.history_index], false, context);
+        self.navigate_annotation(self.history[self.history_index], false, context);
     }
 
     fn handle_shortcuts(&mut self, context: &egui::Context) {
@@ -3122,6 +3160,197 @@ impl DesktopApp {
         }
     }
 
+    fn update_comment_rows(&mut self) {
+        let key = (self.generation, self.selection_generation, self.revision);
+        if self.comment_rows_key == Some(key) {
+            return;
+        }
+        self.comment_rows = if let Some(session) = &self.session {
+            self.annotation_browser
+                .update(self.generation, self.revision, &session.annotations);
+            CommentRows::new(
+                self.view.as_ref().map(|view| view.address),
+                &self.decompiled_lines,
+                &self.semantic.mappings,
+                &self.listing,
+                &session.annotations,
+            )
+        } else {
+            CommentRows::new(
+                None,
+                &self.decompiled_lines,
+                &self.semantic.mappings,
+                &self.listing,
+                &BTreeMap::new(),
+            )
+        };
+        if let Some(view) = &self.view {
+            for &address in &self.comment_rows.addresses {
+                self.comment_owners.insert(address, view.address);
+            }
+            if let Some(session) = &self.session {
+                for instruction in &self.listing {
+                    if session.annotations.contains_key(&instruction.address) {
+                        self.comment_owners
+                            .insert(instruction.address, view.address);
+                    }
+                }
+            }
+        }
+        self.comment_owners.retain(|pc, _| {
+            self.history.contains(pc)
+                || self
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| session.annotations.contains_key(pc))
+        });
+        self.comment_rows_key = Some(key);
+    }
+
+    fn navigate_annotation(&mut self, address: u64, record: bool, context: &egui::Context) {
+        self.update_comment_rows();
+        let current_owner = self
+            .view
+            .as_ref()
+            .filter(|view| {
+                address == view.address
+                    || self
+                        .listing
+                        .binary_search_by_key(&address, |i| i.address)
+                        .is_ok()
+                    || self
+                        .semantic
+                        .mappings
+                        .iter()
+                        .any(|m| m.addresses.contains(&address))
+            })
+            .map(|view| view.address);
+        let owner = current_owner
+            .or_else(|| self.comment_owners.get(&address).copied())
+            .unwrap_or(address);
+        if record {
+            // Capture the exact departure selection, including an instruction
+            // reached by a single click, for predictable Back/Forward behavior.
+            if let Some(selected) = self.selected {
+                if let Some(view) = &self.view
+                    && (selected == view.address
+                        || self
+                            .listing
+                            .binary_search_by_key(&selected, |i| i.address)
+                            .is_ok()
+                        || self
+                            .semantic
+                            .mappings
+                            .iter()
+                            .any(|m| m.addresses.contains(&selected)))
+                {
+                    self.comment_owners.insert(selected, view.address);
+                }
+                if let Some(previous) = self.history.get_mut(self.history_index) {
+                    *previous = selected;
+                }
+            }
+            self.history.truncate(self.history_index + 1);
+            if self.history.last() != Some(&address) {
+                self.history.push(address);
+            }
+            if self.history.len() > 256 {
+                self.history.remove(0);
+            }
+            self.history_index = self.history.len().saturating_sub(1);
+            self.comment_owners.retain(|pc, _| {
+                self.history.contains(pc)
+                    || self
+                        .session
+                        .as_ref()
+                        .is_some_and(|s| s.annotations.contains_key(pc))
+            });
+        }
+        self.tab = Tab::Listing;
+        if self.view.as_ref().is_some_and(|view| view.address == owner) {
+            self.select_instruction(address);
+            self.pending_listing_scroll = self.listing.iter().position(|i| i.address == address);
+            if let Some(canvas) = &mut self.canvas {
+                canvas.reveal_instruction(address);
+            }
+        } else {
+            self.navigate(owner, false, context);
+            self.selected = Some(address);
+            self.address = format!("{address:x}");
+            self.reference_focus = Some((owner, address));
+        }
+    }
+
+    fn open_comment(&mut self, address: u64) {
+        self.select_instruction(address);
+        self.annotations_open = true;
+        self.focus_comment = true;
+    }
+
+    fn annotation_browser(&mut self, ui: &mut egui::Ui) {
+        self.update_comment_rows();
+        ui.horizontal(|ui| {
+            ui.add(
+                TextEdit::singleline(&mut self.annotation_browser.query)
+                    .hint_text("Filter address, label or comment")
+                    .char_limit(256),
+            );
+            ui.checkbox(&mut self.annotation_browser.comments_only, "Comments only");
+        });
+        if let Some(session) = &self.session {
+            self.annotation_browser
+                .update(self.generation, self.revision, &session.annotations);
+        }
+        ui.weak(format!(
+            "{} annotations · click an address to go there",
+            self.annotation_browser.filtered.len()
+        ));
+        let mut jump = None;
+        let row = ui.text_style_height(&egui::TextStyle::Monospace) + 5.0;
+        ScrollArea::both()
+            .id_salt("annotation-browser")
+            .max_height(200.0)
+            .auto_shrink([false, false])
+            .show_rows(
+                ui,
+                row,
+                self.annotation_browser.filtered.len(),
+                |ui, rows| {
+                    for row in rows {
+                        let entry =
+                            &self.annotation_browser.entries[self.annotation_browser.filtered[row]];
+                        ui.horizontal(|ui| {
+                            if ui
+                                .selectable_label(
+                                    self.selected == Some(entry.address),
+                                    RichText::new(format!("{:08x}", entry.address)).monospace(),
+                                )
+                                .clicked()
+                            {
+                                jump = Some((entry.address, false));
+                            }
+                            if ui.small_button("Edit").clicked() {
+                                jump = Some((entry.address, true));
+                            }
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(format!("{}  {}", entry.label, entry.comment))
+                                        .color(theme::SYNTAX_COMMENT),
+                                )
+                                .wrap_mode(egui::TextWrapMode::Extend),
+                            );
+                        });
+                    }
+                },
+            );
+        if let Some((address, edit)) = jump {
+            self.navigate_annotation(address, true, ui.ctx());
+            if edit {
+                self.open_comment(address);
+            }
+        }
+    }
+
     fn decompiler_call_target(&self, name: &str) -> Option<u64> {
         let view = self.view.as_ref()?;
         let info = self.info.as_ref()?;
@@ -3140,6 +3369,7 @@ impl DesktopApp {
     }
 
     fn side_panel(&mut self, ui: &mut egui::Ui) {
+        self.update_comment_rows();
         let context = ui.ctx().clone();
         theme::dock_header(ui, "Decompiler", false, |ui| {
             if ui
@@ -3165,6 +3395,7 @@ impl DesktopApp {
             }
         });
         if let Some(view) = &self.view {
+            let entry = view.address;
             let function = self
                 .info
                 .as_ref()
@@ -3177,7 +3408,7 @@ impl DesktopApp {
             );
             response.context_menu(|ui| {
                 if ui.button("Rename / comment…").clicked() {
-                    self.annotations_open = true;
+                    self.open_comment(entry);
                     ui.close();
                 }
             });
@@ -3202,14 +3433,63 @@ impl DesktopApp {
         let row = ui.text_style_height(&egui::TextStyle::Monospace);
         let mut navigate = None;
         let mut select_code = None;
+        let mut edit_comment = None;
+        let mut select_comment = None;
         let mut scroll = ScrollArea::both()
             .id_salt("decompiler-text")
             .auto_shrink([false, false]);
-        if let Some(target) = self.pending_code_scroll.take() {
-            scroll = scroll.vertical_scroll_offset(target as f32 * row);
+        let code_target = self.pending_code_scroll.take().map(|target| {
+            self.comment_rows
+                .source_rows
+                .get(target)
+                .copied()
+                .unwrap_or(target)
+        });
+        let comment_target = self
+            .pending_comment_scroll
+            .take()
+            .and_then(|address| self.comment_rows.comment_rows.get(&address).copied());
+        if let Some(target) = comment_target.or(code_target) {
+            scroll =
+                scroll.vertical_scroll_offset(target as f32 * (row + ui.spacing().item_spacing.y));
         }
-        scroll.show_rows(ui, row, self.decompiled_lines.len(), |ui, rows| {
-            for index in rows {
+        scroll.show_rows(ui, row, self.comment_rows.rows.len(), |ui, rows| {
+            for display_row in rows {
+                let index = match self.comment_rows.rows[display_row] {
+                    CodeRow::Source(index) => index,
+                    CodeRow::UnmappedHeading => {
+                        ui.colored_label(theme::WARNING, "Comments without visible code");
+                        continue;
+                    }
+                    CodeRow::Comment(address) => {
+                        if let Some(preview) = self.annotation_browser.comments.get(&address) {
+                            let response = ui
+                                .add(
+                                    egui::Label::new(
+                                        RichText::new(format!("// {address:08x}: {preview}"))
+                                            .monospace()
+                                            .color(theme::SYNTAX_COMMENT),
+                                    )
+                                    .sense(egui::Sense::click())
+                                    .wrap_mode(egui::TextWrapMode::Extend),
+                                )
+                                .on_hover_text("Double-click to view or edit the full comment");
+                            if response.clicked() {
+                                select_comment = Some(address);
+                            }
+                            if response.double_clicked() {
+                                edit_comment = Some(address);
+                            }
+                            response.context_menu(|ui| {
+                                if ui.button("Edit comment…").clicked() {
+                                    edit_comment = Some(address);
+                                    ui.close();
+                                }
+                            });
+                        }
+                        continue;
+                    }
+                };
                 let (start, end) = self.decompiled_lines[index];
                 let line = self.decompiled[start..end].trim_end_matches(['\n', '\r']);
                 let visible = line
@@ -3271,6 +3551,14 @@ impl DesktopApp {
         });
         if let Some(target) = navigate {
             self.navigate(target, true, &context);
+        } else if let Some(address) = edit_comment {
+            self.open_comment(address);
+        } else if let Some(address) = select_comment {
+            self.select_instruction(address);
+            self.pending_listing_scroll = self.listing.iter().position(|i| i.address == address);
+            if let Some(canvas) = &mut self.canvas {
+                canvas.reveal_instruction(address);
+            }
         } else if let Some(byte) = select_code {
             self.select_decompiled_byte(byte);
         }
@@ -3311,12 +3599,18 @@ impl DesktopApp {
                 }
             }
         }
-        let comment = ui.add(
-            TextEdit::multiline(&mut self.comment_edit)
-                .hint_text("Comment at selected address")
-                .desired_rows(3)
-                .char_limit(16 * 1024),
-        );
+        let comment = ScrollArea::vertical()
+            .id_salt("comment-editor")
+            .max_height(180.0)
+            .show(ui, |ui| {
+                ui.add(
+                    TextEdit::multiline(&mut self.comment_edit)
+                        .hint_text("Comment at selected address")
+                        .desired_rows(4)
+                        .char_limit(crate::session::MAX_COMMENT_BYTES),
+                )
+            })
+            .inner;
         if self.focus_comment {
             comment.request_focus();
             self.focus_comment = false;
@@ -3330,7 +3624,16 @@ impl DesktopApp {
                 .cloned()
                 .unwrap_or_default();
             annotation.comment = self.comment_edit.clone();
-            self.edit_annotation(address, annotation);
+            if annotation.comment.len() > crate::session::MAX_COMMENT_BYTES {
+                self.status = "Comment exceeds the 64 KiB limit".into();
+            } else if self.session.as_ref().is_some_and(|s| {
+                !s.annotations.contains_key(&address)
+                    && s.annotations.len() >= crate::session::MAX_ANNOTATIONS
+            }) {
+                self.status = "Annotation limit reached (10000)".into();
+            } else {
+                self.edit_annotation(address, annotation);
+            }
         }
         if ui.button("Decode 128 bytes here").clicked() {
             self.request(
@@ -3632,6 +3935,7 @@ impl DesktopApp {
     }
 
     fn main_panel(&mut self, ui: &mut egui::Ui) {
+        self.update_comment_rows();
         let title = match self.tab {
             Tab::Listing => "Listing",
             Tab::Graph => "Function Graph",
@@ -3702,13 +4006,19 @@ impl DesktopApp {
                             });
                         });
                     }
-                    if let Some(canvas) = &mut self.canvas
-                        && let Some(action) =
+                    if let Some(canvas) = &mut self.canvas {
+                        canvas.set_comments(
+                            view,
+                            (self.generation, self.revision),
+                            &self.annotation_browser.comments,
+                        );
+                        if let Some(action) =
                             canvas.show_selected(ui, view, self.selected, &self.semantic.addresses)
-                    {
-                        match action {
-                            GraphAction::Select(address) => self.select_instruction(address),
-                            GraphAction::Navigate(target) => navigate = Some(target),
+                        {
+                            match action {
+                                GraphAction::Select(address) => self.select_instruction(address),
+                                GraphAction::Navigate(target) => navigate = Some(target),
+                            }
                         }
                     }
                 } else {
@@ -3761,21 +4071,37 @@ impl DesktopApp {
                 let row = ui.text_style_height(&egui::TextStyle::Monospace) + 5.0;
                 let mut scroll = ScrollArea::both().id_salt("instruction-list");
                 if let Some(target) = self.pending_listing_scroll.take() {
-                    scroll = scroll.vertical_scroll_offset(target as f32 * row);
+                    scroll = scroll.vertical_scroll_offset(
+                        target as f32 * (row + ui.spacing().item_spacing.y),
+                    );
                 }
                 scroll.show_rows(ui, row, self.listing.len(), |ui, rows| {
                     for index in rows {
                         let instruction = &self.listing[index];
+                        let mut job = theme::listing_row(
+                            instruction.address,
+                            &hex(&instruction.bytes),
+                            &instruction.mnemonic,
+                            &instruction.operands,
+                        );
+                        if let Some(comment) =
+                            self.annotation_browser.comments.get(&instruction.address)
+                        {
+                            job.append(
+                                &format!("  ; {comment}"),
+                                0.0,
+                                egui::TextFormat {
+                                    font_id: egui::FontId::monospace(13.0),
+                                    color: theme::SYNTAX_COMMENT,
+                                    ..Default::default()
+                                },
+                            );
+                        }
                         let response = ui.add(
                             egui::Button::selectable(
                                 self.selected == Some(instruction.address)
                                     || self.semantic.addresses.contains(&instruction.address),
-                                theme::listing_row(
-                                    instruction.address,
-                                    &hex(&instruction.bytes),
-                                    &instruction.mnemonic,
-                                    &instruction.operands,
-                                ),
+                                job,
                             )
                             .wrap_mode(egui::TextWrapMode::Extend),
                         );
@@ -3784,7 +4110,11 @@ impl DesktopApp {
                             .as_ref()
                             .and_then(|session| session.annotations.get(&instruction.address))
                         {
-                            response.on_hover_text(format!("{}\n{}", note.label, note.comment))
+                            response.on_hover_text(format!(
+                                "{}\n{}\nUse ; or Rename / comment… to view the full comment.",
+                                crate::annotation_display::preview(&note.label, 80),
+                                crate::annotation_display::preview(&note.comment, 400)
+                            ))
                         } else {
                             response
                         };
@@ -3830,8 +4160,7 @@ impl DesktopApp {
                     self.navigate(address, true, &context);
                 }
                 if let Some(address) = annotate {
-                    self.select_instruction(address);
-                    self.annotations_open = true;
+                    self.open_comment(address);
                 }
                 if let Some((address, bytes)) = decode {
                     self.decoder.set_source(address, bytes);
@@ -4123,6 +4452,8 @@ impl DesktopApp {
             .default_width(420.0)
             .resizable(true)
             .show(&context, |ui| {
+                self.annotation_browser(ui);
+                ui.separator();
                 if self.selected.is_none() {
                     ui.weak("Select an address to add a name or comment.");
                 } else {
@@ -5053,6 +5384,278 @@ mod tests {
         ]
     }
 
+    fn rendered_text(output: &egui::FullOutput) -> Vec<String> {
+        output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) => Some(text.galley.text().to_owned()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn comments_render_at_exact_listing_and_code_locations_and_refresh_after_edit_delete_undo() {
+        let context = egui::Context::default();
+        theme::install(&context);
+        let mut app = semantic_app();
+        let instruction = Instruction {
+            address: 0x100c,
+            bytes: vec![0x90],
+            mnemonic: "nop".into(),
+            operands: String::new(),
+        };
+        app.listing.push(instruction.clone());
+        app.view.as_mut().unwrap().blocks[0]
+            .instructions
+            .push(instruction);
+        for (address, comment) in [
+            (0x1000, "entry note"),
+            (0x1004, "first */ literal"),
+            (0x1008, "second note"),
+            (0x100c, "unmapped note"),
+        ] {
+            app.edit_annotation(
+                address,
+                Annotation {
+                    comment: comment.into(),
+                    ..Default::default()
+                },
+            );
+        }
+        let original_source = app.decompiled.clone();
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| app.main_panel(ui));
+        let listing = rendered_text(&output);
+        assert!(
+            listing
+                .iter()
+                .any(|row| row.starts_with("00001004") && row.contains("; first */ literal"))
+        );
+        assert!(
+            !listing
+                .iter()
+                .any(|row| row.starts_with("00001008") && row.contains("first */ literal"))
+        );
+        output.textures_delta.clear();
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| app.side_panel(ui));
+        let code = rendered_text(&output);
+        for comment in [
+            "entry note",
+            "first */ literal",
+            "second note",
+            "unmapped note",
+        ] {
+            assert_eq!(code.iter().filter(|row| row.contains(comment)).count(), 1);
+        }
+        let position = |needle: &str| code.iter().position(|row| row.contains(needle)).unwrap();
+        assert!(position("first */ literal") < position("return café"));
+        assert!(position("second note") < position("return café"));
+        assert!(position("unmapped note") > position("Comments without visible code"));
+        assert_eq!(app.decompiled, original_source);
+        let mapping = &app.semantic.mappings[0];
+        assert_eq!(
+            &app.decompiled[mapping.start..mapping.end],
+            "return café + 1;"
+        );
+        output.textures_delta.clear();
+
+        app.edit_annotation(
+            0x1004,
+            Annotation {
+                comment: "edited note".into(),
+                ..Default::default()
+            },
+        );
+        app.edit_annotation(0x1008, Annotation::default());
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| app.side_panel(ui));
+        let code = rendered_text(&output);
+        assert!(code.iter().any(|row| row.contains("edited note")));
+        assert!(
+            !code
+                .iter()
+                .any(|row| row.contains("first */ literal") || row.contains("second note"))
+        );
+        output.textures_delta.clear();
+        app.undo(&context);
+        app.update_comment_rows();
+        assert!(app.comment_rows.rows.contains(&CodeRow::Comment(0x1008)));
+        assert_eq!(app.decompiled, original_source);
+    }
+
+    #[test]
+    fn comment_browser_filters_jumps_and_edits_exact_addresses_with_history() {
+        let context = egui::Context::default();
+        theme::install(&context);
+        let mut app = semantic_app();
+        app.edit_annotation(
+            0x1008,
+            Annotation {
+                label: "answer".into(),
+                comment: "unique needle".into(),
+                ..Default::default()
+            },
+        );
+        app.edit_annotation(
+            0x1004,
+            Annotation {
+                comment: "another comment".into(),
+                ..Default::default()
+            },
+        );
+        app.select_instruction(0x1004);
+        app.annotation_browser.query = "NEEDLE".into();
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| app.annotation_browser(ui));
+        assert_eq!(app.annotation_browser.filtered.len(), 1);
+        let point = text_position(&output, "00001008", 4);
+        output.textures_delta.clear();
+        let mut output = context.run_ui(
+            egui::RawInput {
+                events: pointer_events(point),
+                time: Some(1.0),
+                ..Default::default()
+            },
+            |ui| app.annotation_browser(ui),
+        );
+        output.textures_delta.clear();
+        assert_eq!(app.selected, Some(0x1008));
+        assert_eq!(app.pending_listing_scroll, Some(2));
+        assert_eq!(app.history, [0x1004, 0x1008]);
+        app.history_step(false, &context);
+        assert_eq!(app.selected, Some(0x1004));
+        assert_eq!(app.pending_listing_scroll, Some(1));
+        app.history_step(true, &context);
+        assert_eq!(app.selected, Some(0x1008));
+        assert!(
+            app.client.is_none(),
+            "same-function navigation retains displayed analysis"
+        );
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| app.annotation_browser(ui));
+        let point = text_position(&output, "Edit", 1);
+        output.textures_delta.clear();
+        let mut output = context.run_ui(
+            egui::RawInput {
+                events: pointer_events(point),
+                time: Some(2.0),
+                ..Default::default()
+            },
+            |ui| app.annotation_browser(ui),
+        );
+        output.textures_delta.clear();
+        assert!(app.annotations_open && app.focus_comment);
+        assert_eq!(app.selected, Some(0x1008));
+    }
+
+    #[test]
+    fn counterpart_scroll_includes_comments_and_reaches_unmapped_notes_once() {
+        let context = egui::Context::default();
+        theme::install(&context);
+        let mut app = semantic_app();
+        app.decompiled = (0..200).map(|n| format!("statement_{n}();\n")).collect();
+        app.highlighted = Some(HighlightedCode::new(&app.decompiled));
+        let mut offset = 0;
+        app.decompiled_lines = app
+            .decompiled
+            .split_inclusive('\n')
+            .map(|line| {
+                let range = (offset, offset + line.len());
+                offset += line.len();
+                range
+            })
+            .collect();
+        app.semantic.mappings = vec![CodeMapping {
+            start: app.decompiled_lines[150].0,
+            end: app.decompiled_lines[150].1 - 1,
+            addresses: vec![0x1004],
+        }];
+        for (address, comment) in [
+            (0x1004, "mapped scroll target"),
+            (0x1008, "unmapped scroll target"),
+        ] {
+            app.edit_annotation(
+                address,
+                Annotation {
+                    comment: comment.into(),
+                    ..Default::default()
+                },
+            );
+        }
+        for (address, comment) in [
+            (0x1004, "mapped scroll target"),
+            (0x1008, "unmapped scroll target"),
+        ] {
+            app.select_instruction(address);
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(600.0, 300.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| app.side_panel(ui),
+            );
+            let text = rendered_text(&output);
+            assert!(
+                text.iter().any(|row| row.contains(comment)),
+                "{comment} visible after one-shot scroll"
+            );
+            assert!(
+                text.len() < 40,
+                "source and comment rows remain virtualized"
+            );
+            assert!(app.pending_code_scroll.is_none() && app.pending_comment_scroll.is_none());
+            output.textures_delta.clear();
+        }
+        assert!(
+            app.semantic.ranges.is_empty(),
+            "unmapped comment never acquires a code selection"
+        );
+    }
+
+    #[test]
+    fn annotation_navigation_reuses_observed_owner_without_guessing_symbol_extents() {
+        let context = egui::Context::default();
+        let mut app = semantic_app();
+        let original_view = app.view.clone().unwrap();
+        app.edit_annotation(
+            0x1008,
+            Annotation {
+                comment: "inside entry".into(),
+                ..Default::default()
+            },
+        );
+        app.update_comment_rows();
+        app.navigate(0x1040, true, &context);
+        app.navigate_annotation(0x1008, true, &context);
+        assert_eq!(app.selected, Some(0x1008));
+        assert_eq!(app.reference_focus, Some((0x1000, 0x1008)));
+        assert_eq!(app.status, "Loading function 0x1000…");
+        app.receive(
+            Pending {
+                id: 1,
+                request: Request::Graph { address: 0x1000 },
+                started: Instant::now(),
+                selection: app.selection_generation,
+                revision: app.revision,
+                byte_origin: (app.selected, app.tab),
+            },
+            Response::Graph {
+                view: original_view,
+            },
+            &context,
+        );
+        assert_eq!(app.view.as_ref().unwrap().address, 0x1000);
+        assert_eq!(app.selected, Some(0x1008));
+        assert_eq!(app.pending_listing_scroll, Some(2));
+        app.update_comment_rows();
+        assert!(app.comment_rows.rows.contains(&CodeRow::Comment(0x1008)));
+        // An address numerically between symbols has no known owner.
+        app.navigate_annotation(0x1020, true, &context);
+        assert_eq!(app.reference_focus, Some((0x1020, 0x1020)));
+        assert_eq!(app.selected, Some(0x1020));
+    }
+
     fn text_position(output: &egui::FullOutput, needle: &str, byte: usize) -> egui::Pos2 {
         output
             .shapes
@@ -5343,9 +5946,18 @@ mod tests {
             0x1000,
             Annotation {
                 label: "restored_entry".into(),
+                comment: "restored header comment".into(),
                 ..Default::default()
             },
         );
+        session.annotations.insert(
+            0x1004,
+            Annotation {
+                comment: "restored statement comment".into(),
+                ..Default::default()
+            },
+        );
+        let source = "int restored_entry() { return 7; }\n";
         let data = ProjectData {
             info: info.clone(),
             session: session.clone(),
@@ -5356,8 +5968,12 @@ mod tests {
                 calls: vec![],
                 warnings: vec![],
             }),
-            decompiled: Some("int restored_entry() { return 7; }\n".into()),
-            mappings: Vec::new(),
+            decompiled: Some(source.into()),
+            mappings: vec![CodeMapping {
+                start: source.find("return").unwrap(),
+                end: source.find(';').unwrap() + 1,
+                addresses: vec![0x1004],
+            }],
             strings: vec![StringEntry {
                 address: 0x1040,
                 text: "saved string".into(),
@@ -5373,7 +5989,7 @@ mod tests {
         data.save(&project_path, &protection, true).unwrap();
         let project = ProjectData::load(&project_path).unwrap();
         let extracted = project.binary.as_ref().unwrap().path().to_owned();
-        app.session = Some(session);
+        app.session = Some(project.data.session.clone());
         app.restore_project(
             ProjectOpen {
                 project,
@@ -5387,6 +6003,20 @@ mod tests {
         assert!(app.saved_analysis);
         assert!(app.highlighted.is_some());
         assert!(app.decompiled.contains("restored_entry"));
+        let context = egui::Context::default();
+        theme::install(&context);
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| app.side_panel(ui));
+        let text = rendered_text(&output);
+        assert!(
+            text.iter()
+                .any(|row| row.contains("restored header comment"))
+        );
+        assert!(
+            text.iter()
+                .any(|row| row.contains("restored statement comment"))
+        );
+        output.textures_delta.clear();
+        assert_eq!(app.decompiled, source);
         assert_eq!(app.history, [0x1000]);
         assert_eq!(app.strings[0].text, "saved string");
         assert!(app.strings_truncated);
