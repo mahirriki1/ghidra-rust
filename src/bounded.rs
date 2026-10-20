@@ -135,7 +135,13 @@ fn reply_nodes(kind: &str) -> Option<usize> {
                 + 5 * MAX_GRAPH_CALLS
                 + MAX_WARNINGS
         }
-        "decompiled" => 8 * MAX_CODE_MAPPINGS + MAX_CODE_ADDRESS_REFS,
+        "decompiled" => {
+            8 * MAX_CODE_MAPPINGS
+                + MAX_CODE_ADDRESS_REFS
+                + 11 * crate::semantic::MAX_TOKENS
+                + 25 * crate::semantic::MAX_LOCALS
+                + crate::semantic::MAX_FUNCTION_RENAMES
+        }
         "bytes" => MAX_BYTE_READ,
         "strings" => 7 * MAX_STRING_RESULTS,
         "crypto" => 9 * MAX_CRYPTO_MATCHES,

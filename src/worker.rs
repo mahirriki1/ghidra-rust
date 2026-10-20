@@ -331,6 +331,7 @@ mod tests {
             response: Response::Decompiled {
                 address: 0x1000,
                 mappings: Vec::new(),
+                semantics: Default::default(),
                 text: "x".repeat(MAX_RESPONSE_BYTES),
             },
         };

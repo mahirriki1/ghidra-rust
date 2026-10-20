@@ -309,6 +309,40 @@ impl LoadedProgram {
         self.handle_with_progress(request, &mut |_| Ok(()))
     }
 
+    fn decompile(
+        &mut self,
+        address: u64,
+        renames: &[crate::semantic::LocalRename],
+    ) -> Result<Response, String> {
+        crate::semantic::validate_renames(renames, Some(address))?;
+        self.check_unpacked()?;
+        self.check_code(address)?;
+        self.resolve_import_thunks(address)?;
+        let (mut text, mut mappings, mut semantics) = crate::decompile::render_with_locals(
+            &mut self.program,
+            address,
+            &self.info.sections,
+            renames,
+        )
+        .map_err(engine_error)?;
+        if text.len() > MAX_DECOMPILED_BYTES {
+            let mut end = MAX_DECOMPILED_BYTES - 100;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.truncate(end);
+            mappings.retain(|mapping| mapping.end <= end);
+            semantics.tokens.retain(|token| token.end <= end);
+            text.push_str("\n/* Decompiler output truncated at the 2 MiB prototype limit. */\n");
+        }
+        Ok(Response::Decompiled {
+            address,
+            text,
+            mappings,
+            semantics,
+        })
+    }
+
     pub(crate) fn handle_with_progress(
         &mut self,
         request: Request,
@@ -324,30 +358,8 @@ impl LoadedProgram {
                     &self.pe_ranges,
                 )?,
             }),
-            Request::Decompile { address } => {
-                self.check_unpacked()?;
-                self.check_code(address)?;
-                self.resolve_import_thunks(address)?;
-                let (mut text, mut mappings) =
-                    crate::decompile::render(&mut self.program, address, &self.info.sections)
-                        .map_err(engine_error)?;
-                if text.len() > MAX_DECOMPILED_BYTES {
-                    let mut end = MAX_DECOMPILED_BYTES - 100;
-                    while !text.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    text.truncate(end);
-                    mappings.retain(|mapping| mapping.end <= end);
-                    text.push_str(
-                        "\n/* Decompiler output truncated at the 2 MiB prototype limit. */\n",
-                    );
-                }
-                Ok(Response::Decompiled {
-                    address,
-                    text,
-                    mappings,
-                })
-            }
+            Request::Decompile { address } => self.decompile(address, &[]),
+            Request::DecompileWithLocals { address, renames } => self.decompile(address, &renames),
             Request::Discover => {
                 self.check_unpacked()?;
                 // Selected-function analysis can materialize and name a callee

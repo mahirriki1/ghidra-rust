@@ -386,6 +386,13 @@ pub enum Request {
     Decompile {
         address: u64,
     },
+    DecompileWithLocals {
+        address: u64,
+        #[serde(
+            deserialize_with = "crate::bounded::vec::<_, _, { crate::semantic::MAX_FUNCTION_RENAMES }>"
+        )]
+        renames: Vec<crate::semantic::LocalRename>,
+    },
     Discover,
     DiscoverBatch {
         binding: DiscoveryBinding,
@@ -428,6 +435,8 @@ pub enum Response {
         #[serde(default)]
         #[serde(deserialize_with = "crate::bounded::vec::<_, _, { MAX_CODE_MAPPINGS }>")]
         mappings: Vec<CodeMapping>,
+        #[serde(default)]
+        semantics: crate::semantic::SemanticInfo,
     },
     Functions {
         #[serde(deserialize_with = "crate::bounded::vec::<_, _, { MAX_FUNCTIONS }>")]

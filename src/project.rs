@@ -22,9 +22,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 const APPLICATION_ID: i64 = 0x4752504a; // GRPJ
-/// Version 2 adds the optional `discovery` record; version 1 files still open.
-const VERSION: i64 = 2;
-pub const ENGINE_FINGERPRINT: &str = "ghidra-rust-project-v1-mapping-v1-pe-v1-aarch64-v1-calls-v1-arm64pe-v1-inventory-v2:268c3a406d8d964bc00ae2ead4d3e1e1373aaa27";
+/// Version 3 adds semantic tokens and local renames; versions 1/2 still open.
+const VERSION: i64 = 3;
+pub const ENGINE_FINGERPRINT: &str = "ghidra-rust-project-v3-semantic-v1-mapping-v1-pe-v1-aarch64-v1-calls-v1-arm64pe-v1-inventory-v2:268c3a406d8d964bc00ae2ead4d3e1e1373aaa27";
 const MAX_BINARY: usize = 128 * 1024 * 1024;
 const MAX_BODY: usize = 48 * 1024 * 1024;
 const MAX_PROJECT: u64 = 224 * 1024 * 1024;
@@ -39,6 +39,7 @@ pub struct ProjectData {
     pub view: Option<FunctionView>,
     pub decompiled: Option<String>,
     pub mappings: Vec<CodeMapping>,
+    pub semantics: crate::semantic::SemanticInfo,
     pub strings: Vec<StringEntry>,
     pub strings_truncated: bool,
     pub crypto: Vec<CryptoMatch>,
@@ -55,6 +56,8 @@ struct Body {
     #[serde(default)]
     #[serde(deserialize_with = "crate::bounded::vec::<_, _, { crate::model::MAX_CODE_MAPPINGS }>")]
     mappings: Vec<CodeMapping>,
+    #[serde(default)]
+    semantics: crate::semantic::SemanticInfo,
     info: BinaryInfo,
     view: Option<FunctionView>,
     #[serde(deserialize_with = "crate::bounded::vec::<_, _, { MAX_PROJECT_STRINGS }>")]
@@ -110,6 +113,7 @@ impl ProjectData {
         let body = Body {
             engine: ENGINE_FINGERPRINT.into(),
             mappings: self.mappings.clone(),
+            semantics: self.semantics.clone(),
             info: persisted_info,
             view: self.view.clone(),
             strings: self.strings.clone(),
@@ -280,13 +284,19 @@ impl ProjectData {
             .transpose()
             .map_err(|_| "Project decompilation is not UTF-8")?;
         let source_hint = body.info.path.clone();
-        let compatible = body.engine == ENGINE_FINGERPRINT;
+        let compatible = body.engine == ENGINE_FINGERPRINT
+            && body
+                .semantics
+                .locals
+                .iter()
+                .all(|v| v.identity.engine == crate::semantic::LOCAL_FINGERPRINT);
         let mut data = ProjectData {
             info: body.info,
             session,
             view: body.view,
             decompiled,
             mappings: body.mappings,
+            semantics: body.semantics,
             strings: body.strings,
             strings_truncated: body.strings_truncated,
             crypto: body.crypto,
@@ -356,6 +366,7 @@ impl ProjectData {
             data.view = None;
             data.decompiled = None;
             data.mappings.clear();
+            data.semantics = Default::default();
             data.strings.clear();
             data.crypto.clear();
         }
@@ -372,6 +383,15 @@ impl ProjectData {
         // Legacy projects allowed 4 KiB names and no aggregate name budget.
         let ranges = validate_info(&self.info, 4096, false)?;
         self.session.validate_ranges_with(&ranges)?;
+        let executable = crate::selection::ExecutableRanges::new(&self.info.sections)?;
+        if self
+            .session
+            .local_renames
+            .iter()
+            .any(|r| !executable.contains(r.identity.function))
+        {
+            return Err("Local rename function is not executable file-backed code".into());
+        }
         if self.info.sha256 != self.session.binary_sha256 {
             return Err("Project metadata and annotation fingerprints differ".into());
         }
@@ -387,7 +407,19 @@ impl ProjectData {
         }
         if let Some(text) = &self.decompiled {
             validate_mappings(text, &self.mappings, &self.info.sections)?;
-        } else if !self.mappings.is_empty() {
+            self.semantics.validate(
+                text,
+                self.view
+                    .as_ref()
+                    .ok_or("Semantic cache has no function")?
+                    .address,
+                &self.info.sections,
+            )?;
+        } else if !self.mappings.is_empty()
+            || !self.semantics.tokens.is_empty()
+            || !self.semantics.locals.is_empty()
+            || !self.semantics.warnings.is_empty()
+        {
             return Err("Decompiler mappings have no corresponding text".into());
         }
         if self.decompiled.is_some() && self.view.is_none() {
@@ -954,6 +986,7 @@ mod tests {
             },
         );
         let data = ProjectData {
+            semantics: Default::default(),
             info: info.clone(),
             session,
             view: Some(FunctionView {
@@ -1126,8 +1159,24 @@ mod tests {
         let reopened = ProjectData::load(&path).unwrap();
         assert!(reopened.data.discovery.is_none() && reopened.cache_compatible);
 
-        // Existing version 1 files open without discovery.
+        // Version 2 metadata predates semantic tokens; no text fallback is inferred.
         data.save(&path, &protection, true).unwrap();
+        let db = Connection::open(&path).unwrap();
+        let bytes = read_blob(&db, "body", MAX_BODY).unwrap().unwrap();
+        let mut legacy: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        legacy.as_object_mut().unwrap().remove("semantics");
+        db.execute(
+            "UPDATE project_data SET value=?1 WHERE key='body'",
+            [serde_json::to_vec(&legacy).unwrap()],
+        )
+        .unwrap();
+        db.execute_batch("PRAGMA user_version=2").unwrap();
+        drop(db);
+        let reopened = ProjectData::load(&path).unwrap();
+        assert!(reopened.data.discovery.is_some());
+        assert!(reopened.data.semantics.tokens.is_empty());
+
+        // Existing version 1 files open without discovery.
         let db = Connection::open(&path).unwrap();
         db.execute_batch("PRAGMA user_version=1; DELETE FROM project_data WHERE key='discovery'")
             .unwrap();
@@ -1163,7 +1212,7 @@ mod tests {
         let path = directory.path().join("test.grproj");
         for mutation in [
             "PRAGMA user_version=0",
-            "PRAGMA user_version=3",
+            "PRAGMA user_version=4",
             // Version 1 never had discovery records.
             "PRAGMA user_version=1; INSERT INTO project_data VALUES ('discovery',x'7b7d')",
             "INSERT INTO project_data VALUES ('discovery',x'7b7d')",

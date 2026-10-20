@@ -108,7 +108,8 @@ plain text while retaining the complete pseudocode for copying.
 
 - **L:** rename the selected function entry or set an address label. The existing
   name is selected; **Enter** applies and **Escape** cancels. Labels and function
-  renames are saved in projects or exported JSON annotations. Local-variable renaming is deferred.
+  renames are saved in projects or exported JSON annotations. Select a supported
+  decompiler local token and press **L**, or right-click it, to rename that variable.
 - **G:** go to a hexadecimal address or an exact known function/label name.
 - **;:** open the comment editor at the selected address.
 - **Space:** switch Listing / Function Graph.
@@ -118,10 +119,11 @@ plain text while retaining the complete pseudocode for copying.
 
 Shortcuts do not fire while typing, using a dialog, or waiting for file operations.
 Double-click a resolved call instruction in the listing or graph to navigate to
-its target. In the decompiler, double-click a recognized function name with an
-unambiguous known call target; strings, comments, unresolved calls, and ambiguous
-names do not trigger jumps. Decompiler navigation currently requires matching
-function names for call-target jumps.
+its target. In the decompiler, double-click a function-name token emitted for a
+resolved direct call to navigate to the engine's actual target, even after a
+callee rename or when names collide. Strings, comments, indirect/unresolved
+calls, and legacy caches without semantic tokens do not trigger jumps. Refresh
+legacy pseudocode to obtain semantic navigation.
 
 Selecting an instruction in the Listing or Function Graph highlights the
 corresponding pseudocode statement/expression. Clicking a mapped pseudocode
@@ -150,6 +152,27 @@ open the bytes in Decode rather than treating their addresses as functions.
 The README screenshots are captured from the native desktop built with
 `--features capture`; `src/capture.rs` documents the environment variables that
 open a function, select an instruction, and write one frame.
+
+Local renaming supports genuine recovered symbols with a single whole stack or
+register storage mapping (including recovered parameters). The engine renames
+the symbol before printing, so declarations and all uses change together and
+instruction mappings retain correct byte offsets. Names must be C identifiers
+of 1–64 ASCII bytes; keywords and collisions with another local are rejected.
+Globals, split/merged-conflict symbols, dynamic/unique-only temporaries, fields,
+objects larger than 256 bytes, and tokens without a verified identity are
+unsupported. Identity collection also has bounded symbol and definition/use budgets. Such tokens display a
+clear unsupported status and cannot silently rename an address label.
+
+Overrides are bound to the binary, function, pinned engine, storage/use limits,
+type and recovered definition/use structure. Revisit, worker restart, project
+reopen and JSON import replay only the current function's bounded overrides.
+Absent, ambiguous, changed or incompatible identities remain saved and visibly
+**not applied**; refresh cannot redirect them to a different variable. Ctrl+Z
+undoes local renames alongside other annotations. At most 64 overrides per
+function and 4,096 per session are supported. JSON v1 annotations remain readable;
+annotations containing local names use v2 so older clients reject them. Engine
+cache mismatches retain overrides for inspection, but incompatible identities
+are never applied automatically.
 
 ## Current workflow
 
@@ -224,7 +247,7 @@ UPX PE layout, not every packer or modified stub.
 ## Project files
 
 **File → Save project** or **Ctrl+S** creates a single SQLite `.grproj` file.
-It stores function names, comments, decoded annotations, the known function list,
+It stores function names, local-variable name overrides, comments, decoded annotations, the known function list,
 the current function's graph/listing and pseudocode, string/crypto scan results,
 committed discovery results (per-function status, call and data references, and
 counters), and the selected address. It is a snapshot of these results; it does
@@ -233,7 +256,7 @@ previously visited functions. The engine reopens the binary before accepting sav
 results. Reopened references are labeled **Saved analysis**; **Discover** replaces
 them with a fresh run instead of resuming from saved statuses. Saved function
 lists retain their saved-result provenance until recomputed. Projects are written
-as version 2; earlier releases reject them, while version 1 projects still open.
+as version 3; earlier releases reject them, while version 1 and 2 projects still open.
 Graph exits and call targets outside every mapped section, such as a fallthrough
 past the end of `.text` after a no-return call, are saved as unresolved.
 
