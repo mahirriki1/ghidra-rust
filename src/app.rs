@@ -6251,6 +6251,8 @@ mod tests {
                 ..Default::default()
             },
         );
+        let original = app.decompiled.clone();
+        let original_semantics = app.semantic_info.clone();
         // Exercise native egui pointer selection, keyboard dispatch, modal text
         // selection/replacement, Enter application, and Ctrl+Z outside editors.
         theme::install(&context);
@@ -6294,6 +6296,47 @@ mod tests {
             "local_value"
         );
         assert_eq!(app.session.as_ref().unwrap().version, 2);
+        // Rendering while the replacement is pending must not reuse source rows
+        // from the old text. The returned offsets then place the same comment
+        // above the renamed statement without modifying the engine's source.
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| app.side_panel(ui));
+        output.textures_delta.clear();
+        let renamed = original.replace("café", "local_value");
+        let mut semantics = original_semantics;
+        semantics.locals[0].name = "local_value".into();
+        semantics.tokens[0].end = byte + "local_value".len();
+        app.receive(
+            Pending {
+                id: 1,
+                request: Request::Decompile { address: 0x1000 },
+                started: Instant::now(),
+                selection: app.selection_generation,
+                revision: app.revision,
+                byte_origin: (app.selected, app.tab),
+            },
+            Response::Decompiled {
+                address: 0x1000,
+                mappings: vec![CodeMapping {
+                    start: renamed.find("return").unwrap(),
+                    end: renamed.find(';').unwrap() + 1,
+                    addresses: vec![0x1004, 0x1008],
+                }],
+                text: renamed.clone(),
+                semantics,
+            },
+            &context,
+        );
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| app.side_panel(ui));
+        let rows = rendered_text(&output);
+        let comment = rows.iter().position(|row| row.contains("keep me")).unwrap();
+        let statement = rows
+            .iter()
+            .position(|row| row.contains("return local_value"))
+            .unwrap();
+        assert!(comment < statement);
+        assert_eq!(rows.iter().filter(|row| row.contains("keep me")).count(), 1);
+        assert_eq!(app.decompiled, renamed);
+        output.textures_delta.clear();
         keyboard_frame(&context, &mut app, vec![]);
         keyboard_frame(
             &context,

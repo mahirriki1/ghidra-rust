@@ -1132,6 +1132,45 @@ mod tests {
     }
 
     #[test]
+    fn pre_semantic_version_2_project_retains_notes_and_refreshes_old_caches() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut data, protection) = sample(directory.path());
+        data.discovery = Some(Arc::new(discovered(&data)));
+        let path = directory.path().join("legacy.grproj");
+        data.save(&path, &protection, true).unwrap();
+        let db = Connection::open(&path).unwrap();
+        let bytes = read_blob(&db, "body", MAX_BODY).unwrap().unwrap();
+        let mut body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        body.as_object_mut().unwrap().remove("semantics");
+        body["engine"] = "ghidra-rust-project-v1-mapping-v1-pe-v1-aarch64-v1-calls-v1-arm64pe-v1-inventory-v2:268c3a406d8d964bc00ae2ead4d3e1e1373aaa27".into();
+        db.execute(
+            "UPDATE project_data SET value=?1 WHERE key='body'",
+            [serde_json::to_vec(&body).unwrap()],
+        )
+        .unwrap();
+        let mut notes = serde_json::to_value(&data.session).unwrap();
+        notes.as_object_mut().unwrap().remove("local_renames");
+        db.execute(
+            "UPDATE project_data SET value=?1 WHERE key='annotations'",
+            [serde_json::to_vec(&notes).unwrap()],
+        )
+        .unwrap();
+        db.execute_batch("PRAGMA user_version=2").unwrap();
+        drop(db);
+        let reopened = ProjectData::load(&path).unwrap();
+        assert!(!reopened.cache_compatible);
+        assert_eq!(
+            serde_json::to_value(&reopened.data.session.annotations).unwrap(),
+            serde_json::to_value(&data.session.annotations).unwrap()
+        );
+        assert!(reopened.data.view.is_none() && reopened.data.discovery.is_none());
+        assert!(reopened.data.decompiled.is_none());
+        assert!(reopened.data.semantics.tokens.is_empty());
+        assert!(reopened.data.session.local_renames.is_empty());
+        assert!(reopened.binary.is_some());
+    }
+
+    #[test]
     fn saved_discovery_round_trips_and_version_1_projects_still_open() {
         let directory = tempfile::tempdir().unwrap();
         let (mut data, protection) = sample(directory.path());

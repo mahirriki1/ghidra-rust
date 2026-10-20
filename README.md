@@ -257,6 +257,8 @@ results. Reopened references are labeled **Saved analysis**; **Discover** replac
 them with a fresh run instead of resuming from saved statuses. Saved function
 lists retain their saved-result provenance until recomputed. Projects are written
 as version 3; earlier releases reject them, while version 1 and 2 projects still open.
+The semantic-token upgrade refreshes older analysis caches while retaining their
+annotations and embedded binary; rerun discovery to rebuild saved references.
 Graph exits and call targets outside every mapped section, such as a fallthrough
 past the end of `.text` after a no-return call, are saved as unresolved.
 
@@ -406,9 +408,10 @@ imported API prototypes, library signature matching, delay imports, and Windows
 Control Flow Guard substitutions remain incomplete. Known hexadecimal addresses remain navigable.
 The PE integration tests check named exports and recovery after exports are removed.
 
-The architecture/ABI, confirmed-call and ARM64 PE analysis fingerprints invalidate
+The architecture/ABI, confirmed-call, ARM64 PE and semantic-token fingerprints invalidate
 older saved graph/decompiler caches when a project reopens; compatible annotations are
-retained. The project schema and JSON annotation format are unchanged. When comparing
+retained. Project v3 and JSON v2 preserve local renames; older formats remain readable.
+When comparing
 against a Ghidra project, compare the recorded executable SHA-256 and the selected
 function address. An installed program can change at the same path after an update.
 
@@ -418,6 +421,6 @@ can still remain blocked, but repeated cancellations cannot accumulate reader th
 Final publication is not relative to retained directory handles; same-user parent
 directory substitutions and Windows delete-sharing renames remain residual races.
 Existing Java plugins, a general plugin SDK, Python scripting, a user-facing CLI,
-debugger integration, type/variable editing, automatic custom decryption, and
+debugger integration, type editing, arbitrary variable-storage editing, automatic custom decryption, and
 Ghidra project import are later work. Performance improvements over Ghidra have
 not yet been measured.
