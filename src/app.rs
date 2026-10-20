@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
@@ -10,6 +11,7 @@ use eframe::egui::{self, RichText, ScrollArea, TextEdit};
 
 use crate::client::{WorkerClient, WorkerEvent};
 use crate::decoder_ui::{DecoderAction, DecoderPanel};
+use crate::discovery::DiscoverySnapshot;
 use crate::file_dialog::{FileDialogKind, FileDialogs, request_file};
 use crate::graph::{GraphAction, GraphCanvas};
 use crate::highlight::HighlightedCode;
@@ -155,6 +157,8 @@ struct DiscoveryPublication {
 struct DiscoveryUpdate {
     generation: u64,
     state: crate::discovery::Discovery,
+    /// Committed results for project saves, built off the GUI thread.
+    saved: Arc<DiscoverySnapshot>,
     publication: Result<Option<DiscoveryPublication>, String>,
 }
 
@@ -283,6 +287,9 @@ struct ProjectOpen {
     project: LoadedProject,
     project_path: PathBuf,
     binary_path: PathBuf,
+    /// Prepared by the file job, so restoring a large reference index never
+    /// sorts or allocates its lookup tables on the GUI thread.
+    discovery_index: Option<crate::call_analysis::CallIndex>,
 }
 
 struct Edit {
@@ -320,6 +327,11 @@ pub struct DesktopApp {
     worker_epoch: u64,
     discovery_sync: Option<VecDeque<u64>>,
     discovery_bytes: Option<(Request, RequestOrigin)>,
+    /// What a project save stores: the latest committed session results, or
+    /// the restored project's snapshot until discovery runs again.
+    discovery_saved: Option<Arc<DiscoverySnapshot>>,
+    /// References and summary came from a project rather than this session.
+    saved_references: bool,
     analysis_options: AnalysisOptions,
     analyze_prompt: Option<AnalyzePrompt>,
     analysis_plan: Option<AnalysisPlan>,
@@ -420,6 +432,8 @@ impl DesktopApp {
             worker_epoch: 0,
             discovery_sync: None,
             discovery_bytes: None,
+            discovery_saved: None,
+            saved_references: false,
             analysis_options: AnalysisOptions::default(),
             analyze_prompt: None,
             analysis_plan: None,
@@ -563,6 +577,8 @@ impl DesktopApp {
         self.discovery_summary = None;
         self.discovery_sync = None;
         self.discovery_bytes = None;
+        self.discovery_saved = None;
+        self.saved_references = false;
         self.analyze_prompt = None;
         self.analysis_plan = None;
         self.call_index = None;
@@ -876,17 +892,13 @@ impl DesktopApp {
 
     fn update_discovery_summary(&mut self) {
         if let Some(state) = &self.discovery {
-            self.discovery_summary = Some(format!(
-                "Discovery: {} examined · {} remaining · {} batches · {} failed · {}{}",
+            self.discovery_summary = Some(discovery_summary(
+                "Discovery",
                 state.report.functions_examined,
                 state.remaining(),
                 state.batches,
                 state.report.failed_functions,
-                if state.partial() {
-                    "partial coverage"
-                } else {
-                    "complete seed coverage"
-                },
+                state.partial(),
                 if self.discovery_running {
                     " · running"
                 } else if state.remaining() != 0 {
@@ -898,9 +910,38 @@ impl DesktopApp {
         }
     }
 
+    /// Discard all discovery results, including saved ones, and start again
+    /// from the current function inventory.
+    fn rediscover(&mut self, context: &egui::Context) {
+        if self.pending.as_ref().is_some_and(|pending| {
+            matches!(
+                pending.request,
+                Request::DiscoverBatch { .. } | Request::SyncFunctions { .. }
+            )
+        }) {
+            self.stop_worker();
+        }
+        // Dropping the receiver discards any background adoption in progress.
+        self.discovery = None;
+        self.discovery_job = None;
+        self.discovery_running = false;
+        self.discovery_summary = None;
+        self.discovery_saved = None;
+        self.saved_references = false;
+        self.call_index = None;
+        self.request(Request::Discover, context);
+    }
+
     fn start_discovery(&mut self, context: &egui::Context) {
         let Some(info) = &self.info else { return };
         if self.discovery.is_none() && self.discovery_job.is_none() {
+            // Saved results are display-only; a fresh run replaces them.
+            if self.saved_references {
+                self.saved_references = false;
+                self.call_index = None;
+                self.discovery_summary = None;
+                self.discovery_saved = None;
+            }
             // Only copy addresses here; queue construction, validation and all
             // reference sorting/indexing happen in parent background jobs.
             let seeds: Vec<_> = info.functions.iter().map(|f| f.address).collect();
@@ -914,6 +955,7 @@ impl DesktopApp {
                 let state = crate::discovery::Discovery::new(entry, seeds, partial);
                 let _ = sender.send(DiscoveryUpdate {
                     generation,
+                    saved: Arc::new(state.save()),
                     state,
                     publication: Ok(None),
                 });
@@ -949,6 +991,7 @@ impl DesktopApp {
             return;
         }
         self.discovery = Some(update.state);
+        self.discovery_saved = Some(update.saved);
         match update.publication {
             Ok(Some(publication)) => {
                 self.call_index = Some(publication.index);
@@ -1443,6 +1486,7 @@ impl DesktopApp {
                     });
                     let _ = sender.send(DiscoveryUpdate {
                         generation,
+                        saved: Arc::new(state.save()),
                         state,
                         publication,
                     });
@@ -1829,6 +1873,7 @@ impl DesktopApp {
             crypto: self.crypto.clone(),
             crypto_truncated: self.crypto_truncated,
             selected_address: self.selected,
+            discovery: self.discovery_saved.clone(),
         };
         let generation = self.generation;
         let revision = self.revision;
@@ -1855,6 +1900,7 @@ impl DesktopApp {
         let ProjectOpen {
             project,
             project_path,
+            discovery_index,
             ..
         } = project;
         let LoadedProject {
@@ -1874,6 +1920,20 @@ impl DesktopApp {
         self.crypto = data.crypto;
         self.crypto_truncated = data.crypto_truncated;
         self.rebuild_string_filter();
+        if let Some(saved) = data.discovery {
+            self.call_index = discovery_index;
+            self.discovery_summary = Some(discovery_summary(
+                "Saved discovery",
+                saved.report.functions_examined,
+                saved.remaining(),
+                saved.batches,
+                saved.report.failed_functions,
+                saved.report.partial,
+                "",
+            ));
+            self.saved_references = true;
+            self.discovery_saved = Some(saved);
+        }
         let selected = data
             .selected_address
             .or_else(|| data.view.as_ref().map(|v| v.address))
@@ -1949,6 +2009,11 @@ impl DesktopApp {
         self.file_task(context, move || {
             let result = (|| {
                 let project = ProjectData::load(&project_path)?;
+                let discovery_index = project
+                    .data
+                    .discovery
+                    .as_ref()
+                    .map(|saved| crate::call_analysis::CallIndex::new(saved.report.clone()));
                 let binary_path = if let Some(binary) = &project.binary {
                     binary.path().to_owned()
                 } else {
@@ -1964,6 +2029,7 @@ impl DesktopApp {
                     project,
                     project_path,
                     binary_path,
+                    discovery_index,
                 })))
             })();
             FileEvent::ProjectLoaded {
@@ -2687,6 +2753,17 @@ impl DesktopApp {
                             ui.close();
                         }
                     }
+                    if ui
+                        .add_enabled(
+                            self.discovery.is_some() || self.call_index.is_some(),
+                            egui::Button::new("Rediscover from scratch"),
+                        )
+                        .on_hover_text("Discard discovery results, including saved ones, and examine every known function again.")
+                        .clicked()
+                    {
+                        self.rediscover(&context);
+                        ui.close();
+                    }
                 });
                 if ui
                     .add_enabled(
@@ -3316,12 +3393,17 @@ impl DesktopApp {
             return;
         };
         ui.weak(format!(
-            "{} direct accesses · {} p-code operations charged · {} access candidates",
+            "{}{} direct accesses · {} p-code operations charged · {} access candidates",
+            if self.saved_references {
+                "Saved analysis · "
+            } else {
+                ""
+            },
             data.references.len(),
             data.operations_charged,
             data.accesses_examined
         ));
-        ui.weak("Direct memory reads/writes in examined functions. AArch64 register constants are propagated only within a basic block; address-only values and loaded pointers are outside this pass. Recomputed after project reopen.");
+        ui.weak("Direct memory reads/writes in examined functions. AArch64 register constants are propagated only within a basic block; address-only values and loaded pointers are outside this pass.");
         if data.partial || index.report.partial {
             ui.colored_label(theme::WARNING, "Partial access coverage: work limits, unsupported instructions or incomplete function walks.");
         }
@@ -3427,10 +3509,16 @@ impl DesktopApp {
         };
         let report = &index.report;
         ui.weak(format!(
-            "Computed this session · {} functions examined · {} decode attempts",
-            report.functions_examined, report.decode_attempts
+            "{} · {} functions examined · {} decode attempts",
+            if self.saved_references {
+                "Saved analysis"
+            } else {
+                "Computed this session"
+            },
+            report.functions_examined,
+            report.decode_attempts
         ));
-        ui.weak("Confirmed direct calls in examined functions. Unknown indirect targets remain unresolved. References are recomputed after reopening a project.");
+        ui.weak("Confirmed direct calls in examined functions. Unknown indirect targets remain unresolved.");
         if report.partial {
             ui.colored_label(
                 theme::WARNING,
@@ -4097,6 +4185,25 @@ impl DesktopApp {
         }
         capture.tick(context, !busy);
     }
+}
+
+fn discovery_summary(
+    label: &str,
+    examined: usize,
+    remaining: usize,
+    batches: usize,
+    failed: usize,
+    partial: bool,
+    activity: &str,
+) -> String {
+    format!(
+        "{label}: {examined} examined · {remaining} remaining · {batches} batches · {failed} failed · {}{activity}",
+        if partial {
+            "partial coverage"
+        } else {
+            "complete seed coverage"
+        },
+    )
 }
 
 fn is_project_path(path: &std::path::Path) -> bool {
@@ -5260,6 +5367,7 @@ mod tests {
             crypto: vec![],
             crypto_truncated: false,
             selected_address: Some(0x1000),
+            discovery: None,
         };
         let project_path = directory.path().join("analysis.grproj");
         data.save(&project_path, &protection, true).unwrap();
@@ -5271,6 +5379,7 @@ mod tests {
                 project,
                 project_path: project_path.clone(),
                 binary_path: extracted.clone(),
+                discovery_index: None,
             },
             &egui::Context::default(),
         );
@@ -5328,6 +5437,100 @@ mod tests {
         app.poll_files(&egui::Context::default());
         assert!(app.dirty());
         assert!(matches!(app.intent, Some(Intent::Close)));
+    }
+
+    #[test]
+    fn saved_references_restore_with_provenance_until_discovery_runs_again() {
+        let context = egui::Context::default();
+        theme::install(&context);
+        let mut app = keyboard_app();
+        let info = app.info.clone().unwrap();
+        let mut state = crate::discovery::Discovery::new(Some(0x1000), [0x1000, 0x1040], false);
+        let Some(Request::DiscoverBatch { binding, .. }) = state.begin(1, 1, 0) else {
+            panic!()
+        };
+        let batch = DiscoveryBatch {
+            binding,
+            functions: info.functions.clone(),
+            truncated: false,
+            outcomes: vec![DiscoveryOutcome {
+                address: 0x1000,
+                status: DiscoveryStatus::Done,
+            }],
+            analysis: CallAnalysis {
+                references: vec![CallReference {
+                    caller: 0x1000,
+                    address: 0x1004,
+                    target: 0x1040,
+                }],
+                functions_examined: 1,
+                decode_attempts: 2,
+                ..Default::default()
+            },
+        };
+        state.commit(&info, &batch).unwrap();
+        let saved = Arc::new(state.save());
+        let data = ProjectData {
+            info: info.clone(),
+            session: app.session.clone().unwrap(),
+            view: None,
+            decompiled: None,
+            mappings: Vec::new(),
+            strings: Vec::new(),
+            strings_truncated: false,
+            crypto: Vec::new(),
+            crypto_truncated: false,
+            selected_address: None,
+            discovery: Some(saved.clone()),
+        };
+        app.restore_project(
+            ProjectOpen {
+                discovery_index: Some(crate::call_analysis::CallIndex::new(saved.report.clone())),
+                project: LoadedProject {
+                    data,
+                    binary: None,
+                    source_hint: "fixture".into(),
+                    cache_compatible: true,
+                },
+                project_path: "analysis.grproj".into(),
+                binary_path: "fixture".into(),
+            },
+            &context,
+        );
+        assert!(app.saved_references);
+        assert!(Arc::ptr_eq(app.discovery_saved.as_ref().unwrap(), &saved));
+        assert_eq!(app.call_index.as_ref().unwrap().incoming[&0x1040], [0]);
+        assert!(
+            app.discovery_summary
+                .as_ref()
+                .unwrap()
+                .starts_with("Saved discovery: 1 examined · 1 remaining")
+        );
+        app.tab = Tab::References;
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| app.main_panel(ui));
+        output.textures_delta.clear();
+        assert!(
+            output.shapes.iter().any(|shape| matches!(&shape.shape,
+            egui::epaint::Shape::Text(text) if text.galley.text().starts_with("Saved analysis ·")))
+        );
+
+        // Discover never resumes or trusts saved statuses; it starts fresh.
+        app.request(Request::Discover, &context);
+        assert!(!app.saved_references && app.call_index.is_none());
+        assert!(app.discovery_saved.is_none());
+        while app.discovery_job.is_some() {
+            app.poll_discovery(&context);
+        }
+        let fresh = app.discovery_saved.as_ref().unwrap();
+        assert_eq!((fresh.batches, fresh.pending.len()), (0, 2));
+
+        // Rediscover discards session results too.
+        app.discovery.as_mut().unwrap().batches = 3;
+        app.rediscover(&context);
+        while app.discovery_job.is_some() {
+            app.poll_discovery(&context);
+        }
+        assert_eq!(app.discovery.as_ref().unwrap().batches, 0);
     }
 
     #[test]

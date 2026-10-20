@@ -1,7 +1,116 @@
-//! Parent-owned, session-only continuation. No engine state or project data.
+//! Parent-owned continuation. Projects store committed results as a
+//! display-only snapshot; continuation state itself is never persisted.
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use serde::{Deserialize, Serialize};
+
 use crate::model::*;
+
+/// Saved discovery format and evidence semantics. A different value discards a
+/// project's saved discovery while keeping its other cached results.
+pub const DISCOVERY_FINGERPRINT: &str = "discovery-v1-calls-v1-data-v1";
+
+/// Committed discovery results as stored in a project. After loading they are
+/// display-only: Discover starts a fresh queue instead of trusting saved
+/// statuses, so a forged "complete" snapshot cannot suppress recomputation.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiscoverySnapshot {
+    pub fingerprint: String,
+    /// Strictly increasing addresses per status; together at most
+    /// `MAX_FUNCTIONS` entries. Seeds of an unfinished batch remain pending.
+    #[serde(deserialize_with = "crate::bounded::vec::<_, _, { MAX_FUNCTIONS }>")]
+    pub pending: Vec<u64>,
+    #[serde(deserialize_with = "crate::bounded::vec::<_, _, { MAX_FUNCTIONS }>")]
+    pub done: Vec<u64>,
+    #[serde(deserialize_with = "crate::bounded::vec::<_, _, { MAX_FUNCTIONS }>")]
+    pub limited: Vec<u64>,
+    #[serde(deserialize_with = "crate::bounded::vec::<_, _, { MAX_FUNCTIONS }>")]
+    pub failed: Vec<u64>,
+    pub batches: usize,
+    pub capped: bool,
+    pub report: CallAnalysis,
+}
+
+impl DiscoverySnapshot {
+    /// Treats every field as untrusted. Structural consistency only: this does
+    /// not establish that the evidence matches the binary's instructions.
+    pub fn validate(&self, info: &BinaryInfo) -> Result<(), String> {
+        let total = [&self.pending, &self.done, &self.limited, &self.failed]
+            .iter()
+            .try_fold(0usize, |total, list| total.checked_add(list.len()))
+            .filter(|&total| total <= MAX_FUNCTIONS)
+            .ok_or("Saved discovery exceeds the function limit")?;
+        let mut statuses = Vec::with_capacity(total);
+        for (list, status) in [
+            (&self.pending, Status::Pending),
+            (&self.done, Status::Done),
+            (&self.limited, Status::PartialByOwnLimit),
+            (&self.failed, Status::Failed),
+        ] {
+            for (index, &address) in list.iter().enumerate() {
+                if !crate::call_analysis::code_address(info, address)
+                    || (index > 0 && list[index - 1] >= address)
+                {
+                    return Err("Invalid saved discovery function addresses or ordering".into());
+                }
+                statuses.push((address, status));
+            }
+        }
+        statuses.sort_unstable_by_key(|&(address, _)| address);
+        if statuses.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return Err("Saved discovery lists a function more than once".into());
+        }
+        let status = |address| {
+            statuses
+                .binary_search_by_key(&address, |&(address, _)| address)
+                .ok()
+                .map(|index| statuses[index].1)
+        };
+        let examined = |address| status(address).is_some_and(|status| status != Status::Pending);
+        let report = &self.report;
+        let terminal = self.done.len() + self.limited.len();
+        // Interrupted seeds can fail without being examined by a batch.
+        if !report.work_within(self.batches)
+            || report.failed_functions != self.failed.len()
+            || report.functions_examined < terminal.max(self.batches)
+            || report.functions_examined > terminal + self.failed.len()
+            || report
+                .data
+                .as_ref()
+                .is_some_and(|data| !data.work_within(report.decode_attempts, self.batches))
+        {
+            return Err("Saved discovery accounting is inconsistent".into());
+        }
+        report.validate_references(info, examined)?;
+        if report
+            .references
+            .iter()
+            .any(|reference| status(reference.target).is_none() && !self.capped)
+        {
+            return Err("Saved call targets were not admitted to discovery".into());
+        }
+        if let Some(data) = &report.data {
+            data.validate_references(info, examined)?;
+        }
+        // Never trust a separate completeness claim; derive what must be partial.
+        if (!self.pending.is_empty()
+            || !self.limited.is_empty()
+            || !self.failed.is_empty()
+            || info.functions_truncated
+            || self.capped
+            || report.data.as_ref().is_some_and(|data| data.partial))
+            && !report.partial
+        {
+            return Err("Saved discovery claims complete coverage it does not have".into());
+        }
+        Ok(())
+    }
+
+    pub fn remaining(&self) -> usize {
+        self.pending.len()
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
@@ -218,6 +327,30 @@ impl Discovery {
         let mut report = self.report.clone();
         report.partial = self.partial();
         report
+    }
+
+    /// Committed results for a project. In-flight seeds are still pending.
+    pub fn save(&self) -> DiscoverySnapshot {
+        let mut saved = DiscoverySnapshot {
+            fingerprint: DISCOVERY_FINGERPRINT.into(),
+            pending: Vec::new(),
+            done: Vec::new(),
+            limited: Vec::new(),
+            failed: Vec::new(),
+            batches: self.batches,
+            capped: self.capped,
+            report: self.snapshot(),
+        };
+        for (&address, entry) in &self.entries {
+            match entry.status {
+                Status::Pending => &mut saved.pending,
+                Status::Done => &mut saved.done,
+                Status::PartialByOwnLimit => &mut saved.limited,
+                Status::Failed => &mut saved.failed,
+            }
+            .push(address);
+        }
+        saved
     }
 }
 
@@ -455,5 +588,89 @@ mod tests {
         );
         assert!(state.snapshot().partial);
         assert_eq!(state.remaining(), 0);
+    }
+
+    #[test]
+    fn interrupted_failures_cannot_claim_complete_saved_coverage() {
+        let info = info(1);
+        let mut state = Discovery::new(Some(info.entry), [], false);
+        for epoch in 1..=MAX_DISCOVERY_INTERRUPTION_ATTEMPTS {
+            state.begin(1, epoch as u64, 0).unwrap();
+            state.interrupt();
+        }
+        let mut saved = state.save();
+        assert_eq!(saved.failed, [info.entry]);
+        assert_eq!((saved.batches, saved.report.functions_examined), (0, 0));
+        saved.validate(&info).unwrap();
+        saved.report.partial = false;
+        assert!(saved.validate(&info).is_err());
+    }
+
+    #[test]
+    fn saved_snapshots_round_trip_and_reject_forged_accounting_or_evidence() {
+        let info = info(200);
+        let mut state = Discovery::new(
+            Some(info.entry),
+            info.functions.iter().map(|f| f.address),
+            false,
+        );
+        let mut first = batch(state.begin(1, 1, 0).unwrap(), &info);
+        first.analysis.references.push(CallReference {
+            caller: info.entry,
+            address: info.entry,
+            target: 0x9000,
+        });
+        first.analysis.data = Some(DataAnalysis {
+            references: vec![DataReference {
+                function: info.entry,
+                address: info.entry,
+                target: 0x11000,
+                size: 4,
+                access: DataAccess::Read,
+                provenance: DataProvenance::InstructionLocal,
+            }],
+            operations_charged: 1,
+            accesses_examined: 1,
+            ..Default::default()
+        });
+        state.commit(&info, &first).unwrap();
+        // Two interruptions fail the next seed without a batch examining it.
+        state.begin(1, 1, 0).unwrap();
+        state.interrupt();
+        state.begin(1, 2, 0).unwrap();
+        state.interrupt();
+        let saved = state.save();
+        assert_eq!((saved.done.len(), saved.failed.len()), (128, 1));
+        assert!(saved.pending.contains(&0x9000));
+        let json = serde_json::to_vec(&saved).unwrap();
+        let parsed: DiscoverySnapshot = serde_json::from_slice(&json).unwrap();
+        parsed.validate(&info).unwrap();
+        let mut extra: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        extra["complete"] = true.into();
+        assert!(serde_json::from_value::<DiscoverySnapshot>(extra).is_err());
+
+        type Forge = fn(&mut DiscoverySnapshot);
+        let forgeries: [(&str, Forge); 9] = [
+            ("unordered", |s| s.pending.reverse()),
+            ("listed twice", |s| {
+                s.done.push(s.failed[0]);
+                s.done.sort_unstable();
+            }),
+            ("outside code", |s| s.pending.push(0x9_0000_0000)),
+            ("failure count", |s| s.report.failed_functions = 0),
+            ("examined count", |s| s.report.functions_examined += 100),
+            ("pending owner", |s| {
+                s.done.retain(|&address| address != 0x1000);
+                s.pending.insert(0, 0x1000);
+            }),
+            ("unadmitted target", |s| s.pending.retain(|&a| a != 0x9000)),
+            ("false completeness", |s| s.report.partial = false),
+            ("no batches", |s| s.batches = 0),
+        ];
+        for (name, forge) in forgeries {
+            let mut forged = saved.clone();
+            forge(&mut forged);
+            assert!(forged.validate(&info).is_err(), "accepted {name}");
+        }
     }
 }

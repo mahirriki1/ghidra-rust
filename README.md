@@ -214,11 +214,14 @@ UPX PE layout, not every packer or modified stub.
 **File → Save project** or **Ctrl+S** creates a single SQLite `.grproj` file.
 It stores function names, comments, decoded annotations, the known function list,
 the current function's graph/listing and pseudocode, string/crypto scan results,
-and the selected address. It is a snapshot of these results; it does not serialize
-the upstream decompiler's complete internal database or all previously visited
-functions. The engine reopens the binary before accepting saved results. The
-References index is session-only; run discovery again after reopening a project.
-Saved function lists retain their saved-result provenance until recomputed.
+committed discovery results (per-function status, call and data references, and
+counters), and the selected address. It is a snapshot of these results; it does
+not serialize the upstream decompiler's complete internal database or all
+previously visited functions. The engine reopens the binary before accepting saved
+results. Reopened references are labeled **Saved analysis**; **Discover** replaces
+them with a fresh run instead of resuming from saved statuses. Saved function
+lists retain their saved-result provenance until recomputed. Projects are written
+as version 2; earlier releases reject them, while version 1 projects still open.
 Graph exits and call targets outside every mapped section, such as a fallthrough
 past the end of `.text` after a no-return call, are saved as unresolved.
 
@@ -299,9 +302,9 @@ Each discovery batch examines at most 128 function entries and charges at most
 128-function cumulative ceiling: batches continue across the admitted inventory.
 Call and data reference aggregates are each capped at 16,384 unique entries;
 reaching a cap visibly marks coverage partial. A limited or failed function walk
-is terminal for this session. Discovery queues and references remain session-only
-and are rebuilt after project reopen. Failed decodes and work omitted by display
-limits count against these budgets.
+is terminal for this session. Projects save committed results for display only;
+a reopened project's Discover starts a fresh queue. Failed decodes and work
+omitted by display limits count against these budgets.
 
 Function-list and decompiler-text limits bound returned results, after the engine
 has constructed its internal data. They are not preallocation limits inside the

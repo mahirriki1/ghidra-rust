@@ -2,6 +2,7 @@
 //!
 //! A project stores a bounded current-function cache, annotations, and optionally
 //! the exact analyzed input. The decompiler's internal database is rebuilt on open.
+use crate::discovery::{DISCOVERY_FINGERPRINT, DiscoverySnapshot};
 use crate::model::{
     BinaryInfo, CodeMapping, CryptoMatch, FunctionView, MAX_CRYPTO_MATCHES, MAX_DECOMPILED_BYTES,
     MAX_GRAPH_BLOCKS, MAX_GRAPH_CALLS, MAX_GRAPH_EDGES, MAX_GRAPH_INSTRUCTIONS,
@@ -21,7 +22,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 const APPLICATION_ID: i64 = 0x4752504a; // GRPJ
-const VERSION: i64 = 1;
+/// Version 2 adds the optional `discovery` record; version 1 files still open.
+const VERSION: i64 = 2;
 pub const ENGINE_FINGERPRINT: &str = "ghidra-rust-project-v1-mapping-v1-pe-v1-aarch64-v1-calls-v1-arm64pe-v1-inventory-v2:268c3a406d8d964bc00ae2ead4d3e1e1373aaa27";
 const MAX_BINARY: usize = 128 * 1024 * 1024;
 const MAX_BODY: usize = 48 * 1024 * 1024;
@@ -42,6 +44,8 @@ pub struct ProjectData {
     pub crypto: Vec<CryptoMatch>,
     pub crypto_truncated: bool,
     pub selected_address: Option<u64>,
+    /// Shared with the desktop so capturing a save never copies the evidence.
+    pub discovery: Option<Arc<DiscoverySnapshot>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -90,6 +94,9 @@ impl ProjectData {
         embed_binary: bool,
     ) -> Result<(), String> {
         self.validate()?;
+        if let Some(discovery) = &self.discovery {
+            discovery.validate(&self.info)?;
+        }
         protection.ensure_bound(&self.info.sha256)?;
         protection.verify_identity(&self.info)?;
         // Check both modes against the immutable worker fingerprint. An external
@@ -113,6 +120,15 @@ impl ProjectData {
         };
         let body = encode(&body, MAX_BODY)?;
         check_json_budget(&body)?;
+        // Metadata and discovery share one decoded-JSON budget.
+        let discovery = self
+            .discovery
+            .as_ref()
+            .map(|discovery| encode(&**discovery, MAX_BODY - body.len()))
+            .transpose()?;
+        if let Some(discovery) = &discovery {
+            check_json_budget(discovery)?;
+        }
         let annotations = encode(&self.session, session::MAX_SESSION_BYTES as usize)?;
         let destination = session::safe_destination(path, protection)?;
         protect_binary_destination(&destination, &self.info)?;
@@ -151,6 +167,14 @@ impl ProjectData {
                     .execute(
                         "INSERT INTO project_data (key,value) VALUES (?1,?2)",
                         params![key, value],
+                    )
+                    .map_err(sql_error)?;
+            }
+            if let Some(discovery) = &discovery {
+                transaction
+                    .execute(
+                        "INSERT INTO project_data (key,value) VALUES ('discovery',?1)",
+                        params![discovery],
                     )
                     .map_err(sql_error)?;
             }
@@ -229,11 +253,24 @@ impl ProjectData {
         )
         .map_err(sql_error)?;
         configure(&db, true)?;
-        verify_database(&db)?;
+        let version = verify_database(&db)?;
         let body_bytes = read_blob(&db, "body", MAX_BODY)?.ok_or("Project metadata is missing")?;
         check_json_budget(&body_bytes)?;
         let body: Body = serde_json::from_slice(&body_bytes)
             .map_err(|e| format!("Invalid project metadata: {e}"))?;
+        // Version 1 never recorded discovery; absence is not "never analyzed".
+        let discovery = if version >= 2 {
+            read_blob(&db, "discovery", MAX_BODY - body_bytes.len())?
+        } else {
+            None
+        };
+        let discovery = discovery
+            .map(|bytes| {
+                check_json_budget(&bytes)?;
+                serde_json::from_slice::<DiscoverySnapshot>(&bytes)
+                    .map_err(|e| format!("Invalid saved discovery: {e}"))
+            })
+            .transpose()?;
         let annotations = read_blob(&db, "annotations", session::MAX_SESSION_BYTES as usize)?
             .ok_or("Project annotations are missing")?;
         let session: Session = serde_json::from_slice(&annotations)
@@ -255,8 +292,17 @@ impl ProjectData {
             crypto: body.crypto,
             crypto_truncated: body.crypto_truncated,
             selected_address: body.selected_address,
+            discovery: None,
         };
         data.validate()?;
+        // A different engine or discovery format discards only saved discovery.
+        if let Some(discovery) = discovery
+            && compatible
+            && discovery.fingerprint == DISCOVERY_FINGERPRINT
+        {
+            discovery.validate(&data.info)?;
+            data.discovery = Some(Arc::new(discovery));
+        }
         let binary = if let Some((rowid, length)) = blob_properties(&db, "binary", MAX_BINARY)? {
             if length as u64 != data.info.file_len {
                 return Err("Embedded binary length does not match project metadata".into());
@@ -447,7 +493,8 @@ pub(crate) fn protect_binary_destination(
     Ok(())
 }
 
-fn verify_database(db: &Connection) -> Result<(), String> {
+/// Returns the accepted project version.
+fn verify_database(db: &Connection) -> Result<i64, String> {
     let application: i64 = db
         .pragma_query_value(None, "application_id", |row| row.get(0))
         .map_err(sql_error)?;
@@ -457,9 +504,9 @@ fn verify_database(db: &Connection) -> Result<(), String> {
     if application != APPLICATION_ID {
         return Err("File is not a Ghidra Rust project".into());
     }
-    if version != VERSION {
+    if !(1..=VERSION).contains(&version) {
         return Err(format!(
-            "Unsupported project version {version} (expected {VERSION})"
+            "Unsupported project version {version} (expected 1 to {VERSION})"
         ));
     }
     // No views, virtual tables, triggers, generated columns, or attacker SQL.
@@ -485,15 +532,17 @@ fn verify_database(db: &Connection) -> Result<(), String> {
         return Err("Project has an unsupported or unsafe database schema".into());
     }
 
-    // Read at most five keys. Check their type and length inside SQL before any
-    // Rust String allocation or DISTINCT/ordering over attacker-sized keys.
-    let mut statement=db.prepare("SELECT typeof(key),length(key),CASE WHEN typeof(key)='text' AND length(key)<=16 THEN key ELSE NULL END FROM project_data LIMIT 5").map_err(sql_error)?;
+    // Read at most one key beyond the version's record limit. Check their type
+    // and length inside SQL before any Rust String allocation or
+    // DISTINCT/ordering over attacker-sized keys.
+    let records = if version >= 2 { 5 } else { 4 };
+    let mut statement=db.prepare("SELECT typeof(key),length(key),CASE WHEN typeof(key)='text' AND length(key)<=16 THEN key ELSE NULL END FROM project_data LIMIT 6").map_err(sql_error)?;
     let mut rows = statement.query([]).map_err(sql_error)?;
     let mut keys = std::collections::BTreeSet::new();
     let mut count = 0;
     while let Some(row) = rows.next().map_err(sql_error)? {
         count += 1;
-        if count > 4 {
+        if count > records {
             return Err("Project contains an invalid record count".into());
         }
         let kind: String = row.get(0).map_err(sql_error)?;
@@ -505,7 +554,8 @@ fn verify_database(db: &Connection) -> Result<(), String> {
         if !matches!(
             key.as_str(),
             "body" | "annotations" | "decompiled" | "binary"
-        ) {
+        ) && !(version >= 2 && key == "discovery")
+        {
             return Err("Project contains unsupported records".into());
         }
         if !keys.insert(key) {
@@ -515,7 +565,7 @@ fn verify_database(db: &Connection) -> Result<(), String> {
     if !keys.contains("body") || !keys.contains("annotations") {
         return Err("Project metadata or annotations are missing".into());
     }
-    Ok(())
+    Ok(version)
 }
 
 fn verify_written_database(path: &Path) -> Result<(), String> {
@@ -538,6 +588,7 @@ fn verify_written_database(path: &Path) -> Result<(), String> {
     verify_database(&db)?;
     for (key, limit) in [
         ("body", MAX_BODY),
+        ("discovery", MAX_BODY),
         ("annotations", session::MAX_SESSION_BYTES as usize),
         ("decompiled", MAX_DECOMPILED_BYTES),
         ("binary", MAX_BINARY),
@@ -923,6 +974,7 @@ mod tests {
             crypto: vec![],
             crypto_truncated: false,
             selected_address: Some(0x1000),
+            discovery: None,
         };
         (data, protection.bind_snapshot(&info).unwrap())
     }
@@ -1015,13 +1067,109 @@ mod tests {
         assert_eq!(fs::read(&project).unwrap(), saved);
     }
 
+    fn discovered(data: &ProjectData) -> DiscoverySnapshot {
+        use crate::discovery::Discovery;
+        use crate::model::{CallAnalysis, CallReference, DiscoveryBatch, DiscoveryOutcome};
+        let mut state = Discovery::new(Some(0x1000), [0x1000], false);
+        let Some(crate::model::Request::DiscoverBatch { binding, .. }) = state.begin(1, 1, 0)
+        else {
+            panic!()
+        };
+        let batch = DiscoveryBatch {
+            binding,
+            functions: data.info.functions.clone(),
+            truncated: false,
+            outcomes: vec![DiscoveryOutcome {
+                address: 0x1000,
+                status: crate::model::DiscoveryStatus::Done,
+            }],
+            analysis: CallAnalysis {
+                references: vec![CallReference {
+                    caller: 0x1000,
+                    address: 0x1004,
+                    target: 0x1008,
+                }],
+                functions_examined: 1,
+                decode_attempts: 3,
+                ..Default::default()
+            },
+        };
+        state.commit(&data.info, &batch).unwrap();
+        state.save()
+    }
+
+    #[test]
+    fn saved_discovery_round_trips_and_version_1_projects_still_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut data, protection) = sample(directory.path());
+        let saved = discovered(&data);
+        assert_eq!(
+            (saved.done.as_slice(), saved.pending.as_slice()),
+            (&[0x1000][..], &[0x1008][..])
+        );
+        data.discovery = Some(Arc::new(saved));
+        let path = directory.path().join("discovered.grproj");
+        data.save(&path, &protection, true).unwrap();
+        let loaded = ProjectData::load(&path).unwrap().data.discovery.unwrap();
+        assert_eq!(
+            loaded.report.references,
+            data.discovery.as_ref().unwrap().report.references
+        );
+        assert_eq!(loaded.pending, [0x1008]);
+
+        // A different discovery format drops only discovery.
+        let mut other = (**data.discovery.as_ref().unwrap()).clone();
+        other.fingerprint = "discovery-v0".into();
+        let mut older = data.clone();
+        older.discovery = Some(Arc::new(other));
+        older.save(&path, &protection, true).unwrap();
+        let reopened = ProjectData::load(&path).unwrap();
+        assert!(reopened.data.discovery.is_none() && reopened.cache_compatible);
+
+        // Existing version 1 files open without discovery.
+        data.save(&path, &protection, true).unwrap();
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("PRAGMA user_version=1; DELETE FROM project_data WHERE key='discovery'")
+            .unwrap();
+        drop(db);
+        let reopened = ProjectData::load(&path).unwrap();
+        assert!(reopened.data.discovery.is_none() && reopened.data.view.is_some());
+
+        // Forged evidence is rejected on save and when written directly.
+        let mut forged = (**data.discovery.as_ref().unwrap()).clone();
+        forged.report.partial = false;
+        let mut hostile = data.clone();
+        hostile.discovery = Some(Arc::new(forged.clone()));
+        assert!(hostile.save(&path, &protection, true).is_err());
+        data.save(&path, &protection, true).unwrap();
+        let db = Connection::open(&path).unwrap();
+        db.execute(
+            "UPDATE project_data SET value=?1 WHERE key='discovery'",
+            [serde_json::to_vec(&forged).unwrap()],
+        )
+        .unwrap();
+        drop(db);
+        assert!(
+            ProjectData::load(&path)
+                .unwrap_err()
+                .contains("complete coverage")
+        );
+    }
+
     #[test]
     fn rejects_hostile_schema_versions_types_and_tampered_embedded_bytes() {
         let directory = tempfile::tempdir().unwrap();
         let (data, protection) = sample(directory.path());
         let path = directory.path().join("test.grproj");
         for mutation in [
-            "PRAGMA user_version=2",
+            "PRAGMA user_version=0",
+            "PRAGMA user_version=3",
+            // Version 1 never had discovery records.
+            "PRAGMA user_version=1; INSERT INTO project_data VALUES ('discovery',x'7b7d')",
+            "INSERT INTO project_data VALUES ('discovery',x'7b7d')",
+            "INSERT INTO project_data VALUES ('discovery','{}')",
+            // Metadata and discovery share one 48 MiB budget.
+            "INSERT INTO project_data VALUES ('discovery',zeroblob(50331000))",
             "UPDATE project_data SET key=zeroblob(1048576) WHERE key='binary'",
             "UPDATE project_data SET key=printf('%1048576s','x') WHERE key='binary'",
             "PRAGMA application_id=0",
