@@ -211,6 +211,8 @@ the upstream decompiler's complete internal database or all previously visited
 functions. The engine reopens the binary before accepting saved results. The
 References index is session-only; run discovery again after reopening a project.
 Saved function lists retain their saved-result provenance until recomputed.
+Graph exits and call targets outside every mapped section, such as a fallthrough
+past the end of `.text` after a no-return call, are saved as unresolved.
 
 **File → Include binary in project** is enabled initially. Keeping it checked
 embeds the exact analyzed binary, so the project can move between Linux and
