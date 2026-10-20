@@ -3266,7 +3266,28 @@ impl DesktopApp {
                         .is_some_and(|s| s.annotations.contains_key(pc))
             });
         }
-        self.tab = Tab::Listing;
+        if self
+            .info
+            .as_ref()
+            .is_some_and(|info| !crate::call_analysis::code_address(info, address))
+        {
+            // Comments can belong to data as well as instructions. Never turn
+            // an annotated string/global into a guessed function entry.
+            self.reference_focus = None;
+            self.select_instruction(address);
+            self.tab = Tab::Decode;
+            self.request(
+                Request::Bytes {
+                    address,
+                    length: 128,
+                },
+                context,
+            );
+            return;
+        }
+        if record || !matches!(self.tab, Tab::Listing | Tab::Graph) {
+            self.tab = Tab::Listing;
+        }
         if self.view.as_ref().is_some_and(|view| view.address == owner) {
             self.select_instruction(address);
             self.pending_listing_scroll = self.listing.iter().position(|i| i.address == address);
@@ -5611,6 +5632,49 @@ mod tests {
             app.semantic.ranges.is_empty(),
             "unmapped comment never acquires a code selection"
         );
+    }
+
+    #[test]
+    fn annotation_history_retains_graph_and_data_comments_open_bytes() {
+        let context = egui::Context::default();
+        let mut app = semantic_app();
+        app.tab = Tab::Graph;
+        app.history = vec![0x1000, 0x1004];
+        app.history_index = 1;
+        app.history_step(false, &context);
+        assert_eq!(app.selected, Some(0x1000));
+        assert!(app.tab == Tab::Graph);
+        app.history_step(true, &context);
+        assert_eq!(app.selected, Some(0x1004));
+        assert!(app.tab == Tab::Graph);
+
+        let info = app.info.as_mut().unwrap();
+        info.file_len = 512;
+        info.sections.push(SectionInfo {
+            name: ".data".into(),
+            address: 0x2000,
+            size: 256,
+            file_offset: 256,
+            file_size: 256,
+            executable: false,
+        });
+        app.discovery_job = Some(mpsc::sync_channel(1).1);
+        app.navigate_annotation(0x2000, true, &context);
+        assert_eq!(app.selected, Some(0x2000));
+        assert!(app.tab == Tab::Decode);
+        assert!(app.reference_focus.is_none());
+        assert!(matches!(
+            app.discovery_bytes,
+            Some((
+                Request::Bytes {
+                    address: 0x2000,
+                    ..
+                },
+                _
+            ))
+        ));
+        assert!(app.queue.is_empty());
+        assert_eq!(app.view.as_ref().unwrap().address, 0x1000);
     }
 
     #[test]
