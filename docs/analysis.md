@@ -146,8 +146,9 @@ following a confirmed call can reveal more work. These counts are work measures,
 not completion percentages. Cancel still terminates the disposable worker and pauses the run, retaining
 completed batches. Discover continues it after a worker restart. Interactive
 requests run between batches, without discarding program-wide evidence. On
-restart, admitted function context and names are replayed in small bounded
-requests before the next batch. Interrupted seeds retry individually at most
+restart, inventory entries the fresh worker lacks or names differently (such as
+discovered functions and renames) are replayed in small bounded requests before
+the next batch. Interrupted seeds retry individually at most
 once; a second interruption marks them failed. Errors and timeouts pause the run
 for explicit continuation. Batch replies are bound to their request ID, worker
 epoch, binary generation, annotation revision at dispatch, and batch sequence.

@@ -125,6 +125,27 @@ fn info_without_functions(info: &BinaryInfo) -> BinaryInfo {
     }
 }
 
+/// UI annotation labels can be longer than worker inventory names.
+fn inventory_name(name: &str) -> &str {
+    let mut end = name.len().min(MAX_FUNCTION_NAME_BYTES);
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    &name[..end]
+}
+
+/// Addresses whose displayed inventory entry a freshly opened worker lacks.
+fn replay_addresses(worker: &[FunctionInfo], desired: &[FunctionInfo]) -> VecDeque<u64> {
+    desired
+        .iter()
+        .filter(|function| {
+            function_at(worker, function.address)
+                .is_none_or(|current| current.name != inventory_name(&function.name))
+        })
+        .map(|function| function.address)
+        .collect()
+}
+
 struct DiscoveryPublication {
     functions: Vec<FunctionInfo>,
     truncated: bool,
@@ -238,7 +259,7 @@ pub struct DesktopApp {
     discovery_running: bool,
     discovery_summary: Option<String>,
     worker_epoch: u64,
-    discovery_sync: Option<usize>,
+    discovery_sync: Option<VecDeque<u64>>,
     discovery_bytes: Option<(Request, RequestOrigin)>,
     reference_data: bool,
     reference_target: Option<u64>,
@@ -809,7 +830,7 @@ impl DesktopApp {
             // Only copy addresses here; queue construction, validation and all
             // reference sorting/indexing happen in parent background jobs.
             let seeds: Vec<_> = info.functions.iter().map(|f| f.address).collect();
-            let entry = crate::discovery::valid_seed(info, info.entry).then_some(info.entry);
+            let entry = crate::call_analysis::code_address(info, info.entry).then_some(info.entry);
             let partial = info.functions_truncated;
             let generation = self.generation;
             let (sender, receiver) = mpsc::sync_channel(1);
@@ -888,22 +909,22 @@ impl DesktopApp {
         {
             return;
         }
-        if let Some(cursor) = self.discovery_sync {
+        if let Some(addresses) = &mut self.discovery_sync {
             let Some(info) = &self.info else { return };
-            if cursor < info.functions.len() {
-                let end = (cursor + MAX_DISCOVERY_SYNC_FUNCTIONS).min(info.functions.len());
-                let mut functions = info.functions[cursor..end].to_vec();
-                for function in &mut functions {
-                    // UI annotation labels can be longer than inventory names.
-                    let mut end = function.name.len().min(MAX_FUNCTION_NAME_BYTES);
-                    while !function.name.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    function.name.truncate(end);
+            while !addresses.is_empty() {
+                // Read current names at send time so a later rename is not replaced.
+                let functions: Vec<_> = addresses
+                    .drain(..addresses.len().min(MAX_DISCOVERY_SYNC_FUNCTIONS))
+                    .filter_map(|address| function_at(&info.functions, address))
+                    .map(|function| FunctionInfo {
+                        address: function.address,
+                        name: inventory_name(&function.name).to_owned(),
+                    })
+                    .collect();
+                if !functions.is_empty() {
+                    self.send_direct(Request::SyncFunctions { functions });
+                    return;
                 }
-                self.discovery_sync = Some(end);
-                self.send_direct(Request::SyncFunctions { functions });
-                return;
             }
             self.discovery_sync = None;
         }
@@ -1078,6 +1099,13 @@ impl DesktopApp {
                     self.project_path = None;
                     self.project_binary = None;
                 }
+                // Replay only names the fresh worker inventory lacks or differs on.
+                let replay = project.is_some() || opening.preserve && self.info.is_some();
+                let worker_functions = if replay {
+                    info.functions.clone()
+                } else {
+                    Vec::new()
+                };
                 if let Some(project) = &project {
                     self.session = Some(project.project.data.session.clone());
                     if project.project.cache_compatible {
@@ -1096,9 +1124,6 @@ impl DesktopApp {
                 {
                     info.functions = std::mem::take(&mut previous.functions);
                     info.functions_truncated = previous.functions_truncated;
-                    self.discovery_sync = Some(0);
-                } else if project.is_some() {
-                    self.discovery_sync = Some(0);
                 }
                 if let Some(session) = &self.session {
                     for function in &mut info.functions {
@@ -1109,6 +1134,8 @@ impl DesktopApp {
                         }
                     }
                 }
+                self.discovery_sync =
+                    replay.then(|| replay_addresses(&worker_functions, &info.functions));
                 let first = info
                     .functions
                     .iter()
@@ -2424,7 +2451,12 @@ impl DesktopApp {
                     }
                 });
                 if ui
-                    .add_enabled(self.pending.is_some() || self.discovery_running || self.discovery_job.is_some(), egui::Button::new("Cancel analysis"))
+                    .add_enabled(
+                        self.pending.is_some()
+                            || self.discovery_running
+                            || self.discovery_job.is_some(),
+                        egui::Button::new("Cancel analysis"),
+                    )
                     .clicked()
                 {
                     self.stop_worker();
@@ -3681,7 +3713,9 @@ impl DesktopApp {
                             ui.spinner();
                         }
                         ui.label(&self.status);
-                        if let Some(summary) = &self.discovery_summary { ui.weak(summary); }
+                        if let Some(summary) = &self.discovery_summary {
+                            ui.weak(summary);
+                        }
                         if let Some(info) = &self.info {
                             ui.weak(format!(
                                 "{} · {} · {} bytes",
@@ -3707,7 +3741,9 @@ impl DesktopApp {
                                 Request::Open { .. } => "Opening binary",
                                 Request::Graph { .. } => "Building graph",
                                 Request::Decompile { .. } => "Decompiling",
-                                Request::Discover | Request::DiscoverBatch { .. } => "Discovering functions",
+                                Request::Discover | Request::DiscoverBatch { .. } => {
+                                    "Discovering functions"
+                                }
                                 Request::SyncFunctions { .. } => "Restoring function context",
                                 Request::Rename { .. } => "Renaming function",
                                 Request::Bytes { .. } => "Reading bytes",
@@ -5207,6 +5243,31 @@ mod tests {
         let output = frame(&mut app);
         assert!(!output.shapes.iter().any(|shape| matches!(&shape.shape,
             egui::epaint::Shape::Text(text) if text.galley.text().contains("Decompiling ·"))));
+    }
+
+    #[test]
+    fn worker_restart_replays_only_missing_or_renamed_inventory_entries() {
+        let function = |address, name: &str| FunctionInfo {
+            address,
+            name: name.into(),
+        };
+        let long = format!("{}é", "x".repeat(MAX_FUNCTION_NAME_BYTES - 1));
+        let worker = [
+            function(0x1000, "entry"),
+            function(0x1040, "next"),
+            function(0x1060, inventory_name(&long)),
+        ];
+        let desired = [
+            function(0x1000, "entry"),
+            function(0x1040, "renamed"),
+            function(0x1060, &long),
+            function(0x1080, "FUN_00001080"),
+        ];
+        assert_eq!(
+            replay_addresses(&worker, &desired),
+            [0x1040, 0x1080],
+            "Unchanged and already-truncated labels need no replay request"
+        );
     }
 
     #[test]

@@ -354,7 +354,7 @@ fn profile_contained_analysis_client() {
             };
             assert_eq!(info.sha256, input_sha256);
             let mut state = ghidra_rust::discovery::Discovery::new(
-                ghidra_rust::discovery::valid_seed(&info, info.entry).then_some(info.entry),
+                ghidra_rust::call_analysis::code_address(&info, info.entry).then_some(info.entry),
                 info.functions.iter().map(|f| f.address),
                 info.functions_truncated,
             );
