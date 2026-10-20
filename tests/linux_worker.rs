@@ -283,6 +283,7 @@ fn sandboxed_linux_worker_and_embedded_project_round_trip() {
         },
     );
     let mut project = ProjectData {
+        semantics: Default::default(),
         info,
         session,
         view: Some(view),
@@ -350,4 +351,116 @@ fn sandboxed_linux_worker_and_embedded_project_round_trip() {
         "Extracted input leaked after sandboxed worker shutdown"
     );
     assert_eq!(std::fs::read(&binary).unwrap(), original);
+}
+
+#[test]
+fn semantic_local_rename_survives_sandboxed_worker_restart() {
+    use ghidra_rust::semantic::{LocalRename, TokenKind};
+    let directory = tempfile::tempdir().unwrap();
+    let binary = directory.path().join("locals");
+    let compiled = Command::new("gcc")
+        .args(["-g", "-O0", "-fno-pie", "-no-pie", "-fno-inline"])
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/sample.c"
+        ))
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .unwrap();
+    assert!(compiled.status.success(), "{:?}", compiled);
+    let bytes = std::fs::read(&binary).unwrap();
+    let image = object::File::parse(bytes.as_slice()).unwrap();
+    let address = image
+        .symbols()
+        .find(|s| s.name().ok() == Some("branch_loop"))
+        .unwrap()
+        .address();
+    let context = eframe::egui::Context::default();
+    let executable = Path::new(env!("CARGO_BIN_EXE_ghidra-rust"));
+    let mut worker =
+        WorkerClient::start_using_executable(context.clone(), &binary, executable).unwrap();
+    assert!(matches!(
+        request(
+            &mut worker,
+            Request::Open {
+                path: binary.to_string_lossy().into_owned()
+            }
+        ),
+        Response::Opened { .. }
+    ));
+    let Response::Decompiled {
+        semantics,
+        text: original,
+        ..
+    } = request(&mut worker, Request::Decompile { address })
+    else {
+        panic!()
+    };
+    let (index, local) = semantics
+        .locals
+        .iter()
+        .enumerate()
+        .find(|(i, _)| {
+            semantics
+                .tokens
+                .iter()
+                .filter(|t| matches!(t.kind, TokenKind::Local { local: Some(j) } if j == *i))
+                .count()
+                > 2
+        })
+        .unwrap();
+    let rename = LocalRename {
+        identity: local.identity.clone(),
+        name: "sandbox_local".into(),
+    };
+    let mut expected = original;
+    for token in semantics
+        .tokens
+        .iter()
+        .rev()
+        .filter(|t| matches!(t.kind, TokenKind::Local { local: Some(i) } if i == index))
+    {
+        expected.replace_range(token.start..token.end, &rename.name);
+    }
+    let Response::Decompiled {
+        text, semantics, ..
+    } = request(
+        &mut worker,
+        Request::DecompileWithLocals {
+            address,
+            renames: vec![rename.clone()],
+        },
+    )
+    else {
+        panic!()
+    };
+    assert_eq!(text, expected);
+    assert!(semantics.warnings.is_empty());
+    drop(worker);
+    let mut worker = WorkerClient::start_using_executable(context, &binary, executable).unwrap();
+    assert!(matches!(
+        request(
+            &mut worker,
+            Request::Open {
+                path: binary.to_string_lossy().into_owned()
+            }
+        ),
+        Response::Opened { .. }
+    ));
+    let Response::Decompiled {
+        text, semantics, ..
+    } = request(
+        &mut worker,
+        Request::DecompileWithLocals {
+            address,
+            renames: vec![rename],
+        },
+    )
+    else {
+        panic!()
+    };
+    assert_eq!(text, expected);
+    assert!(semantics.warnings.is_empty());
+    assert_eq!(std::fs::read(&binary).unwrap(), bytes);
 }

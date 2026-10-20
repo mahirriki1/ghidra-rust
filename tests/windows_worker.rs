@@ -5,6 +5,7 @@ use ghidra_rust::client::{WorkerClient, WorkerEvent};
 use ghidra_rust::discovery::Discovery;
 use ghidra_rust::model::{FileIdentity, Request, Response};
 use ghidra_rust::project::ProjectData;
+use ghidra_rust::semantic::{LocalRename, TokenKind};
 use ghidra_rust::session::{Annotation, BinaryProtection, Session};
 use object::Object;
 use std::path::{Path, PathBuf};
@@ -193,6 +194,7 @@ fn real_windows_worker_and_embedded_project_round_trip() {
         "PE fixture's loop must retain a backedge"
     );
     let Response::Decompiled {
+        semantics,
         address: decompiled_address,
         text,
         mappings,
@@ -210,6 +212,36 @@ fn real_windows_worker_and_embedded_project_round_trip() {
         !mappings.is_empty(),
         "PE decompilation must return semantic instruction locations"
     );
+    let (local_index, local) = semantics.locals.iter().enumerate().find(|(index, _)| {
+        semantics.tokens.iter().filter(|token| matches!(token.kind, TokenKind::Local { local: Some(i) } if i == *index)).count() > 2
+    }).expect("MSVC /Od branch fixture must recover a storage-backed local and its declaration/uses");
+    let local_rename = LocalRename {
+        identity: local.identity.clone(),
+        name: "windows_local_value".into(),
+    };
+    let mut expected = text;
+    for token in semantics.tokens.iter().rev().filter(
+        |token| matches!(token.kind, TokenKind::Local { local: Some(i) } if i == local_index),
+    ) {
+        expected.replace_range(token.start..token.end, &local_rename.name);
+    }
+    let Response::Decompiled {
+        text,
+        mappings,
+        semantics,
+        ..
+    } = request(
+        &mut worker,
+        Request::DecompileWithLocals {
+            address,
+            renames: vec![local_rename.clone()],
+        },
+    )
+    else {
+        panic!("Windows worker did not rename the recovered local");
+    };
+    assert_eq!(text, expected);
+    assert!(semantics.warnings.is_empty());
     let Response::Strings { strings, truncated } = request(&mut worker, Request::Strings) else {
         panic!("Windows worker did not return strings");
     };
@@ -246,6 +278,12 @@ fn real_windows_worker_and_embedded_project_round_trip() {
     assert!(!saved.report.references.is_empty());
     assert!(!saved.report.data.as_ref().unwrap().references.is_empty());
     let mut session = Session::new(info.sha256.clone());
+    session.version = 2;
+    session.local_renames.push(local_rename.clone());
+    let sidecar = directory.path().join("local names 日本語.json");
+    session.save(&sidecar, &protection).unwrap();
+    let mut session = Session::load(&sidecar, &info.sha256).unwrap();
+    assert_eq!(session.local_renames, vec![local_rename.clone()]);
     session.annotations.insert(
         address,
         Annotation {
@@ -255,6 +293,7 @@ fn real_windows_worker_and_embedded_project_round_trip() {
         },
     );
     let mut project = ProjectData {
+        semantics,
         info,
         session,
         view: Some(view),
@@ -331,6 +370,22 @@ fn real_windows_worker_and_embedded_project_round_trip() {
         panic!("Windows worker did not reopen embedded project input");
     };
     loaded.data.validate_against(&fresh).unwrap();
+    let Response::Decompiled {
+        text: replayed,
+        semantics: replayed_semantics,
+        ..
+    } = request(
+        &mut reopened,
+        Request::DecompileWithLocals {
+            address,
+            renames: loaded.data.session.local_renames.clone(),
+        },
+    )
+    else {
+        panic!("Windows worker did not replay saved local names");
+    };
+    assert_eq!(Some(&replayed), loaded.data.decompiled.as_ref());
+    assert!(replayed_semantics.warnings.is_empty());
     assert!(fresh.source_identity.is_some());
     assert_ne!(fresh.source_identity, project.info.source_identity);
     let fresh_protection = reopened.protection().bind_snapshot(&fresh).unwrap();

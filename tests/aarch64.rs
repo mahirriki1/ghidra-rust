@@ -150,6 +150,7 @@ fn decompile(
     view: &FunctionView,
 ) -> (String, Vec<CodeMapping>) {
     let Response::Decompiled {
+        semantics: _,
         address: returned,
         text,
         mappings,
@@ -322,6 +323,7 @@ fn contained_aarch64_workers_analyze_elf_pe_macho_and_reopen_projects() {
             },
         );
         let project = ProjectData {
+            semantics: Default::default(),
             info,
             session,
             view: Some(sum),

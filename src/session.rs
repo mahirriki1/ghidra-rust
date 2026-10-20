@@ -198,6 +198,11 @@ pub struct Session {
     pub binary_sha256: String,
     #[serde(deserialize_with = "deserialize_annotations")]
     pub annotations: BTreeMap<u64, Annotation>,
+    #[serde(
+        default,
+        deserialize_with = "crate::bounded::vec::<_, _, { crate::semantic::MAX_LOCAL_RENAMES }>"
+    )]
+    pub local_renames: Vec<crate::semantic::LocalRename>,
 }
 
 impl Session {
@@ -206,6 +211,7 @@ impl Session {
             version: SESSION_VERSION,
             binary_sha256: sha256,
             annotations: BTreeMap::new(),
+            local_renames: Vec::new(),
         }
     }
 
@@ -268,7 +274,16 @@ impl Session {
     /// mapped regions. Like virtual byte reads, spans may cross contiguous
     /// sections and include mapped zero-filled tails, but never unmapped gaps.
     pub fn validate_ranges(&self, sections: &[SectionInfo]) -> Result<(), String> {
-        self.validate_ranges_with(&crate::selection::MappedRanges::new(sections)?)
+        self.validate_ranges_with(&crate::selection::MappedRanges::new(sections)?)?;
+        let executable = crate::selection::ExecutableRanges::new(sections)?;
+        if self
+            .local_renames
+            .iter()
+            .any(|r| !executable.contains(r.identity.function))
+        {
+            return Err("Local rename function is not executable file-backed code".into());
+        }
+        Ok(())
     }
 
     pub(crate) fn validate_ranges_with(
@@ -276,6 +291,11 @@ impl Session {
         ranges: &crate::selection::MappedRanges,
     ) -> Result<(), String> {
         self.validate()?;
+        for rename in &self.local_renames {
+            if !ranges.contains(rename.identity.function) {
+                return Err("Local rename function is outside mapped memory".into());
+            }
+        }
         for annotation in self.annotations.values() {
             for decoded in &annotation.decoded {
                 if decoded.source_length == 0 {
@@ -382,12 +402,16 @@ impl Session {
     }
 
     pub(crate) fn validate(&self) -> Result<(), String> {
-        if self.version != SESSION_VERSION {
+        if !matches!(self.version, 1 | 2) {
             return Err(format!(
-                "Unsupported session version {} (expected 1)",
+                "Unsupported session version {} (expected 1 or 2)",
                 self.version
             ));
         }
+        if self.version == 1 && !self.local_renames.is_empty() {
+            return Err("Session v1 cannot contain local names; use version 2".into());
+        }
+        crate::semantic::validate_renames(&self.local_renames, None)?;
         validate_fingerprint(&self.binary_sha256)?;
         if self.annotations.len() > MAX_ANNOTATIONS {
             return Err("Session annotation count exceeds the 10000 annotation limit".into());
@@ -1077,7 +1101,7 @@ mod tests {
                 .unwrap_err()
                 .contains("Invalid session JSON")
         );
-        for version in [0, 2, u32::MAX] {
+        for version in [0, 3, u32::MAX] {
             fs::write(
                 &path,
                 format!(r#"{{"version":{version},"binary_sha256":"{hash}","annotations":{{}}}}"#),
@@ -1137,7 +1161,7 @@ mod tests {
             "decode_payload"
         );
         let saved = fs::read(&path).unwrap();
-        replacement.version = 2;
+        replacement.version = 3;
         assert!(replacement.save(&path, &directory.protection()).is_err());
         assert_eq!(fs::read(&path).unwrap(), saved);
         assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 2);
