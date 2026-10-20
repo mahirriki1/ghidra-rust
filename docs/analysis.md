@@ -151,9 +151,10 @@ partial. This establishes structural consistency, not that the evidence matches 
 instructions. Metadata and discovery share the 48 MiB metadata budget. The
 discovery record has its own format fingerprint: a mismatch, or an incompatible
 engine fingerprint, drops saved discovery while keeping annotations. Project
-schema version 2 adds the optional record; version 1 projects still open without
-saved discovery, and earlier releases reject version 2 files. The JSON annotation
-format is unchanged. The existing saved function inventory keeps its saved-result
+schema version 2 introduced this optional record; version 1 projects still open
+without saved discovery. Current saves use version 3 for semantic tokens and local
+name overrides, and still load version 2. Older releases reject newer project
+versions. JSON v1 annotations remain readable; adding local names uses JSON v2. The existing saved function inventory keeps its saved-result
 provenance; a matching binary hash does not authenticate cached results.
 
 Legacy replies without a data report are shown as not analyzed, not as a fresh

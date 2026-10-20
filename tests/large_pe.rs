@@ -99,6 +99,7 @@ fn large_pe_metadata_analysis_and_project_round_trip() {
     eprintln!("Strings: {}, partial={truncated}", strings.len());
     let protection = worker.protection().bind_snapshot(&info).unwrap();
     let project = ProjectData {
+        semantics: Default::default(),
         session: Session::new(hash.clone()),
         info,
         view: Some(view),
