@@ -3,24 +3,6 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::model::*;
 
-/// Matches worker seed admission using indexed, checked file-backed ranges.
-pub fn valid_seed(info: &BinaryInfo, address: u64) -> bool {
-    let alignment = if info.architecture == "AArch64" { 4 } else { 1 };
-    address.is_multiple_of(alignment)
-        && info
-            .sections
-            .partition_point(|s| s.address <= address)
-            .checked_sub(1)
-            .and_then(|i| info.sections.get(i))
-            .is_some_and(|section| {
-                section.executable
-                    && address
-                        .checked_sub(section.address)
-                        .and_then(|offset| offset.checked_add(alignment))
-                        .is_some_and(|end| end <= section.file_size.min(section.size))
-            })
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
     Pending,
