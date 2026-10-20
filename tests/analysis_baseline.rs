@@ -1,6 +1,7 @@
 //! Opt-in Linux analysis-client baseline, not a GUI or cross-tool benchmark.
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod common;
+mod inventory;
 
 use ghidra_rust::client::{WorkerClient, WorkerEvent};
 use ghidra_rust::model::{Request, Response};
@@ -359,12 +360,14 @@ fn profile_contained_analysis_client() {
                 info.functions_truncated,
             );
             let mut functions = info.functions.clone();
+            let mut inventory = inventory::Inventory::default();
             let mut discover_ms = 0.;
             let mut reply_bytes = 0;
             let mut batch_metrics = Vec::new();
             while let Some(request) = state.begin(1, 1, 0) {
-                let (Response::DiscoveryBatch { batch }, elapsed, _) =
-                    sampler.request(&mut worker, request)
+                let request = inventory.bind(request);
+                let (Response::DiscoveryBatch { mut batch }, elapsed, _) =
+                    sampler.request(&mut worker, request.clone())
                 else {
                     panic!("Expected discovery batch");
                 };
@@ -379,8 +382,10 @@ fn profile_contained_analysis_client() {
                     "decode_attempts": batch.analysis.decode_attempts, "request_ms": elapsed,
                     "reply_bytes": serde_json::to_vec(&batch).unwrap().len() }),
                 );
-                state.commit(&info, &batch).unwrap();
-                functions = batch.functions;
+                inventory
+                    .commit(&mut state, &info, &request, &mut batch)
+                    .unwrap();
+                functions = inventory.functions().to_vec();
             }
             let analysis = state.snapshot();
             let second_start = Instant::now();

@@ -607,17 +607,20 @@ impl DataAnalysis {
         functions: &[FunctionInfo],
         decode_attempts: usize,
     ) -> Result<(), String> {
+        validate_inventory(info, functions)?;
+        self.validate_evidence(info, functions, decode_attempts)
+    }
+
+    /// Bounds and ownership of this reply's evidence for an inventory already
+    /// accepted by [`validate_inventory`].
+    pub(crate) fn validate_evidence(
+        &self,
+        info: &BinaryInfo,
+        functions: &[FunctionInfo],
+        decode_attempts: usize,
+    ) -> Result<(), String> {
         if !self.work_within(decode_attempts, 1) || functions.len() > MAX_FUNCTIONS {
             return Err("Data analysis exceeds its work or result bounds".into());
-        }
-        let (alignment, pointer_bytes) = layout(info)?;
-        for (index, function) in functions.iter().enumerate() {
-            if !valid_pc(info, alignment, pointer_bytes, function.address)
-                || function.name.len() > 256
-                || (index > 0 && functions[index - 1].address >= function.address)
-            {
-                return Err("Invalid data analysis function inventory".into());
-            }
         }
         self.validate_references(info, |owner| {
             functions
@@ -682,6 +685,26 @@ impl DataAnalysis {
 }
 
 /// Instruction alignment and pointer width after checking section layout.
+/// Inventory entries owning data evidence must be valid instruction starts.
+pub(crate) fn validate_inventory(
+    info: &BinaryInfo,
+    functions: &[FunctionInfo],
+) -> Result<(), String> {
+    if functions.len() > MAX_FUNCTIONS {
+        return Err("Data analysis exceeds its work or result bounds".into());
+    }
+    let (alignment, pointer_bytes) = layout(info)?;
+    for (index, function) in functions.iter().enumerate() {
+        if !valid_pc(info, alignment, pointer_bytes, function.address)
+            || function.name.len() > 256
+            || (index > 0 && functions[index - 1].address >= function.address)
+        {
+            return Err("Invalid data analysis function inventory".into());
+        }
+    }
+    Ok(())
+}
+
 fn layout(info: &BinaryInfo) -> Result<(u32, u32), String> {
     if info.sections.len() > 4096 {
         return Err("Data analysis exceeds its work or result bounds".into());

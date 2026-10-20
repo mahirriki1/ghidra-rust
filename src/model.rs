@@ -165,11 +165,117 @@ pub struct DiscoveryOutcome {
     pub status: DiscoveryStatus,
 }
 
+/// A worker's function inventory relative to the revision the parent last
+/// adopted from it. Revisions are scoped to one worker process.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "change", rename_all = "snake_case")]
+pub enum InventoryChange {
+    /// Identical to the requested base.
+    Unchanged { revision: u64 },
+    /// The requested base with strictly ordered, disjoint upserts and removals.
+    Delta {
+        base: u64,
+        revision: u64,
+        #[serde(deserialize_with = "crate::bounded::vec::<_, _, { MAX_FUNCTIONS }>")]
+        upserts: Vec<FunctionInfo>,
+        #[serde(deserialize_with = "crate::bounded::vec::<_, _, { MAX_FUNCTIONS }>")]
+        removals: Vec<u64>,
+    },
+    /// The complete inventory, sent when the parent holds no matching base.
+    Replace {
+        revision: u64,
+        #[serde(deserialize_with = "crate::bounded::vec::<_, _, { MAX_FUNCTIONS }>")]
+        functions: Vec<FunctionInfo>,
+    },
+}
+
+impl InventoryChange {
+    pub fn revision(&self) -> u64 {
+        match self {
+            Self::Unchanged { revision }
+            | Self::Delta { revision, .. }
+            | Self::Replace { revision, .. } => *revision,
+        }
+    }
+
+    /// The complete inventory this change produces from `base`, which must be
+    /// the inventory adopted at the revision the request named. Unchanged rows
+    /// are moved or shared, never revalidated here; callers validate the result.
+    pub fn apply(
+        self,
+        base: Option<(u64, &[FunctionInfo])>,
+    ) -> Result<Option<Vec<FunctionInfo>>, String> {
+        match self {
+            Self::Replace { functions, .. } => Ok(Some(functions)),
+            Self::Unchanged { revision } => match base {
+                Some((current, _)) if current == revision => Ok(None),
+                _ => Err("Unchanged inventory does not match the adopted revision".into()),
+            },
+            Self::Delta {
+                base: from,
+                revision,
+                upserts,
+                removals,
+            } => {
+                let Some((current, functions)) = base.filter(|(current, _)| *current == from)
+                else {
+                    return Err("Inventory delta does not match the adopted revision".into());
+                };
+                if revision
+                    != current
+                        .checked_add(1)
+                        .ok_or("Inventory revision overflow")?
+                    || upserts.len().saturating_add(removals.len()) > MAX_FUNCTIONS
+                    || upserts.is_empty() && removals.is_empty()
+                    || upserts
+                        .windows(2)
+                        .any(|pair| pair[0].address >= pair[1].address)
+                    || removals.windows(2).any(|pair| pair[0] >= pair[1])
+                    || upserts
+                        .iter()
+                        .any(|function| function.name.len() > MAX_FUNCTION_NAME_BYTES)
+                {
+                    return Err("Invalid inventory delta bounds or ordering".into());
+                }
+                let mut merged = Vec::with_capacity(
+                    (functions.len() + upserts.len()).min(MAX_FUNCTIONS.saturating_add(1)),
+                );
+                let mut upserts = upserts.into_iter().peekable();
+                let mut removals = removals.into_iter().peekable();
+                let mut rows = functions.iter().peekable();
+                loop {
+                    let next = [
+                        rows.peek().map(|row| row.address),
+                        upserts.peek().map(|row| row.address),
+                        removals.peek().copied(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .min();
+                    let Some(address) = next else { break };
+                    let existing = rows.next_if(|row| row.address == address);
+                    let upsert = upserts.next_if(|row| row.address == address);
+                    let removed = removals.next_if_eq(&address).is_some();
+                    match (existing, upsert, removed) {
+                        (Some(_), None, true) => {}
+                        (Some(row), None, false) => merged.push(row.clone()),
+                        (_, Some(row), false) => merged.push(row),
+                        _ => return Err("Inventory delta removes an absent or upserted row".into()),
+                    }
+                    if merged.len() > MAX_FUNCTIONS {
+                        return Err("Inventory delta exceeds the function limit".into());
+                    }
+                }
+                Ok(Some(merged))
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DiscoveryBatch {
     pub binding: DiscoveryBinding,
-    #[serde(deserialize_with = "crate::bounded::vec::<_, _, { MAX_FUNCTIONS }>")]
-    pub functions: Vec<FunctionInfo>,
+    pub inventory: InventoryChange,
     pub truncated: bool,
     pub analysis: CallAnalysis,
     /// The examined prefix of the request's seeds; the suffix remains pending.
@@ -186,7 +292,7 @@ pub struct CodeMapping {
     pub addresses: Vec<u64>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FunctionInfo {
     pub address: u64,
     pub name: String,
@@ -396,6 +502,9 @@ pub enum Request {
     Discover,
     DiscoverBatch {
         binding: DiscoveryBinding,
+        /// Inventory revision the parent adopted from this worker, if any.
+        #[serde(default)]
+        inventory_base: Option<u64>,
         #[serde(deserialize_with = "crate::bounded::vec::<_, _, { MAX_ANALYSIS_FUNCTIONS }>")]
         seeds: Vec<u64>,
     },
