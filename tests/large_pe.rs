@@ -109,6 +109,7 @@ fn large_pe_metadata_analysis_and_project_round_trip() {
         crypto: vec![],
         crypto_truncated: false,
         selected_address: Some(address),
+        discovery: None,
     };
     let output = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/large-pe-test");
     std::fs::create_dir_all(&output).unwrap();

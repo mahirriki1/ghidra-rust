@@ -120,7 +120,10 @@ its hosted build; Windows test results come from local runs.
 4. Save a project to a local writable directory with **Include binary in project**
    enabled. Add a comment and save again to exercise replacement. Close the binary
    and reopen the `.grproj`; verify annotations, saved graph/pseudocode, and
-   selection. Refresh the function to exercise a new worker for the embedded input.
+   selection. If discovery ran before saving, verify References and Data accesses
+   show **Saved analysis** on reopen. Run Discover to replace them with fresh
+   results; **Analysis → Rediscover from scratch** starts another pass. Refresh
+   the function to exercise a new worker for the embedded input.
 5. Repeat with **Include binary in project** disabled. Reopening must ask you to
    locate the original binary and verify its hash. Close the app and verify no
    analysis-worker process remains.

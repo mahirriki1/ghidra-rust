@@ -607,6 +607,28 @@ impl DataAnalysis {
         functions: &[FunctionInfo],
         decode_attempts: usize,
     ) -> Result<(), String> {
+        if !self.work_within(decode_attempts, 1) || functions.len() > MAX_FUNCTIONS {
+            return Err("Data analysis exceeds its work or result bounds".into());
+        }
+        let (alignment, pointer_bytes) = layout(info)?;
+        for (index, function) in functions.iter().enumerate() {
+            if !valid_pc(info, alignment, pointer_bytes, function.address)
+                || function.name.len() > 256
+                || (index > 0 && functions[index - 1].address >= function.address)
+            {
+                return Err("Invalid data analysis function inventory".into());
+            }
+        }
+        self.validate_references(info, |owner| {
+            functions
+                .binary_search_by_key(&owner, |function| function.address)
+                .is_ok()
+        })
+    }
+
+    /// Accounting consistent with `batches` committed worker replies; one batch
+    /// is a single reply. Counters add across batches while evidence is merged.
+    pub(crate) fn work_within(&self, decode_attempts: usize, batches: usize) -> bool {
         let counted = self
             .references
             .len()
@@ -616,59 +638,30 @@ impl DataAnalysis {
         let access_limit = self
             .operations_charged
             .checked_mul(MAX_DATA_OPERATION_INPUTS + 2);
-        if decode_attempts > MAX_ANALYSIS_INSTRUCTIONS
-            || self.operations_charged > MAX_DATA_OPERATIONS
-            || self.accesses_examined > MAX_DATA_REFERENCES
+        let scaled = |limit: usize| batches.saturating_mul(limit);
+        !(decode_attempts > scaled(MAX_ANALYSIS_INSTRUCTIONS)
+            || self.operations_charged > scaled(MAX_DATA_OPERATIONS)
+            || self.accesses_examined > scaled(MAX_DATA_REFERENCES)
             || self.references.len() > MAX_DATA_REFERENCES
             || self.unsupported_instructions > decode_attempts
             || counted.is_none_or(|count| count > self.accesses_examined)
             || operation_limit.is_none_or(|limit| self.operations_charged > limit)
             || access_limit.is_none_or(|limit| self.accesses_examined > limit)
-            || (!self.partial && self.unsupported_instructions != 0)
-            || functions.len() > MAX_FUNCTIONS
-            || info.sections.len() > 4096
-        {
-            return Err("Data analysis exceeds its work or result bounds".into());
-        }
-        let mut previous_end = None;
-        for section in &info.sections {
-            let end = section.address.checked_add(section.size);
-            let file_end = section
-                .file_offset
-                .checked_add(section.size.min(section.file_size));
-            if section.size == 0
-                || end.is_none()
-                || file_end.is_none_or(|end| end > info.file_len)
-                || previous_end.is_some_and(|end| end > section.address)
-            {
-                return Err("Invalid data analysis section bounds or ordering".into());
-            }
-            previous_end = end;
-        }
-        let (pointer_bytes, alignment) = match info.architecture.as_str() {
-            "x86" => (4, 1),
-            "x86-64" => (8, 1),
-            "AArch64" => (8, 4),
-            _ => return Err("Unsupported data analysis architecture".into()),
-        };
-        let valid_pc = |address: u64| {
-            address.is_multiple_of(u64::from(alignment))
-                && mapped_range(&info.sections, address, alignment, pointer_bytes, true)
-        };
-        for (index, function) in functions.iter().enumerate() {
-            if !valid_pc(function.address)
-                || function.name.len() > 256
-                || (index > 0 && functions[index - 1].address >= function.address)
-            {
-                return Err("Invalid data analysis function inventory".into());
-            }
-        }
+            || (!self.partial && self.unsupported_instructions != 0))
+    }
+
+    /// Address, owner, ordering, and duplicate checks shared by worker replies
+    /// and saved discovery snapshots; work bounds are checked by each caller.
+    pub(crate) fn validate_references(
+        &self,
+        info: &BinaryInfo,
+        owned: impl Fn(u64) -> bool,
+    ) -> Result<(), String> {
+        let (alignment, pointer_bytes) = layout(info)?;
         for (index, reference) in self.references.iter().enumerate() {
-            if !valid_pc(reference.function)
-                || !valid_pc(reference.address)
-                || functions
-                    .binary_search_by_key(&reference.function, |function| function.address)
-                    .is_err()
+            if !valid_pc(info, alignment, pointer_bytes, reference.function)
+                || !valid_pc(info, alignment, pointer_bytes, reference.address)
+                || !owned(reference.function)
                 || !mapped_range(
                     &info.sections,
                     reference.target,
@@ -686,6 +679,39 @@ impl DataAnalysis {
         }
         Ok(())
     }
+}
+
+/// Instruction alignment and pointer width after checking section layout.
+fn layout(info: &BinaryInfo) -> Result<(u32, u32), String> {
+    if info.sections.len() > 4096 {
+        return Err("Data analysis exceeds its work or result bounds".into());
+    }
+    let mut previous_end = None;
+    for section in &info.sections {
+        let end = section.address.checked_add(section.size);
+        let file_end = section
+            .file_offset
+            .checked_add(section.size.min(section.file_size));
+        if section.size == 0
+            || end.is_none()
+            || file_end.is_none_or(|end| end > info.file_len)
+            || previous_end.is_some_and(|end| end > section.address)
+        {
+            return Err("Invalid data analysis section bounds or ordering".into());
+        }
+        previous_end = end;
+    }
+    match info.architecture.as_str() {
+        "x86" => Ok((1, 4)),
+        "x86-64" => Ok((1, 8)),
+        "AArch64" => Ok((4, 8)),
+        _ => Err("Unsupported data analysis architecture".into()),
+    }
+}
+
+fn valid_pc(info: &BinaryInfo, alignment: u32, pointer_bytes: u32, address: u64) -> bool {
+    address.is_multiple_of(u64::from(alignment))
+        && mapped_range(&info.sections, address, alignment, pointer_bytes, true)
 }
 
 #[cfg(test)]

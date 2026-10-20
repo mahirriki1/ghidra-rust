@@ -122,14 +122,14 @@ pub struct AnalysisProgress {
     pub decode_attempts: usize,
 }
 
-/// A fresh worker computation. References are deliberately session-only; project
-/// snapshots retain the existing function inventory with saved-result provenance.
+/// A fresh worker computation, or a discovery session's cumulative aggregate.
+/// Projects store aggregates only through `discovery::DiscoverySnapshot`.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct CallAnalysis {
     #[serde(deserialize_with = "crate::bounded::vec::<_, _, { MAX_CALL_REFERENCES }>")]
     pub references: Vec<CallReference>,
     /// Optional for legacy protocol replies; absent evidence is not a fresh
-    /// empty computation. Neither reference class is stored in projects.
+    /// empty computation.
     #[serde(default)]
     pub data: Option<DataAnalysis>,
     pub functions_examined: usize,

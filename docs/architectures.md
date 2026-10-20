@@ -25,8 +25,8 @@ Decompilation uses the same engine pipeline and genuine semantic address marks a
 x86. Optimized-away instructions can have no pseudocode counterpart. Projects
 retain their binary SHA-256, file identity protections, explicit saved-analysis
 provenance, and bounded mapping validation. The architecture/ABI cache fingerprint
-invalidates older cached results while retaining compatible JSON annotations; the
-project schema remains version 1.
+invalidates older cached results while retaining compatible JSON annotations.
+Project schema version 2 adds saved discovery; version 1 projects still open.
 
 ## Limits
 

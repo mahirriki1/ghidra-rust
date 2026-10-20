@@ -332,6 +332,7 @@ fn contained_aarch64_workers_analyze_elf_pe_macho_and_reopen_projects() {
             crypto: vec![],
             crypto_truncated: false,
             selected_address: Some(base + 48),
+            discovery: None,
         };
         assert!(project.save(&binary, &protection, true).is_err());
         let path = directory.path().join("analysis.grproj");
