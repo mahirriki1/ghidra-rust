@@ -2,6 +2,7 @@
 #![cfg(windows)]
 
 use ghidra_rust::client::{WorkerClient, WorkerEvent};
+use ghidra_rust::discovery::Discovery;
 use ghidra_rust::model::{FileIdentity, Request, Response};
 use ghidra_rust::project::ProjectData;
 use ghidra_rust::session::{Annotation, BinaryProtection, Session};
@@ -229,6 +230,21 @@ fn real_windows_worker_and_embedded_project_round_trip() {
             .iter()
             .any(|hit| hit.address == aes && hit.algorithm.contains("AES"))
     );
+    let mut discovery = Discovery::new(
+        Some(info.entry),
+        info.functions.iter().map(|function| function.address),
+        info.functions_truncated,
+    );
+    let Response::DiscoveryBatch { batch } =
+        request(&mut worker, discovery.begin(1, 1, 0).unwrap())
+    else {
+        panic!("Windows worker did not return a discovery batch");
+    };
+    discovery.commit(&info, &batch).unwrap();
+    let saved = discovery.save();
+    saved.validate(&info).unwrap();
+    assert!(!saved.report.references.is_empty());
+    assert!(!saved.report.data.as_ref().unwrap().references.is_empty());
     let mut session = Session::new(info.sha256.clone());
     session.annotations.insert(
         address,
@@ -249,6 +265,7 @@ fn real_windows_worker_and_embedded_project_round_trip() {
         crypto,
         crypto_truncated,
         selected_address: Some(address),
+        discovery: Some(Arc::new(saved)),
     };
     assert!(
         project.save(&binary, &protection, true).is_err(),
@@ -280,6 +297,14 @@ fn real_windows_worker_and_embedded_project_round_trip() {
         serde_json::to_value(&project.mappings).unwrap()
     );
     assert_eq!(loaded.data.selected_address, Some(address));
+    let restored = loaded.data.discovery.as_ref().unwrap();
+    let original = project.discovery.as_ref().unwrap();
+    assert_eq!(restored.report.references, original.report.references);
+    assert_eq!(
+        restored.report.data.as_ref().unwrap().references,
+        original.report.data.as_ref().unwrap().references
+    );
+    assert_eq!(restored.pending, original.pending);
     assert_eq!(
         loaded.data.session.annotations[&address].comment,
         "Updated Windows project 日本語"
