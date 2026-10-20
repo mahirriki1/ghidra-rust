@@ -293,6 +293,7 @@ fn sandboxed_linux_worker_and_embedded_project_round_trip() {
         crypto: vec![],
         crypto_truncated: false,
         selected_address: Some(address),
+        discovery: None,
     };
     assert!(project.save(&binary, &protection, true).is_err());
     let project_path = directory.path().join("analysis 日本語.grproj");

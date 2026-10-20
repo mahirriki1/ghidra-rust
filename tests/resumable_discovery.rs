@@ -143,6 +143,10 @@ fn all_known_seeds_survive_cancel_restart_and_interactive_requests() {
             .iter()
             .all(|reference| state.report.references.contains(reference))
     );
+    // Real worker evidence passes the checks applied to saved projects.
+    let saved = state.save();
+    saved.validate(&info).unwrap();
+    assert!(saved.pending.is_empty() && saved.report.references.len() >= committed.len());
 }
 
 #[test]
@@ -182,4 +186,5 @@ fn confirmed_callees_are_scheduled_in_later_batches_on_stripped_image() {
             .iter()
             .any(|r| r.target == base + 48)
     );
+    state.save().validate(&info).unwrap();
 }

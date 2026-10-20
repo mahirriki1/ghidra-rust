@@ -133,17 +133,29 @@ Rows are virtualized. Batch validation, aggregate merging, and incoming/outgoing
 index construction run in a parent background job. Committed references remain
 visible during subsequent batches and navigation.
 
-The queue, per-function statuses, cumulative counters and reference index are
-session-only and are not serialized in
-`.grproj` files. Reopening a project requires another discovery run to rebuild it.
-The existing saved function inventory keeps its saved-result provenance; a
-matching binary hash does not authenticate cached results. The `calls-v1` analysis
-fingerprint, together with `arm64pe-v1`, invalidates older cached analysis while
-preserving compatible annotations. The project schema and JSON annotation format
-remain unchanged.
+Saving a project stores cumulative results through the last committed discovery
+batch: per-function statuses (seeds of an unfinished batch stay pending), cumulative counters, and
+call and data references. The queue order, retry counts, and worker bindings are
+not saved. A reopened project shows these results as **Saved analysis** in the
+References tab and the discovery summary. They are display-only: **Discover**
+discards them and starts a fresh queue, so a saved "complete" state cannot
+suppress recomputation. **Analysis → Rediscover from scratch** likewise discards
+session results and examines every known function again.
 
-Data references are also session-only and do not change persisted function,
-graph or decompiler results, so this increment keeps the existing fingerprint.
+Saved discovery is untrusted input. Loading checks counts against the shared
+function and reference limits, strictly ordered and unique addresses under the
+same executable-code rule as seed admission, evidence owned by examined
+functions, admitted call targets, cumulative counters consistent with the saved
+batch count, and that pending, failed, limited, or capped results are marked
+partial. This establishes structural consistency, not that the evidence matches the
+instructions. Metadata and discovery share the 48 MiB metadata budget. The
+discovery record has its own format fingerprint: a mismatch, or an incompatible
+engine fingerprint, drops saved discovery while keeping annotations. Project
+schema version 2 adds the optional record; version 1 projects still open without
+saved discovery, and earlier releases reject version 2 files. The JSON annotation
+format is unchanged. The existing saved function inventory keeps its saved-result
+provenance; a matching binary hash does not authenticate cached results.
+
 Legacy replies without a data report are shown as not analyzed, not as a fresh
 empty result. Work counters, sorted/unique evidence, source ownership and complete
 mapped target extents are validated before adoption.

@@ -214,6 +214,7 @@ fn real_worker_browses_decompiles_decodes_scans_and_recovers_from_bad_open() {
         crypto: matches,
         crypto_truncated: false,
         selected_address: Some(branch),
+        discovery: None,
     };
     let project_path = directory.join("analysis.grproj");
     project.save(&project_path, &protection, true).unwrap();

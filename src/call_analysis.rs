@@ -42,16 +42,8 @@ pub fn code_address(info: &BinaryInfo, address: u64) -> bool {
 
 impl CallAnalysis {
     pub fn validate(&self, info: &BinaryInfo, functions: &[FunctionInfo]) -> Result<(), String> {
-        if self.functions_examined > MAX_ANALYSIS_FUNCTIONS
-            || self.decode_attempts > MAX_ANALYSIS_INSTRUCTIONS
+        if !self.work_within(1)
             || self.failed_functions > self.functions_examined
-            || self.references.len() > MAX_CALL_REFERENCES
-            || self.unresolved_calls > MAX_CALL_REFERENCES
-            || self.skipped_fallthrough_calls > MAX_CALL_REFERENCES
-            || self.references.len() + self.unresolved_calls + self.skipped_fallthrough_calls
-                > MAX_CALL_REFERENCES
-            || self.references.len() + self.unresolved_calls + self.skipped_fallthrough_calls
-                > self.decode_attempts
             || functions.len() > MAX_FUNCTIONS
         {
             return Err("Call analysis exceeds its work or result bounds".into());
@@ -66,20 +58,52 @@ impl CallAnalysis {
                 return Err("Invalid analysis function inventory".into());
             }
         }
+        self.validate_references(info, |caller| {
+            functions
+                .binary_search_by_key(&caller, |f| f.address)
+                .is_ok()
+        })?;
+        if let Some(data) = &self.data {
+            data.validate(info, functions, self.decode_attempts)?;
+        }
+        Ok(())
+    }
+
+    /// Accounting consistent with `batches` committed worker replies; one batch
+    /// is a single reply. Counters add across batches while evidence is merged.
+    /// Failures are checked by callers: interrupted seeds fail unexamined.
+    pub(crate) fn work_within(&self, batches: usize) -> bool {
+        let scaled = |limit: usize| batches.saturating_mul(limit);
+        let calls = self
+            .references
+            .len()
+            .checked_add(self.unresolved_calls)
+            .and_then(|count| count.checked_add(self.skipped_fallthrough_calls));
+        !(self.functions_examined > scaled(MAX_ANALYSIS_FUNCTIONS)
+            || self.decode_attempts > scaled(MAX_ANALYSIS_INSTRUCTIONS)
+            || self.references.len() > MAX_CALL_REFERENCES
+            || calls.is_none_or(|calls| {
+                calls > scaled(MAX_CALL_REFERENCES) || calls > self.decode_attempts
+            }))
+    }
+
+    /// Address, owner, ordering, and duplicate checks shared by worker replies
+    /// and saved discovery snapshots; work bounds are checked by each caller.
+    pub(crate) fn validate_references(
+        &self,
+        info: &BinaryInfo,
+        owned: impl Fn(u64) -> bool,
+    ) -> Result<(), String> {
+        let valid = |address| code_address(info, address);
         for (index, reference) in self.references.iter().enumerate() {
             if !valid(reference.caller)
                 || !valid(reference.address)
                 || !valid(reference.target)
-                || functions
-                    .binary_search_by_key(&reference.caller, |f| f.address)
-                    .is_err()
+                || !owned(reference.caller)
                 || (index > 0 && self.references[index - 1] >= *reference)
             {
                 return Err("Invalid call evidence addresses, ordering, or duplicates".into());
             }
-        }
-        if let Some(data) = &self.data {
-            data.validate(info, functions, self.decode_attempts)?;
         }
         Ok(())
     }
