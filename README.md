@@ -222,6 +222,8 @@ results. Reopened references are labeled **Saved analysis**; **Discover** replac
 them with a fresh run instead of resuming from saved statuses. Saved function
 lists retain their saved-result provenance until recomputed. Projects are written
 as version 2; earlier releases reject them, while version 1 projects still open.
+Graph exits and call targets outside every mapped section, such as a fallthrough
+past the end of `.text` after a no-return call, are saved as unresolved.
 
 **File → Include binary in project** is enabled initially. Keeping it checked
 embeds the exact analyzed binary, so the project can move between Linux and
