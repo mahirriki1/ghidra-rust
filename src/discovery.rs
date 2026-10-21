@@ -9,7 +9,8 @@ use crate::model::*;
 
 /// Saved discovery format and evidence semantics. A different value discards a
 /// project's saved discovery while keeping its other cached results.
-pub const DISCOVERY_FINGERPRINT: &str = "discovery-v1-calls-v1-data-v1-switch-v1-patterns-v1";
+pub const DISCOVERY_FINGERPRINT: &str =
+    "discovery-v1-calls-v1-data-v1-switch-v1-patterns-v1-noreturn-v1";
 
 /// Committed discovery results as stored in a project. After loading they are
 /// display-only: Discover starts a fresh queue instead of trusting saved

@@ -31,6 +31,19 @@ The Rust adaptation admits only funcstart actions, requires each candidate's
 code to decode completely outside established code, and uses bounded,
 resumable scanning instead of the Java Program database.
 
+Ghidra named no-return functions
+
+The three data/no-return/*FunctionsThatDoNotReturn files are copied unchanged
+from Ghidra/Features/Base/data at revision
+9a723ce99952771b8368329503aa589ae233e916. src/no_return.rs adapts the container
+selection and leading-underscore name matching of NoReturnFunctionAnalyzer.java:
+https://github.com/NationalSecurityAgency/ghidra/blob/9a723ce99952771b8368329503aa589ae233e916/Ghidra/Features/Base/src/main/java/ghidra/app/plugin/core/analysis/NoReturnFunctionAnalyzer.java
+
+License: Apache License, Version 2.0 (see LICENSE).
+The native policy excludes returning/ABI-sensitive entries, adds two documented
+ELF entries, uses exact import-slot/thunk evidence, and does not infer wrappers.
+Provenance and file hashes are recorded in data/no-return/README.md.
+
 Ghidra-derived direct-memory reference analysis
 
 The bounded data-access pass adapts direct-memory reference rules from the COPY,
