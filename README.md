@@ -349,7 +349,10 @@ Call and data reference aggregates are each capped at 16,384 unique entries;
 reaching a cap visibly marks coverage partial. A limited or failed function walk
 is terminal for this session. Projects save committed results for display only;
 a reopened project's Discover starts a fresh queue. Failed decodes and work
-omitted by display limits count against these budgets.
+omitted by display limits count against these budgets. On x86-64 ELF and PE, once
+the queue drains, discovery scans for Ghidra's function-start byte patterns and
+admits only candidates whose complete code decodes outside existing functions;
+see [function-start patterns](docs/analysis.md#function-start-patterns).
 
 Function-list and decompiler-text limits bound returned results, after the engine
 has constructed its internal data. They are not preallocation limits inside the

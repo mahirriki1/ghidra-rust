@@ -9,7 +9,7 @@ use crate::model::*;
 
 /// Saved discovery format and evidence semantics. A different value discards a
 /// project's saved discovery while keeping its other cached results.
-pub const DISCOVERY_FINGERPRINT: &str = "discovery-v1-calls-v1-data-v1-switch-v1";
+pub const DISCOVERY_FINGERPRINT: &str = "discovery-v1-calls-v1-data-v1-switch-v1-patterns-v1";
 
 /// Committed discovery results as stored in a project. After loading they are
 /// display-only: Discover starts a fresh queue instead of trusting saved
@@ -202,11 +202,29 @@ struct Entry {
     interruptions: usize,
 }
 
+/// The function-start pattern phase, which runs whenever the seed queue is
+/// empty until the whole executable image has been scanned.
+#[derive(Clone, Debug, Default)]
+pub struct PatternPhase {
+    /// Where the next scan step continues; `None` once complete.
+    pub cursor: Option<u64>,
+    pub scanned_bytes: u64,
+    pub matches: usize,
+    pub validated: usize,
+    pub admitted: usize,
+    pub partial: bool,
+    interruptions: usize,
+    /// Consecutive steps that neither advanced nor admitted nor decoded.
+    stalls: usize,
+}
+
 #[derive(Default)]
 pub struct Discovery {
     entries: BTreeMap<u64, Entry>,
     pending: VecDeque<u64>,
+    /// Seeds of the batch in flight; empty for a pattern-scan step.
     flight: Option<(DiscoveryBinding, Vec<u64>)>,
+    pub patterns: Option<PatternPhase>,
     sequence: u64,
     /// Worker epoch and inventory revision whose addresses are all admitted.
     admitted: Option<(u64, u64)>,
@@ -243,8 +261,37 @@ impl Discovery {
         self.pending.push_back(address);
     }
 
+    /// Whether function-start patterns apply: a supported pattern set and
+    /// an image whose discovery is not disabled as packed.
+    pub fn patterns_apply(info: &BinaryInfo) -> bool {
+        crate::function_patterns::supported(&info.architecture, &info.format)
+            && !crate::packing::has_upx_warning(info)
+    }
+
+    /// Adds the pattern phase, scanning from the start of the image.
+    pub fn start_patterns(&mut self) {
+        self.patterns = Some(PatternPhase {
+            cursor: Some(0),
+            ..Default::default()
+        });
+    }
+
+    /// Adds the pattern phase when [`Self::patterns_apply`].
+    pub fn enable_patterns(&mut self, info: &BinaryInfo) {
+        if Self::patterns_apply(info) {
+            self.start_patterns();
+        }
+    }
+
     pub fn remaining(&self) -> usize {
         self.pending.len() + self.flight.as_ref().map_or(0, |(_, seeds)| seeds.len())
+    }
+
+    /// Whether a pattern-scan step remains.
+    pub fn scanning(&self) -> bool {
+        self.patterns
+            .as_ref()
+            .is_some_and(|phase| phase.cursor.is_some())
     }
 
     pub fn status(&self, address: u64) -> Option<Status> {
@@ -256,11 +303,34 @@ impl Discovery {
             || self.report.partial
             || self.report.data.as_ref().is_some_and(|data| data.partial)
             || self.remaining() != 0
+            || self
+                .patterns
+                .as_ref()
+                .is_some_and(|phase| phase.partial || phase.cursor.is_some())
     }
 
     pub fn begin(&mut self, generation: u64, epoch: u64, revision: u64) -> Option<Request> {
-        if self.flight.is_some() || self.pending.is_empty() {
+        if self.flight.is_some() {
             return None;
+        }
+        if self.pending.is_empty() {
+            // Scan only once every known seed has been walked, so candidates
+            // are judged against all established code.
+            let cursor = self.patterns.as_ref()?.cursor?;
+            self.sequence = self.sequence.checked_add(1)?;
+            let binding = DiscoveryBinding {
+                generation,
+                epoch,
+                revision,
+                batch: self.sequence,
+            };
+            self.flight = Some((binding, Vec::new()));
+            return Some(Request::DiscoverBatch {
+                binding,
+                inventory_base: None,
+                seeds: Vec::new(),
+                patterns: Some(cursor),
+            });
         }
         let limit = if self.entries[&self.pending[0]].interruptions > 0 {
             1
@@ -283,6 +353,7 @@ impl Discovery {
             binding,
             inventory_base: None,
             seeds,
+            patterns: None,
         })
     }
 
@@ -290,6 +361,15 @@ impl Discovery {
     /// interrupted seeds individually, and never more than the shared limit.
     pub fn interrupt(&mut self) {
         if let Some((_, seeds)) = self.flight.take() {
+            if seeds.is_empty()
+                && let Some(phase) = &mut self.patterns
+            {
+                phase.interruptions += 1;
+                if phase.interruptions >= MAX_DISCOVERY_INTERRUPTION_ATTEMPTS {
+                    phase.cursor = None;
+                    phase.partial = true;
+                }
+            }
             for address in seeds.into_iter().rev() {
                 let entry = self.entries.get_mut(&address).expect("scheduled seed");
                 entry.interruptions += 1;
@@ -325,6 +405,12 @@ impl Discovery {
         }
         let functions = inventory.functions();
         batch.analysis.validate_evidence(info, functions)?;
+        if seeds.is_empty() {
+            return self.commit_patterns(info, batch, inventory);
+        }
+        if batch.patterns.is_some() {
+            return Err("A seed batch reply carries a pattern scan".into());
+        }
         if batch.outcomes.len() != batch.analysis.functions_examined
             || batch.outcomes.is_empty()
             || batch.outcomes.len() > seeds.len()
@@ -417,6 +503,69 @@ impl Discovery {
             data.omitted_accesses += update.omitted_accesses;
             data.unsupported_instructions += update.unsupported_instructions;
             data.partial |= update.partial;
+        }
+        Ok(())
+    }
+
+    /// Commits a pattern-scan step: admitted starts must be new aligned code
+    /// entries in the reply's inventory, and the cursor may only move forward.
+    fn commit_patterns(
+        &mut self,
+        info: &BinaryInfo,
+        batch: &DiscoveryBatch,
+        inventory: &WorkerInventory,
+    ) -> Result<(), String> {
+        let scan = batch
+            .patterns
+            .as_ref()
+            .ok_or("A pattern-scan step returned no scan")?;
+        let phase = self.patterns.as_mut().ok_or("No pattern scan is pending")?;
+        let cursor = phase.cursor.ok_or("The pattern scan is already complete")?;
+        let analysis = &batch.analysis;
+        if !batch.outcomes.is_empty()
+            || analysis.functions_examined != 0
+            || analysis.decode_attempts != 0
+            || !analysis.references.is_empty()
+            || analysis.unresolved_calls != 0
+            || analysis.skipped_fallthrough_calls != 0
+            || analysis.failed_functions != 0
+            || analysis.data.is_some()
+            || scan.next.is_some_and(|next| next < cursor)
+            || scan.admitted.len() > MAX_PATTERN_ADMISSIONS
+            || scan.admitted.len() > scan.validated
+            || scan.validated > scan.matches
+            || scan.admitted.windows(2).any(|pair| pair[0] >= pair[1])
+            || scan.admitted.iter().any(|&address| {
+                address < cursor
+                    || self.entries.contains_key(&address)
+                    || !crate::call_analysis::code_address(info, address)
+                    || function_at(inventory.functions(), address).is_none()
+            })
+        {
+            return Err("Invalid function-start pattern scan".into());
+        }
+        let progressed =
+            scan.next != Some(cursor) || !scan.admitted.is_empty() || scan.covered != 0;
+        phase.stalls = if progressed { 0 } else { phase.stalls + 1 };
+        phase.cursor = scan.next;
+        if phase.stalls >= MAX_DISCOVERY_INTERRUPTION_ATTEMPTS {
+            phase.cursor = None;
+            phase.partial = true;
+        }
+        phase.scanned_bytes = phase.scanned_bytes.saturating_add(scan.scanned_bytes);
+        phase.matches = phase.matches.saturating_add(scan.matches);
+        phase.validated = phase.validated.saturating_add(scan.validated);
+        phase.admitted = phase.admitted.saturating_add(scan.admitted.len());
+        phase.partial |= scan.partial;
+        phase.interruptions = 0;
+        self.flight = None;
+        self.report.partial |= batch.truncated;
+        let key = (inventory.epoch, inventory.revision);
+        if self.admitted != Some(key) {
+            for function in inventory.functions() {
+                self.admit(function.address);
+            }
+            self.admitted = Some(key);
         }
         Ok(())
     }
@@ -550,6 +699,7 @@ mod tests {
                 functions: info.functions.clone(),
             },
             truncated: false,
+            patterns: None,
             outcomes: seeds
                 .iter()
                 .map(|&address| DiscoveryOutcome {
@@ -563,6 +713,123 @@ mod tests {
                 ..Default::default()
             },
         }
+    }
+
+    #[test]
+    fn the_pattern_scan_runs_after_seeds_and_admits_only_new_inventory_starts() {
+        let mut info = info(1);
+        let mut state = Discovery::new(Some(info.entry), [], false);
+        state.enable_patterns(&info);
+        // Seeds first; the scan starts only once the queue is empty.
+        let request = state.begin(1, 1, 0).unwrap();
+        assert!(matches!(
+            request,
+            Request::DiscoverBatch { patterns: None, .. }
+        ));
+        commit_replacement(&mut state, &info, &batch(request, &info)).unwrap();
+        let scan_step = |state: &mut Discovery| {
+            let request = state.begin(1, 1, 0).unwrap();
+            let Request::DiscoverBatch {
+                binding,
+                ref seeds,
+                patterns: Some(cursor),
+                ..
+            } = request
+            else {
+                panic!("expected a pattern scan: {request:?}");
+            };
+            assert!(seeds.is_empty());
+            (request, binding, cursor)
+        };
+        let (_, binding, cursor) = scan_step(&mut state);
+        assert_eq!(cursor, 0);
+        info.functions.push(FunctionInfo {
+            address: 0x2000,
+            name: "FUN_00002000".into(),
+        });
+        let reply = |admitted: Vec<u64>, next| DiscoveryBatch {
+            binding,
+            inventory: InventoryChange::Replace {
+                revision: binding.batch,
+                functions: info.functions.clone(),
+            },
+            truncated: false,
+            analysis: CallAnalysis::default(),
+            outcomes: vec![],
+            patterns: Some(PatternScan {
+                next,
+                scanned_bytes: 0x1000,
+                matches: 4,
+                validated: 2,
+                admitted,
+                ..Default::default()
+            }),
+        };
+        // Starts must be new functions in the reply's own inventory.
+        for invalid in [vec![0x3000], vec![0x2000, 0x2000], vec![0x2001]] {
+            let mut state = Discovery::new(None, [], false);
+            state.start_patterns();
+            let request = state.begin(1, 1, 0).unwrap();
+            let Request::DiscoverBatch { binding, .. } = request else {
+                panic!()
+            };
+            let mut reply = reply(invalid, Some(0x2000));
+            reply.binding = binding;
+            assert!(commit_replacement(&mut state, &info, &reply).is_err());
+        }
+        commit_replacement(&mut state, &info, &reply(vec![0x2000], Some(0x2000))).unwrap();
+        // The admitted start is an ordinary seed before the scan continues.
+        assert_eq!(state.remaining(), 1);
+        let request = state.begin(1, 1, 0).unwrap();
+        assert!(matches!(&request, Request::DiscoverBatch { seeds, .. } if seeds == &[0x2000]));
+        commit_replacement(&mut state, &info, &batch(request, &info)).unwrap();
+        let (_, binding, cursor) = scan_step(&mut state);
+        assert_eq!(cursor, 0x2000);
+        let mut backwards = reply(vec![], Some(0x1000));
+        backwards.binding = binding;
+        assert!(commit_replacement(&mut state, &info, &backwards).is_err());
+        let mut done = reply(vec![], None);
+        done.binding = binding;
+        commit_replacement(&mut state, &info, &done).unwrap();
+        assert!(state.begin(1, 1, 0).is_none());
+        assert!(!state.scanning() && !state.partial());
+        assert_eq!(state.patterns.as_ref().unwrap().admitted, 1);
+    }
+
+    #[test]
+    fn interrupted_or_stalled_pattern_scans_end_partial() {
+        let info = info(0);
+        let mut state = Discovery::new(None, [], false);
+        state.start_patterns();
+        for _ in 0..MAX_DISCOVERY_INTERRUPTION_ATTEMPTS {
+            assert!(state.begin(1, 1, 0).is_some());
+            state.interrupt();
+        }
+        assert!(state.begin(1, 1, 0).is_none());
+        assert!(state.partial());
+        let mut state = Discovery::new(None, [], false);
+        state.start_patterns();
+        while let Some(request) = state.begin(1, 1, 0) {
+            let Request::DiscoverBatch { binding, .. } = request else {
+                panic!()
+            };
+            let stalled = DiscoveryBatch {
+                binding,
+                inventory: InventoryChange::Replace {
+                    revision: binding.batch,
+                    functions: vec![],
+                },
+                truncated: false,
+                analysis: CallAnalysis::default(),
+                outcomes: vec![],
+                patterns: Some(PatternScan {
+                    next: Some(0),
+                    ..Default::default()
+                }),
+            };
+            commit_replacement(&mut state, &info, &stalled).unwrap();
+        }
+        assert!(state.patterns.as_ref().unwrap().partial && state.partial());
     }
 
     #[test]

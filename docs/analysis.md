@@ -29,8 +29,8 @@ not seed a function. The parent owns a deterministic session queue: entry first,
 function inventory in its existing address order. Duplicate entries are examined
 once per session; newly confirmed callees are scheduled for later batches.
 
-Arbitrary constants, prologue byte patterns, and unresolved register targets do
-not create functions. Unknown indirect calls and branches remain unresolved.
+Arbitrary constants and unresolved register targets do not create functions;
+function-start patterns are a separate, strictly validated phase described below. Unknown indirect calls and branches remain unresolved.
 Calls are separate from intrafunction control-flow edges. An established call
 instruction is machine-code evidence; it does not reconstruct a source-language
 function boundary or prove that all possible runtime calls have been found.
@@ -116,6 +116,43 @@ fixtures), i386, static and static-PIE executables, musl's `_start_c` helper,
 sectionless (`sstrip`) files, and wrapper-based startup variants are not
 recognized. Functions reachable only through pointer tables or as callbacks
 still need function-start patterns or broader pointer analysis.
+
+## Function-start patterns
+
+Functions reached only through pointer tables or callbacks have no direct call.
+On x86-64 ELF and PE, once every queued function has been walked, discovery scans
+executable file-backed sections (except `.plt*`) with Ghidra's function-start
+byte patterns: the GCC set for ELF, the Windows set for PE, vendored unchanged
+with their [provenance](../data/function-starts/README.md). A match is only a
+candidate. It is admitted as a `FUN_` function only when:
+
+- it is aligned, not already a function, not inside an instruction decoded from
+  an established function, and not inside a PE runtime-function range;
+- for patterns marked `after="defined"`, established code ends exactly at it or
+  it begins its section (padding alone does not count);
+- its own instruction walk decodes completely within 2,048 instructions with no
+  overlap with established code, no unresolved indirect jump, no internal p-code
+  branch, and no warning; every path ends in a return or an explicit jump to a
+  known function (running into another function is rejected), at least one
+  return exists, and every direct call targets executable code outside other
+  functions' interiors; numeric `validcode` sets a minimum instruction count.
+
+Candidates are examined in address order and each admitted function's code
+joins the established code immediately, so a later match inside it is
+rejected. Admitted starts become ordinary discovery seeds, so their direct
+calls are followed. `codeboundary`, `possiblefuncstart`, `setcontext` and
+patterns that require an existing function never create one. Before scanning,
+the worker decodes any established function it has not walked, so a restarted
+worker still judges candidates against all known code.
+
+Each scan step covers at most 1 MiB, 4,096 matches per 64 KiB chunk, 128
+validated candidates, 128 admissions and 16,384 decode attempts, then resumes
+from where it stopped. A match flood, an interrupted or stalled step, or a full
+inventory leaves the scan partial. Optimized code without a recognizable
+prologue (for example GCC `-O2` leaf functions) is not recovered. AArch64,
+32-bit x86 and Mach-O have no pattern set yet. Function rows do not yet record
+which evidence created them; the discovery summary reports the number of
+pattern-derived starts.
 
 ## Switch tables
 

@@ -977,21 +977,37 @@ impl DesktopApp {
 
     fn update_discovery_summary(&mut self) {
         if let Some(state) = &self.discovery {
-            self.discovery_summary = Some(discovery_summary(
-                "Discovery",
-                state.report.functions_examined,
-                state.remaining(),
-                state.batches,
-                state.report.failed_functions,
-                state.partial(),
-                if self.discovery_running {
-                    " · running"
-                } else if state.remaining() != 0 {
-                    " · paused"
-                } else {
-                    ""
-                },
-            ));
+            let patterns = state.patterns.as_ref().map_or(String::new(), |phase| {
+                format!(
+                    " · {} pattern starts from {} KiB{}",
+                    phase.admitted,
+                    phase.scanned_bytes / 1024,
+                    if phase.cursor.is_some() {
+                        " (scanning)"
+                    } else if phase.partial {
+                        " (partial)"
+                    } else {
+                        ""
+                    }
+                )
+            });
+            self.discovery_summary = Some(
+                discovery_summary(
+                    "Discovery",
+                    state.report.functions_examined,
+                    state.remaining(),
+                    state.batches,
+                    state.report.failed_functions,
+                    state.partial(),
+                    if self.discovery_running {
+                        " · running"
+                    } else if state.remaining() != 0 || state.scanning() {
+                        " · paused"
+                    } else {
+                        ""
+                    },
+                ) + &patterns,
+            );
         }
     }
 
@@ -1035,12 +1051,16 @@ impl DesktopApp {
             let seeds: Vec<_> = info.functions.iter().map(|f| f.address).collect();
             let entry = crate::call_analysis::code_address(info, info.entry).then_some(info.entry);
             let partial = info.functions_truncated;
+            let patterns = crate::discovery::Discovery::patterns_apply(info);
             let generation = self.generation;
             let (sender, receiver) = mpsc::sync_channel(1);
             self.discovery_job = Some(receiver);
             let context = context.clone();
             std::thread::spawn(move || {
-                let state = crate::discovery::Discovery::new(entry, seeds, partial);
+                let mut state = crate::discovery::Discovery::new(entry, seeds, partial);
+                if patterns {
+                    state.start_patterns();
+                }
                 let _ = sender.send(DiscoveryUpdate {
                     generation,
                     saved: Arc::new(state.save()),
@@ -1156,7 +1176,7 @@ impl DesktopApp {
                 *inventory_base = base;
             }
             self.send_direct(request);
-        } else if state.remaining() == 0 {
+        } else if state.remaining() == 0 && !state.scanning() {
             crate::performance::event("discovery_action_adopted", self.generation);
             self.discovery_running = false;
             self.worker_inventory = None;
@@ -6731,6 +6751,7 @@ mod tests {
                 functions: info.functions.clone(),
             },
             truncated: false,
+            patterns: None,
             outcomes: vec![DiscoveryOutcome {
                 address: 0x1000,
                 status: DiscoveryStatus::Done,
@@ -7157,6 +7178,7 @@ mod tests {
                 binding,
                 inventory_base: None,
                 seeds: vec![0x1000],
+                patterns: None,
             },
             started: Instant::now(),
             selection: app.selection_generation,
@@ -7206,6 +7228,7 @@ mod tests {
                 functions: info.functions.clone(),
             },
             truncated: false,
+            patterns: None,
             outcomes: seeds
                 .iter()
                 .map(|&address| DiscoveryOutcome {

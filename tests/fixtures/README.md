@@ -86,6 +86,13 @@ from one case, and `computed` tail-jumps through an unknown function pointer.
 edges, the case's call reference and decompilation, the unresolved computed jump,
 and discovery of `case_only` in a stripped copy.
 
+`callbacks.c` is an original fixture for
+[function-start patterns](../../docs/analysis.md#function-start-patterns): four
+callbacks reached only through a table of function pointers, and a helper called
+only from them. `tests/linux_worker.rs` builds stripped `-O0`/`-O2`, PIE and
+non-PIE copies and checks that every pattern-derived function exists in the
+unstripped twin, and that `-O0` recovers all five.
+
 ## AArch64
 
 `aarch64.S` is original assembly with explicit little-endian instruction words.
