@@ -21,28 +21,10 @@ fn truncated(text: &str, limit: usize) -> &str {
     &text[..end]
 }
 
-/// Global symbol names for collision-free naming, collected on first use.
-/// Callers only skip entries until a name is needed, so the symbol table is
-/// then exactly what an up-front collection would have seen. Registration
-/// that adds nothing, such as revisiting a function, never copies every name.
-#[derive(Default)]
-struct GlobalNames(Option<BTreeSet<String>>);
-
-impl GlobalNames {
-    fn get(&mut self, table: &Database, global: ScopeId) -> &mut BTreeSet<String> {
-        self.0.get_or_insert_with(|| {
-            table
-                .symbols
-                .iter()
-                .filter(|(_, symbol)| symbol.get_scope() == global)
-                .map(|(_, symbol)| symbol.get_name().to_owned())
-                .collect()
-        })
-    }
-}
-
 fn unique_name(
-    names: &mut BTreeSet<String>,
+    table: &Database,
+    global: ScopeId,
+    retired_names: &BTreeSet<String>,
     requested: &str,
     address: u64,
     fallback: &str,
@@ -64,7 +46,13 @@ fn unique_name(
     if base.is_empty() {
         base = format!("{fallback}_{address:x}");
     }
-    if names.insert(base.clone()) {
+    // Public scope insertion and rename APIs update this index before the next
+    // registration. Include global data/labels as well as functions, without
+    // copying the entire symbol arena for each new import thunk.
+    let occupied = |name: &str| {
+        table.scope_find_first_by_name(global, name).is_some() || retired_names.contains(name)
+    };
+    if !occupied(&base) {
         return base;
     }
     let mut collision = 0usize;
@@ -79,7 +67,7 @@ fn unique_name(
             truncated(&base, MAX_NAME_BYTES - suffix.len()),
             suffix
         );
-        if names.insert(candidate.clone()) {
+        if !occupied(&candidate) {
             return candidate;
         }
         collision += 1;
@@ -111,10 +99,7 @@ pub(crate) fn register(
         .map_err(|error| error.explain().to_string())?
         .get_global_scope()
         .ok_or("Missing global scope while registering PE symbols")?;
-    // Include every existing global symbol, including symbols registered outside
-    // Program's private records. Build the inventory once instead of repeatedly
-    // calling Program::set_function_name's linear uniqueness checks.
-    let mut names = GlobalNames::default();
+    let retired_names = BTreeSet::new();
 
     for (&offset, requested) in &metadata.functions {
         let address = Address::new(code_space.clone(), offset);
@@ -128,7 +113,7 @@ pub(crate) fn register(
         {
             continue;
         }
-        let name = unique_name(names.get(table, global), requested, offset, "FUN");
+        let name = unique_name(table, global, &retired_names, requested, offset, "FUN");
         Database::scope_add_function(architecture, global, &address, &name).map_err(|error| {
             format!(
                 "Cannot register PE function at {offset:#x}: {}",
@@ -158,7 +143,9 @@ pub(crate) fn register(
             continue;
         }
         let name = unique_name(
-            names.get(table, global),
+            table,
+            global,
+            &retired_names,
             &format!("__imp_{requested}"),
             offset,
             "__imp",
@@ -409,7 +396,10 @@ pub(crate) fn register_aarch64_import_thunks_budgeted(
     let global = table
         .get_global_scope()
         .ok_or("Missing global scope while naming ARM64 veneers")?;
-    let mut names = GlobalNames::default();
+    // The previous name-set implementation reserved names present at the start
+    // of this pass, even after a veneer rename. Retain just those removed names
+    // (bounded by MAX_THUNK_TARGETS), preserving collision suffixes exactly.
+    let mut retired_names = BTreeSet::new();
     for (&address, requested) in &metadata.functions {
         let Some(old_name) = existing.get(&address) else {
             continue;
@@ -421,10 +411,11 @@ pub(crate) fn register_aarch64_import_thunks_budgeted(
             .architecture()
             .symboltab_ref()
             .map_err(|error| error.explain().to_string())?;
-        let name = unique_name(names.get(table, global), requested, address, "FUN");
+        let name = unique_name(table, global, &retired_names, requested, address, "FUN");
         program
             .set_function_name(address, &name)
             .map_err(|error| error.explain().to_string())?;
+        retired_names.insert(old_name.clone());
         // Program::set_function_name updates its record and global symbol, but
         // not already materialized Funcdata/local scopes in the pinned engine.
         let architecture = program.architecture();
@@ -794,6 +785,171 @@ mod tests {
                 .iter()
                 .any(|(_, symbol)| symbol.get_name() == "must_not_overlap")
         );
+    }
+
+    fn assert_global_name_index(program: &mut Program) {
+        let table = program.architecture().symboltab_ref().unwrap();
+        let global = table.get_global_scope().unwrap();
+        let arena = table
+            .symbols
+            .iter()
+            .filter(|(_, symbol)| symbol.get_scope() == global)
+            .map(|(_, symbol)| symbol.get_name().to_owned())
+            .collect::<BTreeSet<_>>();
+        let index = table
+            .scope(global)
+            .nametree
+            .keys()
+            .map(|key| key.name.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(index, arena);
+    }
+
+    #[test]
+    fn indexed_names_preserve_collisions_across_symbol_kinds_and_mutations() {
+        for language in [
+            "x86:LE:32:default:windows",
+            "x86:LE:64:default:windows",
+            "AARCH64:LE:64:v8A:windows",
+        ] {
+            let mut program = Program::from_raw_bytes(vec![0; 0x1000], language, 0x1000).unwrap();
+            program.set_function_name(0x1000, "taken").unwrap();
+            program.set_data_name(0x1800, "taken_1020").unwrap();
+            program.set_data_name(0x1810, "taken_1020_1").unwrap();
+            program.set_data_name(0x1820, "__imp_ExitProcess").unwrap();
+            let (global, label) = {
+                let architecture = program.architecture();
+                let code = architecture.manager.get_default_code_space().unwrap();
+                let global = architecture
+                    .symboltab_ref()
+                    .unwrap()
+                    .get_global_scope()
+                    .unwrap();
+                let label = Database::scope_add_code_label(
+                    architecture,
+                    global,
+                    &Address::new(code.clone(), 0x1100),
+                    "taken_1030",
+                )
+                .unwrap();
+                // Symbols created through the public database API, outside
+                // Program's private records, participate in collisions too.
+                Database::scope_add_function(
+                    architecture,
+                    global,
+                    &Address::new(code.clone(), 0x1110),
+                    "outside",
+                )
+                .unwrap();
+                let child = architecture
+                    .symboltab_mut()
+                    .unwrap()
+                    .scope_build_sub_scope(global, 9001, "nested", 0);
+                architecture
+                    .symboltab_mut()
+                    .unwrap()
+                    .attach_scope(child, Some(global))
+                    .unwrap();
+                Database::scope_add_code_label(
+                    architecture,
+                    child,
+                    &Address::new(code, 0x1120),
+                    "nested_only",
+                )
+                .unwrap();
+                (global, label)
+            };
+            assert_global_name_index(&mut program);
+            let mut metadata = PeMetadata::default();
+            metadata.functions.extend([
+                (0x1020, "taken".into()),
+                (0x1030, "taken".into()),
+                (0x1040, "outside".into()),
+                (0x1050, "nested_only".into()),
+                (0x1060, "with\nspace".into()),
+            ]);
+            metadata.imports.insert(0x1900, "ExitProcess".into());
+            let width = if language.contains(":32:") { 4 } else { 8 };
+            register(&mut program, &metadata, width).unwrap();
+            let functions = program
+                .functions()
+                .unwrap()
+                .into_iter()
+                .map(|function| (function.address, function.name))
+                .collect::<BTreeMap<_, _>>();
+            assert_eq!(functions[&0x1020], "taken_1020_2");
+            assert_eq!(functions[&0x1030], "taken_1030_1");
+            assert_eq!(functions[&0x1040], "outside_1040");
+            assert_eq!(functions[&0x1050], "nested_only");
+            assert_eq!(functions[&0x1060], "with_space");
+            {
+                let architecture = program.architecture();
+                let data = architecture.manager.get_default_data_space().unwrap();
+                let table = architecture.symboltab_ref().unwrap();
+                let entry = table
+                    .scope_find_overlap(global, &Address::new(data, 0x1900), width)
+                    .unwrap();
+                assert_eq!(
+                    table.symbol(table.entry(entry).get_symbol()).get_name(),
+                    "__imp_ExitProcess_1900"
+                );
+            }
+            assert_global_name_index(&mut program);
+
+            program.set_function_name(0x1000, "renamed").unwrap();
+            program
+                .architecture()
+                .symboltab_mut()
+                .unwrap()
+                .scope_remove_symbol(global, label);
+            let mut later = PeMetadata::default();
+            later.functions.insert(0x1070, "taken".into());
+            later.functions.insert(0x1080, "taken_1030".into());
+            register(&mut program, &later, width).unwrap();
+            let functions = program
+                .functions()
+                .unwrap()
+                .into_iter()
+                .map(|function| (function.address, function.name))
+                .collect::<BTreeMap<_, _>>();
+            assert_eq!(functions[&0x1070], "taken");
+            assert_eq!(functions[&0x1080], "taken_1030");
+            assert_global_name_index(&mut program);
+        }
+    }
+
+    #[test]
+    fn veneer_promotion_keeps_retired_names_reserved_for_the_whole_pass() {
+        let (mut bytes, sections, mut metadata) = arm64_fixture(ARM64_VENEER);
+        for (index, word) in [0x9000_0010u32, 0xf940_4611, 0xd61f_0220]
+            .into_iter()
+            .enumerate()
+        {
+            bytes[0x50 + index * 4..0x54 + index * 4].copy_from_slice(&word.to_le_bytes());
+        }
+        metadata.functions.insert(0x1050, "FUN_1050".into());
+        metadata.imports.insert(0x1080, "Renamed".into());
+        metadata.imports.insert(0x1088, "FUN_1040".into());
+        let mut program =
+            Program::from_raw_bytes(bytes.clone(), "AARCH64:LE:64:v8A:windows", 0x1000).unwrap();
+        register(&mut program, &metadata, 8).unwrap();
+        register_aarch64_import_thunks(
+            &mut program,
+            &metadata.imports,
+            &bytes,
+            &sections,
+            &BTreeSet::from([0x1040, 0x1050]),
+        )
+        .unwrap();
+        let functions = program
+            .functions()
+            .unwrap()
+            .into_iter()
+            .map(|function| (function.address, function.name))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(functions[&0x1040], "Renamed");
+        assert_eq!(functions[&0x1050], "FUN_1040_1050");
+        assert_global_name_index(&mut program);
     }
 
     #[test]

@@ -138,7 +138,10 @@ impl Inventory {
                 .filter(|(revision, _)| Some(*revision) == base)
                 .map(|(revision, rows)| (*revision, rows.as_slice()));
             let rebuilt = change.clone().apply(shadow).expect("valid publication");
-            assert_eq!(rebuilt.as_deref().unwrap_or(functions), functions);
+            let published = rebuilt
+                .as_deref()
+                .unwrap_or_else(|| shadow.expect("unchanged publication has a matching base").1);
+            assert_eq!(published, functions);
             self.shadow = Some((change.revision(), functions.to_vec()));
         }
         Ok(change)
@@ -190,6 +193,19 @@ impl Inventory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "assertion `left == right` failed")]
+    fn publication_oracle_rejects_an_unjournaled_name_change() {
+        let mut inventory = Inventory::default();
+        let mut functions = rows(&[(0x10, "before")]);
+        let first = inventory.publish(None, &functions).unwrap();
+        functions[0].name = "after".into();
+        inventory
+            .publish(Some(first.revision()), &functions)
+            .unwrap();
+    }
 
     fn rows(rows: &[(u64, &str)]) -> Vec<FunctionInfo> {
         rows.iter()
