@@ -16,6 +16,21 @@ Rust adaptations use the desktop's immutable image model and public engine APIs,
 with explicit work budgets, session-only call references, and worker progress.
 This is separate from the pinned decompiler port and its Ghidra source revision.
 
+Ghidra function-start patterns
+
+data/function-starts/x86-64gcc_patterns.xml and x86-64win_patterns.xml are
+copied unchanged from Ghidra's Processors/x86/data/patterns at revision
+9a723ce99952771b8368329503aa589ae233e916. src/function_patterns.rs adapts the
+pattern-pair, ditted-bit, alignment and funcstart semantics of Ghidra's
+FunctionStartAnalyzer.java and PatternPairSet.java:
+https://github.com/NationalSecurityAgency/ghidra/blob/9a723ce99952771b8368329503aa589ae233e916/Ghidra/Features/BytePatterns/src/main/java/ghidra/app/analyzers/FunctionStartAnalyzer.java
+https://github.com/NationalSecurityAgency/ghidra/blob/9a723ce99952771b8368329503aa589ae233e916/Ghidra/Features/Base/src/main/java/ghidra/util/bytesearch/PatternPairSet.java
+
+License: Apache License, Version 2.0 (see LICENSE).
+The Rust adaptation admits only funcstart actions, requires each candidate's
+code to decode completely outside established code, and uses bounded,
+resumable scanning instead of the Java Program database.
+
 Ghidra-derived direct-memory reference analysis
 
 The bounded data-access pass adapts direct-memory reference rules from the COPY,

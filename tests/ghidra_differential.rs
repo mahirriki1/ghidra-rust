@@ -205,6 +205,8 @@ fn rust_arm(request_doc: &RunRequest) -> RustRun {
         info.functions.iter().map(|function| function.address),
         info.functions_truncated,
     );
+    // As in the desktop: function-start patterns run once the queue drains.
+    state.enable_patterns(&info);
     let mut inventory = inventory::Inventory::default();
     run.functions = info.functions.clone();
     let mut request_ms = 0.;
@@ -787,7 +789,7 @@ fn benchmark_against_ghidra() {
             "truth": truths.get(&case.id), "requested": case.requested})).collect::<Vec<_>>(),
         "runs": runs,
         "limitations": [
-            "Ghidra runs its default analyzers; ghidra-rust runs contained direct-call discovery. Scopes differ",
+            "Ghidra runs its default analyzers; ghidra-rust runs contained direct-call discovery and function-start patterns. Scopes differ",
             "Ghidra runs without the production worker's sandbox; use trusted inputs only",
             "Ghidra's 2 GiB heap limit is not equivalent to the worker's 2 GiB address-space limit",
             "Samples are non-atomic estimates; RSS sums can double-count shared pages",
