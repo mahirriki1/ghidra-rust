@@ -464,20 +464,25 @@ impl Emit for LocationEmitter {
             highlight,
             SyntaxHighlight::VarColor | SyntaxHighlight::ParamColor
         ) {
+            let capture = self.capture.lock().unwrap_or_else(|e| e.into_inner());
             let local = match node {
-                Some(node) => self
-                    .capture
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .locals
-                    .nodes
-                    .get(&node.id)
-                    .copied(),
+                Some(node) => capture.locals.nodes.get(&node.id).copied(),
                 None if self.declaration_overflow == 0 => {
                     self.declarations.last().copied().flatten()
                 }
                 None => None,
             };
+            // Optimized output can print a captured member under another
+            // variable's name. Such a token is not verified as that local, so
+            // it stays unsupported instead of rejecting the whole result.
+            let local = local.filter(|&index| {
+                capture
+                    .locals
+                    .variables
+                    .get(index)
+                    .is_some_and(|variable| variable.name == text)
+            });
+            drop(capture);
             self.semantic_token(start, text, TokenKind::Local { local });
         }
         Ok(())

@@ -7,7 +7,7 @@ use ghidra_rust::project::ProjectData;
 use ghidra_rust::session::{Annotation, Session};
 use object::{Object, ObjectSymbol};
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -463,4 +463,180 @@ fn semantic_local_rename_survives_sandboxed_worker_restart() {
     assert_eq!(text, expected);
     assert!(semantics.warnings.is_empty());
     assert_eq!(std::fs::read(&binary).unwrap(), bytes);
+}
+
+/// Compiles original C with GCC; `strip` additionally removes every symbol.
+fn compile(directory: &Path, name: &str, source: &Path, args: &[&str], strip: bool) -> PathBuf {
+    let output = directory.join(name);
+    let compiled = Command::new("gcc")
+        .args(args)
+        .arg(source)
+        .arg("-o")
+        .arg(&output)
+        .output()
+        .expect("Linux integration tests require GCC");
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    if strip {
+        let stripped = Command::new("strip")
+            .arg("--strip-all")
+            .arg(&output)
+            .status()
+            .expect("Linux integration tests require binutils strip");
+        assert!(stripped.success());
+    }
+    output
+}
+
+fn symbol(binary: &Path, name: &str) -> u64 {
+    let bytes = std::fs::read(binary).unwrap();
+    let image = object::File::parse(bytes.as_slice()).unwrap();
+    image
+        .symbols()
+        .find(|symbol| symbol.name().ok() == Some(name))
+        .unwrap_or_else(|| panic!("{name} symbol"))
+        .address()
+}
+
+fn open(binary: &Path) -> (WorkerClient, ghidra_rust::model::BinaryInfo) {
+    let mut worker = WorkerClient::start_using_executable(
+        eframe::egui::Context::default(),
+        binary,
+        Path::new(env!("CARGO_BIN_EXE_ghidra-rust")),
+    )
+    .unwrap();
+    let response = request(
+        &mut worker,
+        Request::Open {
+            path: binary.to_string_lossy().into_owned(),
+        },
+    );
+    let Response::Opened { info } = response else {
+        panic!(
+            "Sandboxed worker did not open {}: {response:?}",
+            binary.display()
+        );
+    };
+    (worker, info)
+}
+
+fn recovered_main(info: &ghidra_rust::model::BinaryInfo) -> Option<u64> {
+    let main = info
+        .functions
+        .iter()
+        .find(|function| function.name == "main")?;
+    let note = format!("Recovered main at {:#x}", main.address);
+    info.warnings
+        .iter()
+        .any(|warning| warning.starts_with(&note))
+        .then_some(main.address)
+}
+
+// Stripped glibc executables keep no symbol for main: the C runtime's entry
+// passes it to the imported __libc_start_main. Truth comes from the unstripped
+// twin, whose allocated sections stripping leaves unchanged.
+#[test]
+fn stripped_elf_recovers_main_from_its_startup_call() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/sample.c"
+    ));
+    for flags in [
+        ["-O0", "-fno-pie", "-no-pie"],
+        ["-O0", "-fPIE", "-pie"],
+        ["-O2", "-fno-pie", "-no-pie"],
+        ["-O2", "-fPIE", "-pie"],
+    ] {
+        let name = flags.join("");
+        let args = [&flags[..], &["-fno-inline"]].concat();
+        let reference = compile(
+            directory.path(),
+            &format!("{name}-symbols"),
+            source,
+            &args,
+            false,
+        );
+        let binary = compile(directory.path(), &name, source, &args, true);
+        let (main, callee) = (
+            symbol(&reference, "main"),
+            symbol(&reference, "branch_loop"),
+        );
+        let (mut worker, info) = open(&binary);
+        assert_eq!(recovered_main(&info), Some(main), "{name}");
+        assert!(
+            !info.functions.iter().any(|f| f.address == callee),
+            "{name}"
+        );
+        let Response::Functions {
+            functions,
+            analysis,
+            ..
+        } = request(&mut worker, Request::Discover)
+        else {
+            panic!("Sandboxed worker did not discover calls");
+        };
+        analysis.validate(&info, &functions).unwrap();
+        // Discovery follows main's genuine direct calls; the startup handoff is
+        // an indirect call and is never reported as a direct reference.
+        assert!(functions.iter().any(|f| f.address == callee), "{name}");
+        assert!(
+            analysis
+                .references
+                .iter()
+                .any(|r| r.caller == main && r.target == callee)
+        );
+        assert!(!analysis.references.iter().any(|r| r.target == main));
+        // Optimized main once failed semantic capture: a member printed under
+        // another variable's name must stay unverified, not reject the result.
+        let response = request(&mut worker, Request::Decompile { address: main });
+        let Response::Decompiled { text, mappings, .. } = response else {
+            panic!("{name}: recovered main did not decompile: {response:?}");
+        };
+        ghidra_rust::selection::validate_mappings(&text, &mappings, &info.sections).unwrap();
+        assert!(text.contains("main("), "{name}: {text}");
+    }
+}
+
+#[test]
+fn elf_startup_recovery_requires_complete_evidence() {
+    let directory = tempfile::tempdir().unwrap();
+    let sample = Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/sample.c"
+    ));
+    // Symbols win: the unstripped build names main itself, without a note.
+    let symbols = compile(directory.path(), "symbols", sample, &["-O0"], false);
+    let (_, info) = open(&symbols);
+    assert!(info.functions.iter().any(|f| f.name == "main"));
+    assert_eq!(recovered_main(&info), None);
+    // Original startup code: a direct PLT call with a constant callback is
+    // recognized through the verified import stub. When an unknown call can
+    // clobber the argument first, nothing is recovered rather than guessed.
+    let startup = directory.path().join("startup.c");
+    std::fs::write(
+        &startup,
+        "extern int __libc_start_main(void *, int, char **, void *, void *, void *, void *);\n\
+         extern int puts(const char *);\n\
+         __attribute__((noinline)) int callback(void) { return puts(\"callback\"); }\n\
+         __attribute__((noinline)) void *pick(void) { puts(\"pick\"); return (void *)callback; }\n\
+         #ifdef UNKNOWN\n\
+         void _start(void) { __libc_start_main(pick(), 0, 0, 0, 0, 0, 0); }\n\
+         #else\n\
+         void _start(void) { __libc_start_main((void *)callback, 0, 0, 0, 0, 0, 0); }\n\
+         #endif\n",
+    )
+    .unwrap();
+    let args = ["-O1", "-fno-pie", "-no-pie", "-nostartfiles"];
+    let reference = compile(directory.path(), "direct-symbols", &startup, &args, false);
+    let direct = compile(directory.path(), "direct", &startup, &args, true);
+    let (_, info) = open(&direct);
+    assert_eq!(recovered_main(&info), Some(symbol(&reference, "callback")));
+    let unknown_args = [&args[..], &["-DUNKNOWN"]].concat();
+    let unknown = compile(directory.path(), "unknown", &startup, &unknown_args, true);
+    let (_, info) = open(&unknown);
+    assert!(!info.functions.iter().any(|f| f.name == "main"));
 }
