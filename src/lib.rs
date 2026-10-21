@@ -17,6 +17,7 @@ pub mod discovery;
 pub mod file_dialog;
 pub mod graph;
 pub mod highlight;
+mod inventory;
 pub mod limits;
 mod local_symbols;
 pub mod model;

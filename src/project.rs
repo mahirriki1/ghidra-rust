@@ -1110,7 +1110,10 @@ mod tests {
         };
         let batch = DiscoveryBatch {
             binding,
-            functions: data.info.functions.clone(),
+            inventory: crate::model::InventoryChange::Replace {
+                revision: 1,
+                functions: data.info.functions.clone(),
+            },
             truncated: false,
             outcomes: vec![DiscoveryOutcome {
                 address: 0x1000,
@@ -1127,7 +1130,7 @@ mod tests {
                 ..Default::default()
             },
         };
-        state.commit(&data.info, &batch).unwrap();
+        crate::discovery::commit_replacement(&mut state, &data.info, &batch).unwrap();
         state.save()
     }
 

@@ -64,6 +64,19 @@ replies also reserve the callers that own published evidence. The
 inventory bounds cumulative seed admission; the smaller function/decode budgets
 apply independently to each batch.
 
+Batch replies publish the inventory relative to the revision the desktop last
+adopted from the same worker: unchanged, a bounded delta of upserted and removed
+entries, or the complete list when the desktop holds no matching revision (each
+new worker's first batch, after a rename, or after more than 16,384 journaled
+changes). The desktop reconstructs and validates the complete inventory before
+committing a batch, so admission, evidence ownership and partial coverage are
+the same as with complete replies. The worker skips rebuilding the inventory
+when it can prove the result unchanged: the batch named nothing and every owner
+was already admitted, or every candidate already fit and the batch only added
+the functions it named within the same budgets. Otherwise it applies the full
+admission order above. During discovery the desktop retains one additional copy
+of the adopted inventory, bounded by the same count and name budgets.
+
 Conventional UPX PE detection still prevents discovery and decompilation of the
 packed stub. Listing, CFG, strings, and byte inspection remain available. The
 desktop neither unpacks nor executes the input.
