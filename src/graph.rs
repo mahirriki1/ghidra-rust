@@ -103,6 +103,7 @@ impl GraphCanvas {
             *self = Self::new(view);
         }
         if self.comment_key != Some(key) {
+            let _layout = crate::performance::span("gui_graph_comment_layout");
             self.layout = Layout::with_comments(view, comments);
             self.comment_key = Some(key);
         }

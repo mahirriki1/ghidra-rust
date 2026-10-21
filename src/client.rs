@@ -44,9 +44,13 @@ impl WorkerClient {
         binary_path: &Path,
         exe: &Path,
     ) -> Result<Self, String> {
+        let startup = crate::performance::span("worker_start");
+        let protection_time = crate::performance::span("binary_protection");
         let protection = BinaryProtection::open(binary_path)?;
+        protection_time.finish(0);
         let binary_path = protection.path().to_owned();
         let mut command = worker_command(exe, &binary_path)?;
+        let spawning = crate::performance::span("worker_spawn");
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -55,6 +59,9 @@ impl WorkerClient {
             .stderr(Stdio::null())
             .spawn()
             .map_err(|e| format!("Cannot start analysis worker: {e}"))?;
+        spawning.finish(child.id() as u64);
+        #[cfg(windows)]
+        let _assigning = crate::performance::span("worker_job_assignment");
         #[cfg(windows)]
         let job = match crate::windows::WorkerJob::assign_and_resume(&child) {
             Ok(job) => job,
@@ -64,6 +71,8 @@ impl WorkerClient {
                 return Err(format!("Cannot contain Windows analysis worker: {error}"));
             }
         };
+        #[cfg(windows)]
+        _assigning.finish(0);
         let input = child.stdin.take().ok_or("Worker has no input pipe")?;
         let output = child.stdout.take().ok_or("Worker has no output pipe")?;
         let (sender, events) = mpsc::sync_channel(8);
@@ -71,9 +80,11 @@ impl WorkerClient {
         let reader_protection = protection.clone();
         let sent = Arc::new(AtomicU64::new(0));
         let reader_sent = sent.clone();
+        let worker_pid = child.id();
         std::thread::Builder::new()
             .name("analysis-responses".into())
             .spawn(move || {
+                let _peer = crate::performance::peer(worker_pid as u64);
                 let mut reader = BufReader::new(output);
                 let mut answered = 0;
                 let mut sections = Vec::new();
@@ -81,71 +92,87 @@ impl WorkerClient {
                     let event = match bounded_line(&mut reader, MAX_RESPONSE).and_then(|line| {
                         match line {
                             Some(line) => {
-                                check_reply_order(&line, &reader_sent, &mut answered)?;
-                                Ok(Some(line))
+                                let _preflight = crate::performance::span("reply_preflight");
+                                let request_id =
+                                    check_reply_order(&line, &reader_sent, &mut answered)?;
+                                Ok(Some((line, request_id)))
                             }
                             None => Ok(None),
                         }
                     }) {
-                        Ok(Some(line)) => match serde_json::from_slice::<WorkerResponse>(&line) {
-                            Ok(mut reply) => {
-                                // The sandbox sees only /input/binary. Keep the
-                                // actual user-selected path in the desktop model.
-                                if let crate::model::Response::Opened { info } = &mut reply.response
-                                {
-                                    if let Err(error) = reader_protection.verify_identity(info) {
-                                        if sender.send(WorkerEvent::Failed(error)).is_ok() {
-                                            ctx.request_repaint();
-                                        }
-                                        return;
-                                    }
-                                    info.path.clone_from(&display_path);
-                                    sections.clone_from(&info.sections);
-                                }
-                                if let crate::model::Response::Decompiled {
-                                    address,
-                                    text,
-                                    mappings,
-                                    semantics,
-                                } = &reply.response
-                                {
-                                    let checked = if text.len() > crate::model::MAX_DECOMPILED_BYTES
+                        Ok(Some((line, request_id))) => {
+                            let _trace_context = crate::performance::context(request_id);
+                            let parsing = crate::performance::span("reply_parse");
+                            let decoded = serde_json::from_slice::<WorkerResponse>(&line);
+                            parsing.finish(line.len() as u64);
+                            match decoded {
+                                Ok(mut reply) => {
+                                    let _trace_context = crate::performance::context(reply.id);
+                                    let _validation =
+                                        crate::performance::span("reply_reader_validation");
+                                    // The sandbox sees only /input/binary. Keep the
+                                    // actual user-selected path in the desktop model.
+                                    if let crate::model::Response::Opened { info } =
+                                        &mut reply.response
                                     {
-                                        Err("Decompiler text exceeds limit".into())
-                                    } else {
-                                        crate::selection::validate_mappings(
-                                            text, mappings, &sections,
-                                        )
-                                        .and_then(|()| {
-                                            semantics.validate(text, *address, &sections)
-                                        })
-                                        .and_then(|()| {
-                                            if semantics.locals.iter().any(|v| {
-                                                v.identity.engine
-                                                    != crate::semantic::LOCAL_FINGERPRINT
-                                            }) {
-                                                Err("Incompatible semantic local identity".into())
-                                            } else {
-                                                Ok(())
-                                            }
-                                        })
-                                    };
-                                    if let Err(error) = checked {
-                                        if sender
-                                            .send(WorkerEvent::Failed(format!(
-                                                "Invalid decompiler reply: {error}"
-                                            )))
-                                            .is_ok()
+                                        if let Err(error) = reader_protection.verify_identity(info)
                                         {
-                                            ctx.request_repaint();
+                                            if sender.send(WorkerEvent::Failed(error)).is_ok() {
+                                                ctx.request_repaint();
+                                            }
+                                            return;
                                         }
-                                        return;
+                                        info.path.clone_from(&display_path);
+                                        sections.clone_from(&info.sections);
                                     }
+                                    if let crate::model::Response::Decompiled {
+                                        address,
+                                        text,
+                                        mappings,
+                                        semantics,
+                                    } = &reply.response
+                                    {
+                                        let checked =
+                                            if text.len() > crate::model::MAX_DECOMPILED_BYTES {
+                                                Err("Decompiler text exceeds limit".into())
+                                            } else {
+                                                crate::selection::validate_mappings(
+                                                    text, mappings, &sections,
+                                                )
+                                                .and_then(|()| {
+                                                    semantics.validate(text, *address, &sections)
+                                                })
+                                                .and_then(|()| {
+                                                    if semantics.locals.iter().any(|v| {
+                                                        v.identity.engine
+                                                            != crate::semantic::LOCAL_FINGERPRINT
+                                                    }) {
+                                                        Err("Incompatible semantic local identity"
+                                                            .into())
+                                                    } else {
+                                                        Ok(())
+                                                    }
+                                                })
+                                            };
+                                        if let Err(error) = checked {
+                                            if sender
+                                                .send(WorkerEvent::Failed(format!(
+                                                    "Invalid decompiler reply: {error}"
+                                                )))
+                                                .is_ok()
+                                            {
+                                                ctx.request_repaint();
+                                            }
+                                            return;
+                                        }
+                                    }
+                                    WorkerEvent::Reply(Box::new(reply))
                                 }
-                                WorkerEvent::Reply(Box::new(reply))
+                                Err(e) => {
+                                    WorkerEvent::Failed(format!("Invalid worker response: {e}"))
+                                }
                             }
-                            Err(e) => WorkerEvent::Failed(format!("Invalid worker response: {e}")),
-                        },
+                        }
                         Ok(None) => WorkerEvent::Failed(
                             "Analysis worker exited. Reopen the binary to restart it.".into(),
                         ),
@@ -166,6 +193,7 @@ impl WorkerClient {
                 let _ = child.wait();
                 format!("Cannot start response reader: {e}")
             })?;
+        startup.finish(child.id() as u64);
         Ok(Self {
             child: Some(child),
             #[cfg(windows)]
@@ -191,6 +219,9 @@ impl WorkerClient {
     }
 
     pub fn send(&mut self, mut request: Request) -> Result<u64, String> {
+        let _trace_context = crate::performance::context(self.next_id.saturating_add(1));
+        let _sending = crate::performance::span("request_send");
+        crate::performance::event(crate::performance::operation(&request), 0);
         if let Request::Open { path } = &mut request {
             let requested = Path::new(path)
                 .canonicalize()
@@ -353,15 +384,17 @@ impl Drop for WorkerClient {
 /// terminal reply per sent request, in order. Progress replies are small and
 /// must belong to an unanswered request. This bounds how many large replies a
 /// misbehaving worker can queue.
-fn check_reply_order(line: &[u8], sent: &AtomicU64, answered: &mut u64) -> Result<(), String> {
+fn check_reply_order(line: &[u8], sent: &AtomicU64, answered: &mut u64) -> Result<u64, String> {
+    let preflight = crate::performance::span("reply_preflight_scan");
     let shape = crate::bounded::check_reply(line)?;
     if shape.id <= *answered || shape.id > sent.load(Ordering::Acquire) {
         return Err("Worker reply does not answer a pending request".into());
     }
+    preflight.finish(shape.id);
     if shape.kind != "progress" {
         *answered = shape.id;
     }
-    Ok(())
+    Ok(shape.id)
 }
 
 fn bounded_line(reader: &mut impl BufRead, limit: usize) -> Result<Option<Vec<u8>>, String> {

@@ -23,6 +23,7 @@ pub mod model;
 pub mod packing;
 mod pe;
 mod pe_symbols;
+pub mod performance;
 pub mod project;
 pub mod selection;
 pub mod semantic;

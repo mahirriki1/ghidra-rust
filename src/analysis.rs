@@ -222,6 +222,7 @@ impl LoadedProgram {
             return Err("This prototype limits executable files to 128 MiB.".into());
         }
         // Bounded reading also handles a file growing after the metadata check.
+        let reading = crate::performance::span("open_read");
         let mut bytes = Vec::new();
         (&mut file)
             .take(MAX_IMAGE_BYTES + 1)
@@ -230,7 +231,10 @@ impl LoadedProgram {
         if bytes.len() as u64 > MAX_IMAGE_BYTES {
             return Err("Executable grew beyond the 128 MiB prototype limit while reading.".into());
         }
+        reading.finish(bytes.len() as u64);
+        let metadata_time = crate::performance::span("open_metadata_hash");
         let (mut info, target) = metadata_with_target(path, &bytes)?;
+        metadata_time.finish(0);
         // This flag comes only from the freshly parsed immutable image, never a
         // saved project's warnings or cached analysis.
         let upx_packed = crate::packing::has_upx_warning(&info);
@@ -241,11 +245,17 @@ impl LoadedProgram {
             );
         }
         info.source_identity = FileIdentity::from_file(&file);
+        let snapshot_time = crate::performance::span("open_snapshot_copy");
         let snapshot = Arc::from(bytes.as_slice());
+        snapshot_time.finish(bytes.len() as u64);
+        let pe_time = crate::performance::span("open_pe_parse");
         let pe = crate::pe::parse(&bytes, &info.sections)?;
+        pe_time.finish(0);
+        let engine_load = crate::performance::span("open_engine_image");
         let mut program =
             Program::from_image(&path.to_string_lossy(), bytes, Some(target.language))
                 .map_err(engine_error)?;
+        engine_load.finish(0);
         if program.language_id() != target.language {
             return Err(
                 "Engine language does not match the validated binary architecture and ABI.".into(),
@@ -254,6 +264,7 @@ impl LoadedProgram {
         let mut pe_ranges = Vec::new();
         let mut pe_imports = BTreeMap::new();
         if let Some(pe) = pe {
+            let _registration = crate::performance::span("open_pe_register");
             crate::pe_symbols::register(&mut program, &pe, target.pointer_bytes)?;
             info.functions_truncated = pe.functions_truncated;
             for note in pe.warnings {
@@ -317,7 +328,10 @@ impl LoadedProgram {
         crate::semantic::validate_renames(renames, Some(address))?;
         self.check_unpacked()?;
         self.check_code(address)?;
+        let imports = crate::performance::span("decompile_import_resolution");
         self.resolve_import_thunks(address)?;
+        imports.finish(0);
+        let _rendering = crate::performance::span("decompile_render");
         let (mut text, mut mappings, mut semantics) = crate::decompile::render_with_locals(
             &mut self.program,
             address,
@@ -401,10 +415,13 @@ impl LoadedProgram {
                 let (analysis, outcomes) = self.discover_calls(Some(&seeds), progress)?;
                 let owners = outcomes.iter().map(|outcome| outcome.address).collect();
                 self.info.functions = function_list(&self.program, &mut self.info, &owners)?;
+                let cloning = crate::performance::span("inventory_clone");
+                let functions = self.info.functions.clone();
+                cloning.finish(functions.len() as u64);
                 Ok(Response::DiscoveryBatch {
                     batch: DiscoveryBatch {
                         binding,
-                        functions: self.info.functions.clone(),
+                        functions,
                         truncated: self.info.functions_truncated,
                         analysis,
                         outcomes,
@@ -476,6 +493,7 @@ impl LoadedProgram {
         seeds: Option<&[u64]>,
         progress: &mut dyn FnMut(AnalysisProgress) -> Result<(), String>,
     ) -> Result<(CallAnalysis, Vec<DiscoveryOutcome>), String> {
+        let _discovery = crate::performance::span("discovery_decode_cfg_data_admission");
         // Adapted from Ghidra FunctionAnalyzer's established-call rule and its
         // fallthrough-call exclusion. See NOTICE and docs/analysis.md. Decode
         // through public pinned-engine APIs; never promote arbitrary constants.
@@ -540,6 +558,7 @@ impl LoadedProgram {
                 }
             }
         }
+        let mut decoding = crate::performance::Accumulator::new("discovery_recovery_accumulated");
         let mut outcomes = Vec::new();
         let mut references = BTreeSet::new();
         emit(AnalysisStage::Calls, &report, progress)?;
@@ -558,15 +577,17 @@ impl LoadedProgram {
             let available =
                 (MAX_ANALYSIS_INSTRUCTIONS - report.decode_attempts).min(MAX_INSTRUCTIONS);
             let mut remaining = available;
-            let recovered = recover_graph_budgeted(
-                &self.program,
-                &self.info.sections,
-                &|candidate| known.contains_key(&candidate),
-                address,
-                &self.pe_ranges,
-                &mut remaining,
-                Some(&mut data),
-            );
+            let recovered = decoding.measure(|| {
+                recover_graph_budgeted(
+                    &self.program,
+                    &self.info.sections,
+                    &|candidate| known.contains_key(&candidate),
+                    address,
+                    &self.pe_ranges,
+                    &mut remaining,
+                    Some(&mut data),
+                )
+            });
             report.decode_attempts += available - remaining;
             match recovered {
                 Ok(recovered) => {
@@ -873,6 +894,7 @@ fn function_list(
     info: &mut BinaryInfo,
     required: &BTreeSet<u64>,
 ) -> Result<Vec<FunctionInfo>, String> {
+    let _inventory = crate::performance::span("inventory_rebuild");
     let alignment = crate::architecture::instruction_alignment(program.language_id());
     let code_entry = |address: u64| {
         address.is_multiple_of(alignment) && executable(&info.sections, address, alignment as usize)
