@@ -95,7 +95,10 @@ ELF's own `GLOB_DAT`/`JUMP_SLOT` relocations against the undefined dynamic symbo
 not from names alone. The first argument (`RDI`) must then hold either a complete
 constant or the contents of a slot whose `RELATIVE` relocation, or symbol
 relocation against a function defined in the executable, establishes the
-address. A conditional branch, jump, unrelated call, partial register write or
+address. A slot is trusted only while the path has not stored to it: stores
+through the entry stack pointer are allowed, but a store at a constant address
+overlapping the slot, or at any other computed address, discards its relocated
+contents. A conditional branch, jump, unrelated call, partial register write or
 unsupported relocation ends recognition with no result rather than a guess.
 
 The candidate must be an aligned file-backed executable address that is not the
