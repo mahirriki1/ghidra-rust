@@ -11,8 +11,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub const SCHEMA_VERSION: u64 = 1;
-/// Benchmark admission ceiling; matches the production input-size limit.
-pub const MAX_INPUT_BYTES: u64 = 128 * 1024 * 1024;
 pub const MAX_REQUESTED: usize = 32;
 pub const MAX_C_BYTES_PER_FUNCTION: usize = 256 * 1024;
 pub const MAX_C_BYTES_TOTAL: usize = 8 * 1024 * 1024;
@@ -326,7 +324,10 @@ fn objdump_evidence(
         let Some(owner) = containing(pc) else {
             continue;
         };
-        let mut fields = instruction.split_whitespace();
+        // CET and MPX prefixes, as in `notrack jmp *%rax` for jump tables.
+        let mut fields = instruction
+            .split_whitespace()
+            .skip_while(|field| matches!(*field, "notrack" | "bnd"));
         let Some(mnemonic) = fields.next() else {
             continue;
         };
@@ -484,7 +485,7 @@ fn verify_strip_correspondence(unstripped: &Path, stripped: &Path) -> Result<(),
 
 fn admit(path: &Path) -> Result<(String, u64, u64), String> {
     let bytes = fs::metadata(path).map_err(|e| e.to_string())?.len();
-    if bytes > MAX_INPUT_BYTES {
+    if bytes > ghidra_rust::analysis::MAX_IMAGE_BYTES {
         return Err(format!("{} exceeds the 128 MiB limit", path.display()));
     }
     let base = load_base(&fs::read(path).map_err(|e| e.to_string())?)?;

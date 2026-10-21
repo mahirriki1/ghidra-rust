@@ -20,13 +20,22 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const REQUEST_ENV: &str = "GHIDRA_RUST_DIFF_REQUEST";
-const RUN_TIMEOUT: Duration = Duration::from_secs(1200);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const PER_REQUEST_SECONDS: u64 =
+    if REQUEST_TIMEOUT.as_secs() > differential::DECOMPILE_TIMEOUT_SECONDS {
+        REQUEST_TIMEOUT.as_secs()
+    } else {
+        differential::DECOMPILE_TIMEOUT_SECONDS
+    };
+/// Covers each arm's own budgets: analysis, one request or decompilation
+/// in flight at its end, every requested decompilation, and process startup.
+const RUN_TIMEOUT: Duration = Duration::from_secs(
+    differential::ANALYSIS_TIMEOUT_SECONDS
+        + (differential::MAX_REQUESTED as u64 + 1) * PER_REQUEST_SECONDS
+        + 300,
+);
 const REAP_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_REPEATS: usize = 20;
-/// The exact trailer `analysis.rs` appends when it truncates decompiler text.
-const RUST_TRUNCATION_TRAILER: &str =
-    "\n/* Decompiler output truncated at the 2 MiB prototype limit. */\n";
 /// Inherited variables that would silently change the JVM configuration.
 const JAVA_OVERRIDES: [&str; 6] = [
     "JAVA_TOOL_OPTIONS",
@@ -258,7 +267,7 @@ fn rust_arm(request_doc: &RunRequest) -> RustRun {
                 Ok((Response::Decompiled { text, .. }, elapsed)) => {
                     record["elapsed_ms"] = elapsed.into();
                     record["c_bytes"] = text.len().into();
-                    let truncated = text.ends_with(RUST_TRUNCATION_TRAILER);
+                    let truncated = text.ends_with(ghidra_rust::decompile::TRUNCATION_TRAILER);
                     record["engine_truncation"] = truncated.into();
                     let limit = request_doc
                         .limits
@@ -405,6 +414,26 @@ struct Measured {
     sampler: Sampler,
 }
 
+/// Whether the child `pid` has exited, without reaping it.
+fn exited(pid: libc::pid_t) -> Result<bool, String> {
+    // SAFETY: an all-zero `siginfo_t` is valid; `waitid` writes at most one
+    // record for this unreaped child and, with WNOHANG, leaves `si_pid` zero
+    // when it has not exited. WNOWAIT leaves the child waitable.
+    unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        if libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        ) != 0
+        {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        Ok(info.si_pid() != 0)
+    }
+}
+
 /// Runs `command` in its own process group, sampling its whole tree. Only the
 /// owned group is ever signalled, and only after the run deadline.
 fn measure(command: &mut Command, log: &Path) -> Result<Measured, String> {
@@ -422,35 +451,34 @@ fn measure(command: &mut Command, log: &Path) -> Result<Measured, String> {
     let group = child.id() as libc::pid_t;
     let mut sampler = Sampler::new(child.id());
     let mut timed_out = false;
-    let status = loop {
-        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
-            break status;
-        }
-        if start.elapsed() >= RUN_TIMEOUT {
+    // The leader stays unreaped until every signal below has been sent: a
+    // zombie keeps its PID, so the group ID cannot be reused meanwhile.
+    while !exited(group)? {
+        if !timed_out && start.elapsed() >= RUN_TIMEOUT {
             timed_out = true;
             // SAFETY: `group` is the process group created for this child by
-            // `process_group(0)`; the child is unreaped, so its ID is not reused.
+            // `process_group(0)`; its unreaped leader reserves the ID.
             unsafe { libc::kill(-group, libc::SIGKILL) };
-            break child.wait().map_err(|e| e.to_string())?;
         }
         if sampler.last.elapsed() >= SAMPLE_INTERVAL {
             sampler.sample();
         }
         std::thread::sleep(Duration::from_millis(1));
-    };
+    }
     let wall_ms = ms(start.elapsed());
     let stop = Instant::now();
     let mut leaked_descendants = false;
     while sampler.descendants_alive() {
         if stop.elapsed() >= REAP_TIMEOUT {
             leaked_descendants = true;
-            // SAFETY: as above; descendants that stayed in the owned group are
-            // the only processes this can reach.
+            // SAFETY: as above; the leader is still an unreaped zombie, and
+            // only descendants that stayed in the owned group are reached.
             unsafe { libc::kill(-group, libc::SIGKILL) };
             break;
         }
         std::thread::sleep(Duration::from_millis(5));
     }
+    let status = child.wait().map_err(|e| e.to_string())?;
     Ok(Measured {
         exit: status.code(),
         timed_out,
