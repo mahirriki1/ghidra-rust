@@ -2,7 +2,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use ghidra_decompiler::address::Address;
-use ghidra_decompiler::database::Database;
+use ghidra_decompiler::database::{Database, ScopeId};
 use ghidra_decompiler::opcodes::OpCode;
 use ghidra_decompiler::program::Program;
 use ghidra_decompiler::types::TypeMetatype;
@@ -19,6 +19,26 @@ fn truncated(text: &str, limit: usize) -> &str {
         end -= 1;
     }
     &text[..end]
+}
+
+/// Global symbol names for collision-free naming, collected on first use.
+/// Callers only skip entries until a name is needed, so the symbol table is
+/// then exactly what an up-front collection would have seen. Registration
+/// that adds nothing, such as revisiting a function, never copies every name.
+#[derive(Default)]
+struct GlobalNames(Option<BTreeSet<String>>);
+
+impl GlobalNames {
+    fn get(&mut self, table: &Database, global: ScopeId) -> &mut BTreeSet<String> {
+        self.0.get_or_insert_with(|| {
+            table
+                .symbols
+                .iter()
+                .filter(|(_, symbol)| symbol.get_scope() == global)
+                .map(|(_, symbol)| symbol.get_name().to_owned())
+                .collect()
+        })
+    }
 }
 
 fn unique_name(
@@ -94,14 +114,7 @@ pub(crate) fn register(
     // Include every existing global symbol, including symbols registered outside
     // Program's private records. Build the inventory once instead of repeatedly
     // calling Program::set_function_name's linear uniqueness checks.
-    let mut names = architecture
-        .symboltab_ref()
-        .map_err(|error| error.explain().to_string())?
-        .symbols
-        .iter()
-        .filter(|(_, symbol)| symbol.get_scope() == global)
-        .map(|(_, symbol)| symbol.get_name().to_owned())
-        .collect::<BTreeSet<_>>();
+    let mut names = GlobalNames::default();
 
     for (&offset, requested) in &metadata.functions {
         let address = Address::new(code_space.clone(), offset);
@@ -115,7 +128,7 @@ pub(crate) fn register(
         {
             continue;
         }
-        let name = unique_name(&mut names, requested, offset, "FUN");
+        let name = unique_name(names.get(table, global), requested, offset, "FUN");
         Database::scope_add_function(architecture, global, &address, &name).map_err(|error| {
             format!(
                 "Cannot register PE function at {offset:#x}: {}",
@@ -135,15 +148,21 @@ pub(crate) fn register(
             return Err("PE import slot address overflow".into());
         }
         let address = Address::new(data_space.clone(), offset);
-        if architecture
+        let table = architecture
             .symboltab_ref()
-            .map_err(|error| error.explain().to_string())?
+            .map_err(|error| error.explain().to_string())?;
+        if table
             .scope_find_overlap(global, &address, pointer_bytes)
             .is_some()
         {
             continue;
         }
-        let name = unique_name(&mut names, &format!("__imp_{requested}"), offset, "__imp");
+        let name = unique_name(
+            names.get(table, global),
+            &format!("__imp_{requested}"),
+            offset,
+            "__imp",
+        );
         // An IAT entry is a pointer-sized data slot. It is not executable code,
         // and its name does not establish an imported prototype or target address.
         let entry = Database::scope_add_symbol_at(
@@ -390,12 +409,7 @@ pub(crate) fn register_aarch64_import_thunks_budgeted(
     let global = table
         .get_global_scope()
         .ok_or("Missing global scope while naming ARM64 veneers")?;
-    let mut names = table
-        .symbols
-        .iter()
-        .filter(|(_, symbol)| symbol.get_scope() == global)
-        .map(|(_, symbol)| symbol.get_name().to_owned())
-        .collect::<BTreeSet<_>>();
+    let mut names = GlobalNames::default();
     for (&address, requested) in &metadata.functions {
         let Some(old_name) = existing.get(&address) else {
             continue;
@@ -403,7 +417,11 @@ pub(crate) fn register_aarch64_import_thunks_budgeted(
         if old_name != &format!("FUN_{address:x}") && old_name != &format!("FUN_{address:08x}") {
             continue;
         }
-        let name = unique_name(&mut names, requested, address, "FUN");
+        let table = program
+            .architecture()
+            .symboltab_ref()
+            .map_err(|error| error.explain().to_string())?;
+        let name = unique_name(names.get(table, global), requested, address, "FUN");
         program
             .set_function_name(address, &name)
             .map_err(|error| error.explain().to_string())?;
