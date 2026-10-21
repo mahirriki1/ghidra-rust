@@ -14,7 +14,9 @@ use ghidra_decompiler::opcodes::OpCode;
 use ghidra_decompiler::program::{FunctionSource, InstructionPcode, PcodeVarnode, Program};
 use object::Endianness;
 use object::elf;
-use object::read::elf::{ElfFile64, FileHeader, ProgramHeader, Rela, SectionHeader, Sym};
+use object::read::elf::{
+    ElfFile64, FileHeader, ProgramHeader, Rela, SectionHeader, Sym, SymbolTable,
+};
 
 const LIBC_START_MAIN: &str = "__libc_start_main";
 /// Contiguous bytes the entry path may span.
@@ -25,8 +27,8 @@ const MAX_OPERATIONS: usize = 4096;
 const MAX_OPERATIONS_PER_INSTRUCTION: usize = 256;
 /// Tracked register and temporary values; more makes the path unsupported.
 const MAX_VALUES: usize = 128;
-const MAX_RELOCATIONS: usize = 65_536;
-/// Import stubs claiming the libc name that are checked against its slots.
+/// Import stubs claiming the libc name that are checked against its slots,
+/// and relocated slots for that import.
 const MAX_STUBS: usize = 4;
 /// Leading landing-pad or no-op instructions skipped by the wrapper check.
 const MAX_PREFIX: usize = 4;
@@ -53,16 +55,69 @@ enum Value {
     Constant(u64),
     /// The pointer-sized contents of an image slot, not yet interpreted.
     Loaded(u64),
+    /// An address derived from the entry stack pointer, whose stores cannot
+    /// change image slots.
+    Stack,
 }
 
-/// The libc import's slots and pointer values established by relocations.
-struct Relocations {
+/// The executable's dynamic relocations, with the libc import's slots.
+/// Lookups scan the records again rather than indexing them: recognition needs
+/// only a handful, and the records are bounded by the image size.
+struct Relocations<'a> {
+    endian: Endianness,
+    tables: Vec<&'a [elf::Rela64<Endianness>]>,
+    symbols: SymbolTable<'a, elf::FileHeader64<Endianness>>,
     libc_slots: BTreeSet<u64>,
-    /// Link-time values of slots that hold a pointer to a local definition.
-    pointers: BTreeMap<u64, u64>,
 }
 
-fn relocations(bytes: &[u8], architecture: &str) -> Result<Option<Relocations>, Miss> {
+impl Relocations<'_> {
+    fn records(&self) -> impl Iterator<Item = &elf::Rela64<Endianness>> {
+        self.tables.iter().flat_map(|records| records.iter())
+    }
+
+    /// The only relocation at `slot`; conflicting relocations establish nothing.
+    fn single(&self, slot: u64) -> Option<&elf::Rela64<Endianness>> {
+        let mut found = None;
+        for record in self.records() {
+            if record.r_offset(self.endian) == slot && found.replace(record).is_some() {
+                return None;
+            }
+        }
+        found
+    }
+
+    /// The link-time value of a slot holding a pointer to a local definition.
+    fn pointer(&self, slot: u64) -> Option<u64> {
+        let endian = self.endian;
+        let record = self.single(slot)?;
+        let (r_type, symbol, addend) = (
+            record.r_type(endian, false),
+            record.r_sym(endian, false),
+            record.r_addend(endian),
+        );
+        if symbol == 0 {
+            return (r_type == elf::R_X86_64_RELATIVE)
+                .then(|| u64::try_from(addend).ok())
+                .flatten();
+        }
+        let symbol = self
+            .symbols
+            .symbol(object::SymbolIndex(symbol as usize))
+            .ok()?;
+        // A function defined in the executable itself; executables are not
+        // interposed, so the slot holds this link-time address.
+        (matches!(r_type, elf::R_X86_64_GLOB_DAT | elf::R_X86_64_64)
+            && symbol.st_shndx(endian) != elf::SHN_UNDEF
+            && symbol.st_type() == elf::STT_FUNC)
+            .then(|| symbol.st_value(endian).checked_add_signed(addend))
+            .flatten()
+    }
+}
+
+fn relocations<'a>(bytes: &'a [u8], architecture: &str) -> Result<Relocations<'a>, Miss> {
+    if architecture != "x86-64" {
+        return Err(Miss::NotApplicable);
+    }
     let Ok(file) = ElfFile64::<Endianness>::parse(bytes) else {
         return Err(Miss::NotApplicable);
     };
@@ -76,21 +131,11 @@ fn relocations(bytes: &[u8], architecture: &str) -> Result<Option<Relocations>, 
     {
         return Err(Miss::NotApplicable);
     }
-    if architecture != "x86-64" {
-        return Err(Miss::NotApplicable);
-    }
-    let (glob_dat, jump_slot, relative, absolute) = (
-        elf::R_X86_64_GLOB_DAT,
-        elf::R_X86_64_JUMP_SLOT,
-        elf::R_X86_64_RELATIVE,
-        elf::R_X86_64_64,
-    );
-    // Collect every relocation against the dynamic symbol table first:
-    // import slots and pointer slots usually live in different sections.
+    // Every relocation against the dynamic symbol table: import slots and
+    // pointer slots usually live in different sections.
     let sections = file.elf_section_table();
-    let mut table = None;
-    let mut slots: BTreeMap<u64, Vec<(u32, u32, i64)>> = BTreeMap::new();
-    let mut seen = 0usize;
+    let mut symbols = None;
+    let mut tables = Vec::new();
     for section in sections.iter() {
         if section.sh_type(endian) != elf::SHT_RELA {
             continue;
@@ -104,68 +149,55 @@ fn relocations(bytes: &[u8], architecture: &str) -> Result<Option<Relocations>, 
         {
             continue;
         }
-        match table {
+        match symbols {
             None => match sections.symbol_table_by_index(endian, bytes, link) {
-                Ok(symbols) => table = Some((link, symbols)),
+                Ok(table) => symbols = Some((link, table)),
                 Err(_) => return Err(Miss::Unrecognized),
             },
             // One dynamic symbol table names every import.
             Some((existing, _)) if existing != link => return Err(Miss::Unrecognized),
             Some(_) => {}
         }
-        for record in records {
-            seen += 1;
-            if seen > MAX_RELOCATIONS {
-                return Err(Miss::Exhausted);
-            }
-            slots.entry(record.r_offset(endian)).or_default().push((
-                record.r_type(endian, false),
-                record.r_sym(endian, false),
-                record.r_addend(endian),
-            ));
-        }
+        tables.push(records);
     }
-    let Some((_, table)) = table else {
-        return Ok(None);
+    let Some((_, symbols)) = symbols else {
+        return Err(Miss::Unrecognized);
     };
-    let mut libc_slots = BTreeSet::new();
-    let mut pointers = BTreeMap::new();
-    for (&slot, records) in &slots {
-        // Conflicting relocations at one slot establish nothing.
-        let &[(r_type, symbol, addend)] = records.as_slice() else {
-            continue;
-        };
-        if symbol == 0 {
-            if r_type == relative
-                && let Ok(value) = u64::try_from(addend)
-            {
-                pointers.insert(slot, value);
+    let imports: BTreeSet<u32> = symbols
+        .symbols()
+        .iter()
+        .enumerate()
+        .filter(|(_, symbol)| {
+            symbol.st_shndx(endian) == elf::SHN_UNDEF
+                && symbols.symbol_name(endian, *symbol) == Ok(LIBC_START_MAIN.as_bytes())
+        })
+        .filter_map(|(index, _)| u32::try_from(index).ok())
+        .collect();
+    let mut relocations = Relocations {
+        endian,
+        tables,
+        symbols,
+        libc_slots: BTreeSet::new(),
+    };
+    let mut candidates = BTreeSet::new();
+    for record in relocations.records() {
+        if matches!(
+            record.r_type(endian, false),
+            elf::R_X86_64_GLOB_DAT | elf::R_X86_64_JUMP_SLOT
+        ) && imports.contains(&record.r_sym(endian, false))
+        {
+            candidates.insert(record.r_offset(endian));
+            if candidates.len() > MAX_STUBS {
+                return Err(Miss::Unrecognized);
             }
-            continue;
-        }
-        let Ok(symbol) = table.symbol(object::SymbolIndex(symbol as usize)) else {
-            continue;
-        };
-        let undefined = symbol.st_shndx(endian) == elf::SHN_UNDEF;
-        if (r_type == glob_dat || r_type == jump_slot)
-            && undefined
-            && table.symbol_name(endian, symbol) == Ok(LIBC_START_MAIN.as_bytes())
-        {
-            libc_slots.insert(slot);
-        } else if (r_type == glob_dat || r_type == absolute)
-            && !undefined
-            && symbol.st_type() == elf::STT_FUNC
-            && let Some(value) = symbol.st_value(endian).checked_add_signed(addend)
-        {
-            // A function defined in the executable itself; executables are
-            // not interposed, so the slot holds this link-time address.
-            pointers.insert(slot, value);
         }
     }
-    Ok((!libc_slots.is_empty()).then_some(Relocations {
-        libc_slots,
-        pointers,
-    }))
+    candidates.retain(|&slot| relocations.single(slot).is_some());
+    if candidates.is_empty() {
+        return Err(Miss::Unrecognized);
+    }
+    relocations.libc_slots = candidates;
+    Ok(relocations)
 }
 
 fn mask(size: u32) -> u64 {
@@ -178,9 +210,15 @@ fn mask(size: u32) -> u64 {
 
 /// Register and temporary values along one straight-line path. Writes that
 /// overlap a tracked value forget it; reads need the exact stored extent.
+/// Image slots keep their relocated contents only until the path may have
+/// stored to them.
 struct State {
     values: BTreeMap<(bool, u64), (u32, Value)>,
     pointer_bytes: u32,
+    /// Memory ranges written at constant addresses.
+    stored: Vec<(u64, u64)>,
+    /// A store whose address is neither constant nor stack-derived.
+    unknown_store: bool,
 }
 
 impl State {
@@ -197,9 +235,7 @@ impl State {
             "const" => return Some(Value::Constant(varnode.offset & mask(varnode.size))),
             // A pointer-sized operand at a fixed image address, such as a GOT
             // slot read by `call *slot(%rip)`.
-            "ram" if varnode.size == self.pointer_bytes => {
-                return Some(Value::Loaded(varnode.offset));
-            }
+            "ram" if varnode.size == self.pointer_bytes => return self.slot(varnode.offset),
             _ => {}
         }
         let &(size, value) = self.values.get(&Self::key(varnode)?)?;
@@ -230,27 +266,67 @@ impl State {
         Ok(())
     }
 
+    fn new(pointer_bytes: u32) -> Self {
+        Self {
+            values: BTreeMap::new(),
+            pointer_bytes,
+            stored: Vec::new(),
+            unknown_store: false,
+        }
+    }
+
+    /// The contents of the pointer slot at `address`, unless overwritten.
+    fn slot(&self, address: u64) -> Option<Value> {
+        let end = address.checked_add(u64::from(self.pointer_bytes))?;
+        let overwritten = self.unknown_store
+            || self
+                .stored
+                .iter()
+                .any(|&(start, stop)| start < end && address < stop);
+        (!overwritten).then_some(Value::Loaded(address))
+    }
+
+    /// A pointer-sized read through `address`.
+    fn load(&self, address: Option<Value>, size: u32) -> Option<Value> {
+        match address {
+            Some(Value::Constant(address)) if size == self.pointer_bytes => self.slot(address),
+            _ => None,
+        }
+    }
+
+    fn store(&mut self, address: Option<Value>, size: u32) -> Result<(), Miss> {
+        match address {
+            Some(Value::Stack) => {}
+            Some(Value::Constant(start)) => match start.checked_add(u64::from(size)) {
+                Some(end) if self.stored.len() < MAX_VALUES => self.stored.push((start, end)),
+                Some(_) => return Err(Miss::Exhausted),
+                None => self.unknown_store = true,
+            },
+            _ => self.unknown_store = true,
+        }
+        Ok(())
+    }
+
     fn clear_temporaries(&mut self) {
         self.values.retain(|&(unique, _), _| !unique);
     }
 }
 
-fn evaluate(
-    opcode: OpCode,
-    inputs: &[Option<Value>],
-    output_size: u32,
-    pointer_bytes: u32,
-) -> Option<Value> {
+fn evaluate(opcode: OpCode, inputs: &[Option<Value>], output_size: u32) -> Option<Value> {
     use OpCode::*;
     let constant = |index: usize| match inputs.get(index)? {
         Some(Value::Constant(value)) => Some(*value),
         _ => None,
     };
+    let stack = |index: usize| inputs.get(index) == Some(&Some(Value::Stack));
     let output = mask(output_size);
     let value = match opcode {
         Copy => return *inputs.first()?,
-        // A pointer-sized read through a known slot address.
-        Load if output_size == pointer_bytes => return Some(Value::Loaded(constant(1)?)),
+        // Stack adjustment and realignment, as in `and $-16, %rsp`.
+        IntAdd if stack(0) && constant(1).is_some() || stack(1) && constant(0).is_some() => {
+            return Some(Value::Stack);
+        }
+        IntSub | IntAnd if stack(0) && constant(1).is_some() => return Some(Value::Stack),
         IntAdd => constant(0)?.wrapping_add(constant(1)?),
         IntSub => constant(0)?.wrapping_sub(constant(1)?),
         IntAnd => constant(0)? & constant(1)?,
@@ -280,6 +356,7 @@ struct Walker<'a> {
     program: &'a Program,
     pointer_bytes: u32,
     argument: PcodeVarnode,
+    stack: PcodeVarnode,
     libc_slots: &'a BTreeSet<u64>,
     libc_stubs: BTreeSet<u64>,
     instructions: usize,
@@ -310,10 +387,8 @@ impl Walker<'_> {
 
     /// Follows sequential instructions from `start` until a call or transfer.
     fn walk(&mut self, start: u64, limit: u64) -> Result<Stop, Miss> {
-        let mut state = State {
-            values: BTreeMap::new(),
-            pointer_bytes: self.pointer_bytes,
-        };
+        let mut state = State::new(self.pointer_bytes);
+        state.write(&self.stack, Some(Value::Stack))?;
         let mut address = start;
         let end = start.saturating_add(limit);
         while address < end {
@@ -356,15 +431,21 @@ impl Walker<'_> {
                     }
                     // Internal p-code branches make the path conditional.
                     Branch | Cbranch | Return => return Ok(Stop::Other),
-                    Store => {}
+                    Store => {
+                        let address = operation.inputs.get(1).and_then(|a| state.read(a));
+                        let size = operation.inputs.get(2).map_or(0, |value| value.size);
+                        state.store(address, size)?;
+                    }
                     _ => {
                         let Some(output) = &operation.output else {
                             continue;
                         };
                         let inputs: Vec<_> =
                             operation.inputs.iter().map(|i| state.read(i)).collect();
-                        let value =
-                            evaluate(operation.opcode, &inputs, output.size, self.pointer_bytes);
+                        let value = match operation.opcode {
+                            Load => state.load(inputs.get(1).copied().flatten(), output.size),
+                            opcode => evaluate(opcode, &inputs, output.size),
+                        };
                         state.write(output, value)?;
                     }
                 }
@@ -409,23 +490,27 @@ pub(crate) fn recognize(
     pointer_bytes: u32,
     code_address: impl Fn(u64) -> bool,
 ) -> Result<Recovery, Miss> {
-    let relocations = relocations(bytes, architecture)?.ok_or(Miss::Unrecognized)?;
-    // The first integer argument in the System V AMD64 calling convention.
-    let argument = {
+    let relocations = relocations(bytes, architecture)?;
+    // The first integer argument in the System V AMD64 calling convention,
+    // and the stack pointer.
+    let (argument, stack) = {
         let translator = program
             .architecture()
             .translator()
             .map_err(|_| Miss::Unrecognized)?;
-        let storage = translator
-            .get_register("RDI")
-            .map_err(|_| Miss::Unrecognized)?;
-        PcodeVarnode {
-            space: "register".into(),
-            offset: storage.offset,
-            size: storage.size,
-        }
+        let register = |name| {
+            let storage = translator
+                .get_register(name)
+                .map_err(|_| Miss::Unrecognized)?;
+            Ok(PcodeVarnode {
+                space: "register".into(),
+                offset: storage.offset,
+                size: storage.size,
+            })
+        };
+        (register("RDI")?, register("RSP")?)
     };
-    if argument.size != pointer_bytes {
+    if argument.size != pointer_bytes || stack.size != pointer_bytes {
         return Err(Miss::Unrecognized);
     }
     let claimed: Vec<_> = program
@@ -448,6 +533,7 @@ pub(crate) fn recognize(
         program,
         pointer_bytes,
         argument,
+        stack,
         libc_slots: &relocations.libc_slots,
         libc_stubs: BTreeSet::new(),
         instructions: 0,
@@ -467,8 +553,8 @@ pub(crate) fn recognize(
     };
     let main = match argument {
         Some(Value::Constant(address)) => address,
-        Some(Value::Loaded(slot)) => *relocations.pointers.get(&slot).ok_or(Miss::Unrecognized)?,
-        None => return Err(Miss::Unrecognized),
+        Some(Value::Loaded(slot)) => relocations.pointer(slot).ok_or(Miss::Unrecognized)?,
+        Some(Value::Stack) | None => return Err(Miss::Unrecognized),
     };
     if main == entry
         || walker.libc_stubs.contains(&main)
@@ -494,10 +580,7 @@ mod tests {
 
     #[test]
     fn partial_and_overlapping_writes_forget_the_argument() {
-        let mut state = State {
-            values: BTreeMap::new(),
-            pointer_bytes: 8,
-        };
+        let mut state = State::new(8);
         let rdi = register(0x38, 8);
         state.write(&rdi, Some(Value::Constant(0x3090))).unwrap();
         // The low half of a known constant is still known.
@@ -517,10 +600,7 @@ mod tests {
 
     #[test]
     fn only_pointer_sized_fixed_reads_name_a_slot() {
-        let state = State {
-            values: BTreeMap::new(),
-            pointer_bytes: 8,
-        };
+        let state = State::new(8);
         let slot = |size| PcodeVarnode {
             space: "ram".into(),
             offset: 0x9fc0,
@@ -528,19 +608,44 @@ mod tests {
         };
         assert_eq!(state.read(&slot(8)), Some(Value::Loaded(0x9fc0)));
         assert_eq!(state.read(&slot(4)), None);
-        assert_eq!(
-            evaluate(OpCode::Load, &[None, Some(Value::Constant(0x9fc0))], 4, 8),
-            None
-        );
+        assert_eq!(state.load(Some(Value::Constant(0x9fc0)), 4), None);
         // A slot's contents are not a constant to compute with.
         assert_eq!(
             evaluate(
                 OpCode::IntAdd,
                 &[Some(Value::Loaded(0x9fc0)), Some(Value::Constant(8))],
-                8,
                 8
             ),
             None
         );
+    }
+
+    #[test]
+    fn stores_that_may_reach_a_slot_hide_its_relocated_contents() {
+        let mut state = State::new(8);
+        // Pushes through the realigned entry stack leave slots intact.
+        let aligned = evaluate(
+            OpCode::IntAnd,
+            &[Some(Value::Stack), Some(Value::Constant(!0xf))],
+            8,
+        );
+        assert_eq!(aligned, Some(Value::Stack));
+        state.store(aligned, 8).unwrap();
+        assert_eq!(
+            state.load(Some(Value::Constant(0x9fc0)), 8),
+            Some(Value::Loaded(0x9fc0))
+        );
+        // A store overlapping the slot's last byte overwrites it.
+        state.store(Some(Value::Constant(0x9fc7)), 1).unwrap();
+        assert_eq!(state.load(Some(Value::Constant(0x9fc0)), 8), None);
+        assert_eq!(
+            state.load(Some(Value::Constant(0x9fc8)), 8),
+            Some(Value::Loaded(0x9fc8))
+        );
+        // An unknown destination could be any slot.
+        state.store(None, 8).unwrap();
+        assert_eq!(state.load(Some(Value::Constant(0x9fc8)), 8), None);
+        // Stack contents are never slot contents.
+        assert_eq!(state.load(Some(Value::Stack), 8), None);
     }
 }

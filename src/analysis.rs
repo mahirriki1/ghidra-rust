@@ -1031,8 +1031,9 @@ impl LoadedProgram {
 
 /// Names `main` when a stripped ELF executable's startup code passes it to
 /// the imported `__libc_start_main`, then republishes the inventory. Existing
-/// functions and names always win; failure leaves the inventory unchanged.
-/// Returns whether republishing rejected any inventory candidate.
+/// functions and names always win; a failed recognition leaves the inventory
+/// unchanged. Returns whether republishing rejected any inventory candidate,
+/// which is also recorded as truncation.
 fn recover_elf_main(
     program: &mut Program,
     info: &mut BinaryInfo,
@@ -1077,9 +1078,17 @@ fn recover_elf_main(
     if occupied || program.set_function_name(recovery.main, "main").is_err() {
         return Ok(false);
     }
-    let (functions, rejected) = select_functions(program, info, &BTreeSet::new())?;
+    // The engine cannot forget the new function, so a publication that omits
+    // it is merely incomplete rather than an open failure.
+    let (functions, rejected) = select_functions(program, info, &BTreeSet::from([recovery.main]))?;
+    info.functions_truncated |= rejected;
     if function_at(&functions, recovery.main).is_none_or(|function| function.name != "main") {
-        return Err("The recovered ELF startup callback did not enter the inventory.".into());
+        warning(
+            &mut info.warnings,
+            "A recovered ELF startup callback did not fit the function list; main was not published.",
+        );
+        info.functions_truncated = true;
+        return Ok(true);
     }
     info.functions = functions;
     warning(
