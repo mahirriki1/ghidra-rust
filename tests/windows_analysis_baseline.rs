@@ -7,6 +7,7 @@
 //! GHIDRA_RUST_BENCH_A/B select hexadecimal function addresses in that image.
 //! GHIDRA_RUST_BENCH_REPEATS defaults to three (accepted range: 1..=20).
 //! GHIDRA_RUST_BENCH_EXTERNAL_BATCHES defaults to eight; zero opts into exhaustion.
+//! GHIDRA_RUST_BENCH_MODE is latency (default) or memory (in-request sampling).
 //! GHIDRA_RUST_BENCH_SOURCE_METADATA may name JSON containing the original git
 //! revision/status and source archive hash, for exported Windows checkouts.
 #![cfg(windows)]
@@ -47,6 +48,23 @@ const SAMPLE_INTERVAL: Duration = Duration::from_millis(10);
 // Match the existing contained-worker integration tests. Progress never resets it.
 const REQUEST_DEADLINE: Duration = Duration::from_secs(30);
 const REAP_DEADLINE: Duration = Duration::from_secs(10);
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum MeasurementMode {
+    Latency,
+    Memory,
+}
+impl MeasurementMode {
+    fn from_env() -> Self {
+        match std::env::var("GHIDRA_RUST_BENCH_MODE") {
+            Err(std::env::VarError::NotPresent) => Self::Latency,
+            Ok(value) if value == "latency" => Self::Latency,
+            Ok(value) if value == "memory" => Self::Memory,
+            _ => panic!("GHIDRA_RUST_BENCH_MODE must be latency or memory"),
+        }
+    }
+}
 
 // PROCESS_MEMORY_COUNTERS_EX from psapi.h. SIZE_T fields use the native pointer
 // width; the first two DWORD fields and repr(C) preserve both Win32/Win64 ABI.
@@ -190,6 +208,7 @@ impl TrackedProcess {
             identity: self.identity.clone(),
             working_set_bytes: counters.working_set_size as u64,
             private_bytes: counters.private_usage as u64,
+            page_fault_count: counters.page_fault_count,
         }
     }
 }
@@ -234,10 +253,14 @@ struct ProcessMemory {
     identity: ProcessIdentity,
     working_set_bytes: u64,
     private_bytes: u64,
+    page_fault_count: u32,
 }
 #[derive(Clone, Serialize)]
 struct MemorySample {
+    measurement_mode: MeasurementMode,
+    sample_index: usize,
     since_start_ms: f64,
+    collection_ms: f64,
     processes: Vec<ProcessMemory>,
     process_count: usize,
     worker_count: usize,
@@ -284,10 +307,13 @@ fn value_digest(value: &impl Serialize) -> String {
 }
 #[derive(Serialize)]
 struct RequestRecord<'a> {
+    measurement_mode: MeasurementMode,
     phase: &'a str,
     id: u64,
     request: &'a Request,
     request_ms: f64,
+    in_request_sample_count: usize,
+    in_request_sampling_ms: f64,
     memory: &'a MemorySample,
     progress_count: usize,
     response_bytes: usize,
@@ -296,24 +322,28 @@ struct RequestRecord<'a> {
 }
 
 struct Sampler {
+    mode: MeasurementMode,
     client: TrackedProcess,
     worker: Option<TrackedProcess>,
     origin: Instant,
     last: Instant,
     samples: usize,
+    sampling_ms: f64,
     peak_sum_working_set_bytes: u64,
     peak_sum_private_bytes: u64,
     records: BufWriter<File>,
     memory: BufWriter<File>,
 }
 impl Sampler {
-    fn new(directory: &Path, name: &str) -> Self {
+    fn new(directory: &Path, name: &str, mode: MeasurementMode) -> Self {
         Self {
+            mode,
             client: TrackedProcess::open(std::process::id()),
             worker: None,
             origin: Instant::now(),
             last: Instant::now(),
             samples: 0,
+            sampling_ms: 0.,
             peak_sum_working_set_bytes: 0,
             peak_sum_private_bytes: 0,
             records: BufWriter::new(
@@ -345,6 +375,8 @@ impl Sampler {
     }
 
     fn sample(&mut self) -> MemorySample {
+        let start = Instant::now();
+        let since_start_ms = milliseconds(self.origin);
         let mut processes = vec![self.client.memory("client")];
         if let Some(worker) = &self.worker {
             // Count the active worker on every sample, and reject unexpected
@@ -362,7 +394,10 @@ impl Sampler {
             );
         }
         let sample = MemorySample {
-            since_start_ms: milliseconds(self.origin),
+            measurement_mode: self.mode,
+            sample_index: self.samples + 1,
+            since_start_ms,
+            collection_ms: milliseconds(start),
             process_count: processes.len(),
             worker_count: usize::from(self.worker.is_some()),
             sum_working_set_bytes: processes.iter().map(|p| p.working_set_bytes).sum(),
@@ -374,13 +409,27 @@ impl Sampler {
             .peak_sum_working_set_bytes
             .max(sample.sum_working_set_bytes);
         self.peak_sum_private_bytes = self.peak_sum_private_bytes.max(sample.sum_private_bytes);
-        self.last = Instant::now();
         json_line(&mut self.memory, &sample);
+        // This duration includes the snapshot, process reads and memory JSON
+        // flush. Its own timing-record write cannot be included in this value;
+        // sampling_ms below includes that write in request/run overhead totals.
+        json_line(
+            &mut self.records,
+            &json!({ "phase": "memory_sample_timing", "measurement_mode": self.mode,
+                "sample_index": sample.sample_index, "collection_ms": sample.collection_ms,
+                "sample_and_memory_write_ms": milliseconds(start),
+                "cumulative_sampling_ms_before": self.sampling_ms,
+            }),
+        );
+        self.sampling_ms += milliseconds(start);
+        self.last = Instant::now();
         sample
     }
 
     fn request(&mut self, worker: &mut WorkerClient, request: Request, phase: &str) -> Response {
         let start = Instant::now();
+        let samples_before = self.samples;
+        let sampling_ms_before = self.sampling_ms;
         let id = worker.send(request.clone()).unwrap();
         let mut previous = None;
         let mut progress_count = 0usize;
@@ -389,16 +438,17 @@ impl Sampler {
                 json_line(
                     &mut self.records,
                     &json!({ "phase": phase, "id": id,
+                    "measurement_mode": self.mode,
                     "request": request, "failure": "request_deadline_exceeded",
+                    "in_request_sample_count": self.samples - samples_before,
+                    "in_request_sampling_ms": self.sampling_ms - sampling_ms_before,
                     "elapsed_ms": milliseconds(start) }),
                 );
                 panic!("{phase} request {id} exceeded 30 seconds");
             }
-            if self.last.elapsed() >= SAMPLE_INTERVAL {
-                self.sample();
-            }
             match worker.poll() {
                 Some(WorkerEvent::Reply(reply)) => {
+                    let elapsed_ms = milliseconds(start);
                     assert_eq!(reply.id, id);
                     if let Response::Progress { progress: update } = reply.response {
                         update.validate_after(previous.as_ref()).unwrap();
@@ -418,6 +468,7 @@ impl Sampler {
                         json_line(
                             &mut self.records,
                             &json!({ "phase": phase,
+                            "measurement_mode": self.mode,
                             "id": id, "progress": update, "since_request_ms": milliseconds(start) }),
                         );
                         previous = Some(update);
@@ -434,16 +485,20 @@ impl Sampler {
                         assert_eq!(last.functions_examined, analysis.functions_examined);
                         assert_eq!(last.decode_attempts, analysis.decode_attempts);
                     }
-                    let elapsed_ms = milliseconds(start);
+                    let in_request_sample_count = self.samples - samples_before;
+                    let in_request_sampling_ms = self.sampling_ms - sampling_ms_before;
                     let memory = self.sample();
                     let (response_bytes, response_sha256) = value_identity(&reply.response);
                     json_line(
                         &mut self.records,
                         &RequestRecord {
+                            measurement_mode: self.mode,
                             phase,
                             id,
                             request: &request,
                             request_ms: elapsed_ms,
+                            in_request_sample_count,
+                            in_request_sampling_ms,
                             memory: &memory,
                             progress_count,
                             response_bytes,
@@ -462,11 +517,24 @@ impl Sampler {
                     json_line(
                         &mut self.records,
                         &json!({ "phase": phase, "id": id,
+                        "measurement_mode": self.mode,
+                        "in_request_sample_count": self.samples - samples_before,
+                        "in_request_sampling_ms": self.sampling_ms - sampling_ms_before,
                         "request": request, "failure": error, "elapsed_ms": milliseconds(start) }),
                     );
                     panic!("Production worker failed during {phase}: {error}")
                 }
-                None => std::thread::sleep(Duration::from_millis(1)),
+                None => {
+                    // Latency mode never enumerates processes or writes memory
+                    // records while any request is pending, including Open and
+                    // inventory replay. Memory mode retains active-work samples.
+                    if self.mode == MeasurementMode::Memory
+                        && self.last.elapsed() >= SAMPLE_INTERVAL
+                    {
+                        self.sample();
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
             }
         }
     }
@@ -1340,6 +1408,7 @@ fn profile_windows_production_workers() {
     }
     ghidra_rust::performance::init().unwrap();
     let mut trace_guard = TraceFlushOnFailure(true);
+    let measurement_mode = MeasurementMode::from_env();
     let repeats: usize = std::env::var("GHIDRA_RUST_BENCH_REPEATS").map_or(3, |value| {
         value
             .parse()
@@ -1398,7 +1467,7 @@ fn profile_windows_production_workers() {
         })
     };
     let metadata = json!({
-        "schema": 1, "started_unix_ms": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis(),
+        "schema": 2, "started_unix_ms": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis(),
         "scope": "native Windows instrumented analysis test client plus production worker; no native GUI",
         "platform": std::env::consts::OS, "architecture": std::env::consts::ARCH,
         "windows_version": command_text("cmd.exe", &["/d", "/c", "ver"]),
@@ -1413,7 +1482,12 @@ fn profile_windows_production_workers() {
         "assembly_sources": [hash_file(&root.join("tests/fixtures/aarch64.S")),
             hash_file(&root.join("tests/fixtures/arm64-pe.S")), hash_file(&root.join("tests/fixtures/aarch64-data.S"))],
         "fixture_build": fixture_build,
-        "config": { "repeats": repeats, "sample_interval_ms": SAMPLE_INTERVAL.as_millis(),
+        "config": { "repeats": repeats, "measurement_mode": measurement_mode,
+            "sample_interval_ms": SAMPLE_INTERVAL.as_millis(), "poll_sleep_ms": 1,
+            "in_request_sampling": measurement_mode == MeasurementMode::Memory,
+            "sample_interval_scope": "Minimum gap after a completed sample in memory mode while polling an unanswered request; boundary samples occur in both modes.",
+            "request_timing_scope": "Caller send through terminal WorkerClient::poll, including reader parsing/validation, scheduling and progress handling; excludes terminal boundary sample and report serialization.",
+            "sampling_timing_scope": "Sample collection plus memory JSON serialization/flush; request/run sampling totals also include the sample timing-record write. Other report/progress writes are excluded from sampling totals.",
             "request_deadline_ms": REQUEST_DEADLINE.as_millis(), "profile": "release",
             "external_batch_cap": if external_batches == 0 { None } else { Some(external_batches) },
             "external_zero_means_exhaustion": true, "fixture_discovery_exhausts": true,
@@ -1430,7 +1504,10 @@ fn profile_windows_production_workers() {
             "Samples are non-atomic, can miss short peaks, and include observer/test-harness memory. Only observed peaks are reported.",
             "Restart comparisons retain original discovery state/index alongside recomputed state/index; client totals include both.",
             "Sampling, polling, JSON recording, validation, and the persistent client allocator perturb the workload.",
-            "Request latency ends at receipt of the terminal reply, before report serialization and extra validation.",
+            "Request latency ends when the caller polls the terminal reply; no reader-thread receipt timestamp is measured. The nominal 1 ms sleep can overshoot with Windows timer/scheduling granularity.",
+            "Latency mode samples only between requests and can miss all transient active-worker peaks. Memory mode samples during unanswered requests and its latency includes blocking snapshots/JSON flushes; compare only matching modes.",
+            "Sample collection spans sequential process reads; sample_and_memory_write_ms excludes its own timing-record write. Cumulative sampling overhead is observer wall time, not a subtractable correction to latency.",
+            "Per-process page_fault_count is a cumulative Windows counter (including soft faults), can wrap, and is not hard-fault or I/O latency attribution.",
             "Parent begin/commit/snapshot/index/save timings are measured separately outside worker requests; destructor time is excluded from index construction.",
             "Each repetition starts a fresh worker and also restarts/replays the function inventory; the client process and OS file cache persist.",
             "Builds, fixture generation, input hashing, rendering, project I/O, and Ghidra comparisons are outside measured request scope.",
@@ -1451,13 +1528,20 @@ fn profile_windows_production_workers() {
         let input_bytes = fs::metadata(&fixture.path).unwrap().len();
         json_line(
             &mut summaries,
-            &json!({ "phase": "input_before", "fixture": fixture,
+            &json!({ "phase": "input_before", "measurement_mode": measurement_mode, "fixture": fixture,
             "input_sha256": input_hash, "input_bytes": input_bytes }),
         );
         for repeat in 1..=repeats {
             let name = format!("{}-{repeat}", fixture.name);
             println!("Measuring {name}");
-            let mut sampler = Sampler::new(&directory, &name);
+            let mut sampler = Sampler::new(&directory, &name, measurement_mode);
+            // Retain the selected mode even if this repetition fails before a
+            // completed summary or request record can be written.
+            json_line(
+                &mut summaries,
+                &json!({ "phase": "run_started", "fixture": fixture.name,
+                    "repeat": repeat, "measurement_mode": measurement_mode }),
+            );
             let before = sampler.sample();
             let (mut worker, info, spawn_ms) =
                 start_open(&mut sampler, fixture, executable, &input_hash);
@@ -1572,7 +1656,8 @@ fn profile_windows_production_workers() {
             json_line(
                 &mut summaries,
                 &json!({
-                    "fixture": fixture, "repeat": repeat, "input_sha256_before": input_hash,
+                    "fixture": fixture, "repeat": repeat, "measurement_mode": measurement_mode,
+                    "input_sha256_before": input_hash,
                     "input_sha256_after": after_hash, "input_bytes": input_bytes,
                     "addresses": pair, "aba_has_distinct_functions": pair[0] != pair[1],
                     "spawn_ms": spawn_ms, "shutdown_ms": shutdown_ms,
@@ -1581,7 +1666,8 @@ fn profile_windows_production_workers() {
                     "after_restart_shutdown": after_restart_shutdown,
                     "observed_peak_sum_working_set_bytes": sampler.peak_sum_working_set_bytes,
                     "observed_peak_sum_private_bytes": sampler.peak_sum_private_bytes,
-                    "memory_sample_count": sampler.samples, "evidence_sha256": evidence,
+                    "memory_sample_count": sampler.samples, "cumulative_sampling_ms": sampler.sampling_ms,
+                    "evidence_sha256": evidence,
                     "restart_evidence_sha256": replayed_evidence,
                     "restart_evidence_equal": evidence_equal, "restart_last_result_digests_equal": results_equal,
                     "restart_step_digest_equality": restart_step_equality,

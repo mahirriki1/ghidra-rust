@@ -194,6 +194,31 @@ ignored `target/analysis-baseline/windows-*`. These files can contain input path
 symbols and pseudocode; keep real-input reports local. This is a test client,
 not the GUI. Use the separate desktop sampler for actual GUI observations.
 
+`GHIDRA_RUST_BENCH_MODE=latency` (default) samples memory only between requests,
+after stopping each request timer. This applies to every request, including Open,
+discovery and inventory replay. `GHIDRA_RUST_BENCH_MODE=memory` also samples while
+waiting for replies, preserving observations of active worker/client overlap;
+its synchronous process snapshots and JSON flushes delay polling and contribute
+to request latency. Both modes retain boundary samples with client and live
+worker memory and check worker identity, shutdown and reaping. Latency mode can
+miss transient active-worker peaks entirely; memory mode can also miss short
+peaks. Samples are sequential, non-atomic observations. The ten-millisecond
+interval is a minimum gap after a completed sample while waiting in memory mode,
+not a guaranteed cadence. Metadata, run-start/completion and request records
+identify the mode; compare corresponding sequences only within the same mode.
+Request times run from send through the caller polling the terminal reply,
+including reader parsing/validation and progress handling, before the terminal
+boundary sample and report serialization. No reader-thread receipt timestamp is
+measured. The nominal one-millisecond poll sleep may overshoot with Windows
+timer/scheduling granularity, so these are caller-observed latencies. Memory rows
+record collection duration and per-process cumulative `page_fault_count`;
+`memory_sample_timing` records collection plus memory JSON write/flush duration.
+That duration excludes its own timing-record write; per-request in-flight and
+completed-run cumulative sampling totals include it. Other report/progress writes
+are outside those overhead totals. Sampling overhead is observer wall time,
+not a correction to subtract from request latency. Page-fault counts include
+soft faults, may wrap and do not identify hard-fault or I/O latency.
+
 `GHIDRA_RUST_BENCH_REPEATS` selects 1–20 repetitions (default 3).
 `GHIDRA_RUST_BENCH_INPUT` adds any supported trusted image without executing it;
 `GHIDRA_RUST_BENCH_A` and `GHIDRA_RUST_BENCH_B` optionally select two hexadecimal
@@ -207,6 +232,13 @@ For exported native source copies without `.git`, supply
 revision/status and exported source hashes. `GHIDRA_RUST_BENCH_BUILD_METADATA`
 can bind the fixture compiler/version/flags record. Otherwise the harness reads
 Git metadata from its checkout and records unknown fixture compiler provenance.
+When swapping exported source revisions in one build directory, invalidate the
+application artifacts before rebuilding, for example with `cargo clean -p
+ghidra-rust --release --target x86_64-pc-windows-msvc`. A source-copy tool can
+preserve timestamps older than the cached objects, allowing Cargo to reuse
+objects from a different source revision. Source hashes alone do not establish
+which code those cached objects contain. Retain executable hashes and verify
+the expected worker phases before comparing builds.
 
 Normal `WorkerClient` destruction terminates its disposable worker, including on
 ordinary desktop shutdown. A missing worker `trace_health` is therefore expected.
@@ -241,3 +273,61 @@ callee is analyzed. The harness validates each result and records every digest
 difference rather than assuming immutable engine context. Any future result
 cache must account for global types as well as function names, imports and CFG
 boundaries. Before/after comparisons must use corresponding request sequences.
+
+### Observer and allocator effects
+
+A native Windows investigation of the inventory-delta change found two distinct
+effects on the same large PE workload. Synchronous in-request memory collection
+took about 20–22 ms per observation and delayed caller polling by up to 23 ms.
+Use latency mode for request comparisons and a separate memory-mode run for
+active-work observations; neither mode measures display presentation.
+
+Removing discovery's temporary inventories also changed the worker's heap
+history. A later import-registration pass still copied roughly 262,000 global
+names into a temporary set. With fewer committed free heap pages available,
+that copy incurred more page faults and decompilation took about 9–15 ms longer.
+An experiment restoring the discarded allocations restored the earlier timings
+and fault counts, with identical analysis results. This does not justify keeping
+the discovery allocations: it identifies another avoidable copy.
+
+PE registration now checks collisions through the pinned engine's public global
+scope name index. New symbols enter that index before the next registration;
+there is no retained copy of all global names. ARM64 veneer promotion reserves
+only names retired during its current bounded pass, preserving the earlier
+collision suffixes even after the engine releases a renamed symbol's old name.
+Regression coverage compares the complete index and arena name sets, including
+global data, labels, nested scopes, insertion, rename and deletion. The debug
+inventory-publication oracle also compares an unchanged reply against the
+previously published shadow rows, so an unjournaled mutation is detectable.
+
+An accepted native Windows release session compared the parent implementation
+(`a19d7c7`) with indexed registration in A/B/B/A order, three repetitions per
+arm. Both application crates were rebuilt after clearing their artifacts; the
+same latency-mode harness drove both executables. Rust and Cargo were 1.98.1
+MSVC. Ten original/generated inputs produced 120 fixture repetitions, each with
+a fresh worker, discovery, A/B/A navigation, worker restart and replay.
+
+| Large x64 PE decompile, caller-observed median | Parent | Indexed names | Samples per build |
+| --- | ---: | ---: | ---: |
+| First A in each worker | 106.8 ms | 20.5 ms | 12 |
+| A revisit | 18.1 ms | 16.1 ms | 12 |
+| B | 2.8 ms | 3.0 ms | 12 |
+
+First-A ranges were 94.0–121.0 ms and 14.9–25.4 ms respectively. These requests
+followed the same eight discovery batches: 1,024 functions examined, 20,151
+decode attempts and 260,590 pending functions, with partial coverage explicit.
+All initial/replayed inventory, coverage/status/queue, call/data evidence and
+graph/decompiled-result fingerprints matched across every fixture repetition.
+Those result fingerprints include mappings and semantic identities. No uniform
+speedup is claimed for functions that need no new registration or other formats.
+
+Separate traced memory-mode runs observed first-A import resolution at about
+92 ms in the parent and 1.4–1.8 ms with indexed names. One repetition per build
+observed peak contemporaneous client-plus-worker private-byte sums of 784 and
+772 MiB. These are sampled committed private bytes, not unique resident memory;
+the observer adds overhead and can miss peaks. They are not latency-mode memory
+measurements. Native desktop checks covered the large input's A/B/A navigation,
+selection and Graph, plus fixture local rename/undo, comment retention, semantic
+call navigation/history, refresh and embedded-project save/reopen. GUI frame
+submission proxies are not display-presentation measurements. Filesystem cache
+state was uncontrolled, and this is not a comparison against Ghidra.
