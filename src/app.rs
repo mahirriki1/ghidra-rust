@@ -152,7 +152,9 @@ fn replay_addresses(worker: &[FunctionInfo], desired: &[FunctionInfo]) -> VecDeq
 }
 
 struct DiscoveryPublication {
-    functions: Vec<FunctionInfo>,
+    /// Display inventory when the batch changed it.
+    functions: Option<Vec<FunctionInfo>>,
+    inventory: crate::discovery::WorkerInventory,
     truncated: bool,
     index: crate::call_analysis::CallIndex,
 }
@@ -329,6 +331,11 @@ pub struct DesktopApp {
     discovery_running: bool,
     discovery_summary: Option<String>,
     worker_epoch: u64,
+    /// The inventory last adopted from the current worker. Batch requests name
+    /// its revision while `inventory_synced` records that `info.functions` is
+    /// still that inventory; every other inventory write clears it.
+    worker_inventory: Option<crate::discovery::WorkerInventory>,
+    inventory_synced: bool,
     discovery_sync: Option<VecDeque<u64>>,
     discovery_bytes: Option<(Request, RequestOrigin)>,
     /// What a project save stores: the latest committed session results, or
@@ -444,6 +451,8 @@ impl DesktopApp {
             discovery_running: false,
             discovery_summary: None,
             worker_epoch: 0,
+            worker_inventory: None,
+            inventory_synced: false,
             discovery_sync: None,
             discovery_bytes: None,
             discovery_saved: None,
@@ -593,6 +602,8 @@ impl DesktopApp {
     }
 
     fn clear_views(&mut self) {
+        self.worker_inventory = None;
+        self.inventory_synced = false;
         self.discovery = None;
         self.discovery_job = None;
         self.discovery_running = false;
@@ -659,6 +670,8 @@ impl DesktopApp {
         self.discovery_running = false;
         self.discovery_sync = None;
         self.discovery_bytes = None;
+        self.worker_inventory = None;
+        self.inventory_synced = false;
         if let Some(state) = &mut self.discovery {
             state.interrupt();
         }
@@ -1071,15 +1084,28 @@ impl DesktopApp {
         match update.publication {
             Ok(Some(publication)) => {
                 self.call_index = Some(publication.index);
+                let changed = publication.functions.is_some();
                 if let Some(info) = &mut self.info {
-                    info.functions = publication.functions;
+                    if let Some(functions) = publication.functions {
+                        info.functions = functions;
+                    }
                     info.functions_truncated = publication.truncated;
+                }
+                // A batch committed after its worker stopped is not a base for
+                // the replacement worker.
+                if publication.inventory.epoch() == self.worker_epoch {
+                    self.worker_inventory = Some(publication.inventory);
+                    self.inventory_synced = true;
+                } else {
+                    self.inventory_synced = false;
                 }
                 self.cached_functions &= self
                     .discovery
                     .as_ref()
                     .is_some_and(|state| state.remaining() != 0);
-                self.rebuild_filter();
+                if changed {
+                    self.rebuild_filter();
+                }
                 self.status = "Discovery batch committed".into();
             }
             Ok(None) => {}
@@ -1121,17 +1147,38 @@ impl DesktopApp {
             }
             self.discovery_sync = None;
         }
+        let base = self.inventory_base();
         let Some(state) = &mut self.discovery else {
             return;
         };
-        if let Some(request) = state.begin(self.generation, self.worker_epoch, self.revision) {
+        if let Some(mut request) = state.begin(self.generation, self.worker_epoch, self.revision) {
+            if let Request::DiscoverBatch { inventory_base, .. } = &mut request {
+                *inventory_base = base;
+            }
             self.send_direct(request);
         } else if state.remaining() == 0 {
             crate::performance::event("discovery_action_adopted", self.generation);
             self.discovery_running = false;
+            self.worker_inventory = None;
+            self.inventory_synced = false;
             self.status = "Discovery seed queue exhausted".into();
         }
         self.update_discovery_summary();
+    }
+
+    /// The adopted worker inventory revision `info.functions` still matches.
+    fn inventory_base(&self) -> Option<u64> {
+        let inventory = self
+            .worker_inventory
+            .as_ref()
+            .filter(|inventory| self.inventory_synced && inventory.epoch() == self.worker_epoch)?;
+        debug_assert!(
+            self.info
+                .as_ref()
+                .is_some_and(|info| info.functions == inventory.functions()),
+            "display inventory changed without clearing its worker base"
+        );
+        Some(inventory.revision())
     }
 
     fn start_auto_analysis(&mut self) {
@@ -1407,6 +1454,10 @@ impl DesktopApp {
                 }
                 self.cached_functions =
                     project.as_ref().is_some_and(|p| p.project.cache_compatible);
+                // Replayed names and display labels differ from the raw Opened
+                // inventory; the first batch from this worker replaces it.
+                self.worker_inventory = None;
+                self.inventory_synced = false;
                 self.info = Some(info);
                 self.rebuild_filter();
                 self.status = "Binary loaded".into();
@@ -1561,7 +1612,14 @@ impl DesktopApp {
                 }
             }
             (Request::SyncFunctions { .. }, Response::FunctionsSynced) => {}
-            (Request::DiscoverBatch { binding, .. }, Response::DiscoveryBatch { batch }) => {
+            (
+                Request::DiscoverBatch {
+                    binding,
+                    inventory_base,
+                    ..
+                },
+                Response::DiscoveryBatch { batch },
+            ) => {
                 if batch.binding != binding
                     || binding.generation != self.generation
                     || binding.epoch != self.worker_epoch
@@ -1581,6 +1639,7 @@ impl DesktopApp {
                 // with; current annotations are applied after atomic adoption.
                 let validation = info_without_functions(info);
                 let generation = self.generation;
+                let base = self.worker_inventory.clone();
                 let (sender, receiver) = mpsc::sync_channel(1);
                 self.discovery_job = Some(receiver);
                 let context = context.clone();
@@ -1590,13 +1649,16 @@ impl DesktopApp {
                     scheduled.finish(0);
                     let _trace_context = crate::performance::context(trace_id);
                     let mut state = state;
+                    let mut batch = batch;
                     let commit = crate::performance::span("parent_discovery_commit");
-                    let committed = state.commit(&validation, &batch);
+                    let committed =
+                        state.commit_reply(&validation, base.as_ref(), inventory_base, &mut batch);
                     commit.finish(0);
-                    let publication = committed.map(|()| {
+                    let publication = committed.map(|(inventory, changed)| {
                         let _index = crate::performance::span("parent_reference_index");
                         Some(DiscoveryPublication {
-                            functions: batch.functions,
+                            functions: changed.then(|| inventory.functions().to_vec()),
+                            inventory,
                             truncated: batch.truncated,
                             index: crate::call_analysis::CallIndex::new(state.snapshot()),
                         })
@@ -1652,6 +1714,7 @@ impl DesktopApp {
                 );
                 self.call_index = Some(crate::call_analysis::CallIndex::new(analysis));
                 self.cached_functions = false;
+                self.inventory_synced = false;
                 if let Some(info) = &mut self.info {
                     info.functions = functions;
                     info.functions_truncated = truncated;
@@ -1666,6 +1729,8 @@ impl DesktopApp {
                 Response::Renamed { address, name },
             ) if address == expected && name == requested => {
                 self.applied_names.insert(address, name.clone());
+                // The worker may also have re-admitted entries; resend in full.
+                self.inventory_synced = false;
                 if let Some(info) = &mut self.info
                     && let Ok(index) = info
                         .functions
@@ -5032,6 +5097,60 @@ mod tests {
     }
 
     #[test]
+    fn discovery_requests_name_a_worker_inventory_only_while_it_is_displayed() {
+        let mut app = keyboard_app();
+        app.worker_epoch = 2;
+        let info = app.info.clone().unwrap();
+        let adopt = || {
+            crate::discovery::WorkerInventory::adopt(
+                &info,
+                None,
+                None,
+                2,
+                InventoryChange::Replace {
+                    revision: 5,
+                    functions: info.functions.clone(),
+                },
+                false,
+            )
+            .unwrap()
+            .0
+        };
+        app.worker_inventory = Some(adopt());
+        app.inventory_synced = true;
+        assert_eq!(app.inventory_base(), Some(5));
+        app.worker_epoch = 3;
+        assert_eq!(app.inventory_base(), None, "another worker's revision");
+        app.worker_epoch = 2;
+        // The worker may re-admit entries after a rename, so resend in full.
+        app.receive(
+            Pending {
+                id: 1,
+                request: Request::Rename {
+                    address: 0x1000,
+                    name: "renamed".into(),
+                },
+                started: Instant::now(),
+                selection: app.selection_generation,
+                revision: app.revision,
+                byte_origin: (app.selected, app.tab),
+            },
+            Response::Renamed {
+                address: 0x1000,
+                name: "renamed".into(),
+            },
+            &egui::Context::default(),
+        );
+        assert_eq!(app.info.as_ref().unwrap().functions[0].name, "renamed");
+        assert_eq!(app.inventory_base(), None);
+        app.worker_inventory = Some(adopt());
+        app.inventory_synced = true;
+        app.stop_worker();
+        assert!(app.worker_inventory.is_none());
+        assert_eq!(app.inventory_base(), None);
+    }
+
+    #[test]
     fn large_function_filters_progress_across_frames_and_follow_label_edits() {
         let mut app = keyboard_app();
         let info = app.info.as_mut().unwrap();
@@ -6607,7 +6726,10 @@ mod tests {
         };
         let batch = DiscoveryBatch {
             binding,
-            functions: info.functions.clone(),
+            inventory: InventoryChange::Replace {
+                revision: 1,
+                functions: info.functions.clone(),
+            },
             truncated: false,
             outcomes: vec![DiscoveryOutcome {
                 address: 0x1000,
@@ -6624,7 +6746,7 @@ mod tests {
                 ..Default::default()
             },
         };
-        state.commit(&info, &batch).unwrap();
+        crate::discovery::commit_replacement(&mut state, &info, &batch).unwrap();
         let saved = Arc::new(state.save());
         let data = ProjectData {
             info: info.clone(),
@@ -7033,6 +7155,7 @@ mod tests {
             id: 7,
             request: Request::DiscoverBatch {
                 binding,
+                inventory_base: None,
                 seeds: vec![0x1000],
             },
             started: Instant::now(),
@@ -7073,12 +7196,15 @@ mod tests {
         let request = state
             .begin(app.generation, app.worker_epoch, app.revision)
             .unwrap();
-        let Request::DiscoverBatch { binding, seeds } = &request else {
+        let Request::DiscoverBatch { binding, seeds, .. } = &request else {
             panic!()
         };
         let batch = DiscoveryBatch {
             binding: *binding,
-            functions: info.functions.clone(),
+            inventory: InventoryChange::Replace {
+                revision: 1,
+                functions: info.functions.clone(),
+            },
             truncated: false,
             outcomes: seeds
                 .iter()

@@ -267,12 +267,14 @@ fn real_windows_worker_and_embedded_project_round_trip() {
         info.functions.iter().map(|function| function.address),
         info.functions_truncated,
     );
-    let Response::DiscoveryBatch { batch } =
+    let Response::DiscoveryBatch { mut batch } =
         request(&mut worker, discovery.begin(1, 1, 0).unwrap())
     else {
         panic!("Windows worker did not return a discovery batch");
     };
-    discovery.commit(&info, &batch).unwrap();
+    discovery
+        .commit_reply(&info, None, None, &mut batch)
+        .unwrap();
     let saved = discovery.save();
     saved.validate(&info).unwrap();
     assert!(!saved.report.references.is_empty());
