@@ -11,6 +11,59 @@ pub fn configure_viewport(viewport: egui::ViewportBuilder) -> egui::ViewportBuil
     }
 }
 
+/// Fraction of the work area a reduced startup window may fill, leaving it
+/// visibly a window rather than an unmaximizable full-screen surface.
+#[cfg(any(windows, test))]
+const WORK_AREA_FILL: f32 = 0.9;
+
+/// Startup rectangle in points, centered in the primary monitor's work area.
+/// eframe's own centering uses the full monitor, so a window clamped to a small
+/// screen would start under the taskbar. `None` keeps eframe's placement.
+pub fn initial_placement(desired: egui::Vec2, minimum: egui::Vec2) -> Option<egui::Rect> {
+    #[cfg(windows)]
+    {
+        primary_work_area().map(|area| fit_centered(area, desired, minimum))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (desired, minimum);
+        None
+    }
+}
+
+/// The desired size, reduced to fit the work area but not below `minimum`
+/// unless the work area itself is smaller.
+#[cfg(any(windows, test))]
+fn fit_centered(area: egui::Rect, desired: egui::Vec2, minimum: egui::Vec2) -> egui::Rect {
+    let size = desired
+        .min((area.size() * WORK_AREA_FILL).max(minimum))
+        .min(area.size());
+    egui::Rect::from_center_size(area.center(), size)
+}
+
+#[cfg(windows)]
+fn primary_work_area() -> Option<egui::Rect> {
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::UI::HiDpi::GetDpiForSystem;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SPI_GETWORKAREA, SystemParametersInfoW};
+    let mut area = RECT::default();
+    // SAFETY: SPI_GETWORKAREA writes exactly one RECT to the live, writable
+    // `area`; no user profile update is requested.
+    if unsafe { SystemParametersInfoW(SPI_GETWORKAREA, 0, (&raw mut area).cast(), 0) } == 0 {
+        return None;
+    }
+    // Before winit opts into DPI awareness, coordinates are scaled to 96 DPI
+    // and this reports 96; when aware, both are physical. Either way the
+    // quotient is in logical points.
+    // SAFETY: GetDpiForSystem has no arguments or preconditions.
+    let scale = unsafe { GetDpiForSystem() } as f32 / 96.0;
+    let rect = egui::Rect::from_min_max(
+        egui::pos2(area.left as f32, area.top as f32) / scale,
+        egui::pos2(area.right as f32, area.bottom as f32) / scale,
+    );
+    (rect.is_finite() && rect.width() > 0.0 && rect.height() > 0.0).then_some(rect)
+}
+
 /// Call after the application menus. Only the remaining empty space is draggable.
 pub fn menu_bar_controls(ui: &mut egui::Ui) {
     #[cfg(windows)]
@@ -418,5 +471,27 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn startup_window_fits_centered_in_offset_work_areas() {
+        let desired = egui::vec2(1440.0, 920.0);
+        let minimum = egui::vec2(1000.0, 640.0);
+        // A 200% 2880x1800 display with a bottom taskbar, a large display with
+        // a left taskbar, and a work area smaller than the minimum size.
+        for area in [
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 846.0)),
+            egui::Rect::from_min_size(egui::pos2(48.0, 0.0), egui::vec2(2512.0, 1440.0)),
+            egui::Rect::from_min_size(egui::pos2(-800.0, 0.0), egui::vec2(800.0, 552.0)),
+        ] {
+            let window = fit_centered(area, desired, minimum);
+            assert!(area.contains_rect(window), "{window:?} outside {area:?}");
+            assert!((window.center() - area.center()).length() < 0.01);
+            assert!(window.width() <= desired.x && window.height() <= desired.y);
+            assert!(window.width() >= minimum.x.min(area.width()));
+            assert!(window.height() >= minimum.y.min(area.height()));
+        }
+        let roomy = egui::Rect::from_min_size(egui::pos2(48.0, 0.0), egui::vec2(2512.0, 1440.0));
+        assert_eq!(fit_centered(roomy, desired, minimum).size(), desired);
     }
 }

@@ -5,30 +5,53 @@ use std::path::PathBuf;
 
 fn main() -> std::process::ExitCode {
     let argument = std::env::args_os().nth(1);
-    if argument.as_deref() == Some(std::ffi::OsStr::new("--analysis-worker")) {
-        if let Err(error) = ghidra_rust::worker::run_worker() {
+    let worker = argument.as_deref() == Some(std::ffi::OsStr::new("--analysis-worker"));
+    if let Err(error) = ghidra_rust::performance::init() {
+        if worker {
             eprintln!("{error}");
-            std::process::exit(1);
+        } else {
+            report_startup_error(&error);
         }
-        return std::process::ExitCode::SUCCESS;
-    }
-    let initial_path = argument.map(PathBuf::from);
-    if let Err(error) = run_desktop(initial_path) {
-        report_startup_error(&error.to_string());
         return std::process::ExitCode::FAILURE;
     }
-    std::process::ExitCode::SUCCESS
+    let lifetime = ghidra_rust::performance::span("process_lifetime");
+    let mut success = if worker {
+        ghidra_rust::worker::run_worker().map_err(|error| eprintln!("{error}"))
+    } else {
+        run_desktop(argument.map(PathBuf::from))
+            .map_err(|error| report_startup_error(&error.to_string()))
+    }
+    .is_ok();
+    lifetime.finish(0);
+    if let Err(error) = ghidra_rust::performance::flush() {
+        eprintln!("{error}");
+        success = false;
+    }
+    if success {
+        std::process::ExitCode::SUCCESS
+    } else {
+        std::process::ExitCode::FAILURE
+    }
 }
 
 fn run_desktop(initial_path: Option<PathBuf>) -> eframe::Result<()> {
+    let size = egui::vec2(1440.0, 920.0);
+    let minimum = egui::vec2(1000.0, 640.0);
+    let placement = ghidra_rust::window_chrome::initial_placement(size, minimum);
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_icon(ghidra_rust::brand::icon())
+        .with_inner_size(size)
+        .with_min_inner_size(minimum);
+    if let Some(rect) = placement {
+        viewport = viewport
+            .with_inner_size(rect.size())
+            .with_position(rect.min);
+    }
     let options = eframe::NativeOptions {
-        viewport: ghidra_rust::window_chrome::configure_viewport(
-            egui::ViewportBuilder::default()
-                .with_icon(ghidra_rust::brand::icon())
-                .with_inner_size([1440.0, 920.0])
-                .with_min_inner_size([1000.0, 640.0]),
-        ),
+        viewport: ghidra_rust::window_chrome::configure_viewport(viewport),
         renderer: eframe::Renderer::Glow,
+        // eframe centers on the full primary monitor where no work area is known.
+        centered: placement.is_none(),
         ..Default::default()
     };
     eframe::run_native(
