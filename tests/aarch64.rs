@@ -497,6 +497,56 @@ fn aarch64_rejects_unaligned_entries_and_truncated_instructions() {
 }
 
 #[test]
+fn arm64_pe_named_noreturn_veneer_ends_its_callers_block() {
+    let (mut bytes, base) = common::arm64_pe_metadata();
+    bytes[0x8a2..0x8b1].fill(0);
+    bytes[0x8a2..0x8ae].copy_from_slice(b"ExitProcess\0");
+    let directory = tempfile::tempdir().unwrap();
+    let binary = directory.path().join("named-noreturn-arm64.exe");
+    std::fs::write(&binary, &bytes).unwrap();
+    let mut worker = WorkerClient::start_using_executable(
+        eframe::egui::Context::default(),
+        &binary,
+        Path::new(env!("CARGO_BIN_EXE_ghidra-rust")),
+    )
+    .unwrap();
+    let Response::Opened { info } = request(
+        &mut worker,
+        Request::Open {
+            path: binary.to_string_lossy().into_owned(),
+        },
+    ) else {
+        panic!("Expected ARM64 PE");
+    };
+    let view = graph(&mut worker, base + 0xa0);
+    let call = view
+        .calls
+        .iter()
+        .find(|call| call.no_return.is_some())
+        .expect("ExitProcess call");
+    assert_eq!(call.target, Some(base + 0xc0));
+    assert!(matches!(
+        call.no_return,
+        Some(ghidra_rust::model::NoReturnEvidence::ImportSlot { .. })
+    ));
+    let block = view
+        .blocks
+        .iter()
+        .find(|block| block.instructions.last().unwrap().address == call.address)
+        .unwrap();
+    assert!(!view.edges.iter().any(|edge| edge.source == block.address));
+    assert!(
+        !view
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .any(|instruction| instruction.address > call.address)
+    );
+    let (text, _) = decompile(&mut worker, base + 0xa0, &info, &view);
+    assert!(text.contains("ExitProcess"), "{text}");
+}
+
+#[test]
 fn stripped_arm64_pe_recovers_unwind_entries_and_names_confirmed_import_veneers() {
     let (bytes, base) = common::arm64_pe_metadata();
     let directory = tempfile::tempdir().unwrap();

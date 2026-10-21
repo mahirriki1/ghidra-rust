@@ -204,7 +204,9 @@ are never applied automatically.
   unresolved-flow markers. CFG recovery is bounded; switch jump tables are
   resolved through the engine's flow analysis (`S` edges), and warnings identify
   unsupported or incomplete cases such as other indirect flow. Calls are
-  displayed separately from intra-function branches.
+  displayed separately from intra-function branches. Recognized named no-return
+  calls (such as `exit`/`abort`) end their block and show a **[no return]** marker;
+  custom wrapper inference remains unsupported. See [no-return coverage](docs/analysis.md#no-return-calls).
   Large graphs open around the entry block at a readable scale. **Fit** shows the
   complete overview with text hidden at small scales; **Entry** returns to readable
   entry code. Nonlocal and loop edges use separate routes outside the block columns.

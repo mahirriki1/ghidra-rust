@@ -1867,7 +1867,11 @@ impl DesktopApp {
             Response::Opened { info } => {
                 validate_info(info, MAX_FUNCTION_NAME_BYTES, true).map(|_| ())
             }
-            Response::Graph { view } => validate_view(view, &ranges()?),
+            Response::Graph { view } => validate_view(
+                view,
+                &ranges()?,
+                self.info.as_ref().ok_or("No binary is open")?,
+            ),
             Response::Strings { strings, .. } => {
                 validate_strings(strings, MAX_STRING_RESULTS, &ranges()?)
             }
@@ -4361,13 +4365,40 @@ impl DesktopApp {
                                 for call in view.calls.iter().take(256) {
                                     if let Some(target) = call.target {
                                         if ui
-                                            .button(format!("{:x} → {:x}", call.address, target))
+                                            .button(format!(
+                                                "{:x} → {:x}{}",
+                                                call.address,
+                                                target,
+                                                if call.no_return.is_some() {
+                                                    " [no return]"
+                                                } else {
+                                                    ""
+                                                }
+                                            ))
+                                            .on_hover_text(call.no_return.map_or_else(
+                                                || "Direct call".into(),
+                                                |e| e.description(),
+                                            ))
                                             .clicked()
                                         {
                                             navigate = Some(target);
                                         }
                                     } else {
-                                        ui.weak(format!("{:x} → unresolved", call.address));
+                                        ui.weak(format!(
+                                            "{:x} → unresolved{}",
+                                            call.address,
+                                            if call.no_return.is_some() {
+                                                " [no return]"
+                                            } else {
+                                                ""
+                                            }
+                                        ))
+                                        .on_hover_text(
+                                            call.no_return.map_or_else(
+                                                || "Unresolved indirect call".into(),
+                                                |e| e.description(),
+                                            ),
+                                        );
                                     }
                                 }
                             });
@@ -4482,6 +4513,20 @@ impl DesktopApp {
                                 crate::annotation_display::preview(&note.label, 80),
                                 crate::annotation_display::preview(&note.comment, 400)
                             ))
+                        } else {
+                            response
+                        };
+                        let response = if let Some(evidence) = self
+                            .view
+                            .as_ref()
+                            .and_then(|view| {
+                                view.calls
+                                    .iter()
+                                    .find(|call| call.address == instruction.address)
+                            })
+                            .and_then(|call| call.no_return)
+                        {
+                            response.on_hover_text(evidence.description())
                         } else {
                             response
                         };
@@ -5762,6 +5807,7 @@ mod tests {
             calls: vec![CallSite {
                 address: 0x1004,
                 target: Some(0x1040),
+                no_return: None,
             }],
             warnings: vec![],
         });
