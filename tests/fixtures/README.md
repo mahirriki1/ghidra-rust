@@ -67,6 +67,18 @@ not a copied signature database. This fixture does not establish broad processor
 compiler, binary-format, C++, or Rust compatibility. Compiler-generated startup
 code and addresses can vary with the compiler and system libraries.
 
+## Differential corpus
+
+`differential/corpus.c` and `differential/many_functions.c` are original C for
+the opt-in [Ghidra differential benchmark](../../docs/analysis-performance.md#differential-comparison-with-ghidra).
+They cover dense and sparse switches, indirect and tail calls, standard and
+custom no-return calls, recursion, static helpers, globals, strings, and 300
+distinct functions reachable only through a pointer table. The benchmark builds
+them with GCC at `-O0`/`-O2`, PIE and non-PIE, plus stripped copies, beneath
+ignored `target/ghidra-differential/`. The binaries are analyzed, never executed.
+Optimization can remove or reshape constructs; the generated ground truth
+records which jump tables, indirect calls and tail jumps actually survived.
+
 ## AArch64
 
 `aarch64.S` is original assembly with explicit little-endian instruction words.
