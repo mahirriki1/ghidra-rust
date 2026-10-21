@@ -30,6 +30,7 @@ pub mod project;
 pub mod selection;
 pub mod semantic;
 pub mod session;
+mod switch_analysis;
 pub mod theme;
 pub mod window_chrome;
 #[cfg(windows)]

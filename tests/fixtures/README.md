@@ -79,6 +79,13 @@ ignored `target/ghidra-differential/`. The binaries are analyzed, never executed
 Optimization can remove or reshape constructs; the generated ground truth
 records which jump tables, indirect calls and tail jumps actually survived.
 
+`switch.c` is an original fixture for [switch tables](../../docs/analysis.md#switch-tables).
+At `-O2`, GCC emits its dense switch as a jump table; `case_only` is called only
+from one case, and `computed` tail-jumps through an unknown function pointer.
+`tests/linux_worker.rs` builds PIE and non-PIE copies, checks the recovered `S`
+edges, the case's call reference and decompilation, the unresolved computed jump,
+and discovery of `case_only` in a stripped copy.
+
 ## AArch64
 
 `aarch64.S` is original assembly with explicit little-endian instruction words.

@@ -439,11 +439,21 @@ pub enum EdgeKind {
     Unknown,
 }
 
+/// Analysis evidence beyond the instruction's own encoding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EdgeEvidence {
+    /// A destination of a switch table recovered by engine flow analysis.
+    EngineJumpTable,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Edge {
     pub source: u64,
     pub target: Option<u64>,
     pub kind: EdgeKind,
+    /// Absent in projects saved before switch recovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<EdgeEvidence>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -1,7 +1,7 @@
 //! A bounded native instruction CFG. Construct a new canvas when analysis changes;
 //! selection changes alone intentionally retain the current camera.
 
-use crate::model::{EdgeKind, FunctionView};
+use crate::model::{EdgeEvidence, EdgeKind, FunctionView};
 use crate::theme;
 use eframe::egui::{
     self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2, pos2, vec2,
@@ -150,6 +150,7 @@ impl GraphCanvas {
                 (EdgeKind::True, "T: true"),
                 (EdgeKind::False, "F: false"),
                 (EdgeKind::Branch, "B: branch"),
+                (EdgeKind::Branch, "S: recovered switch target"),
                 (EdgeKind::Unknown, "?: unresolved"),
             ] {
                 ui.colored_label(edge_color(kind), label);
@@ -580,6 +581,9 @@ impl Layout {
             let (label, color_kind) = match edge.kind {
                 EdgeKind::True => ("T", EdgeKind::True),
                 EdgeKind::False => ("F", EdgeKind::False),
+                EdgeKind::Branch if edge.evidence == Some(EdgeEvidence::EngineJumpTable) => {
+                    ("S", EdgeKind::Branch)
+                }
                 EdgeKind::Branch => ("B", EdgeKind::Branch),
                 EdgeKind::Unknown => ("?", EdgeKind::Unknown),
             };
@@ -812,31 +816,37 @@ mod tests {
                     source: 0x401146,
                     target: Some(0x40115a),
                     kind: EdgeKind::True,
+                    evidence: None,
                 },
                 Edge {
                     source: 0x401146,
                     target: Some(0x40116b),
                     kind: EdgeKind::False,
+                    evidence: None,
                 },
                 Edge {
                     source: 0x40115a,
                     target: Some(0x40117d),
                     kind: EdgeKind::Branch,
+                    evidence: None,
                 },
                 Edge {
                     source: 0x40116b,
                     target: Some(0x40117d),
                     kind: EdgeKind::Branch,
+                    evidence: None,
                 },
                 Edge {
                     source: 0x40117d,
                     target: Some(0x401146),
                     kind: EdgeKind::True,
+                    evidence: None,
                 },
                 Edge {
                     source: 0x401190,
                     target: None,
                     kind: EdgeKind::Unknown,
+                    evidence: None,
                 },
             ],
             calls: vec![],
@@ -870,6 +880,7 @@ mod tests {
                 source: blocks[0].address,
                 target: Some(blocks[1].address),
                 kind: EdgeKind::Branch,
+                evidence: None,
             })
             .collect();
         // Overlapping loop intervals must have distinct outer lanes.
@@ -878,6 +889,7 @@ mod tests {
                 source: view.blocks[source].address,
                 target: Some(view.address),
                 kind: EdgeKind::True,
+                evidence: None,
             });
         }
         view
