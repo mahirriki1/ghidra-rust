@@ -201,9 +201,10 @@ are never applied automatically.
   FindCrypt) in the background while you browse. **Analysis → Auto analyze…**
   reopens it; see [auto analysis](docs/analysis.md#auto-analysis).
 - Navigate a function's instruction CFG with pan, zoom, branch labels, and
-  unresolved-flow markers. CFG recovery is bounded; warnings identify unsupported
-  or incomplete cases such as indirect flow. Calls are displayed separately from
-  intra-function branches.
+  unresolved-flow markers. CFG recovery is bounded; switch jump tables are
+  resolved through the engine's flow analysis (`S` edges), and warnings identify
+  unsupported or incomplete cases such as other indirect flow. Calls are
+  displayed separately from intra-function branches.
   Large graphs open around the entry block at a readable scale. **Fit** shows the
   complete overview with text hidden at small scales; **Entry** returns to readable
   entry code. Nonlocal and loop edges use separate routes outside the block columns.
