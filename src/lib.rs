@@ -14,6 +14,7 @@ pub mod decode;
 pub mod decoder_ui;
 pub mod decompile;
 pub mod discovery;
+mod elf_startup;
 pub mod file_dialog;
 pub mod graph;
 pub mod highlight;
