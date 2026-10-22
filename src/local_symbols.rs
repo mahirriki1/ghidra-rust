@@ -26,6 +26,8 @@ pub(crate) fn capture(
     data: &mut Funcdata,
     arch: &mut Architecture,
     renames: &[LocalRename],
+    signature_context: &str,
+    signature_owned: bool,
 ) -> ghidra_decompiler::error::Result<Locals> {
     let mut result = Locals::default();
     let Some(scope) = data.localmap else {
@@ -99,14 +101,14 @@ pub(crate) fn capture(
         else {
             continue;
         };
-        let Some(verification) = verify(data, arch, symbol, nodes) else {
+        let Some(verification) = verify(data, arch, symbol, nodes, signature_context) else {
             continue;
         };
         candidates.push((
             symbol,
             LocalIdentity {
                 function: data.baseaddr.get_offset(),
-                engine: LOCAL_FINGERPRINT.into(),
+                engine: local_fingerprint(signature_context).into(),
                 storage,
                 offset: addr.get_offset(),
                 size: entry.size as u32,
@@ -130,6 +132,10 @@ pub(crate) fn capture(
         result.variables.push(LocalVariable {
             identity,
             name: arch.symboltab_ref()?.symbol(symbol).display_name.clone(),
+            signature_parameter: {
+                let sym = arch.symboltab_ref()?.symbol(symbol);
+                (signature_owned && sym.category == 0).then_some(sym.catindex as usize)
+            },
         });
     }
     // Verify each override before applying it. Stale overrides stay saved and
@@ -149,6 +155,13 @@ pub(crate) fn capture(
             ));
             continue;
         };
+        if result.variables[index].signature_parameter.is_some() {
+            result.warnings.push(format!(
+                "Local rename '{}' not applied: parameter name is owned by its function signature",
+                rename.name
+            ));
+            continue;
+        }
         let symbol = *result
             .symbols
             .iter()
@@ -182,12 +195,17 @@ fn verify(
     arch: &Architecture,
     symbol: SymbolId,
     nodes: &BTreeSet<VarnodeId>,
+    signature_context: &str,
 ) -> Option<String> {
     let db = arch.symboltab_ref().ok()?;
     let sym = db.symbol(symbol);
     let entry = db.entry(*sym.mapentry.first()?);
     let mut digest = Sha256::new();
-    digest.update(LOCAL_FINGERPRINT);
+    digest.update(local_fingerprint(signature_context));
+    if !signature_context.is_empty() {
+        // Bind all overrides, including callers, to the complete canonical state.
+        digest.update(Sha256::digest(signature_context.as_bytes()));
+    }
     digest.update(sym.category.to_le_bytes());
     digest.update(sym.catindex.to_le_bytes());
     let tp = arch.types.as_ref()?.get(sym.tp?);

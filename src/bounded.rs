@@ -141,7 +141,10 @@ fn reply_nodes(kind: &str) -> Option<usize> {
                 + 11 * crate::semantic::MAX_TOKENS
                 + 25 * crate::semantic::MAX_LOCALS
                 + crate::semantic::MAX_FUNCTION_RENAMES
+                + 16 * crate::signatures::MAX_PARAMETERS
+                + crate::signatures::MAX_INFERRED_NOTES
         }
+        "signatures_synced" => 5 * crate::signatures::MAX_SIGNATURES,
         "bytes" => MAX_BYTE_READ,
         "strings" => 7 * MAX_STRING_RESULTS,
         "crypto" => 9 * MAX_CRYPTO_MATCHES,
@@ -263,6 +266,30 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(error.contains("2-element limit"), "{error}");
+    }
+
+    #[test]
+    fn complete_signature_acknowledgement_fits_reply_preflight() {
+        let reply = WorkerResponse {
+            id: 7,
+            response: Response::SignaturesSynced {
+                binary_sha256: "a".repeat(64),
+                context: "b".repeat(64),
+                unapplied: (0..crate::signatures::MAX_SIGNATURES)
+                    .map(|function| SignatureStatus {
+                        function: function as u64,
+                        reason: "Incompatible engine or ABI".into(),
+                    })
+                    .collect(),
+            },
+        };
+        let encoded = serde_json::to_vec(&reply).unwrap();
+        let shape = check_reply(&encoded).unwrap();
+        assert_eq!((shape.id, shape.kind.as_str()), (7, "signatures_synced"));
+        assert!(
+            matches!(serde_json::from_slice::<WorkerResponse>(&encoded).unwrap().response,
+            Response::SignaturesSynced { unapplied,.. } if unapplied.len() == crate::signatures::MAX_SIGNATURES)
+        );
     }
 
     #[test]

@@ -22,8 +22,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 const APPLICATION_ID: i64 = 0x4752504a; // GRPJ
-/// Version 3 adds semantic tokens and local renames; versions 1/2 still open.
-const VERSION: i64 = 3;
+/// Version 4 adds signatures and their cache context; versions 1–3 still open.
+const VERSION: i64 = 4;
 pub const ENGINE_FINGERPRINT: &str = "ghidra-rust-project-v3-semantic-v1-mapping-v1-pe-v1-aarch64-v1-calls-v1-arm64pe-v1-inventory-v2-elfcrt-v1-switch-v1-noreturn-v1:268c3a406d8d964bc00ae2ead4d3e1e1373aaa27";
 const MAX_BINARY: usize = 128 * 1024 * 1024;
 const MAX_BODY: usize = 48 * 1024 * 1024;
@@ -53,6 +53,10 @@ pub struct ProjectData {
 #[serde(deny_unknown_fields)]
 struct Body {
     engine: String,
+    #[serde(default)]
+    signature_fingerprint: String,
+    #[serde(default)]
+    signature_context: String,
     #[serde(default)]
     #[serde(deserialize_with = "crate::bounded::vec::<_, _, { crate::model::MAX_CODE_MAPPINGS }>")]
     mappings: Vec<CodeMapping>,
@@ -112,6 +116,8 @@ impl ProjectData {
         persisted_info.source_identity = None; // live file identities are not portable capabilities
         let body = Body {
             engine: ENGINE_FINGERPRINT.into(),
+            signature_fingerprint: crate::signatures::SIGNATURE_FINGERPRINT.into(),
+            signature_context: crate::signatures::state_digest(&self.session.signatures),
             mappings: self.mappings.clone(),
             semantics: self.semantics.clone(),
             info: persisted_info,
@@ -279,17 +285,33 @@ impl ProjectData {
             .ok_or("Project annotations are missing")?;
         let session: Session = serde_json::from_slice(&annotations)
             .map_err(|e| format!("Invalid project annotations: {e}"))?;
+        session.validate()?;
+        if version < 4 && session.needed_version() >= 3 {
+            return Err("Project signatures require version 4".into());
+        }
+        if version >= 4
+            && body.signature_context != crate::signatures::state_digest(&session.signatures)
+        {
+            return Err("Project signature context does not match its saved annotations".into());
+        }
         let decompiled = read_blob(&db, "decompiled", MAX_DECOMPILED_BYTES)?
             .map(String::from_utf8)
             .transpose()
             .map_err(|_| "Project decompilation is not UTF-8")?;
         let source_hint = body.info.path.clone();
-        let compatible = body.engine == ENGINE_FINGERPRINT
-            && body
-                .semantics
-                .locals
-                .iter()
-                .all(|v| v.identity.engine == crate::semantic::LOCAL_FINGERPRINT);
+        let local_context = if session.signatures.is_empty() {
+            String::new()
+        } else {
+            crate::signatures::state_digest(&session.signatures)
+        };
+        let engine_compatible = body.engine == ENGINE_FINGERPRINT;
+        let compatible =
+            version >= 4
+                && engine_compatible
+                && body.signature_fingerprint == crate::signatures::SIGNATURE_FINGERPRINT
+                && body.semantics.locals.iter().all(|v| {
+                    v.identity.engine == crate::semantic::local_fingerprint(&local_context)
+                });
         let mut data = ProjectData {
             info: body.info,
             session,
@@ -304,6 +326,18 @@ impl ProjectData {
             selected_address: body.selected_address,
             discovery: None,
         };
+        // Incompatible cached semantics may use an older identity schema. Keep
+        // annotations, but do not interpret those caches with current validators.
+        if !compatible {
+            data.view = None;
+            data.decompiled = None;
+            data.mappings.clear();
+            data.semantics = Default::default();
+        }
+        if !engine_compatible {
+            data.strings.clear();
+            data.crypto.clear();
+        }
         data.validate()?;
         // A different engine or discovery format discards only saved discovery.
         if let Some(discovery) = discovery
@@ -361,15 +395,6 @@ impl ProjectData {
         } else {
             None
         };
-        // A different engine can reuse annotations, but must regenerate analysis.
-        if !compatible {
-            data.view = None;
-            data.decompiled = None;
-            data.mappings.clear();
-            data.semantics = Default::default();
-            data.strings.clear();
-            data.crypto.clear();
-        }
         data.info.source_identity = None;
         Ok(LoadedProject {
             data,
@@ -391,6 +416,14 @@ impl ProjectData {
             .any(|r| !executable.contains(r.identity.function))
         {
             return Err("Local rename function is not executable file-backed code".into());
+        }
+        if self
+            .session
+            .signatures
+            .iter()
+            .any(|s| !executable.contains(s.function))
+        {
+            return Err("Signature function is not executable file-backed code".into());
         }
         if self.info.sha256 != self.session.binary_sha256 {
             return Err("Project metadata and annotation fingerprints differ".into());
@@ -419,6 +452,7 @@ impl ProjectData {
             || !self.semantics.tokens.is_empty()
             || !self.semantics.locals.is_empty()
             || !self.semantics.warnings.is_empty()
+            || self.semantics.prototype.is_some()
         {
             return Err("Decompiler mappings have no corresponding text".into());
         }
@@ -1089,6 +1123,249 @@ mod tests {
         (data, protection.bind_snapshot(&info).unwrap())
     }
 
+    fn signature(function: u64) -> crate::signatures::FunctionSignature {
+        use crate::signatures::{
+            FunctionSignature, SignatureBase, SignatureParameter, SignatureType,
+        };
+        FunctionSignature {
+            function,
+            engine: crate::signatures::SIGNATURE_FINGERPRINT.into(),
+            abi: "saved-abi".into(),
+            return_type: SignatureType {
+                base: SignatureBase::I32,
+                pointer_depth: 0,
+            },
+            parameters: vec![
+                SignatureParameter {
+                    name: "buffer".into(),
+                    ty: SignatureType {
+                        base: SignatureBase::U8,
+                        pointer_depth: 1,
+                    },
+                },
+                SignatureParameter {
+                    name: "length".into(),
+                    ty: SignatureType {
+                        base: SignatureBase::U64,
+                        pointer_depth: 0,
+                    },
+                },
+            ],
+        }
+    }
+
+    fn rewrite_json(db: &Connection, key: &str, edit: impl FnOnce(&mut serde_json::Value)) {
+        let bytes = read_blob(db, key, MAX_BODY).unwrap().unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        edit(&mut value);
+        db.execute(
+            "UPDATE project_data SET value=?1 WHERE key=?2",
+            params![serde_json::to_vec(&value).unwrap(), key],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn version_4_signature_context_round_trips_and_binds_every_signature_field() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut data, protection) = sample(directory.path());
+        data.session.signatures = vec![signature(0x1000)];
+        data.session.upgrade_version();
+        data.discovery = Some(Arc::new(discovered(&data)));
+        let path = directory.path().join("signatures.grproj");
+        data.save(&path, &protection, true).unwrap();
+        let loaded = ProjectData::load(&path).unwrap();
+        assert!(loaded.cache_compatible && loaded.data.discovery.is_some());
+        assert_eq!(loaded.data.session.signatures, data.session.signatures);
+        assert_eq!(loaded.data.decompiled, data.decompiled);
+        let db = Connection::open(&path).unwrap();
+        assert_eq!(
+            db.pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
+                .unwrap(),
+            4
+        );
+        drop(db);
+
+        let original = data.session.signatures[0].clone();
+        let mut changed = Vec::new();
+        let mut s = original.clone();
+        s.parameters[0].name = "other".into();
+        changed.push(s);
+        let mut s = original.clone();
+        s.parameters[0].ty.pointer_depth = 2;
+        changed.push(s);
+        let mut s = original.clone();
+        s.parameters.swap(0, 1);
+        changed.push(s);
+        let mut s = original.clone();
+        s.abi = "different-abi".into();
+        changed.push(s);
+        let mut s = original.clone();
+        s.engine = "different-engine".into();
+        changed.push(s);
+        let mut s = original.clone();
+        s.function = 0x1001;
+        changed.push(s);
+        let mut s = original;
+        s.return_type.base = crate::signatures::SignatureBase::U32;
+        changed.push(s);
+        for signature in changed {
+            data.save(&path, &protection, true).unwrap();
+            let db = Connection::open(&path).unwrap();
+            rewrite_json(&db, "annotations", |v| {
+                v["signatures"][0] = serde_json::to_value(signature).unwrap()
+            });
+            drop(db);
+            assert!(
+                ProjectData::load(&path)
+                    .unwrap_err()
+                    .contains("signature context")
+            );
+        }
+        data.save(&path, &protection, true).unwrap();
+        let db = Connection::open(&path).unwrap();
+        rewrite_json(&db, "body", |v| {
+            v["signature_context"] = "0".repeat(64).into()
+        });
+        drop(db);
+        assert!(
+            ProjectData::load(&path)
+                .unwrap_err()
+                .contains("signature context")
+        );
+
+        // Function insertion order is irrelevant; parameter order is semantic.
+        data.session.signatures.push(signature(0x1008));
+        data.save(&path, &protection, true).unwrap();
+        let db = Connection::open(&path).unwrap();
+        rewrite_json(&db, "annotations", |v| {
+            v["signatures"].as_array_mut().unwrap().reverse();
+        });
+        drop(db);
+        assert!(ProjectData::load(&path).unwrap().cache_compatible);
+    }
+
+    #[test]
+    fn signature_fingerprint_migration_retains_pending_overrides_and_annotations() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut data, protection) = sample(directory.path());
+        data.session.signatures = vec![signature(0x1000)];
+        data.session.signatures[0].engine = "older-engine".into();
+        data.session.upgrade_version();
+        data.discovery = Some(Arc::new(discovered(&data)));
+        let path = directory.path().join("old-signature-engine.grproj");
+        data.save(&path, &protection, true).unwrap();
+        let db = Connection::open(&path).unwrap();
+        rewrite_json(&db, "body", |v| {
+            v["signature_fingerprint"] = "old-signature-format".into()
+        });
+        drop(db);
+        let loaded = ProjectData::load(&path).unwrap();
+        assert!(!loaded.cache_compatible);
+        assert!(loaded.data.view.is_none() && loaded.data.decompiled.is_none());
+        assert!(loaded.data.discovery.is_none() && loaded.data.mappings.is_empty());
+        assert_eq!(loaded.data.session.signatures, data.session.signatures);
+        assert_eq!(
+            loaded.data.session.annotations[&0x1000].comment,
+            "saved note"
+        );
+        assert_eq!(loaded.data.info.functions.len(), data.info.functions.len());
+        assert!(loaded.binary.is_some());
+    }
+
+    #[test]
+    fn cached_local_identities_use_the_signature_context_fingerprint() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut data, protection) = sample(directory.path());
+        data.session.signatures = vec![signature(0x1000)];
+        data.session.upgrade_version();
+        let context = crate::signatures::state_digest(&data.session.signatures);
+        let expected = crate::semantic::local_fingerprint(&context);
+        data.semantics.locals.push(
+            serde_json::from_value(serde_json::json!({
+                "identity": {
+                    "function": 0x1000, "engine": expected, "storage": "stack",
+                    "offset": 0, "size": 4, "verification": "a".repeat(64)
+                },
+                "name": "saved_local"
+            }))
+            .unwrap(),
+        );
+        let path = directory.path().join("signature-locals.grproj");
+        data.save(&path, &protection, true).unwrap();
+        assert!(ProjectData::load(&path).unwrap().cache_compatible);
+        let db = Connection::open(&path).unwrap();
+        rewrite_json(&db, "body", |v| {
+            v["semantics"]["locals"][0]["identity"]["engine"] =
+                crate::semantic::LOCAL_FINGERPRINT.into();
+        });
+        drop(db);
+        let loaded = ProjectData::load(&path).unwrap();
+        assert!(!loaded.cache_compatible && loaded.data.decompiled.is_none());
+        assert_eq!(loaded.data.session.signatures, data.session.signatures);
+
+        // A changed engine identity also preserves annotations during migration.
+        data.save(&path, &protection, true).unwrap();
+        let db = Connection::open(&path).unwrap();
+        rewrite_json(&db, "body", |v| {
+            v["engine"] = "older-engine".into();
+            v["semantics"]["locals"][0]["identity"]["engine"] = "older-local-schema".into();
+        });
+        drop(db);
+        let loaded = ProjectData::load(&path).unwrap();
+        assert!(!loaded.cache_compatible && loaded.data.semantics.locals.is_empty());
+        assert_eq!(loaded.data.session.signatures, data.session.signatures);
+        assert_eq!(loaded.data.session.annotations[&0x1000].label, "entry");
+    }
+
+    #[test]
+    fn version_3_project_migration_keeps_notes_but_discards_analysis_caches() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut data, protection) = sample(directory.path());
+        data.discovery = Some(Arc::new(discovered(&data)));
+        let path = directory.path().join("legacy-v3.grproj");
+        data.save(&path, &protection, true).unwrap();
+        let db = Connection::open(&path).unwrap();
+        rewrite_json(&db, "body", |v| {
+            v.as_object_mut().unwrap().remove("signature_context");
+            v.as_object_mut().unwrap().remove("signature_fingerprint");
+        });
+        db.execute_batch("PRAGMA user_version=3").unwrap();
+        drop(db);
+        let loaded = ProjectData::load(&path).unwrap();
+        assert!(!loaded.cache_compatible);
+        assert!(loaded.data.view.is_none() && loaded.data.discovery.is_none());
+        assert!(loaded.data.decompiled.is_none() && loaded.data.semantics.locals.is_empty());
+        assert_eq!(loaded.data.session.annotations[&0x1000].label, "entry");
+        assert!(loaded.data.session.signatures.is_empty() && loaded.binary.is_some());
+
+        data.session.signatures = vec![signature(0x1000)];
+        data.session.upgrade_version();
+        data.save(&path, &protection, true).unwrap();
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("PRAGMA user_version=3").unwrap();
+        drop(db);
+        assert!(ProjectData::load(&path).unwrap_err().contains("version 4"));
+    }
+
+    #[test]
+    fn project_signature_ranges_require_executable_file_backed_addresses() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut data, _) = sample(directory.path());
+        data.session.signatures = vec![signature(0x1000)];
+        data.session.upgrade_version();
+        data.validate().unwrap();
+        data.session.signatures[0].function = 0x100e;
+        assert!(data.validate().is_err());
+        data.session.signatures[0].function = 0x1000;
+        data.info.sections[0].file_size = 0;
+        assert!(
+            data.validate()
+                .unwrap_err()
+                .contains("executable file-backed")
+        );
+    }
+
     #[test]
     fn embedded_project_round_trip_and_private_extraction_lifetime() {
         let directory = tempfile::tempdir().unwrap();
@@ -1293,7 +1570,7 @@ mod tests {
         db.execute_batch("PRAGMA user_version=2").unwrap();
         drop(db);
         let reopened = ProjectData::load(&path).unwrap();
-        assert!(reopened.data.discovery.is_some());
+        assert!(reopened.data.discovery.is_none());
         assert!(reopened.data.semantics.tokens.is_empty());
 
         // Existing version 1 files open without discovery.
@@ -1302,7 +1579,7 @@ mod tests {
             .unwrap();
         drop(db);
         let reopened = ProjectData::load(&path).unwrap();
-        assert!(reopened.data.discovery.is_none() && reopened.data.view.is_some());
+        assert!(reopened.data.discovery.is_none() && reopened.data.view.is_none());
 
         // Forged evidence is rejected on save and when written directly.
         let mut forged = (**data.discovery.as_ref().unwrap()).clone();
@@ -1398,7 +1675,7 @@ mod tests {
         let path = directory.path().join("test.grproj");
         for mutation in [
             "PRAGMA user_version=0",
-            "PRAGMA user_version=4",
+            "PRAGMA user_version=5",
             // Version 1 never had discovery records.
             "PRAGMA user_version=1; INSERT INTO project_data VALUES ('discovery',x'7b7d')",
             "INSERT INTO project_data VALUES ('discovery',x'7b7d')",
