@@ -157,6 +157,14 @@ impl SemanticSelection {
         self.addresses.insert(address);
         self.update_ranges();
     }
+    /// Engine addresses printed for exactly the expression at `byte`.
+    pub fn addresses_at(&self, byte: usize) -> &[u64] {
+        let index = self.mappings.partition_point(|m| m.end <= byte);
+        self.mappings
+            .get(index)
+            .filter(|m| m.start <= byte && byte < m.end)
+            .map_or(&[], |m| m.addresses.as_slice())
+    }
     pub fn select_code(&mut self, byte: usize) -> Option<u64> {
         let index = self.mappings.partition_point(|m| m.end <= byte);
         let mapping = self
