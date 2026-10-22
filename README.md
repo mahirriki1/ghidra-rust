@@ -184,7 +184,10 @@ are never applied automatically.
   See [architecture coverage and limits](docs/architectures.md).
 - Browse/filter known functions; start at `main` when found, otherwise the entry
   point. PE exports and supported x64/ARM64 exception-table function entries load
-  on open, including stripped images. The list is capped at 262,144 entries and
+  on open, including stripped images. In stripped dynamically linked x86-64 ELF
+  executables, `main` is recovered from glibc's startup call to
+  `__libc_start_main` and labeled as analysis-derived in **Analysis notes**
+  ([details](docs/analysis.md#stripped-elf-startup)). The list is capped at 262,144 entries and
   8 MiB of names; large PEs prioritize the entry point, exports, and runtime
   functions near entry, with a visible partial-list notice. Projects containing
   more than 10,000 functions cannot be opened by releases before this limit.

@@ -310,6 +310,9 @@ impl LoadedProgram {
             info.functions_truncated |= rejected;
             info.functions = functions;
         }
+        if info.format == "ELF" && !info.functions_truncated {
+            rejected |= recover_elf_main(&mut program, &mut info, &target, &snapshot)?;
+        }
         let mut inventory = crate::inventory::Inventory::default();
         inventory.certify(&info.functions, !rejected);
         if !info.entry.is_multiple_of(target.instruction_alignment)
@@ -1024,6 +1027,78 @@ impl LoadedProgram {
         matches.sort_by_key(|m| m.address);
         Ok(Response::Crypto { matches, truncated })
     }
+}
+
+/// Names `main` when a stripped ELF executable's startup code passes it to
+/// the imported `__libc_start_main`, then republishes the inventory. Existing
+/// functions and names always win; a failed recognition leaves the inventory
+/// unchanged. Returns whether republishing rejected any inventory candidate,
+/// which is also recorded as truncation.
+fn recover_elf_main(
+    program: &mut Program,
+    info: &mut BinaryInfo,
+    target: &crate::architecture::Target,
+    bytes: &[u8],
+) -> Result<bool, String> {
+    let _span = crate::performance::span("open_elf_startup");
+    let known = |address| function_at(&info.functions, address).is_some();
+    if info
+        .functions
+        .iter()
+        .any(|function| function.name == "main")
+        || info.functions.len() >= MAX_FUNCTIONS
+    {
+        return Ok(false);
+    }
+    let recovery = match crate::elf_startup::recognize(
+        program,
+        bytes,
+        target.name,
+        info.entry,
+        target.pointer_bytes as u32,
+        |address| crate::call_analysis::code_address(info, address) && !known(address),
+    ) {
+        Ok(recovery) => recovery,
+        Err(crate::elf_startup::Miss::Exhausted) => {
+            warning(
+                &mut info.warnings,
+                "ELF startup recognition stopped at its work limit; main was not recovered.",
+            );
+            return Ok(false);
+        }
+        Err(_) => return Ok(false),
+    };
+    // A global symbol already named main (for example a data label) keeps
+    // its name; the callback stays an unnamed discovery candidate instead.
+    let occupied = program
+        .data_symbols()
+        .map_err(engine_error)?
+        .iter()
+        .any(|symbol| symbol.name == "main");
+    if occupied || program.set_function_name(recovery.main, "main").is_err() {
+        return Ok(false);
+    }
+    // The engine cannot forget the new function, so a publication that omits
+    // it is merely incomplete rather than an open failure.
+    let (functions, rejected) = select_functions(program, info, &BTreeSet::from([recovery.main]))?;
+    info.functions_truncated |= rejected;
+    if function_at(&functions, recovery.main).is_none_or(|function| function.name != "main") {
+        warning(
+            &mut info.warnings,
+            "A recovered ELF startup callback did not fit the function list; main was not published.",
+        );
+        info.functions_truncated = true;
+        return Ok(true);
+    }
+    info.functions = functions;
+    warning(
+        &mut info.warnings,
+        format!(
+            "Recovered main at {:#x} from the first argument passed to the imported __libc_start_main at {:#x}. This name is analysis-derived, not an ELF symbol.",
+            recovery.main, recovery.call
+        ),
+    );
+    Ok(rejected)
 }
 
 /// Publishes the engine inventory within the shared count and escaped-name

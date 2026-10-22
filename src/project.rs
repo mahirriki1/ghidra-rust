@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 const APPLICATION_ID: i64 = 0x4752504a; // GRPJ
 /// Version 3 adds semantic tokens and local renames; versions 1/2 still open.
 const VERSION: i64 = 3;
-pub const ENGINE_FINGERPRINT: &str = "ghidra-rust-project-v3-semantic-v1-mapping-v1-pe-v1-aarch64-v1-calls-v1-arm64pe-v1-inventory-v2:268c3a406d8d964bc00ae2ead4d3e1e1373aaa27";
+pub const ENGINE_FINGERPRINT: &str = "ghidra-rust-project-v3-semantic-v1-mapping-v1-pe-v1-aarch64-v1-calls-v1-arm64pe-v1-inventory-v2-elfcrt-v1:268c3a406d8d964bc00ae2ead4d3e1e1373aaa27";
 const MAX_BINARY: usize = 128 * 1024 * 1024;
 const MAX_BODY: usize = 48 * 1024 * 1024;
 const MAX_PROJECT: u64 = 224 * 1024 * 1024;
@@ -1145,7 +1145,7 @@ mod tests {
         let bytes = read_blob(&db, "body", MAX_BODY).unwrap().unwrap();
         let mut body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         body.as_object_mut().unwrap().remove("semantics");
-        body["engine"] = "ghidra-rust-project-v1-mapping-v1-pe-v1-aarch64-v1-calls-v1-arm64pe-v1-inventory-v2:268c3a406d8d964bc00ae2ead4d3e1e1373aaa27".into();
+        body["engine"] = "ghidra-rust-project-v1-mapping-v1-pe-v1-aarch64-v1-calls-v1-arm64pe-v1-inventory-v2-elfcrt-v1:268c3a406d8d964bc00ae2ead4d3e1e1373aaa27".into();
         db.execute(
             "UPDATE project_data SET value=?1 WHERE key='body'",
             [serde_json::to_vec(&body).unwrap()],
