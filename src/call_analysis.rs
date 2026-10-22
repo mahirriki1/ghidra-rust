@@ -24,20 +24,16 @@ impl AnalysisProgress {
 /// An aligned instruction start inside a file-backed executable section, using
 /// indexed checked lookups. Discovery seed admission uses the same rule.
 pub fn code_address(info: &BinaryInfo, address: u64) -> bool {
-    let alignment = if info.architecture == "AArch64" { 4 } else { 1 };
+    let Some((_, alignment)) = crate::architecture::properties(&info.architecture) else {
+        return false;
+    };
     address.is_multiple_of(alignment)
         && info
             .sections
             .partition_point(|section| section.address <= address)
             .checked_sub(1)
             .and_then(|index| info.sections.get(index))
-            .is_some_and(|section| {
-                section.executable
-                    && address
-                        .checked_sub(section.address)
-                        .and_then(|offset| offset.checked_add(alignment))
-                        .is_some_and(|end| end <= section.file_size.min(section.size))
-            })
+            .is_some_and(|section| section.executable && section.backs(address, alignment))
 }
 
 /// A worker function inventory as reference evidence owners. `data` adds the

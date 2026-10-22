@@ -2,7 +2,7 @@
 //! identity against Ghidra's named lists (see `data/no-return/README.md`).
 //! A recognized call ends its block: the bytes after it are not its successor.
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use ghidra_decompiler::address::Address;
 use ghidra_decompiler::opcodes::OpCode;
@@ -104,8 +104,10 @@ pub(crate) struct NoReturnIndex {
     /// Named PE import address table slots and verified glibc startup slots.
     slots: BTreeSet<u64>,
     pointer_bytes: u32,
-    /// Some names or slots were omitted at the limit.
-    pub truncated: bool,
+    /// Import-thunk checks of direct call targets, decoded once per worker.
+    thunks: Mutex<BTreeMap<u64, Option<u64>>>,
+    /// Names were unavailable or omitted at the limit.
+    pub incomplete: bool,
 }
 
 impl NoReturnIndex {
@@ -125,7 +127,11 @@ impl NoReturnIndex {
         let Some(container) = Container::of(format) else {
             return index;
         };
-        for function in program.functions().unwrap_or_default() {
+        let Ok(functions) = program.functions() else {
+            index.incomplete = true;
+            return index;
+        };
+        for function in functions {
             let identity = function.symbol.as_deref().unwrap_or(&function.name);
             if matches!(
                 function.source,
@@ -145,7 +151,7 @@ impl NoReturnIndex {
             for (&slot, name) in imports {
                 if container.matches(name, true) {
                     if index.slots.len() + index.targets.len() == MAX_ENTRIES {
-                        index.truncated = true;
+                        index.incomplete = true;
                         break;
                     }
                     index.slots.insert(slot);
@@ -157,7 +163,7 @@ impl NoReturnIndex {
 
     fn insert_target(&mut self, address: u64) {
         if self.slots.len() + self.targets.len() == MAX_ENTRIES {
-            self.truncated = true;
+            self.incomplete = true;
         } else {
             self.targets.insert(address);
         }
@@ -166,7 +172,7 @@ impl NoReturnIndex {
     pub(crate) fn add_startup_slots(&mut self, slots: impl IntoIterator<Item = u64>) {
         for slot in slots {
             if self.slots.len() + self.targets.len() >= MAX_ENTRIES {
-                self.truncated = true;
+                self.incomplete = true;
                 break;
             }
             self.slots.insert(slot);
@@ -213,9 +219,9 @@ impl NoReturnIndex {
         }
     }
 
-    /// Resolve only a conventional x86 import jump or ARM64 ADRP/LDR/BR
-    /// veneer in file-backed executable code. Extra decodes share the walk's
-    /// work allowance, including failures; they cannot grow an unbounded cache.
+    /// The import slot of a direct call target that is an exact thunk. Each
+    /// target is decoded once per worker; a decode is charged to the walk's
+    /// work allowance, and one that does not fit is skipped, not cached.
     fn thunk_slot(
         &self,
         program: &Program,
@@ -226,27 +232,41 @@ impl NoReturnIndex {
         if self.slots.is_empty() {
             return None;
         }
+        let mut thunks = self
+            .thunks
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(&slot) = thunks.get(&target) {
+            return slot;
+        }
         let arm64 = program.language_id().starts_with("AARCH64:");
         let count = if arm64 { 3 } else { 1 };
-        let length = if arm64 { 12 } else { 6 };
-        if arm64 && !target.is_multiple_of(4) {
-            return None;
-        }
-        if !sections.iter().any(|section| {
-            section.executable
-                && target.checked_sub(section.address).is_some_and(|offset| {
-                    offset
-                        .checked_add(length)
-                        .is_some_and(|end| end <= section.size.min(section.file_size))
-                })
-        }) {
-            return None;
-        }
-        let Some(available) = remaining.checked_sub(count) else {
-            *remaining = 0;
-            return None;
-        };
+        let available = remaining.checked_sub(count)?;
         *remaining = available;
+        let slot = self.decode_thunk(program, target, sections, arm64);
+        if thunks.len() < MAX_ENTRIES {
+            thunks.insert(target, slot);
+        }
+        slot
+    }
+
+    /// Resolve only a conventional x86 import jump or ARM64 ADRP/LDR/BR
+    /// veneer in file-backed executable code.
+    fn decode_thunk(
+        &self,
+        program: &Program,
+        target: u64,
+        sections: &[SectionInfo],
+        arm64: bool,
+    ) -> Option<u64> {
+        let (count, length) = if arm64 { (3, 12) } else { (1, 6) };
+        if arm64 && !target.is_multiple_of(4)
+            || !sections
+                .iter()
+                .any(|section| section.executable && section.backs(target, length))
+        {
+            return None;
+        }
         let decoded = program.disassemble(target, count).ok()?;
         let code = program.pcode(target, count).ok()?;
         if decoded.len() != count || code.len() != count {
@@ -352,38 +372,35 @@ impl NoReturnIndex {
 }
 
 /// Marks the engine's own prototypes of named no-return functions, so the
-/// decompiler also stops at calls to them.
-pub(crate) fn mark_engine(program: &mut Program, index: &NoReturnIndex) -> Result<(), String> {
+/// decompiler also stops at calls to them. Returns whether every target was
+/// marked; an unmarked one only keeps the decompiler's ordinary call flow.
+pub(crate) fn mark_engine(program: &mut Program, index: &NoReturnIndex) -> bool {
     mark_targets(program, index.targets.iter().copied())
 }
 
-pub(crate) fn mark_targets(
-    program: &mut Program,
-    targets: impl IntoIterator<Item = u64>,
-) -> Result<(), String> {
+pub(crate) fn mark_targets(program: &mut Program, targets: impl IntoIterator<Item = u64>) -> bool {
     let architecture = program.architecture();
     let Some(space) = architecture.manager.get_default_code_space() else {
-        return Ok(());
+        return false;
     };
+    let mut complete = true;
     for address in targets {
         let entry = Address::new(space.clone(), address);
-        let symbol = {
-            let symbols = architecture.symboltab_ref().map_err(|e| e.to_string())?;
-            let Some(scope) = symbols.get_global_scope() else {
-                return Ok(());
-            };
-            symbols.scope_query_function(scope, &entry)
-        };
-        if let Some(symbol) = symbol {
+        let symbol = architecture.symboltab_ref().ok().and_then(|symbols| {
+            symbols
+                .get_global_scope()
+                .and_then(|scope| symbols.scope_query_function(scope, &entry))
+        });
+        complete &= symbol.is_some_and(|symbol| {
             architecture
                 .with_function(symbol, |function, _| {
                     function.funcp.set_no_return(true);
                     Ok(())
                 })
-                .map_err(|error| format!("Cannot mark a no-return function: {error}"))?;
-        }
+                .is_ok()
+        });
     }
-    Ok(())
+    complete
 }
 
 #[cfg(test)]
@@ -509,41 +526,30 @@ mod tests {
         }
         let program = Program::from_raw_bytes(bytes, "AARCH64:LE:64:v8A:windows", 0x1000).unwrap();
         let code = program.pcode(0x1000, 1).unwrap().pop().unwrap();
-        let index = NoReturnIndex {
+        let index = || NoReturnIndex {
             slots: [0x1080].into(),
             pointer_bytes: 8,
             ..Default::default()
         };
+        let call = |index: &NoReturnIndex, sections: &[SectionInfo], remaining: &mut usize| {
+            index.call(&program, &code, call_index(&code), sections, remaining)
+        };
+        let veneer = Some(NoReturnEvidence::ImportSlot { slot: 0x1080 });
+        // The three-instruction check is charged once, then remembered.
+        let resolved = index();
         let mut remaining = 3;
-        assert_eq!(
-            index.call(
-                &program,
-                &code,
-                call_index(&code),
-                &sections(),
-                &mut remaining
-            ),
-            Some(NoReturnEvidence::ImportSlot { slot: 0x1080 })
-        );
+        assert_eq!(call(&resolved, &sections(), &mut remaining), veneer);
         assert_eq!(remaining, 0);
+        assert_eq!(call(&resolved, &sections(), &mut remaining), veneer);
+        // A check that does not fit is skipped without consuming the rest.
+        let short = index();
         let mut remaining = 2;
-        assert_eq!(
-            index.call(
-                &program,
-                &code,
-                call_index(&code),
-                &sections(),
-                &mut remaining
-            ),
-            None
-        );
-        assert_eq!(remaining, 0);
+        assert_eq!(call(&short, &sections(), &mut remaining), None);
+        assert_eq!(remaining, 2);
+        assert_eq!(call(&short, &sections(), &mut 3), veneer);
         let mut truncated = sections();
         truncated[0].file_size = 0x48;
-        assert_eq!(
-            index.call(&program, &code, call_index(&code), &truncated, &mut 3),
-            None
-        );
+        assert_eq!(call(&index(), &truncated, &mut 3), None);
     }
 
     #[test]

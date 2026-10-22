@@ -779,22 +779,8 @@ pub(crate) fn validate_view(
     }
     if view.calls.iter().any(|call| call.no_return.is_some()) {
         use crate::model::NoReturnEvidence;
-        let executable = crate::selection::ExecutableRanges::new(&info.sections)?;
-        let backed_sections = info
-            .sections
-            .iter()
-            .map(|section| {
-                let mut section = section.clone();
-                section.size = section.size.min(section.file_size);
-                section
-            })
-            .collect::<Vec<_>>();
-        let backed = MappedRanges::new(&backed_sections)?;
-        let pointer_bytes = match info.architecture.as_str() {
-            "x86" => 4,
-            "x86-64" | "AArch64" => 8,
-            _ => return Err("Unknown architecture for no-return evidence".into()),
-        };
+        let (pointer_bytes, _) = crate::architecture::properties(&info.architecture)
+            .ok_or("Unknown architecture for no-return evidence")?;
         let mut sites = std::collections::BTreeMap::<u64, usize>::new();
         for call in &view.calls {
             *sites.entry(call.address).or_default() += 1;
@@ -827,15 +813,18 @@ pub(crate) fn validate_view(
             match evidence {
                 NoReturnEvidence::NamedTarget => {
                     let target = call.target.ok_or("Named no-return call has no target")?;
-                    let alignment = if info.architecture == "AArch64" { 4 } else { 1 };
-                    if !executable.contains(target) || !target.is_multiple_of(alignment) {
+                    if !crate::call_analysis::code_address(info, target) {
                         return Err(
                             "Named no-return target is not executable file-backed code".into()
                         );
                     }
                 }
                 NoReturnEvidence::ImportSlot { slot } => {
-                    if !backed.contains_span(slot, pointer_bytes) {
+                    if !info
+                        .sections
+                        .iter()
+                        .any(|section| section.backs(slot, pointer_bytes))
+                    {
                         return Err("No-return import slot is not fully file-backed".into());
                     }
                 }
