@@ -190,9 +190,16 @@ entry and accepts it only once per worker epoch. A replacement worker may rebuil
 the same coverage in bounded batches under its new epoch. The parent also checks
 scan cursors against the ordered file-backed executable byte space: address gaps
 cost no scan bytes, forward cursors must land in that space, and an uncharged
-resume may advance only within the current 64 KiB match chunk. At most 4,096
-pattern replies are accepted for the whole phase, including coverage preparation
-and replacement-worker rebuilds; reaching that limit leaves the scan partial.
+resume may advance only within the current 64 KiB match chunk. Coverage-only
+preparation is accounted by those distinct function identities
+rather than by a cursor allowance, so a full 262,144-entry inventory can be
+rebuilt across multiple bounded replies and worker epochs. Cursor work has a
+separate parent-owned ceiling of 256 accepted replies, including at most 64
+uncharged match-point resumes. The parent also permits at most 2,097,152 complete
+inventory rows to be reconstructed and validated during the pattern phase; this
+check runs before an expensive adoption. Reaching any cumulative limit ends the
+phase explicitly partial. Worker-reported match, validation, and byte counters do
+not replenish the parent-owned allowances.
 
 Each scan step covers at most 1 MiB, 4,096 matches per 64 KiB chunk (65,536 in
 one reply), 128 validated candidates, 128 admissions and 16,384 decode attempts,
