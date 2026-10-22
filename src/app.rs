@@ -4516,15 +4516,12 @@ impl DesktopApp {
                         } else {
                             response
                         };
-                        let response = if let Some(evidence) = self
-                            .view
-                            .as_ref()
-                            .and_then(|view| {
-                                view.calls
-                                    .iter()
-                                    .find(|call| call.address == instruction.address)
-                            })
-                            .and_then(|call| call.no_return)
+                        let call = self.view.as_ref().and_then(|view| {
+                            view.calls
+                                .iter()
+                                .find(|call| call.address == instruction.address)
+                        });
+                        let response = if let Some(evidence) = call.and_then(|call| call.no_return)
                         {
                             response.on_hover_text(evidence.description())
                         } else {
@@ -4533,15 +4530,7 @@ impl DesktopApp {
                         if response.clicked() {
                             selected = Some(instruction.address);
                         }
-                        let target = self
-                            .view
-                            .as_ref()
-                            .and_then(|view| {
-                                view.calls
-                                    .iter()
-                                    .find(|call| call.address == instruction.address)
-                            })
-                            .and_then(|call| call.target);
+                        let target = call.and_then(|call| call.target);
                         if response.double_clicked()
                             && let Some(target) = target
                         {
@@ -5263,7 +5252,7 @@ mod tests {
         let mut app = DesktopApp::empty(None);
         app.info = Some(BinaryInfo {
             path: "fixture".into(),
-            architecture: "x86:LE:64:default".into(),
+            architecture: "x86-64".into(),
             format: "ELF".into(),
             entry: 0x1000,
             file_len: 256,

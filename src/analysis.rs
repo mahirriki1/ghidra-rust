@@ -61,17 +61,18 @@ fn warning(warnings: &mut Vec<String>, message: impl Into<String>) {
     }
 }
 
+/// Whether `address` is in the section's virtual extent, including any
+/// zero-filled tail beyond its file-backed bytes.
 fn mapped(section: &SectionInfo, address: u64) -> bool {
     address >= section.address && address - section.address < section.size
 }
 
+/// Whether `length` bytes (at least one) at `address` are file-backed code.
 fn executable(sections: &[SectionInfo], address: u64, length: usize) -> bool {
-    sections.iter().any(|section| {
-        section.executable
-            && mapped(section, address)
-            && address - section.address < section.file_size
-            && (length as u64) <= section.file_size.min(section.size) - (address - section.address)
-    })
+    let length = (length as u64).max(1);
+    sections
+        .iter()
+        .any(|section| section.executable && section.backs(address, length))
 }
 
 #[cfg(test)]
@@ -337,19 +338,16 @@ impl LoadedProgram {
                 crate::elf_startup::libc_start_slots(&snapshot, &info.architecture)
                     .into_iter()
                     .filter(|&slot| {
-                        info.sections.iter().any(|section| {
-                            slot.checked_sub(section.address)
-                                .and_then(|offset| offset.checked_add(target.pointer_bytes as u64))
-                                .is_some_and(|end| end <= section.size.min(section.file_size))
-                        })
+                        info.sections
+                            .iter()
+                            .any(|section| section.backs(slot, target.pointer_bytes as u64))
                     }),
             );
         }
-        crate::no_return::mark_engine(&mut program, &no_return)?;
-        if no_return.truncated {
+        if no_return.incomplete || !crate::no_return::mark_engine(&mut program, &no_return) {
             warning(
                 &mut info.warnings,
-                "No-return recognition reached its 4,096-entry limit; some calls that never return keep a fallthrough.",
+                "No-return recognition is incomplete; some calls that never return keep a fallthrough.",
             );
         }
         let mut inventory = crate::inventory::Inventory::default();
@@ -1280,7 +1278,9 @@ impl LoadedProgram {
                 self.target.pointer_bytes,
             )?;
         }
-        crate::no_return::mark_targets(&mut self.program, no_return_targets)
+        // An unmarked thunk only keeps the decompiler's ordinary call flow.
+        crate::no_return::mark_targets(&mut self.program, no_return_targets);
+        Ok(())
     }
 
     fn synchronize_function_name(&mut self, address: u64, name: &str) -> Result<(), String> {
@@ -2430,10 +2430,17 @@ impl Walk {
                 address: entry,
                 blocks,
                 edges,
+                // Evidence is shown only where its block is; every call stays
+                // listed for navigation.
                 calls: self
                     .calls
                     .into_iter()
-                    .filter(|call| assigned.contains(&call.address))
+                    .map(|mut call| {
+                        if !assigned.contains(&call.address) {
+                            call.no_return = None;
+                        }
+                        call
+                    })
                     .collect(),
                 warnings: std::mem::take(warnings),
             },
@@ -2457,6 +2464,7 @@ fn flow(
     let mut indirect = false;
     let mut internal = false;
     let call_start = calls.len();
+    let mut call_operation = None;
     for (index, operation) in code.operations.iter().enumerate() {
         let direct = operation
             .inputs
@@ -2479,12 +2487,9 @@ fn flow(
                     } else {
                         None
                     },
-                    no_return: if operation.opcode == OpCode::Call && direct == Some(fallthrough) {
-                        None
-                    } else {
-                        no_return(code, index)
-                    },
+                    no_return: None,
                 });
+                call_operation = Some(index);
             }
             OpCode::Branch | OpCode::Cbranch => {
                 if operation.inputs.first().is_some_and(|v| v.space == "const") {
@@ -2531,12 +2536,15 @@ fn flow(
         );
         (vec![(None, EdgeKind::Unknown)], true, false)
     } else if let Some(edges) = transfer {
-        for call in &mut calls[call_start..] {
-            call.no_return = None;
-        }
         (edges, true, indirect)
-    } else if calls.len() == call_start + 1 && calls[call_start].no_return.is_some() {
+    } else if let Some(call) = calls.get_mut(call_start)
+        && let Some(operation) = call_operation
+        // A call to its own fallthrough reads the program counter.
+        && call.target != Some(fallthrough)
+        && let Some(evidence) = no_return(code, operation)
+    {
         // The following bytes are not this call's successor.
+        call.no_return = Some(evidence);
         (Vec::new(), true, false)
     } else {
         (vec![(Some(fallthrough), EdgeKind::Branch)], false, false)

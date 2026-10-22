@@ -381,6 +381,17 @@ pub struct SectionInfo {
     pub executable: bool,
 }
 
+impl SectionInfo {
+    /// Whether `[address, address + length)` lies in this section's
+    /// file-backed bytes.
+    pub fn backs(&self, address: u64, length: u64) -> bool {
+        address
+            .checked_sub(self.address)
+            .and_then(|offset| offset.checked_add(length))
+            .is_some_and(|end| end <= self.size.min(self.file_size))
+    }
+}
+
 /// Identity of an opened file, independent of its current pathname.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileIdentity {
