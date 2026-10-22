@@ -4895,7 +4895,8 @@ impl DesktopApp {
                     let local = token
                         .filter(|t| matches!(t.kind, TokenKind::Local { .. }))
                         .cloned();
-                    let targets = match (token.map(|t| &t.kind), pointer_byte, &self.view) {
+                    let view = self.info.as_ref().zip(self.view.as_ref());
+                    let targets = match (token.map(|t| &t.kind), pointer_byte, view) {
                         (Some(TokenKind::Call { target }), _, _) => TargetSet::single(XrefTarget {
                             address: *target,
                             kind: TargetKind::CallTarget,
@@ -4903,7 +4904,7 @@ impl DesktopApp {
                         (_, Some(byte), Some(view)) => crate::xrefs::instruction_targets(
                             Some(view),
                             self.call_index.as_ref(),
-                            view.address,
+                            view.1.address,
                             self.semantic.addresses_at(byte).iter().copied(),
                         ),
                         _ => TargetSet::default(),
@@ -5123,7 +5124,7 @@ impl DesktopApp {
         };
         if let Some(view) = &self.view {
             set = crate::xrefs::instruction_targets(
-                Some(view),
+                self.info.as_ref().map(|info| (info, view)),
                 self.call_index.as_ref(),
                 view.address,
                 pcs.iter().copied().filter(|pc| {
@@ -5731,6 +5732,7 @@ impl DesktopApp {
                             &self.annotation_browser.comments,
                         );
                         let call_index = self.call_index.as_ref();
+                        let info = self.info.as_ref();
                         let menu = |ui: &mut egui::Ui, pc: Option<u64>| {
                             let call = pc.and_then(|pc| {
                                 view.calls
@@ -5746,7 +5748,7 @@ impl DesktopApp {
                             }
                             let targets = pc.map_or_else(TargetSet::default, |pc| {
                                 crate::xrefs::instruction_targets(
-                                    Some(view),
+                                    info.map(|info| (info, view)),
                                     call_index,
                                     view.address,
                                     [pc],
@@ -5915,7 +5917,7 @@ impl DesktopApp {
                             if let Some(view) = &self.view {
                                 ui.separator();
                                 let targets = crate::xrefs::instruction_targets(
-                                    Some(view),
+                                    self.info.as_ref().map(|info| (info, view)),
                                     self.call_index.as_ref(),
                                     view.address,
                                     [instruction.address],
@@ -8272,6 +8274,25 @@ mod tests {
         app.select_instruction(0x1004);
         app.show_selection_xrefs();
         assert_eq!(app.xref_target.unwrap().address, 0x1040);
+    }
+
+    #[test]
+    fn graph_call_targets_outside_file_backed_code_are_not_xref_targets() {
+        let mut app = xref_app();
+        // A crafted saved view can claim a call into data or unmapped memory.
+        for target in [0x2000, 0x1101, 0x9000] {
+            app.view.as_mut().unwrap().calls[0].target = Some(target);
+            app.set_call_index(None);
+            app.select_instruction(0x1004);
+            assert_eq!(
+                app.selection_xref_targets().targets,
+                [XrefTarget {
+                    address: 0x1004,
+                    kind: TargetKind::Address
+                }],
+                "{target:#x}"
+            );
+        }
     }
 
     #[test]

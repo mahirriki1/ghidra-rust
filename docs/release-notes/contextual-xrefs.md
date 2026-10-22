@@ -1,8 +1,9 @@
 - Show cross-references from context: right-click an instruction in the Listing
   or Function Graph, a decompiler expression, the Listing or Decompiler function
   header, or a Functions entry and choose **Xrefs to…**, or press **X**. Targets
-  come only from decoded call sites and confirmed call/data evidence at the exact
-  instruction, or from a decompiler call token's engine target.
+  come only from decoded call sites whose targets are file-backed executable
+  code, confirmed call/data evidence at the exact instruction, or a decompiler
+  call token's engine target.
 - Offer every distinct target as an explicit choice when one selection has
   several, such as an instruction that reads and writes different addresses or a
   decompiler expression mapped to several instructions. No target is picked

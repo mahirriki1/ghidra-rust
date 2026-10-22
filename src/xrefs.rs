@@ -107,20 +107,25 @@ fn at_pc<'a, R>(
 /// Exact call and data targets of instructions `pcs` in function `owner`.
 /// Call targets come from the displayed graph when it is `owner`'s, and from
 /// confirmed call evidence; data targets only from confirmed data evidence.
+/// Graph call sites are only bounded by view validation (projects may supply
+/// them), so their targets must also be aligned, file-backed code in `info`,
+/// the rule reference evidence and semantic call tokens already satisfy.
 pub fn instruction_targets(
-    view: Option<&FunctionView>,
+    view: Option<(&BinaryInfo, &FunctionView)>,
     index: Option<&CallIndex>,
     owner: u64,
     pcs: impl IntoIterator<Item = u64>,
 ) -> TargetSet {
     let mut set = TargetSet::default();
-    let calls = view
-        .filter(|view| view.address == owner)
-        .map(|view| view.calls.as_slice())
-        .unwrap_or(&[]);
+    let (info, calls) = match view {
+        Some((info, view)) if view.address == owner => (Some(info), view.calls.as_slice()),
+        _ => (None, &[][..]),
+    };
     for pc in pcs {
         for call in calls.iter().filter(|call| call.address == pc) {
-            if let Some(target) = call.target {
+            if let Some(target) = call.target
+                && info.is_some_and(|info| crate::call_analysis::code_address(info, target))
+            {
                 set.push(XrefTarget {
                     address: target,
                     kind: TargetKind::CallTarget,
@@ -405,6 +410,36 @@ mod tests {
 
     #[test]
     fn displayed_call_sites_count_only_for_their_own_function() {
+        let info = BinaryInfo {
+            path: "fixture".into(),
+            architecture: "x86-64".into(),
+            format: "ELF".into(),
+            entry: 0x1000,
+            file_len: 0x200,
+            sha256: "a".repeat(64),
+            source_identity: None,
+            sections: vec![
+                SectionInfo {
+                    name: ".text".into(),
+                    address: 0x1000,
+                    size: 0x100,
+                    file_offset: 0,
+                    file_size: 0x100,
+                    executable: true,
+                },
+                SectionInfo {
+                    name: ".data".into(),
+                    address: 0x2000,
+                    size: 0x100,
+                    file_offset: 0x100,
+                    file_size: 0x100,
+                    executable: false,
+                },
+            ],
+            functions: vec![],
+            functions_truncated: false,
+            warnings: vec![],
+        };
         let view = FunctionView {
             address: 0x1000,
             blocks: vec![],
@@ -420,13 +455,25 @@ mod tests {
                     target: None,
                     no_return: None,
                 },
+                // A saved view can name mapped data or unmapped addresses.
+                CallSite {
+                    address: 0x1028,
+                    target: Some(0x2000),
+                    no_return: None,
+                },
+                CallSite {
+                    address: 0x102c,
+                    target: Some(0x9000),
+                    no_return: None,
+                },
             ],
             warnings: vec![],
         };
-        let set = instruction_targets(Some(&view), None, 0x1000, [0x1020, 0x1024]);
+        let pcs = [0x1020, 0x1024, 0x1028, 0x102c];
+        let set = instruction_targets(Some((&info, &view)), None, 0x1000, pcs);
         assert_eq!(addresses(&set), [(0x10c0, TargetKind::CallTarget)]);
         assert!(
-            instruction_targets(Some(&view), None, 0x1040, [0x1020])
+            instruction_targets(Some((&info, &view)), None, 0x1040, [0x1020])
                 .targets
                 .is_empty()
         );
