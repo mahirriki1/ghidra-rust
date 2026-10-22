@@ -81,6 +81,43 @@ Conventional UPX PE detection still prevents discovery and decompilation of the
 packed stub. Listing, CFG, strings, and byte inspection remain available. The
 desktop neither unpacks nor executes the input.
 
+## Stripped ELF startup
+
+Stripped executables have no symbol for `main`. In a dynamically linked x86-64
+ELF executable (non-PIE or PIE, with an interpreter), glibc's entry code passes
+`main` to the imported `__libc_start_main` as a pointer rather than calling it, so
+direct-call discovery from the entry cannot reach it. On open, the worker
+follows the entry's straight-line instructions in engine p-code (at most 256
+bytes and 64 instructions, with fixed p-code and tracked-value budgets) until a
+call. The call must target `__libc_start_main` through a GOT slot or an engine
+import stub that itself jumps through such a slot. Slots are identified from the
+ELF's own `GLOB_DAT`/`JUMP_SLOT` relocations against the undefined dynamic symbol,
+not from names alone. The first argument (`RDI`) must then hold either a complete
+constant or the contents of a slot whose `RELATIVE` relocation, or symbol
+relocation against a function defined in the executable, establishes the
+address. A slot is trusted only while the path has not stored to it: stores
+through the entry stack pointer are allowed, but a store at a constant address
+overlapping the slot, or at any other computed address, discards its relocated
+contents. A conditional branch, jump, unrelated call, partial register write or
+unsupported relocation ends recognition with no result rather than a guess.
+
+The candidate must be an aligned file-backed executable address that is not the
+entry, an import stub or an existing function, and must not begin with only
+landing pads followed by an unconditional jump (a startup wrapper). It is then
+named `main` unless any function or data symbol already has that name, so real
+symbols always win. **Analysis notes** records the recovered address, the call
+that established it, and that the name is analysis-derived rather than an ELF
+symbol. The desktop then opens `main` as it does for unstripped binaries, and
+discovery follows its direct calls. No `_start → main` call reference is
+invented: the handoff remains an indirect call.
+
+This recognizes conventional glibc startup. AArch64 (pending original dynamic
+fixtures), i386, static and static-PIE executables, musl's `_start_c` helper,
+sectionless (`sstrip`) files, and wrapper-based startup variants are not
+recognized. Functions reachable only through pointer tables, as callbacks, or
+through jump tables still need function-start patterns, broader pointer
+analysis or switch recovery.
+
 ## Direct data accesses
 
 The same discovery walk inspects already decoded instruction p-code for direct
