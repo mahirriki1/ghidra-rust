@@ -80,12 +80,22 @@ before shipping to another machine.
 The **Automatic main release** workflow runs for every push to `main`, including
 merged pull requests. It prepares the next patch version (for example, `v0.0.4`,
 then `v0.0.5`), builds Linux and Windows, verifies the complete package
-set and checksums, and publishes a GitHub Release with automatically generated
-GitHub update notes, merged pull requests, and contributors. Notes also list up to
-100 direct commit summaries since the previous published version, so updates made
-without a pull request are included. The release links its exact source commit,
-native build run, and the full GitHub change comparison. The release does not
-run tests; anything merged to main must already have passed them locally.
+set and checksums, and publishes a GitHub Release. Its description starts with
+detailed bullets from every added or amended `docs/release-notes/*.md` entry
+since the previous published version. Add an entry with each PR or direct change;
+see [writing release notes](release-notes/README.md) for the format and local
+preview command. Notes describe only changes new in that release, rather than
+recapping earlier versions or repeating only the most recent PR title.
+
+An expandable list retains every commit in the release range, including direct
+commits and all merged branches, with no 100-commit cutoff. If the range has no
+entries, the complete commit list supplies the change bullets instead. The
+release links its exact source commit, native build run, and full GitHub change
+comparison. Only a published lower version whose source is in the current
+source's history can establish the baseline; draft, failed, reserved, and newer
+source releases cannot hide changes. The first release covers the full history.
+The release does not run tests; anything merged to main must already have passed
+them locally.
 
 Version allocation uses the highest existing `vX.Y.Z` tag and the version in
 `Cargo.toml`. An intentional higher version in the manifest is respected; otherwise
@@ -103,9 +113,10 @@ tags, and rerunning a failed workflow reuses its original tag.
 The workflow calls the same native jobs used by PR CI. Main pushes use this release
 pipeline instead of starting duplicate unversioned native builds. Both platforms
 must pass before publication; partial asset uploads remain in an unpublished draft
-and can be resumed by rerunning the workflow. A rerun of an already published
-release leaves its assets intact. A slower older main update does not replace the
-current main update as the latest release. The published executables, archives,
+and can be resumed by rerunning the workflow, which refreshes the draft's notes.
+A rerun of an already published release leaves its notes and assets intact.
+A slower older main update does not replace the current main update as the
+latest release. The published executables, archives,
 and four adjacent `.sha256` files are permanent release assets.
 
 The preparation and publication jobs use the repository's built-in `GITHUB_TOKEN`
