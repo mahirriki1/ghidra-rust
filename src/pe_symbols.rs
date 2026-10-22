@@ -226,14 +226,7 @@ pub(crate) fn register_import_thunks(
         if bytes[..2] != [0xff, 0x25] {
             continue;
         }
-        let operand = [bytes[2], bytes[3], bytes[4], bytes[5]];
-        let slot = if pointer_bytes == 8 {
-            target
-                .checked_add(6)
-                .and_then(|next| next.checked_add_signed(i64::from(i32::from_le_bytes(operand))))
-        } else {
-            Some(u64::from(u32::from_le_bytes(operand)))
-        };
+        let slot = x86_thunk_slot(target, bytes, pointer_bytes as u32);
         let Some(name) = slot.and_then(|slot| imports.get(&slot)) else {
             continue;
         };
@@ -464,7 +457,23 @@ fn mapped_bytes<'a>(
     snapshot.get(start..start.checked_add(usize::try_from(size).ok()?)?)
 }
 
-fn aarch64_veneer_slot(address: u64, [adrp, ldr, branch]: [u32; 3]) -> Option<u64> {
+/// Slot encoded by the conventional x86 import jump. The caller validates
+/// executable membership and confirms the engine's decoded flow.
+pub(crate) fn x86_thunk_slot(address: u64, bytes: &[u8], pointer_bytes: u32) -> Option<u64> {
+    if bytes.len() != 6 || bytes[..2] != [0xff, 0x25] {
+        return None;
+    }
+    let operand = u32::from_le_bytes(bytes[2..6].try_into().ok()?);
+    match pointer_bytes {
+        8 => address
+            .checked_add(6)?
+            .checked_add_signed(i64::from(operand as i32)),
+        4 => Some(u64::from(operand)),
+        _ => None,
+    }
+}
+
+pub(crate) fn aarch64_veneer_slot(address: u64, [adrp, ldr, branch]: [u32; 3]) -> Option<u64> {
     // ADRP Xn; LDR Xm,[Xn,#imm12*8]; BR Xm. W-register loads, SP/ZR,
     // pre/post-indexed loads and register-offset forms are deliberately excluded.
     if adrp & 0x9f00_0000 != 0x9000_0000

@@ -27,6 +27,7 @@ struct Node {
     instruction_addresses: BTreeSet<u64>,
     rows: Vec<(u64, String)>,
     remaining: usize,
+    no_return: bool,
 }
 
 struct RoutedEdge {
@@ -308,7 +309,11 @@ impl GraphCanvas {
                 node_painter.text(
                     header.left_center() + vec2(9.0 * self.zoom, 0.0),
                     Align2::LEFT_CENTER,
-                    format!("block {:x}", node.address),
+                    format!(
+                        "block {:x}{}",
+                        node.address,
+                        if node.no_return { " [no return]" } else { "" }
+                    ),
                     FontId::monospace(14.0 * self.zoom),
                     theme::TEXT,
                 );
@@ -449,6 +454,12 @@ impl Layout {
     }
 
     fn with_comments(view: &FunctionView, comments: &BTreeMap<u64, String>) -> Self {
+        let no_return: BTreeSet<_> = view
+            .calls
+            .iter()
+            .filter(|call| call.no_return.is_some())
+            .map(|call| call.address)
+            .collect();
         let mut blocks: BTreeMap<_, _> = BTreeMap::new();
         for block in view.blocks.iter().take(MAX_BLOCKS) {
             blocks.entry(block.address).or_insert(block);
@@ -513,6 +524,10 @@ impl Layout {
                     vec2(WIDTH, height),
                 );
                 nodes.push(Node {
+                    no_return: block
+                        .instructions
+                        .last()
+                        .is_some_and(|instruction| no_return.contains(&instruction.address)),
                     address: *address,
                     rect,
                     instruction_addresses: block
@@ -1092,10 +1107,12 @@ mod tests {
             CallSite {
                 address: 0x401149,
                 target: Some(0x402000),
+                no_return: None,
             },
             CallSite {
                 address: 0x40115d,
                 target: None,
+                no_return: None,
             },
         ];
         // A resolved call follows its call-site target, independently of CFG edges

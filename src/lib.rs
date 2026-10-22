@@ -23,6 +23,7 @@ mod inventory;
 pub mod limits;
 mod local_symbols;
 pub mod model;
+mod no_return;
 pub mod packing;
 mod pe;
 mod pe_symbols;

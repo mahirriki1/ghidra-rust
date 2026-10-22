@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 const APPLICATION_ID: i64 = 0x4752504a; // GRPJ
 /// Version 3 adds semantic tokens and local renames; versions 1/2 still open.
 const VERSION: i64 = 3;
-pub const ENGINE_FINGERPRINT: &str = "ghidra-rust-project-v3-semantic-v1-mapping-v1-pe-v1-aarch64-v1-calls-v1-arm64pe-v1-inventory-v2-elfcrt-v1-switch-v1:268c3a406d8d964bc00ae2ead4d3e1e1373aaa27";
+pub const ENGINE_FINGERPRINT: &str = "ghidra-rust-project-v3-semantic-v1-mapping-v1-pe-v1-aarch64-v1-calls-v1-arm64pe-v1-inventory-v2-elfcrt-v1-switch-v1-noreturn-v1:268c3a406d8d964bc00ae2ead4d3e1e1373aaa27";
 const MAX_BINARY: usize = 128 * 1024 * 1024;
 const MAX_BODY: usize = 48 * 1024 * 1024;
 const MAX_PROJECT: u64 = 224 * 1024 * 1024;
@@ -428,7 +428,7 @@ impl ProjectData {
         validate_strings(&self.strings, MAX_PROJECT_STRINGS, &ranges)?;
         validate_crypto(&self.crypto, &ranges)?;
         if let Some(view) = &self.view {
-            validate_view(view, &ranges)?;
+            validate_view(view, &ranges, &self.info)?;
             // Saved graphs have always required mapped exits and call sites.
             for edge in &view.edges {
                 if let Some(target) = edge.target {
@@ -730,7 +730,11 @@ pub(crate) fn persistable_view(view: &FunctionView, sections: &[SectionInfo]) ->
 /// Structural graph bounds shared by projects and worker replies. Exits and
 /// call targets may legitimately leave the displayed blocks, so only their
 /// sources are checked here.
-pub(crate) fn validate_view(view: &FunctionView, ranges: &MappedRanges) -> Result<(), String> {
+pub(crate) fn validate_view(
+    view: &FunctionView,
+    ranges: &MappedRanges,
+    info: &BinaryInfo,
+) -> Result<(), String> {
     bounded(view.blocks.len(), MAX_GRAPH_BLOCKS, "Basic block count")?;
     bounded(view.edges.len(), MAX_GRAPH_EDGES, "Edge count")?;
     bounded(view.calls.len(), MAX_GRAPH_CALLS, "Call count")?;
@@ -771,6 +775,60 @@ pub(crate) fn validate_view(view: &FunctionView, ranges: &MappedRanges) -> Resul
             bounded(instruction.mnemonic.len(), 128, "Instruction mnemonic")?;
             bounded(instruction.operands.len(), 4096, "Instruction operands")?;
             mapped_range(ranges, instruction.address, instruction.bytes.len())?;
+        }
+    }
+    if view.calls.iter().any(|call| call.no_return.is_some()) {
+        use crate::model::NoReturnEvidence;
+        let (pointer_bytes, _) = crate::architecture::properties(&info.architecture)
+            .ok_or("Unknown architecture for no-return evidence")?;
+        let mut sites = std::collections::BTreeMap::<u64, usize>::new();
+        for call in &view.calls {
+            *sites.entry(call.address).or_default() += 1;
+        }
+        let terminals = view
+            .blocks
+            .iter()
+            .filter_map(|block| {
+                block
+                    .instructions
+                    .last()
+                    .map(|instruction| (instruction.address, block.address))
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let outgoing = view
+            .edges
+            .iter()
+            .map(|edge| edge.source)
+            .collect::<std::collections::BTreeSet<_>>();
+        for call in &view.calls {
+            let Some(evidence) = call.no_return else {
+                continue;
+            };
+            let block = terminals
+                .get(&call.address)
+                .ok_or("No-return call is not the last displayed instruction of a block")?;
+            if sites[&call.address] != 1 || outgoing.contains(block) {
+                return Err("No-return call has conflicting sites or outgoing edges".into());
+            }
+            match evidence {
+                NoReturnEvidence::NamedTarget => {
+                    let target = call.target.ok_or("Named no-return call has no target")?;
+                    if !crate::call_analysis::code_address(info, target) {
+                        return Err(
+                            "Named no-return target is not executable file-backed code".into()
+                        );
+                    }
+                }
+                NoReturnEvidence::ImportSlot { slot } => {
+                    if !info
+                        .sections
+                        .iter()
+                        .any(|section| section.backs(slot, pointer_bytes))
+                    {
+                        return Err("No-return import slot is not fully file-backed".into());
+                    }
+                }
+            }
         }
     }
     for edge in &view.edges {
@@ -1159,7 +1217,7 @@ mod tests {
         let bytes = read_blob(&db, "body", MAX_BODY).unwrap().unwrap();
         let mut body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         body.as_object_mut().unwrap().remove("semantics");
-        body["engine"] = "ghidra-rust-project-v1-mapping-v1-pe-v1-aarch64-v1-calls-v1-arm64pe-v1-inventory-v2-elfcrt-v1-switch-v1:268c3a406d8d964bc00ae2ead4d3e1e1373aaa27".into();
+        body["engine"] = "ghidra-rust-project-v1-mapping-v1-pe-v1-aarch64-v1-calls-v1-arm64pe-v1-inventory-v2-elfcrt-v1-switch-v1-noreturn-v1:268c3a406d8d964bc00ae2ead4d3e1e1373aaa27".into();
         db.execute(
             "UPDATE project_data SET value=?1 WHERE key='body'",
             [serde_json::to_vec(&body).unwrap()],
@@ -1262,6 +1320,72 @@ mod tests {
     }
 
     #[test]
+    fn no_return_evidence_roundtrips_and_rejects_inconsistent_graphs() {
+        use crate::model::{CallSite, NoReturnEvidence};
+        let directory = tempfile::tempdir().unwrap();
+        let (mut data, protection) = sample(directory.path());
+        let view = data.view.as_mut().unwrap();
+        view.blocks = vec![crate::model::BasicBlock {
+            address: 0x1000,
+            instructions: vec![crate::model::Instruction {
+                address: 0x1000,
+                bytes: vec![0xe8, 3, 0, 0, 0],
+                mnemonic: "CALL".into(),
+                operands: "0x1008".into(),
+            }],
+        }];
+        view.edges.clear();
+        view.calls = vec![CallSite {
+            address: 0x1000,
+            target: Some(0x1008),
+            no_return: Some(NoReturnEvidence::NamedTarget),
+        }];
+        let path = directory.path().join("noreturn.grproj");
+        data.save(&path, &protection, true).unwrap();
+        let loaded = ProjectData::load(&path).unwrap();
+        assert_eq!(
+            loaded.data.view.unwrap().calls[0].no_return,
+            Some(NoReturnEvidence::NamedTarget)
+        );
+        let legacy: CallSite = serde_json::from_str(r#"{"address":4096,"target":4104}"#).unwrap();
+        assert_eq!(legacy.no_return, None);
+        let mut invalid = data.clone();
+        invalid
+            .view
+            .as_mut()
+            .unwrap()
+            .calls
+            .push(data.view.as_ref().unwrap().calls[0].clone());
+        assert!(invalid.validate().is_err());
+        let mut invalid = data.clone();
+        invalid.view.as_mut().unwrap().calls[0].address = 0x1001;
+        assert!(invalid.validate().is_err());
+        let mut invalid = data.clone();
+        invalid
+            .view
+            .as_mut()
+            .unwrap()
+            .edges
+            .push(crate::model::Edge {
+                source: 0x1000,
+                target: Some(0x1008),
+                kind: EdgeKind::Branch,
+                evidence: None,
+            });
+        assert!(invalid.validate().is_err());
+        for (slot, valid) in [(0x1006, true), (0x1007, false), (u64::MAX, false)] {
+            let mut data = data.clone();
+            let call = &mut data.view.as_mut().unwrap().calls[0];
+            call.target = None;
+            call.no_return = Some(NoReturnEvidence::ImportSlot { slot });
+            assert_eq!(data.validate().is_ok(), valid, "slot {slot:#x}");
+        }
+        let mut invalid = data.clone();
+        invalid.info.sections[0].executable = false;
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
     fn rejects_hostile_schema_versions_types_and_tampered_embedded_bytes() {
         let directory = tempfile::tempdir().unwrap();
         let (data, protection) = sample(directory.path());
@@ -1358,10 +1482,12 @@ mod tests {
             CallSite {
                 address: 0x1000,
                 target: Some(0x9000),
+                no_return: None,
             },
             CallSite {
                 address: 0x1000,
                 target: Some(0x1008),
+                no_return: None,
             },
         ];
         let project = directory.path().join("gaps.grproj");
@@ -1453,6 +1579,7 @@ mod tests {
             .push(crate::model::CallSite {
                 address: 0x1000,
                 target: Some(0x9000),
+                no_return: None,
             });
         assert!(data.validate().unwrap_err().contains("unmapped"));
         let mut data = original.clone();
