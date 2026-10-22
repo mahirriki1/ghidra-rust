@@ -258,6 +258,10 @@ mod tests {
             inventory: Default::default(),
             coverage: Coverage::default(),
             no_return: Arc::default(),
+            signatures: Vec::new(),
+            applied_signatures: BTreeSet::new(),
+            signature_state: None,
+            analysis_started: false,
         }
     }
 

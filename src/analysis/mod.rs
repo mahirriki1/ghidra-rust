@@ -46,6 +46,10 @@ pub struct LoadedProgram {
     coverage: Coverage,
     /// Calls that never return, from the image's own symbols and imports.
     no_return: Arc<crate::no_return::NoReturnIndex>,
+    signatures: Vec<crate::signatures::FunctionSignature>,
+    applied_signatures: BTreeSet<u64>,
+    signature_state: Option<String>,
+    analysis_started: bool,
 }
 
 /// Engine functions a discovery pass named, and whether it changed the engine
@@ -370,6 +374,10 @@ impl LoadedProgram {
             inventory,
             coverage: Coverage::default(),
             no_return: Arc::new(no_return),
+            signatures: Vec::new(),
+            applied_signatures: BTreeSet::new(),
+            signature_state: None,
+            analysis_started: false,
         })
     }
 
@@ -391,11 +399,19 @@ impl LoadedProgram {
         self.resolve_import_thunks(address)?;
         imports.finish(0);
         let _rendering = crate::performance::span("decompile_render");
-        let (mut text, mut mappings, mut semantics) = crate::decompile::render_with_locals(
+        let context = if self.signatures.is_empty() {
+            String::new()
+        } else {
+            crate::signatures::state_digest(&self.signatures)
+        };
+        let owned = self.applied_signatures.contains(&address);
+        let (mut text, mut mappings, mut semantics) = crate::decompile::render_with_context(
             &mut self.program,
             address,
             &self.info.sections,
             renames,
+            &context,
+            owned,
         )
         .map_err(engine_error)?;
         if text.len() > MAX_DECOMPILED_BYTES {
@@ -461,6 +477,16 @@ impl LoadedProgram {
         request: Request,
         progress: &mut dyn FnMut(AnalysisProgress) -> Result<(), String>,
     ) -> Result<Response, String> {
+        if matches!(
+            request,
+            Request::Graph { .. }
+                | Request::Decompile { .. }
+                | Request::DecompileWithLocals { .. }
+                | Request::Discover
+                | Request::DiscoverBatch { .. }
+        ) {
+            self.analysis_started = true;
+        }
         match request {
             Request::Graph { address } => Ok(Response::Graph {
                 view: self.graph(address)?,
@@ -575,6 +601,52 @@ impl LoadedProgram {
                         outcomes,
                         patterns: None,
                     },
+                })
+            }
+            Request::SyncSignatures {
+                binary_sha256,
+                context,
+                signatures,
+            } => {
+                crate::signatures::validate_signatures(&signatures)?;
+                if binary_sha256 != self.info.sha256
+                    || context != crate::signatures::state_digest(&signatures)
+                {
+                    return Err("Signature state does not match this binary or its digest".into());
+                }
+                if self.analysis_started || self.signature_state.is_some() {
+                    return Err(
+                        "Signature replacement requires a fresh worker before analysis".into(),
+                    );
+                }
+                let abi = crate::signatures::current_abi(&self.info)?;
+                let mut unapplied = Vec::new();
+                let mut compatible = Vec::new();
+                for signature in &signatures {
+                    self.check_code(signature.function)?;
+                    if signature.engine != crate::signatures::SIGNATURE_FINGERPRINT
+                        || signature.abi != abi
+                    {
+                        unapplied.push(SignatureStatus { function: signature.function,
+                            reason: "Saved signature has an incompatible engine or ABI; edit it to apply to this image".into() });
+                    } else if function_at(&self.info.functions, signature.function).is_none() {
+                        unapplied.push(SignatureStatus { function: signature.function,
+                            reason: "Saved signature entry is absent from the current function inventory; recompute discovery before editing it".into() });
+                    } else {
+                        compatible.push(signature.clone());
+                    }
+                }
+                crate::signatures::apply(&mut self.program, &compatible, &abi)?;
+                self.applied_signatures = compatible
+                    .iter()
+                    .map(|signature| signature.function)
+                    .collect();
+                self.signatures = signatures;
+                self.signature_state = Some(context.clone());
+                Ok(Response::SignaturesSynced {
+                    binary_sha256,
+                    context,
+                    unapplied,
                 })
             }
             Request::SyncFunctions { functions } => {
@@ -1441,6 +1513,10 @@ pub(crate) mod tests {
             inventory: Default::default(),
             coverage: Coverage::default(),
             no_return: Arc::default(),
+            signatures: Vec::new(),
+            applied_signatures: BTreeSet::new(),
+            signature_state: None,
+            analysis_started: false,
         }
     }
 
@@ -2155,6 +2231,10 @@ pub(crate) mod tests {
             inventory: Default::default(),
             coverage: Coverage::default(),
             no_return: Arc::default(),
+            signatures: Vec::new(),
+            applied_signatures: BTreeSet::new(),
+            signature_state: None,
+            analysis_started: false,
         };
         loaded.resolve_import_thunks(0x1000).unwrap();
         assert!(

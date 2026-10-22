@@ -22,6 +22,8 @@ use crate::project::{EmbeddedBinary, LoadedProject, ProjectData};
 use crate::selection::{SemanticSelection, validate_mappings};
 use crate::semantic::{LocalIdentity, LocalRename, SemanticInfo, TokenKind};
 use crate::session::{Annotation, BinaryProtection, Session};
+use crate::signature_ui::{DraftParameter, SignatureAction, SignatureEditor};
+use crate::signatures::{self, FunctionSignature};
 use crate::theme;
 
 const DEADLINE: Duration = Duration::from_secs(30);
@@ -316,11 +318,33 @@ struct ProjectOpen {
     discovery_index: Option<crate::call_analysis::CallIndex>,
 }
 
+#[derive(Clone)]
 struct Edit {
     address: u64,
     before: Option<Annotation>,
     function_name: Option<String>,
     local: Option<(LocalIdentity, Option<LocalRename>)>,
+    signature: Option<(u64, Option<FunctionSignature>)>,
+}
+
+struct SignatureReplay {
+    signatures: Vec<FunctionSignature>,
+    context: String,
+    generation: u64,
+    revision: u64,
+    epoch: u64,
+    sent: bool,
+}
+
+struct SignatureChange {
+    function: u64,
+    before: Option<FunctionSignature>,
+    signatures: Vec<FunctionSignature>,
+    generation: u64,
+    revision: u64,
+    selection: u64,
+    epoch: u64,
+    undone: Option<Edit>,
 }
 
 pub struct DesktopApp {
@@ -436,6 +460,13 @@ pub struct DesktopApp {
     program_tree: bool,
     browser_dialog: Option<BrowserDialog>,
     focus_comment: bool,
+    signature_editor: Option<SignatureEditor>,
+    signature_replay: Option<SignatureReplay>,
+    signature_change: Option<SignatureChange>,
+    signature_unapplied: Vec<SignatureStatus>,
+    signature_error: Option<String>,
+    signature_restore_pc: Option<(u64, u64)>,
+    signature_recovery: Option<u64>,
 }
 
 impl DesktopApp {
@@ -548,6 +579,13 @@ impl DesktopApp {
             program_tree: false,
             browser_dialog: None,
             focus_comment: false,
+            signature_editor: None,
+            signature_replay: None,
+            signature_change: None,
+            signature_unapplied: Vec::new(),
+            signature_error: None,
+            signature_restore_pc: None,
+            signature_recovery: None,
         }
     }
 
@@ -626,6 +664,11 @@ impl DesktopApp {
     }
 
     fn clear_views(&mut self) {
+        self.signature_editor = None;
+        self.signature_error = None;
+        self.signature_unapplied.clear();
+        self.signature_restore_pc = None;
+        self.signature_recovery = None;
         self.worker_inventory = None;
         self.inventory_synced = false;
         self.discovery = None;
@@ -700,6 +743,17 @@ impl DesktopApp {
     /// Restarting to verify a retained snapshot may carry a deferred byte origin over
     /// the disposable worker boundary. Explicit stops use `stop_worker` above.
     fn stop_worker_inner(&mut self) {
+        self.signature_replay = None;
+        if let Some(change) = self.signature_change.take() {
+            self.signature_recovery = Some(
+                self.signature_restore_pc
+                    .map_or(change.function, |(function, _)| function),
+            );
+            if let Some(edit) = change.undone {
+                self.undo.push_back(edit);
+            }
+            self.signature_error = Some("Signature change was not committed; the worker stopped. The saved signature state is unchanged.".into());
+        }
         crate::performance::event("worker_stop_epoch", self.worker_epoch);
         if self.discovery_running {
             crate::performance::event("discovery_action_interrupted", self.generation);
@@ -867,6 +921,12 @@ impl DesktopApp {
             }
             return;
         }
+        if self.signature_replay.is_some() {
+            if self.queue.len() < HISTORY_LIMIT {
+                self.queue.push_back(request);
+            }
+            return;
+        }
         if matches!(request, Request::Discover) {
             if self
                 .info
@@ -927,6 +987,12 @@ impl DesktopApp {
     }
 
     fn schedule_request(&mut self, request: Request) {
+        if self.signature_replay.is_some() {
+            if self.queue.len() < HISTORY_LIMIT {
+                self.queue.push_back(request);
+            }
+            return;
+        }
         if matches!(request, Request::Discover) {
             self.discovery_running = true;
             return;
@@ -1346,6 +1412,7 @@ impl DesktopApp {
 
     fn pump_discovery(&mut self, _context: &egui::Context) {
         if !self.discovery_running
+            || self.signature_replay.is_some()
             || self.discovery_job.is_some()
             || self.pending.is_some()
             || self.opening.is_some()
@@ -1472,6 +1539,19 @@ impl DesktopApp {
 
     fn poll_worker(&mut self, context: &egui::Context) {
         self.poll_discovery(context);
+        // A failed/canceled edit restores the committed state once. Recovery
+        // has no staged edit, so another failure cannot start a retry loop.
+        if let Some(function) = self.signature_recovery.take()
+            && self.client.is_none()
+            && let Some(path) = self.binary_path.clone()
+        {
+            self.start_open(
+                path,
+                true,
+                Some(Request::Graph { address: function }),
+                context,
+            );
+        }
         if self
             .pending
             .as_ref()
@@ -1489,7 +1569,11 @@ impl DesktopApp {
             };
             match event {
                 WorkerEvent::Failed(error) => {
+                    let signature_failure = self.signature_change.is_some();
                     self.stop_worker();
+                    if signature_failure {
+                        self.signature_error = Some(format!("Signature change failed: {error}"));
+                    }
                     self.status = error;
                     break;
                 }
@@ -1572,7 +1656,12 @@ impl DesktopApp {
                 self.dispatch_queued(context);
                 return;
             }
+            let signature_failure = self.signature_change.is_some();
             self.stop_worker();
+            if signature_failure {
+                self.signature_error =
+                    Some(format!("Signature not applied: {}", crop(&message, 4096)));
+            }
             self.status = crop(&message, 4096);
             return;
         }
@@ -1754,6 +1843,26 @@ impl DesktopApp {
                 self.worker_inventory = None;
                 self.inventory_synced = false;
                 self.info = Some(info);
+                let signatures = self
+                    .signature_change
+                    .as_ref()
+                    .map(|change| change.signatures.clone())
+                    .or_else(|| {
+                        self.session
+                            .as_ref()
+                            .map(|session| session.signatures.clone())
+                    })
+                    .unwrap_or_default();
+                if !signatures.is_empty() || self.signature_change.is_some() {
+                    self.signature_replay = Some(SignatureReplay {
+                        context: signatures::state_digest(&signatures),
+                        signatures,
+                        generation: self.generation,
+                        revision: self.revision,
+                        epoch: self.worker_epoch,
+                        sent: false,
+                    });
+                }
                 self.rebuild_filter();
                 self.status = "Binary loaded".into();
                 if let Some(project) = project {
@@ -1794,6 +1903,26 @@ impl DesktopApp {
                 self.cached_graph = false;
                 self.saved_analysis = false;
                 self.view = Some(view);
+                if let Some((function, pc)) = self.signature_restore_pc.take()
+                    && function == address
+                {
+                    let pc = if self
+                        .listing
+                        .iter()
+                        .any(|instruction| instruction.address == pc)
+                    {
+                        pc
+                    } else {
+                        address
+                    };
+                    self.selected = Some(pc);
+                    self.address = format!("{pc:x}");
+                    self.select_instruction(pc);
+                    self.pending_listing_scroll = self
+                        .listing
+                        .iter()
+                        .position(|instruction| instruction.address == pc);
+                }
                 self.comment_rows_key = None;
                 self.status = format!("Function {address:#x} ready");
                 if let Some((caller, pc)) = self.reference_focus.take()
@@ -1907,6 +2036,101 @@ impl DesktopApp {
                 }
             }
             (Request::SyncFunctions { .. }, Response::FunctionsSynced) => {}
+            (
+                Request::SyncSignatures {
+                    binary_sha256: expected_binary,
+                    context: expected_context,
+                    signatures,
+                },
+                Response::SignaturesSynced {
+                    binary_sha256,
+                    context: actual_context,
+                    unapplied,
+                },
+            ) => {
+                let valid = expected_binary == binary_sha256
+                    && expected_context == actual_context
+                    && actual_context == signatures::state_digest(&signatures)
+                    && self
+                        .info
+                        .as_ref()
+                        .is_some_and(|info| info.sha256 == binary_sha256)
+                    && self.signature_replay.as_ref().is_some_and(|replay| {
+                        replay.sent
+                            && replay.context == actual_context
+                            && replay.generation == self.generation
+                            && replay.revision == self.revision
+                            && replay.epoch == self.worker_epoch
+                    })
+                    && unapplied.len() <= signatures.len()
+                    && unapplied.iter().all(|status| {
+                        status.reason.len() <= 1024
+                            && signatures
+                                .iter()
+                                .any(|signature| signature.function == status.function)
+                    });
+                if !valid {
+                    self.stop_worker();
+                    self.status = "Signature acknowledgement was stale or incompatible; saved signatures were retained".into();
+                    return;
+                }
+                let committed_edit = self.signature_change.is_some();
+                if let Some(change) = self.signature_change.take() {
+                    // Undo restores the exact saved record even when the current
+                    // engine cannot apply it. New edits still require application.
+                    let restores_saved_signature = change
+                        .undone
+                        .as_ref()
+                        .and_then(|edit| edit.signature.as_ref())
+                        .is_some_and(|(function, before)| {
+                            *function == change.function
+                                && before.as_ref()
+                                    == signatures.iter().find(|s| s.function == *function)
+                        });
+                    if change.generation != self.generation
+                        || change.revision != self.revision
+                        || change.selection != self.selection_generation
+                        || change.epoch != self.worker_epoch
+                        || change.signatures != signatures
+                        || !restores_saved_signature
+                            && unapplied.iter().any(|s| s.function == change.function)
+                    {
+                        if let Some(edit) = change.undone {
+                            self.undo.push_back(edit);
+                        }
+                        self.stop_worker();
+                        self.signature_recovery = Some(change.function);
+                        self.signature_error = Some("Signature change was not committed: the replay could not confirm the edited function".into());
+                        self.status = self.signature_error.clone().unwrap_or_default();
+                        return;
+                    }
+                    if let Some(session) = &mut self.session {
+                        session.signatures = change.signatures;
+                        session.upgrade_version();
+                    }
+                    if change.undone.is_none() {
+                        self.undo.push_back(Edit {
+                            address: change.function,
+                            before: None,
+                            function_name: None,
+                            local: None,
+                            signature: Some((change.function, change.before)),
+                        });
+                        self.trim_undo();
+                    }
+                    self.revision = self.revision.wrapping_add(1);
+                }
+                self.signature_unapplied = unapplied;
+                self.signature_replay = None;
+                if committed_edit {
+                    self.signature_error = None;
+                }
+                self.status = if self.signature_unapplied.is_empty() {
+                    "Function signature state applied".into()
+                } else {
+                    "Saved signatures retained; incompatible signatures are not applied".into()
+                };
+            }
             (
                 Request::DiscoverBatch {
                     binding,
@@ -2096,6 +2320,10 @@ impl DesktopApp {
     }
 
     fn dispatch_queued(&mut self, context: &egui::Context) {
+        if self.signature_replay.is_some() {
+            self.pump_signature_replay();
+            return;
+        }
         // Adopt inventory before renames/navigation, then dispatch the newest
         // byte intent before starting another automatic batch or scan.
         if self.discovery_job.is_some() || self.pending.is_some() || self.opening.is_some() {
@@ -2280,6 +2508,7 @@ impl DesktopApp {
             before,
             function_name,
             local: None,
+            signature: None,
         });
         while self.undo.len() > HISTORY_LIMIT
             || self.undo.iter().map(edit_size).sum::<usize>() > UNDO_BYTES
@@ -2293,6 +2522,14 @@ impl DesktopApp {
         let Some(mut edit) = self.undo.pop_back() else {
             return;
         };
+        if let Some((function, before)) = edit.signature.clone() {
+            if let Err(error) = self.stage_signature(function, before, Some(edit.clone()), context)
+            {
+                self.undo.push_back(edit);
+                self.status = error;
+            }
+            return;
+        }
         if let Some((identity, before)) = edit.local.take() {
             if let Some(session) = &mut self.session {
                 session.local_renames.retain(|r| r.identity != identity);
@@ -2734,6 +2971,12 @@ impl DesktopApp {
                 }
                 match result {
                     Ok(Some((session, path))) => {
+                        let function = self.view.as_ref().map(|view| view.address);
+                        let selected_pc = self.selected;
+                        let signature_changed = self.session.as_ref().is_none_or(|old| {
+                            signatures::state_digest(&old.signatures)
+                                != signatures::state_digest(&session.signatures)
+                        });
                         self.session = Some(session);
                         self.session_path = Some(path);
                         self.undo.clear();
@@ -2754,14 +2997,21 @@ impl DesktopApp {
                         self.pending_listing_scroll = None;
                         self.highlighted = None;
                         self.decompiled_lines.clear();
+                        if signature_changed {
+                            self.invalidate_signature_analysis();
+                            self.signature_restore_pc = function.zip(selected_pc);
+                        }
                         self.status = "Annotations loaded".into();
                         self.rebuild_filter();
                         // A fresh engine also removes names absent from the newly
                         // loaded sidecar; current-function labels are replayed.
-                        if let Some(address) = self.view.as_ref().map(|view| view.address)
-                            && let Some(path) = self.binary_path.clone()
-                        {
-                            self.start_open(path, true, Some(Request::Graph { address }), context);
+                        if let Some(path) = self.binary_path.clone() {
+                            self.start_open(
+                                path,
+                                true,
+                                function.map(|address| Request::Graph { address }),
+                                context,
+                            );
                         }
                     }
                     Ok(None) => {}
@@ -2908,6 +3158,11 @@ impl DesktopApp {
             .selected_local
             .and_then(|i| self.semantic_info.locals.get(i))
         {
+            if local.signature_parameter.is_some() {
+                self.status = "Parameter names are edited in the function signature".into();
+                self.begin_signature_editor();
+                return;
+            }
             self.browser_dialog = Some(BrowserDialog {
                 kind: BrowserDialogKind::RenameLocal {
                     identity: local.identity.clone(),
@@ -2943,6 +3198,302 @@ impl DesktopApp {
         });
     }
 
+    fn signature_context(&self) -> String {
+        self.session
+            .as_ref()
+            .filter(|session| !session.signatures.is_empty())
+            .map(|session| signatures::state_digest(&session.signatures))
+            .unwrap_or_default()
+    }
+
+    fn trim_undo(&mut self) {
+        while self.undo.len() > HISTORY_LIMIT
+            || self.undo.iter().map(edit_size).sum::<usize>() > UNDO_BYTES
+        {
+            self.undo.pop_front();
+        }
+    }
+
+    fn pump_signature_replay(&mut self) {
+        if self.pending.is_some() || self.opening.is_some() || self.client.is_none() {
+            return;
+        }
+        let Some(replay) = &self.signature_replay else {
+            return;
+        };
+        if replay.sent {
+            return;
+        }
+        if replay.generation != self.generation
+            || replay.revision != self.revision
+            || replay.epoch != self.worker_epoch
+        {
+            self.stop_worker();
+            self.status = "Signature replay canceled because the annotation context changed".into();
+            return;
+        }
+        if let Some(addresses) = &mut self.discovery_sync {
+            let Some(info) = &self.info else {
+                return;
+            };
+            while !addresses.is_empty() {
+                let functions = addresses
+                    .drain(..addresses.len().min(MAX_DISCOVERY_SYNC_FUNCTIONS))
+                    .filter_map(|address| function_at(&info.functions, address))
+                    .map(|function| FunctionInfo {
+                        address: function.address,
+                        name: inventory_name(&function.name).to_owned(),
+                    })
+                    .collect::<Vec<_>>();
+                if !functions.is_empty() {
+                    self.send_direct(Request::SyncFunctions { functions });
+                    return;
+                }
+            }
+            self.discovery_sync = None;
+        }
+        let Some(replay) = &mut self.signature_replay else {
+            return;
+        };
+        let Some(info) = &self.info else {
+            return;
+        };
+        let request = Request::SyncSignatures {
+            binary_sha256: info.sha256.clone(),
+            context: replay.context.clone(),
+            signatures: replay.signatures.clone(),
+        };
+        replay.sent = true;
+        self.send_direct(request);
+    }
+
+    /// Prototypes can change caller types and CFG recovery. Retain only the
+    /// immutable byte scans and exact inventory; every engine result is rebuilt.
+    fn invalidate_signature_analysis(&mut self) {
+        self.selection_generation = self.selection_generation.wrapping_add(1);
+        self.view = None;
+        self.canvas = None;
+        self.listing.clear();
+        self.decompiled.clear();
+        self.decompiled_lines.clear();
+        self.highlighted = None;
+        self.semantic.clear();
+        self.semantic_info = SemanticInfo::default();
+        self.selected_local = None;
+        self.decompiler_rename_context = false;
+        self.pending_code_scroll = None;
+        self.pending_comment_scroll = None;
+        self.pending_listing_scroll = None;
+        self.comment_rows_key = None;
+        self.comment_rows = CommentRows::default();
+        self.comment_owners.clear();
+        self.cached_graph = false;
+        self.saved_analysis = false;
+        self.discovery = None;
+        self.discovery_job = None;
+        self.discovery_saved = None;
+        self.discovery_running = false;
+        self.discovery_summary = None;
+        self.saved_references = false;
+        self.call_index = None;
+        self.reference_focus = None;
+        self.undisplayed_call = None;
+        self.analysis_plan = None;
+        self.signature_editor = None;
+        self.signature_unapplied.clear();
+    }
+
+    fn stage_signature(
+        &mut self,
+        function: u64,
+        replacement: Option<FunctionSignature>,
+        undone: Option<Edit>,
+        context: &egui::Context,
+    ) -> Result<(), String> {
+        if self.signature_change.is_some() || self.file_job.is_some() || self.opening.is_some() {
+            return Err("Wait for the current file or signature operation to finish".into());
+        }
+        let info = self.info.as_ref().ok_or("Open a binary first")?;
+        if function_at(&info.functions, function).is_none() {
+            return Err("Choose an exact known function entry".into());
+        }
+        let session = self.session.as_ref().ok_or("Open a binary first")?;
+        let before = session
+            .signatures
+            .iter()
+            .find(|s| s.function == function)
+            .cloned();
+        if before == replacement {
+            return Ok(());
+        }
+        if replacement.as_ref().is_some_and(|s| s.function != function) {
+            return Err("Signature function does not match the editor".into());
+        }
+        let mut signatures = session.signatures.clone();
+        signatures.retain(|s| s.function != function);
+        signatures.extend(replacement);
+        signatures.sort_by_key(|s| s.function);
+        signatures::validate_signatures(&signatures)?;
+        let path = self.binary_path.clone().ok_or("No binary is available")?;
+        let restore_function = self.view.as_ref().map_or(function, |view| view.address);
+        let restore_pc = self.selected.map(|pc| (restore_function, pc));
+        self.stop_worker();
+        self.signature_recovery = None;
+        self.invalidate_signature_analysis();
+        self.signature_restore_pc = restore_pc;
+        self.start_open(
+            path,
+            true,
+            Some(Request::Graph {
+                address: restore_function,
+            }),
+            context,
+        );
+        if self.client.is_none() {
+            return Err(self.status.clone());
+        }
+        self.signature_error = None;
+        self.signature_change = Some(SignatureChange {
+            function,
+            before,
+            signatures,
+            generation: self.generation,
+            revision: self.revision,
+            selection: self.selection_generation,
+            epoch: self.worker_epoch,
+            undone,
+        });
+        self.status = "Applying complete signature state in a fresh worker…".into();
+        Ok(())
+    }
+
+    fn begin_signature_editor(&mut self) {
+        if self.file_job.is_some() || self.opening.is_some() || self.signature_replay.is_some() {
+            return;
+        }
+        let Some(info) = &self.info else {
+            return;
+        };
+        let Some(function) = self.view.as_ref().map(|view| view.address) else {
+            return;
+        };
+        let Some(entry) = function_at(&info.functions, function) else {
+            self.status = "Signature editing requires an exact known function entry".into();
+            return;
+        };
+        let abi = match signatures::current_abi(info) {
+            Ok(abi) => abi,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
+        let saved = self
+            .session
+            .as_ref()
+            .and_then(|s| s.signatures.iter().find(|s| s.function == function));
+        let (return_type, parameters, mut notes) = if let Some(saved) = saved {
+            (
+                Some(saved.return_type),
+                saved
+                    .parameters
+                    .iter()
+                    .map(|p| DraftParameter {
+                        name: p.name.clone(),
+                        ty: Some(p.ty),
+                    })
+                    .collect(),
+                Vec::new(),
+            )
+        } else if let Some(inferred) = &self.semantic_info.prototype {
+            (
+                inferred.return_type,
+                inferred
+                    .parameters
+                    .iter()
+                    .map(|p| DraftParameter {
+                        name: p.name.clone(),
+                        ty: p.ty,
+                    })
+                    .collect(),
+                inferred.unsupported.clone(),
+            )
+        } else {
+            (None, Vec::new(), vec!["No structured inferred prototype is available. Choose the return type and every parameter explicitly, or Cancel and refresh decompilation.".into()])
+        };
+        if let Some(status) = self
+            .signature_unapplied
+            .iter()
+            .find(|s| s.function == function)
+        {
+            notes.push(status.reason.clone());
+        }
+        self.signature_editor = Some(SignatureEditor {
+            function,
+            generation: self.generation,
+            revision: self.revision,
+            selection: self.selection_generation,
+            name: entry.name.clone(),
+            abi,
+            return_type,
+            parameters,
+            notes,
+            error: None,
+            has_override: saved.is_some(),
+        });
+    }
+
+    fn signature_window(&mut self, context: &egui::Context) {
+        if self.signature_change.is_some() {
+            let modal =
+                egui::Modal::new(egui::Id::unique("signature-applying")).show(context, |ui| {
+                    ui.heading("Applying function signature");
+                    ui.label("Verifying the binary and replaying signatures before analysis…");
+                    ui.spinner();
+                    ui.button("Cancel").clicked()
+                });
+            if modal.inner || modal.should_close() {
+                self.stop_worker();
+                self.signature_error = Some(
+                    "Signature change canceled; restoring the committed signature state.".into(),
+                );
+                self.status = self.signature_error.clone().unwrap_or_default();
+            }
+            return;
+        }
+        let Some(mut editor) = self.signature_editor.take() else {
+            return;
+        };
+        if editor.generation != self.generation
+            || editor.revision != self.revision
+            || editor.selection != self.selection_generation
+            || self
+                .view
+                .as_ref()
+                .is_none_or(|v| v.address != editor.function)
+        {
+            return;
+        }
+        match editor.show(context) {
+            Some(SignatureAction::Cancel) => {}
+            Some(SignatureAction::Apply(signature)) => {
+                if let Err(error) =
+                    self.stage_signature(editor.function, Some(signature), None, context)
+                {
+                    editor.error = Some(error);
+                    self.signature_editor = Some(editor);
+                }
+            }
+            Some(SignatureAction::Remove) => {
+                if let Err(error) = self.stage_signature(editor.function, None, None, context) {
+                    editor.error = Some(error);
+                    self.signature_editor = Some(editor);
+                }
+            }
+            None => self.signature_editor = Some(editor),
+        }
+    }
+
     fn rename_local(
         &mut self,
         identity: &LocalIdentity,
@@ -2950,7 +3501,7 @@ impl DesktopApp {
         context: &egui::Context,
     ) -> Result<(), String> {
         crate::semantic::validate_name(name)?;
-        if identity.engine != crate::semantic::LOCAL_FINGERPRINT
+        if identity.engine != crate::semantic::local_fingerprint(&self.signature_context())
             || !self
                 .semantic_info
                 .locals
@@ -2964,6 +3515,14 @@ impl DesktopApp {
             return Err(
                 "Local identity is no longer present; refresh and select the variable again".into(),
             );
+        }
+        if self
+            .semantic_info
+            .locals
+            .iter()
+            .any(|v| &v.identity == identity && v.signature_parameter.is_some())
+        {
+            return Err("This parameter name belongs to the function signature. Use Edit signature to rename it.".into());
         }
         if self
             .semantic_info
@@ -2990,12 +3549,13 @@ impl DesktopApp {
         });
         crate::semantic::validate_renames(&updated, None)?;
         session.local_renames = updated;
-        session.version = 2;
+        session.upgrade_version();
         self.undo.push_back(Edit {
             address: identity.function,
             before: None,
             function_name: None,
             local: Some((identity.clone(), before)),
+            signature: None,
         });
         while self.undo.len() > HISTORY_LIMIT
             || self.undo.iter().map(edit_size).sum::<usize>() > UNDO_BYTES
@@ -3137,6 +3697,8 @@ impl DesktopApp {
             || self.file_job.is_some()
             || self.intent.is_some()
             || self.browser_dialog.is_some()
+            || self.signature_editor.is_some()
+            || self.signature_change.is_some()
             || context.egui_wants_keyboard_input()
             || egui::Popup::is_any_open(context)
             || context.memory(|memory| memory.top_modal_layer().is_some())
@@ -3408,7 +3970,7 @@ impl DesktopApp {
                 ui.label("L: rename function / label · G: go to · ;: comment");
                 ui.label("Space: Listing / Graph · Alt+Left/Right: history");
                 ui.label("Ctrl+S: save project · Ctrl+Z: undo annotation");
-                ui.weak("Shortcuts pause while typing or using a dialog. Local-variable renaming is not yet supported.");
+                ui.weak("Shortcuts pause while typing or using a dialog. Signature parameters are renamed through Signature….");
             });
             crate::window_chrome::menu_bar_controls(ui);
         });
@@ -3983,6 +4545,16 @@ impl DesktopApp {
                     &context,
                 );
             }
+            if ui
+                .add_enabled(
+                    self.view.is_some() && self.signature_replay.is_none(),
+                    egui::Button::new("Signature…").small(),
+                )
+                .on_hover_text("Edit return type, ordered parameters and current image ABI")
+                .clicked()
+            {
+                self.begin_signature_editor();
+            }
             ui.checkbox(&mut self.auto_decompile, "Auto");
             if !self.semantic_info.warnings.is_empty() {
                 ui.colored_label(
@@ -3998,6 +4570,12 @@ impl DesktopApp {
                 ui.weak("Saved analysis").on_hover_text("Cached results from this project. Refresh to recompute with the analysis engine.");
             }
         });
+        if let Some(error) = &self.signature_error {
+            ui.colored_label(theme::WARNING, error);
+        }
+        if self.signature_replay.is_some() {
+            ui.weak("Signature state pending worker verification…");
+        }
         if let Some(view) = &self.view {
             let entry = view.address;
             let function = self
@@ -4011,11 +4589,39 @@ impl DesktopApp {
                     .color(theme::BLUE),
             );
             response.context_menu(|ui| {
+                if ui.button("Edit signature…").clicked() {
+                    self.begin_signature_editor();
+                    ui.close();
+                }
                 if ui.button("Rename / comment…").clicked() {
                     self.open_comment(entry);
                     ui.close();
                 }
             });
+            if let Some(status) = self
+                .signature_unapplied
+                .iter()
+                .find(|s| s.function == entry)
+            {
+                ui.colored_label(
+                    theme::WARNING,
+                    format!("Signature not applied: {}", status.reason),
+                );
+            } else if self
+                .session
+                .as_ref()
+                .is_some_and(|s| s.signatures.iter().any(|s| s.function == entry))
+            {
+                ui.weak(if self.signature_replay.is_some() {
+                    "Signature pending"
+                } else if self.client.is_none() {
+                    "Saved signature · worker inactive"
+                } else {
+                    "Applied signature override"
+                });
+            } else if self.semantic_info.prototype.is_some() {
+                ui.weak("Inferred signature");
+            }
             ui.separator();
         }
         if self.decompiled.is_empty() {
@@ -4247,6 +4853,9 @@ impl DesktopApp {
                 if let Err(error) = self.rename_at(function, &name, &context) {
                     self.status = error;
                 }
+            }
+            if ui.button("Edit function signature…").clicked() {
+                self.begin_signature_editor();
             }
         }
         let comment = ScrollArea::vertical()
@@ -5105,6 +5714,7 @@ impl DesktopApp {
                                     "Discovering functions"
                                 }
                                 Request::SyncFunctions { .. } => "Restoring function context",
+                                Request::SyncSignatures { .. } => "Applying function signatures",
                                 Request::Rename { .. } => "Renaming function",
                                 Request::Bytes { .. } => "Reading bytes",
                                 Request::Strings | Request::StringsWithOptions { .. } => {
@@ -5159,6 +5769,7 @@ impl DesktopApp {
         self.analyze_window(&context);
         self.file_dialogs.show(&context);
         self.browser_dialog(&context);
+        self.signature_window(&context);
         self.handle_shortcuts(&context);
         crate::window_chrome::resize_borders(ui);
     }
@@ -5251,6 +5862,16 @@ fn edit_size(edit: &Edit) -> usize {
             + before.as_ref().map_or(0, |r| {
                 r.name.len() + r.identity.engine.len() + r.identity.verification.len() + 64
             })
+    }) + edit.signature.as_ref().map_or(0, |(_, before)| {
+        16 + before.as_ref().map_or(0, |s| {
+            s.engine.len()
+                + s.abi.len()
+                + 64
+                + s.parameters
+                    .iter()
+                    .map(|p| p.name.len() + 32)
+                    .sum::<usize>()
+        })
     }) + edit.function_name.as_ref().map_or(0, String::len)
         + edit.before.as_ref().map_or(0, |annotation| {
             annotation.label.len()
@@ -5296,6 +5917,352 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_signature() -> FunctionSignature {
+        FunctionSignature {
+            function: 0x1000,
+            engine: signatures::SIGNATURE_FINGERPRINT.into(),
+            abi: "x86:LE:64:default:gcc".into(),
+            return_type: signatures::SignatureType {
+                base: signatures::SignatureBase::I64,
+                pointer_depth: 0,
+            },
+            parameters: vec![signatures::SignatureParameter {
+                name: "values".into(),
+                ty: signatures::SignatureType {
+                    base: signatures::SignatureBase::I32,
+                    pointer_depth: 1,
+                },
+            }],
+        }
+    }
+
+    fn signature_ack(
+        app: &mut DesktopApp,
+        signatures: Vec<FunctionSignature>,
+        undone: Option<Edit>,
+    ) -> (Pending, Response) {
+        let function = 0x1000;
+        let context = signatures::state_digest(&signatures);
+        let binary_sha256 = app.info.as_ref().unwrap().sha256.clone();
+        app.signature_change = Some(SignatureChange {
+            function,
+            before: app
+                .session
+                .as_ref()
+                .unwrap()
+                .signatures
+                .iter()
+                .find(|s| s.function == function)
+                .cloned(),
+            signatures: signatures.clone(),
+            generation: app.generation,
+            revision: app.revision,
+            selection: app.selection_generation,
+            epoch: app.worker_epoch,
+            undone,
+        });
+        app.signature_replay = Some(SignatureReplay {
+            signatures: signatures.clone(),
+            context: context.clone(),
+            generation: app.generation,
+            revision: app.revision,
+            epoch: app.worker_epoch,
+            sent: true,
+        });
+        (
+            Pending {
+                id: 1,
+                request: Request::SyncSignatures {
+                    binary_sha256: binary_sha256.clone(),
+                    context: context.clone(),
+                    signatures,
+                },
+                started: Instant::now(),
+                selection: app.selection_generation,
+                revision: app.revision,
+                byte_origin: (app.selected, app.tab),
+                bytes: None,
+            },
+            Response::SignaturesSynced {
+                binary_sha256,
+                context,
+                unapplied: Vec::new(),
+            },
+        )
+    }
+
+    #[test]
+    fn signature_edits_commit_only_after_ack_and_apply_remove_undo_are_single_edits() {
+        let mut app = keyboard_app();
+        let context = egui::Context::default();
+        let signature = test_signature();
+        let (pending, reply) = signature_ack(&mut app, vec![signature.clone()], None);
+        assert!(
+            app.session.as_ref().unwrap().signatures.is_empty(),
+            "staged state is not saved"
+        );
+        assert!(app.undo.is_empty());
+        app.receive(pending, reply, &context);
+        assert_eq!(
+            app.session.as_ref().unwrap().signatures.as_slice(),
+            std::slice::from_ref(&signature)
+        );
+        assert_eq!(app.session.as_ref().unwrap().version, 3);
+        assert_eq!((app.revision, app.undo.len()), (1, 1));
+        let (pending, reply) = signature_ack(&mut app, vec![], None);
+        app.receive(pending, reply, &context);
+        assert!(app.session.as_ref().unwrap().signatures.is_empty());
+        assert_eq!((app.revision, app.undo.len()), (2, 2));
+        let edit = app.undo.pop_back().unwrap();
+        assert_eq!(
+            edit.signature.as_ref().unwrap().1.as_ref(),
+            Some(&signature)
+        );
+        let (pending, reply) = signature_ack(&mut app, vec![signature.clone()], Some(edit));
+        app.receive(pending, reply, &context);
+        assert_eq!(app.session.as_ref().unwrap().signatures, [signature]);
+        assert_eq!((app.revision, app.undo.len()), (3, 1));
+        assert!(app.signature_recovery.is_none());
+    }
+
+    #[test]
+    fn undo_restores_incompatible_saved_signatures_and_keeps_earlier_history_accessible() {
+        for incompatible_abi in [false, true] {
+            for replace in [false, true] {
+                let mut app = keyboard_app();
+                let context = egui::Context::default();
+                let mut saved = test_signature();
+                if incompatible_abi {
+                    saved.abi = "x86:LE:64:default:windows".into();
+                } else {
+                    saved.engine = "older-signature-engine".into();
+                }
+                app.session.as_mut().unwrap().signatures = vec![saved.clone()];
+                app.session.as_mut().unwrap().upgrade_version();
+                app.edit_annotation(
+                    0x1001,
+                    Annotation {
+                        comment: "earlier note".into(),
+                        ..Annotation::default()
+                    },
+                );
+                let replacement = if replace {
+                    vec![test_signature()]
+                } else {
+                    vec![]
+                };
+                let (pending, reply) = signature_ack(&mut app, replacement, None);
+                app.receive(pending, reply, &context);
+                assert_eq!((app.revision, app.undo.len()), (2, 2));
+                let edit = app.undo.pop_back().unwrap();
+                let (pending, mut reply) = signature_ack(&mut app, vec![saved.clone()], Some(edit));
+                let status = SignatureStatus {
+                    function: saved.function,
+                    reason: "Saved signature has an incompatible engine or ABI".into(),
+                };
+                if let Response::SignaturesSynced { unapplied, .. } = &mut reply {
+                    unapplied.push(status);
+                }
+                app.receive(pending, reply, &context);
+                assert_eq!(app.session.as_ref().unwrap().signatures, [saved.clone()]);
+                assert_eq!((app.revision, app.undo.len()), (3, 1));
+                assert_eq!(app.signature_unapplied.len(), 1);
+                assert_eq!(app.signature_unapplied[0].function, saved.function);
+                assert!(app.signature_change.is_none() && app.signature_replay.is_none());
+                assert!(app.signature_recovery.is_none());
+                app.undo(&context);
+                assert_eq!((app.revision, app.undo.len()), (4, 0));
+                assert!(app.session.as_ref().unwrap().annotations.is_empty());
+                assert_eq!(app.session.as_ref().unwrap().signatures, [saved]);
+            }
+        }
+    }
+
+    #[test]
+    fn failed_canceled_and_stale_signature_replays_retain_committed_state_and_recover_once() {
+        for failure in 0..4 {
+            let mut app = keyboard_app();
+            let context = egui::Context::default();
+            let committed = test_signature();
+            app.session.as_mut().unwrap().signatures = vec![committed.clone()];
+            app.session.as_mut().unwrap().upgrade_version();
+            let mut replacement = committed.clone();
+            replacement.parameters[0].ty.pointer_depth = 2;
+            let undo = Edit {
+                address: 0x1000,
+                before: None,
+                function_name: None,
+                local: None,
+                signature: Some((0x1000, Some(committed.clone()))),
+            };
+            let (pending, mut reply) = signature_ack(&mut app, vec![replacement], Some(undo));
+            match failure {
+                0 => app.stop_worker(),
+                1 => app.receive(
+                    pending,
+                    Response::Error {
+                        message: "storage rejected".into(),
+                    },
+                    &context,
+                ),
+                2 => {
+                    app.selection_generation += 1;
+                    app.receive(pending, reply, &context);
+                }
+                _ => {
+                    if let Response::SignaturesSynced { unapplied, .. } = &mut reply {
+                        unapplied.push(SignatureStatus {
+                            function: 0x1000,
+                            reason: "entry missing".into(),
+                        });
+                    }
+                    app.receive(pending, reply, &context);
+                }
+            }
+            assert_eq!(app.session.as_ref().unwrap().signatures, [committed]);
+            assert_eq!((app.revision, app.undo.len()), (0, 1));
+            assert!(app.signature_change.is_none() && app.signature_replay.is_none());
+            assert_eq!(app.signature_recovery, Some(0x1000), "failure {failure}");
+            // With no retained source, recovery consumes its one opportunity.
+            // A failed baseline reopen has no staged edit to schedule more work.
+            app.poll_worker(&context);
+            assert!(app.signature_recovery.is_none());
+            app.poll_worker(&context);
+            assert!(app.client.is_none());
+        }
+    }
+
+    #[test]
+    fn signature_invalidation_clears_engine_results_and_preserves_byte_scans_and_navigation() {
+        let mut app = semantic_app();
+        app.strings_scanned = true;
+        app.strings.push(StringEntry {
+            address: 0x1010,
+            text: "bytes".into(),
+            encoding: "ASCII".into(),
+        });
+        app.crypto.push(CryptoMatch {
+            address: 0x1010,
+            algorithm: "constant".into(),
+            signature: "bytes".into(),
+            length: 4,
+        });
+        app.history = vec![0x1000, 0x1040];
+        app.history_index = 1;
+        let selected = app.selected;
+        app.comment_owners.insert(0x1001, 0x1000);
+        app.invalidate_signature_analysis();
+        assert!(app.view.is_none() && app.canvas.is_none() && app.listing.is_empty());
+        assert!(
+            app.decompiled.is_empty()
+                && app.semantic.mappings.is_empty()
+                && app.semantic_info.tokens.is_empty()
+        );
+        assert!(
+            app.comment_owners.is_empty()
+                && app.call_index.is_none()
+                && app.discovery_saved.is_none()
+        );
+        assert!(app.strings_scanned && app.strings.len() == 1 && app.crypto.len() == 1);
+        assert_eq!(app.history, [0x1000, 0x1040]);
+        assert_eq!((app.history_index, app.selected), (1, selected));
+    }
+
+    #[test]
+    fn signature_parameter_renames_route_to_editor_and_other_locals_keep_version_three() {
+        let mut app = semantic_app();
+        let context = egui::Context::default();
+        app.session.as_mut().unwrap().signatures = vec![test_signature()];
+        app.session.as_mut().unwrap().upgrade_version();
+        let identity = LocalIdentity {
+            function: 0x1000,
+            engine: crate::semantic::SIGNATURE_LOCAL_FINGERPRINT.into(),
+            storage: crate::semantic::LocalStorage::Register,
+            offset: 0,
+            size: 8,
+            verification: "a".repeat(64),
+        };
+        app.semantic_info
+            .locals
+            .push(crate::semantic::LocalVariable {
+                identity: identity.clone(),
+                name: "values".into(),
+                signature_parameter: Some(0),
+            });
+        app.selected_local = Some(0);
+        app.begin_rename();
+        assert!(app.signature_editor.is_some() && app.browser_dialog.is_none());
+        assert!(
+            app.rename_local(&identity, "ignored", &context)
+                .unwrap_err()
+                .contains("function signature")
+        );
+        let mut other = identity.clone();
+        other.offset = 8;
+        other.verification = "b".repeat(64);
+        app.semantic_info
+            .locals
+            .push(crate::semantic::LocalVariable {
+                identity: other.clone(),
+                name: "local_1".into(),
+                signature_parameter: None,
+            });
+        app.signature_editor = None;
+        app.rename_local(&other, "renamed_local", &context).unwrap();
+        assert_eq!(app.session.as_ref().unwrap().version, 3);
+        assert_eq!(
+            app.session.as_ref().unwrap().local_renames[0].name,
+            "renamed_local"
+        );
+        assert_eq!(app.session.as_ref().unwrap().signatures, [test_signature()]);
+    }
+
+    #[test]
+    fn refreshed_signature_selection_requires_an_instruction_in_the_fresh_graph() {
+        for (old, expected) in [(0x1004, 0x1004), (0x1010, 0x1000)] {
+            let mut app = semantic_app();
+            app.auto_decompile = false;
+            let view = app.view.clone().unwrap();
+            app.selected = Some(old);
+            app.signature_restore_pc = Some((0x1000, old));
+            let pending = Pending {
+                id: 1,
+                request: Request::Graph { address: 0x1000 },
+                started: Instant::now(),
+                selection: app.selection_generation,
+                revision: app.revision,
+                byte_origin: (app.selected, app.tab),
+                bytes: None,
+            };
+            app.receive(pending, Response::Graph { view }, &egui::Context::default());
+            assert_eq!(app.selected, Some(expected));
+            assert!(app.signature_restore_pc.is_none());
+        }
+    }
+
+    #[test]
+    fn signature_editor_uses_structured_inference_and_discards_stale_drafts() {
+        let mut app = semantic_app();
+        app.semantic_info.prototype = Some(signatures::InferredSignature {
+            return_type: None,
+            abi: "x86:LE:64:default:gcc".into(),
+            parameters: vec![signatures::InferredParameter {
+                name: "value".into(),
+                ty: None,
+            }],
+            unsupported: vec!["Floating point type is unsupported".into()],
+        });
+        app.begin_signature_editor();
+        let editor = app.signature_editor.as_ref().unwrap();
+        assert!(editor.return_type.is_none() && editor.parameters[0].ty.is_none());
+        assert!(editor.notes[0].contains("unsupported"));
+        app.revision += 1;
+        app.signature_window(&egui::Context::default());
+        assert!(
+            app.signature_editor.is_none() && app.session.as_ref().unwrap().signatures.is_empty()
+        );
+    }
 
     #[test]
     fn packed_image_skips_automatic_and_manual_expensive_analysis() {
@@ -6757,6 +7724,7 @@ mod tests {
             .push(crate::semantic::LocalVariable {
                 identity: identity.clone(),
                 name: "café".into(),
+                signature_parameter: None,
             });
         app.semantic_info
             .tokens

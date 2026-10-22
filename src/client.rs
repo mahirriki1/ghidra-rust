@@ -28,6 +28,7 @@ pub struct WorkerClient {
     binary_path: PathBuf,
     protection: BinaryProtection,
     source_lease: Option<Arc<dyn Send + Sync>>,
+    signature_context: Arc<Mutex<String>>,
 }
 
 impl WorkerClient {
@@ -80,6 +81,8 @@ impl WorkerClient {
         let reader_protection = protection.clone();
         let sent = Arc::new(AtomicU64::new(0));
         let reader_sent = sent.clone();
+        let signature_context = Arc::new(Mutex::new(String::new()));
+        let reader_signature_context = Arc::clone(&signature_context);
         let worker_pid = child.id();
         std::thread::Builder::new()
             .name("analysis-responses".into())
@@ -143,10 +146,17 @@ impl WorkerClient {
                                                     semantics.validate(text, *address, &sections)
                                                 })
                                                 .and_then(|()| {
-                                                    if semantics.locals.iter().any(|v| {
-                                                        v.identity.engine
-                                                            != crate::semantic::LOCAL_FINGERPRINT
-                                                    }) {
+                                                    let expected =
+                                                        crate::semantic::local_fingerprint(
+                                                            &reader_signature_context
+                                                                .lock()
+                                                                .unwrap_or_else(|e| e.into_inner()),
+                                                        );
+                                                    if semantics
+                                                        .locals
+                                                        .iter()
+                                                        .any(|v| v.identity.engine != expected)
+                                                    {
                                                         Err("Incompatible semantic local identity"
                                                             .into())
                                                     } else {
@@ -205,6 +215,7 @@ impl WorkerClient {
             binary_path,
             protection,
             source_lease: None,
+            signature_context,
         })
     }
 
@@ -222,6 +233,24 @@ impl WorkerClient {
         let _trace_context = crate::performance::context(self.next_id.saturating_add(1));
         let _sending = crate::performance::span("request_send");
         crate::performance::event(crate::performance::operation(&request), 0);
+        let mut next_signature_context = None;
+        if let Request::SyncSignatures {
+            binary_sha256,
+            context,
+            signatures,
+        } = &request
+        {
+            crate::signatures::validate_signatures(signatures)?;
+            if context != &crate::signatures::state_digest(signatures) || binary_sha256.len() != 64
+            {
+                return Err("Invalid signature synchronization binding".into());
+            }
+            next_signature_context = Some(if signatures.is_empty() {
+                String::new()
+            } else {
+                context.clone()
+            });
+        }
         if let Request::Open { path } = &mut request {
             let requested = Path::new(path)
                 .canonicalize()
@@ -229,6 +258,7 @@ impl WorkerClient {
             if requested != self.binary_path {
                 return Err("Restart the worker before opening a different binary".into());
             }
+            next_signature_context = Some(String::new());
             #[cfg(target_os = "linux")]
             {
                 *path = "/input/binary".into();
@@ -245,6 +275,12 @@ impl WorkerClient {
         .map_err(|e| e.to_string())?;
         if bytes.len() > 60 * 1024 {
             return Err("Request is too large".into());
+        }
+        if let Some(context) = next_signature_context {
+            *self
+                .signature_context
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = context;
         }
         bytes.push(b'\n');
         // Publish before writing so the reader never sees an unsent reply id.

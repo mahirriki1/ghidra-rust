@@ -5,6 +5,17 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
 pub const LOCAL_FINGERPRINT: &str = "local-storage-use-v1:268c3a406d8d964bc00ae2ead4d3e1e1373aaa27";
+pub const SIGNATURE_LOCAL_FINGERPRINT: &str =
+    "local-signature-use-v1:268c3a406d8d964bc00ae2ead4d3e1e1373aaa27";
+
+pub fn local_fingerprint(context: &str) -> &'static str {
+    if context.is_empty() {
+        LOCAL_FINGERPRINT
+    } else {
+        SIGNATURE_LOCAL_FINGERPRINT
+    }
+}
+
 pub const MAX_TOKENS: usize = 32_768;
 pub const MAX_LOCALS: usize = 4096;
 pub const MAX_LOCAL_RENAMES: usize = 4096;
@@ -152,6 +163,9 @@ pub fn validate_renames(renames: &[LocalRename], function: Option<u64>) -> Resul
 pub struct LocalVariable {
     pub identity: LocalIdentity,
     pub name: String,
+    /// Ordered engine parameter index when the current signature owns its name.
+    #[serde(default)]
+    pub signature_parameter: Option<usize>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -173,6 +187,8 @@ pub struct SemanticToken {
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SemanticInfo {
+    #[serde(default)]
+    pub prototype: Option<crate::signatures::InferredSignature>,
     #[serde(
         default,
         deserialize_with = "crate::bounded::vec::<_, _, { MAX_TOKENS }>"
@@ -208,6 +224,9 @@ impl SemanticInfo {
         {
             return Err("Semantic metadata exceeds its limits".into());
         }
+        if let Some(prototype) = &self.prototype {
+            prototype.validate()?;
+        }
         let executable = ExecutableRanges::new(sections)?;
         if !executable.contains(function) {
             return Err("Invalid semantic function address".into());
@@ -216,6 +235,11 @@ impl SemanticInfo {
         for local in &self.locals {
             local.identity.validate()?;
             if local.identity.function != function
+                || ![LOCAL_FINGERPRINT, SIGNATURE_LOCAL_FINGERPRINT]
+                    .contains(&local.identity.engine.as_str())
+                || local
+                    .signature_parameter
+                    .is_some_and(|p| p >= crate::signatures::MAX_PARAMETERS)
                 || local.name.len() > 256
                 || local.name.is_empty()
                 || !identities.insert(&local.identity)
@@ -286,8 +310,10 @@ mod tests {
             locals: vec![LocalVariable {
                 identity: identity(),
                 name: "é".into(),
+                signature_parameter: None,
             }],
             warnings: vec![],
+            prototype: None,
         };
         info.validate("é call", 0x1000, &sections).unwrap();
         info.tokens[0].end = 1;
