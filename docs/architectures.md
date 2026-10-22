@@ -48,8 +48,9 @@ and known functions on x86, x86-64, and AArch64 across the supported containers.
 It examines at most 128 function entries with an exact shared limit of 16,384
 decode attempts and at most 2,048 attempts per function. Failed decoding and work
 omitted from the displayed graph count toward the limits. Calls to their own
-fallthrough address do not seed functions. Constants, unknown indirect targets,
-and prologue patterns do not seed functions. Coverage is partial when these
+fallthrough address do not seed functions. Constants and unknown indirect
+targets do not seed functions; on x86-64 ELF and PE, strictly validated
+[function-start patterns](analysis.md#function-start-patterns) can. Coverage is partial when these
 budgets are reached; complete function recovery is not guaranteed. See
 [analysis coverage and provenance](analysis.md) for call references and progress.
 AArch64 PE reads normal packed and supported full unwind records to recover

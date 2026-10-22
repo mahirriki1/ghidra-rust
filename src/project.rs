@@ -1128,6 +1128,7 @@ mod tests {
                 functions: data.info.functions.clone(),
             },
             truncated: false,
+            patterns: None,
             outcomes: vec![DiscoveryOutcome {
                 address: 0x1000,
                 status: crate::model::DiscoveryStatus::Done,
