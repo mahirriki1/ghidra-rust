@@ -156,3 +156,7 @@ Report which checks actually ran and any platform validation that remains pendin
   or obsolete planning mockups to the repository.
 - Preserve unrelated user changes. Keep edits scoped to the requested task and
   update public documentation when supported behavior or limitations change.
+- Add a new `docs/release-notes/*.md` entry for each PR or direct change to main.
+  Use detailed bullets for user-visible features, fixes, and limitations; follow
+  `docs/release-notes/README.md`. Keep published entries and use new files for
+  later changes so each release can collect its complete changes.
