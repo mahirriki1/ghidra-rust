@@ -74,6 +74,76 @@ impl Drop for Process {
 }
 
 #[test]
+fn real_worker_reads_section_pages_and_clipped_zero_filled_tails() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("pages.c");
+    let binary = directory.path().join("pages");
+    std::fs::write(
+        &source,
+        b"const unsigned char page_data[5003] __attribute__((section(\".hex_data\"))) = {65, 66};\nunsigned char page_zero[9001];\nint main(void) { return page_data[0] + page_zero[0]; }\n",
+    )
+    .unwrap();
+    let result = Command::new("gcc")
+        .args(["-g", "-O0", "-fno-pie", "-no-pie"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let original = std::fs::read(&binary).unwrap();
+    let mut worker = Process::start();
+    let Response::Opened { info } = worker.request(Request::Open {
+        path: binary.to_string_lossy().into_owned(),
+    }) else {
+        panic!("cannot open page fixture")
+    };
+    for name in [".hex_data", ".bss"] {
+        let section = info
+            .sections
+            .iter()
+            .find(|section| section.name == name)
+            .unwrap();
+        assert!(section.size > 4096);
+        for offset in [0, (section.size - 1) / 4096 * 4096] {
+            let address = section.address + offset;
+            let length = (section.size - offset).min(4096) as usize;
+            let Response::Bytes {
+                address: actual,
+                bytes,
+            } = worker.request(Request::Bytes { address, length })
+            else {
+                panic!("cannot read section page")
+            };
+            assert_eq!(actual, address);
+            assert_eq!(bytes.len(), length);
+            let expected: Vec<_> = (offset..offset + length as u64)
+                .map(|relative| {
+                    if relative < section.file_size {
+                        original[(section.file_offset + relative) as usize]
+                    } else {
+                        0
+                    }
+                })
+                .collect();
+            assert_eq!(bytes, expected, "{name} page at {address:#x}");
+        }
+    }
+    assert!(matches!(
+        worker.request(Request::Bytes {
+            address: 0,
+            length: 4096
+        }),
+        Response::Error { .. }
+    ));
+    assert_eq!(std::fs::read(&binary).unwrap(), original);
+}
+
+#[test]
 fn real_worker_browses_decompiles_decodes_scans_and_recovers_from_bad_open() {
     let directory = std::env::temp_dir().join(format!("grust-process-test-{}", std::process::id()));
     std::fs::create_dir_all(&directory).unwrap();

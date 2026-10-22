@@ -229,6 +229,20 @@ are never applied automatically.
   This minimum applies before the 10,000-result cap; the text filter searches only
   loaded results. Increase the minimum and rescan when short-string noise fills the
   result budget. A partial scan is explicitly marked; the 64 MiB scan budget remains.
+- Open **Hex / Memory Map** from the middle tabs or **View**, or click a section
+  in the Program Tree. The virtualized map shows loaded mapped sections with
+  exclusive virtual/file ranges, mapped and file-backed sizes, and executable
+  status. Browse section-relative 4 KiB pages with **Prev/Next** or the local
+  **VA (hex)** field. Unmapped addresses show an error without replacing the page.
+  File-backed bytes show their file offset on hover; muted zero-filled bytes
+  have no file offset. This is the analyzed snapshot, not runtime process memory
+  or a whole-file view: unmapped headers and overlays are outside its scope.
+  Click and Shift-click bytes in hex or ASCII to select within the loaded page,
+  then **Decode selection** copies exactly that slice and its starting address.
+  Selection clears when changing pages. Browsing preserves function navigation
+  and annotations; pages and selection are transient and are not saved in projects.
+  Reads wait for busy analysis and rapid paging retains only the newest queued
+  read. A canceled or failed page requires **Retry**.
 - Use **Decode** for selected memory or pasted text/hex: UTF-8, UTF-16LE/BE,
   standard padded Base64, hex, or XOR. XOR keys use explicit `hex:` or `text:`
   prefixes. Common-decoding suggestions are heuristics and require analyst review.
