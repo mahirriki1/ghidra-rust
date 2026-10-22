@@ -334,6 +334,10 @@ snapshot currently duplicates image bytes retained by the engine; total memory
 must be measured before making efficiency claims.
 An opt-in [analysis measurement harness](docs/analysis-performance.md) records
 client/worker timings and process-tree memory; its scope excludes the native GUI.
+A separate opt-in [differential benchmark](docs/analysis-performance.md#differential-comparison-with-ghidra)
+runs a separately installed Ghidra and the contained worker on identical original
+corpus builds, reporting function/call recovery, decompilation outcomes, pseudocode
+text similarity, wall time and process-tree memory for both.
 Each discovery batch examines at most 128 function entries and charges at most
 16,384 decode attempts, with a 2,048-attempt limit per function. There is no
 128-function cumulative ceiling: batches continue across the admitted inventory.

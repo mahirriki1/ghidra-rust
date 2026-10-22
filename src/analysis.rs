@@ -21,7 +21,8 @@ const MAX_SCAN_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_CRYPTO_RESULTS: usize = 10_000;
 const SCAN_CHUNK: usize = 256 * 1024;
 const MAX_STRING_PREVIEW: usize = 512;
-const MAX_IMAGE_BYTES: u64 = 128 * 1024 * 1024;
+/// Largest executable the worker opens.
+pub const MAX_IMAGE_BYTES: u64 = 128 * 1024 * 1024;
 
 pub struct LoadedProgram {
     program: Program,
@@ -365,7 +366,7 @@ impl LoadedProgram {
             text.truncate(end);
             mappings.retain(|mapping| mapping.end <= end);
             semantics.tokens.retain(|token| token.end <= end);
-            text.push_str("\n/* Decompiler output truncated at the 2 MiB prototype limit. */\n");
+            text.push_str(crate::decompile::TRUNCATION_TRAILER);
         }
         Ok(Response::Decompiled {
             address,
