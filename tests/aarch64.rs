@@ -290,6 +290,8 @@ fn contained_aarch64_workers_analyze_elf_pe_macho_and_reopen_projects() {
                 .iter()
                 .any(|e| e.kind == EdgeKind::Unknown && e.target.is_none())
         );
+        // An unknown register is no jump table: nothing is established.
+        assert!(indirect.edges.iter().all(|e| e.evidence.is_none()));
         let indirect_call = graph(&mut worker, base + 80);
         assert_eq!(indirect_call.calls.len(), 1);
         assert_eq!(indirect_call.calls[0].target, None);

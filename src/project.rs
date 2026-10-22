@@ -4,10 +4,10 @@
 //! the exact analyzed input. The decompiler's internal database is rebuilt on open.
 use crate::discovery::{DISCOVERY_FINGERPRINT, DiscoverySnapshot};
 use crate::model::{
-    BinaryInfo, CodeMapping, CryptoMatch, FunctionView, MAX_CRYPTO_MATCHES, MAX_DECOMPILED_BYTES,
-    MAX_GRAPH_BLOCKS, MAX_GRAPH_CALLS, MAX_GRAPH_EDGES, MAX_GRAPH_INSTRUCTIONS,
-    MAX_INSTRUCTION_BYTES, MAX_PROJECT_STRINGS, MAX_SECTIONS, MAX_WARNINGS, SectionInfo,
-    StringEntry, validate_functions,
+    BinaryInfo, CodeMapping, CryptoMatch, EdgeKind, FunctionView, MAX_CRYPTO_MATCHES,
+    MAX_DECOMPILED_BYTES, MAX_GRAPH_BLOCKS, MAX_GRAPH_CALLS, MAX_GRAPH_EDGES,
+    MAX_GRAPH_INSTRUCTIONS, MAX_INSTRUCTION_BYTES, MAX_PROJECT_STRINGS, MAX_SECTIONS, MAX_WARNINGS,
+    SectionInfo, StringEntry, validate_functions,
 };
 use crate::selection::{MappedRanges, validate_mappings};
 use crate::session::{self, BinaryProtection, Session};
@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 const APPLICATION_ID: i64 = 0x4752504a; // GRPJ
 /// Version 3 adds semantic tokens and local renames; versions 1/2 still open.
 const VERSION: i64 = 3;
-pub const ENGINE_FINGERPRINT: &str = "ghidra-rust-project-v3-semantic-v1-mapping-v1-pe-v1-aarch64-v1-calls-v1-arm64pe-v1-inventory-v2-elfcrt-v1:268c3a406d8d964bc00ae2ead4d3e1e1373aaa27";
+pub const ENGINE_FINGERPRINT: &str = "ghidra-rust-project-v3-semantic-v1-mapping-v1-pe-v1-aarch64-v1-calls-v1-arm64pe-v1-inventory-v2-elfcrt-v1-switch-v1:268c3a406d8d964bc00ae2ead4d3e1e1373aaa27";
 const MAX_BINARY: usize = 128 * 1024 * 1024;
 const MAX_BODY: usize = 48 * 1024 * 1024;
 const MAX_PROJECT: u64 = 224 * 1024 * 1024;
@@ -718,6 +718,11 @@ pub(crate) fn persistable_view(view: &FunctionView, sections: &[SectionInfo]) ->
                 *target = None;
             }
         }
+        for edge in &mut view.edges {
+            if edge.target.is_none() {
+                edge.evidence = None;
+            }
+        }
     }
     view
 }
@@ -771,6 +776,14 @@ pub(crate) fn validate_view(view: &FunctionView, ranges: &MappedRanges) -> Resul
     for edge in &view.edges {
         if !blocks.contains(&edge.source) {
             return Err("Graph edge source is not a basic block".into());
+        }
+        if edge.evidence.is_some() {
+            // Switch evidence describes an established branch destination.
+            let target = edge
+                .target
+                .filter(|_| edge.kind == EdgeKind::Branch)
+                .ok_or("Graph switch evidence lacks a branch destination")?;
+            mapped(ranges, target)?;
         }
     }
     Ok(())
@@ -1145,7 +1158,7 @@ mod tests {
         let bytes = read_blob(&db, "body", MAX_BODY).unwrap().unwrap();
         let mut body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         body.as_object_mut().unwrap().remove("semantics");
-        body["engine"] = "ghidra-rust-project-v1-mapping-v1-pe-v1-aarch64-v1-calls-v1-arm64pe-v1-inventory-v2-elfcrt-v1:268c3a406d8d964bc00ae2ead4d3e1e1373aaa27".into();
+        body["engine"] = "ghidra-rust-project-v1-mapping-v1-pe-v1-aarch64-v1-calls-v1-arm64pe-v1-inventory-v2-elfcrt-v1-switch-v1:268c3a406d8d964bc00ae2ead4d3e1e1373aaa27".into();
         db.execute(
             "UPDATE project_data SET value=?1 WHERE key='body'",
             [serde_json::to_vec(&body).unwrap()],
@@ -1331,11 +1344,13 @@ mod tests {
                 source: 0x1000,
                 target: Some(0x100e),
                 kind: EdgeKind::Branch,
+                evidence: None,
             },
             Edge {
                 source: 0x1000,
                 target: Some(0x1005),
                 kind: EdgeKind::True,
+                evidence: None,
             },
         ];
         view.calls = vec![
@@ -1398,8 +1413,37 @@ mod tests {
             source: 0x1000,
             target: None,
             kind: crate::model::EdgeKind::Unknown,
+            evidence: None,
         });
         assert!(data.validate().unwrap_err().contains("not a basic block"));
+        // Switch evidence must name a mapped branch destination.
+        let switch = |target, kind| {
+            let mut data = original.clone();
+            let view = data.view.as_mut().unwrap();
+            view.blocks.push(crate::model::BasicBlock {
+                address: 0x1000,
+                instructions: vec![],
+            });
+            view.edges.push(crate::model::Edge {
+                source: 0x1000,
+                target,
+                kind,
+                evidence: Some(crate::model::EdgeEvidence::EngineJumpTable),
+            });
+            data.validate()
+        };
+        for (target, kind, error) in [
+            (None, EdgeKind::Branch, "lacks a branch destination"),
+            (Some(0x1000), EdgeKind::True, "lacks a branch destination"),
+            (Some(0x9000), EdgeKind::Branch, "unmapped"),
+        ] {
+            assert!(switch(target, kind).unwrap_err().contains(error));
+        }
+        switch(Some(0x1000), EdgeKind::Branch).unwrap();
+        // Graphs saved before switch recovery carry no evidence field.
+        let legacy: crate::model::Edge =
+            serde_json::from_str(r#"{"source":4096,"target":4101,"kind":"Branch"}"#).unwrap();
+        assert_eq!(legacy.evidence, None);
         let mut data = original.clone();
         data.view
             .as_mut()
