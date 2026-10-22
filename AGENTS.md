@@ -28,8 +28,13 @@ the relevant source modules before changing behavior. Follow more specific
 - `src/client.rs`, `worker.rs`, `model.rs`: disposable worker lifecycle, bounded
   JSON transport, request/response types, and shared result limits.
 - `src/architecture.rs`: supported architecture/ABI selection and validation.
-- `src/analysis.rs`: loading, immutable image snapshots, instruction/CFG recovery,
-  function discovery, and analysis requests.
+- `src/analysis/`: loading, immutable image snapshots, function discovery, and
+  analysis requests (`mod.rs`); the resumable bounded instruction walk and CFG
+  (`cfg.rs`); the function-start pattern phase (`patterns.rs`); string scanning
+  (`strings.rs`).
+- `src/elf_startup.rs`, `switch_analysis.rs`, `function_patterns.rs`,
+  `no_return.rs`: stripped-ELF `main` recovery, engine jump-table recovery, and
+  vendored Ghidra function-start/no-return data (`data/`, see `NOTICE`).
 - `src/call_analysis.rs`, `data_analysis.rs`: bounded reference validation/indexes
   and instruction-local direct memory-access evidence.
 - `src/packing.rs`: conservative packed-image diagnostics; detected conventional
@@ -74,7 +79,7 @@ fingerprints, correctness tests, and upstream attribution in `NOTICE`.
 
 - Treat binaries, project files, symbols, and worker replies as untrusted data.
   Keep byte/count/depth budgets and checked address arithmetic. Consult the
-  constants in `model.rs`, `analysis.rs`, `project.rs`, and `session.rs` rather
+  constants in `model.rs`, `analysis/`, `project.rs`, and `session.rs` rather
   than duplicating limits that can drift.
 - Validate mapping bounds, UTF-8 boundaries, ordering, address counts, and
   executable file-backed membership before displaying them. Avoid multiplying

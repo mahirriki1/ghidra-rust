@@ -347,6 +347,9 @@ text similarity, wall time and process-tree memory for both.
 Each discovery batch examines at most 128 function entries and charges at most
 16,384 decode attempts, with a 2,048-attempt limit per function. There is no
 128-function cumulative ceiling: batches continue across the admitted inventory.
+Function-start scanning separately accepts at most 256 cursor-processing replies,
+including 64 uncharged match-point resumes, and bounds cumulative full-inventory
+validation work; exhausting those parent-owned allowances marks coverage partial.
 Call and data reference aggregates are each capped at 16,384 unique entries;
 reaching a cap visibly marks coverage partial. A limited or failed function walk
 is terminal for this session. Projects save committed results for display only;
