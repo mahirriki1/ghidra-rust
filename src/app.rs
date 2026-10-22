@@ -15,6 +15,7 @@ use crate::decoder_ui::{DecoderAction, DecoderPanel};
 use crate::discovery::DiscoverySnapshot;
 use crate::file_dialog::{FileDialogKind, FileDialogs, request_file};
 use crate::graph::{GraphAction, GraphCanvas};
+use crate::hex_ui::{HexAction, HexPanel};
 use crate::highlight::HighlightedCode;
 use crate::model::*;
 use crate::project::{EmbeddedBinary, LoadedProject, ProjectData};
@@ -37,6 +38,7 @@ enum Tab {
     Strings,
     Crypto,
     Decode,
+    Hex,
     References,
 }
 
@@ -167,6 +169,21 @@ struct DiscoveryUpdate {
     publication: Result<Option<DiscoveryPublication>, String>,
 }
 
+/// Byte reads have an explicit consumer; the active tab is only an optional
+/// Decode focus hint, never a destination selector.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ByteDestination {
+    Decode,
+    HexPage { token: u64 },
+}
+
+#[derive(Clone, Copy)]
+struct ByteBinding {
+    generation: u64,
+    intent: u64,
+    destination: ByteDestination,
+}
+
 struct Pending {
     id: u64,
     request: Request,
@@ -174,6 +191,7 @@ struct Pending {
     selection: u64,
     revision: u64,
     byte_origin: (Option<u64>, Tab),
+    bytes: Option<ByteBinding>,
 }
 
 struct Opening {
@@ -189,6 +207,7 @@ struct RequestOrigin {
     selection: u64,
     revision: u64,
     byte_origin: (Option<u64>, Tab),
+    bytes: Option<ByteBinding>,
 }
 
 /// Analyses offered by the auto-analysis dialog; kept for the session.
@@ -337,7 +356,9 @@ pub struct DesktopApp {
     worker_inventory: Option<crate::discovery::WorkerInventory>,
     inventory_synced: bool,
     discovery_sync: Option<VecDeque<u64>>,
+    /// One replaceable byte action, independent of the bounded function queue.
     discovery_bytes: Option<(Request, RequestOrigin)>,
+    byte_intent: u64,
     /// What a project save stores: the latest committed session results, or
     /// the restored project's snapshot until discovery runs again.
     discovery_saved: Option<Arc<DiscoverySnapshot>>,
@@ -403,6 +424,7 @@ pub struct DesktopApp {
     comment_owners: BTreeMap<u64, u64>,
     editor_address: Option<u64>,
     decoder: DecoderPanel,
+    hex: HexPanel,
     status: String,
     file_job: Option<Receiver<FileEvent>>,
     file_dialogs: FileDialogs,
@@ -455,6 +477,7 @@ impl DesktopApp {
             inventory_synced: false,
             discovery_sync: None,
             discovery_bytes: None,
+            byte_intent: 0,
             discovery_saved: None,
             saved_references: false,
             analysis_options: AnalysisOptions::default(),
@@ -513,6 +536,7 @@ impl DesktopApp {
             comment_owners: BTreeMap::new(),
             editor_address: None,
             decoder: DecoderPanel::default(),
+            hex: HexPanel::default(),
             status: "Open a binary to begin".into(),
             file_job: None,
             file_dialogs: FileDialogs::default(),
@@ -660,9 +684,22 @@ impl DesktopApp {
         self.filter_keys.clear();
         self.filter_cursor = None;
         self.decoder = DecoderPanel::default();
+        self.hex = HexPanel::default();
+        self.advance_byte_intent();
     }
 
     fn stop_worker(&mut self) {
+        if self.hex.is_loading() {
+            self.hex
+                .cancel("Analysis stopped. Retry to read this page.");
+        }
+        self.advance_byte_intent();
+        self.stop_worker_inner();
+    }
+
+    /// Restarting to verify a retained snapshot may carry a deferred byte origin over
+    /// the disposable worker boundary. Explicit stops use `stop_worker` above.
+    fn stop_worker_inner(&mut self) {
         crate::performance::event("worker_stop_epoch", self.worker_epoch);
         if self.discovery_running {
             crate::performance::event("discovery_action_interrupted", self.generation);
@@ -694,7 +731,41 @@ impl DesktopApp {
         context: &egui::Context,
     ) {
         let follow_origin = self.request_origin();
-        self.stop_worker();
+        self.start_open_at(path, preserve, follow, follow_origin, context);
+    }
+
+    fn start_open_at(
+        &mut self,
+        path: PathBuf,
+        preserve: bool,
+        follow: Option<Request>,
+        follow_origin: RequestOrigin,
+        context: &egui::Context,
+    ) {
+        let bytes = preserve.then(|| self.discovery_bytes.take()).flatten();
+        // Only carry remaining queued work when dispatch itself needs to
+        // recreate an absent worker. Navigation that preempts a live request
+        // retains its existing behavior of discarding the old function queue.
+        let queued = (preserve && self.client.is_none() && self.pending.is_none())
+            .then(|| std::mem::take(&mut self.queue));
+        if preserve {
+            // A pending page interrupted by function navigation needs an
+            // explicit Retry; a newer deferred page survives the restart.
+            if bytes.is_none()
+                && !matches!(follow, Some(Request::Bytes { .. }))
+                && self.hex.is_loading()
+            {
+                self.hex
+                    .cancel("Read interrupted. Retry to read this page.");
+            }
+            self.stop_worker_inner();
+        } else {
+            self.stop_worker();
+        }
+        self.discovery_bytes = bytes;
+        if let Some(queued) = queued {
+            self.queue = queued;
+        }
         match WorkerClient::start(context.clone(), &path) {
             Ok(mut client) => {
                 if preserve && let Some(binary) = &self.project_binary {
@@ -714,11 +785,19 @@ impl DesktopApp {
                     path: path.to_string_lossy().into_owned(),
                 });
             }
-            Err(error) => self.status = error,
+            Err(error) => {
+                self.stop_worker();
+                self.status = error;
+            }
         }
     }
 
     fn send_direct(&mut self, request: Request) {
+        let origin = self.request_origin();
+        self.send_direct_at(request, origin);
+    }
+
+    fn send_direct_at(&mut self, request: Request, origin: RequestOrigin) {
         self.analysis_progress = None;
         self.progress_events = 0;
         let Some(client) = &mut self.client else {
@@ -753,9 +832,10 @@ impl DesktopApp {
                     id,
                     request,
                     started: Instant::now(),
-                    selection: self.selection_generation,
-                    revision: self.revision,
-                    byte_origin: (self.selected, self.tab),
+                    selection: origin.selection,
+                    revision: origin.revision,
+                    byte_origin: origin.byte_origin,
+                    bytes: origin.bytes,
                 });
             }
             Err(error) => {
@@ -766,10 +846,22 @@ impl DesktopApp {
     }
 
     fn request(&mut self, request: Request, context: &egui::Context) {
+        if let Request::Bytes { address, length } = request {
+            self.request_bytes(address, length, ByteDestination::Decode, context);
+            return;
+        }
         if self.opening.is_some() {
             // The new client must first prove it opened the intended binary.
             let origin = self.request_origin();
             if let Some(opening) = &mut self.opening {
+                if matches!(opening.follow, Some(Request::Bytes { .. }))
+                    && self.discovery_bytes.is_none()
+                {
+                    self.discovery_bytes = opening
+                        .follow
+                        .take()
+                        .map(|read| (read, opening.follow_origin));
+                }
                 opening.follow = Some(request);
                 opening.follow_origin = origin;
             }
@@ -806,10 +898,6 @@ impl DesktopApp {
         {
             // Interactive work runs between bounded batches. Keep only the
             // newest navigation requests, and bound queued user actions.
-            if matches!(request, Request::Bytes { .. }) {
-                self.discovery_bytes = Some((request, self.request_origin()));
-                return;
-            }
             if matches!(request, Request::Graph { .. }) {
                 self.queue.retain(|queued| {
                     !matches!(queued, Request::Graph { .. } | Request::Decompile { .. })
@@ -870,23 +958,142 @@ impl DesktopApp {
             selection: self.selection_generation,
             revision: self.revision,
             byte_origin: (self.selected, self.tab),
+            bytes: None,
+        }
+    }
+
+    fn advance_byte_intent(&mut self) {
+        self.byte_intent = self
+            .byte_intent
+            .checked_add(1)
+            .expect("byte intent exhausted");
+        self.discovery_bytes = None;
+    }
+
+    fn request_bytes(
+        &mut self,
+        address: u64,
+        length: usize,
+        destination: ByteDestination,
+        context: &egui::Context,
+    ) {
+        self.advance_byte_intent();
+        if destination == ByteDestination::Decode && self.hex.is_loading() {
+            self.hex
+                .cancel("Another byte action replaced this read. Retry to load this page.");
+        }
+        let mut origin = self.request_origin();
+        origin.bytes = Some(ByteBinding {
+            generation: self.generation,
+            intent: self.byte_intent,
+            destination,
+        });
+        let request = Request::Bytes { address, length };
+        if length == 0 || length > MAX_BYTE_READ || address.checked_add(length as u64).is_none() {
+            self.fail_byte_request(
+                &request,
+                origin,
+                "Invalid byte read range; choose a bounded range.",
+            );
+            return;
+        }
+        if !self.byte_request_current(&request, origin) {
+            self.retire_byte_request(&request, origin);
+            return;
+        }
+        // Never preempt an in-flight worker or snapshot adoption for a page.
+        // Replacing this slot drops the previous action without re-binding it.
+        self.discovery_bytes = Some((request, origin));
+        self.dispatch_queued(context);
+    }
+
+    fn byte_request_current(&self, request: &Request, origin: RequestOrigin) -> bool {
+        let (Request::Bytes { address, length }, Some(binding)) = (request, origin.bytes) else {
+            return false;
+        };
+        binding.generation == self.generation
+            && binding.intent == self.byte_intent
+            && origin.selection == self.selection_generation
+            && origin.revision == self.revision
+            && origin.byte_origin.0 == self.selected
+            && match binding.destination {
+                ByteDestination::Decode => true,
+                ByteDestination::HexPage { token } => self.hex.expects(token, *address, *length),
+            }
+    }
+
+    /// A context change invalidates even the latest action. Release its loading
+    /// state, but never fail a replacement page or automatically request again.
+    fn retire_byte_request(&mut self, request: &Request, origin: RequestOrigin) {
+        if let (Request::Bytes { address, length }, Some(binding)) = (request, origin.bytes)
+            && binding.generation == self.generation
+            && binding.intent == self.byte_intent
+            && let ByteDestination::HexPage { token } = binding.destination
+            && self.hex.expects(token, *address, *length)
+        {
+            self.hex.cancel("Context changed. Retry to read this page.");
+        }
+    }
+
+    fn fail_byte_request(&mut self, request: &Request, origin: RequestOrigin, message: &str) {
+        if !self.byte_request_current(request, origin) {
+            self.retire_byte_request(request, origin);
+            return;
+        }
+        let message = crop(message, 4096);
+        if let Some(ByteBinding {
+            destination: ByteDestination::HexPage { token },
+            ..
+        }) = origin.bytes
+        {
+            self.hex.fail(token, message.clone());
+        }
+        self.status = message;
+    }
+
+    /// Both already-loaded instruction bytes and Hex selections supersede every
+    /// outstanding byte intent without altering the function/annotation context.
+    fn decode_loaded_bytes(&mut self, address: u64, bytes: Vec<u8>) {
+        self.advance_byte_intent();
+        if self.hex.is_loading() {
+            self.hex
+                .cancel("Bytes copied to Decode. Retry to load this page.");
+        }
+        self.decoder.set_source(address, bytes);
+        self.tab = Tab::Decode;
+    }
+
+    fn handle_hex_action(&mut self, action: HexAction, context: &egui::Context) {
+        match action {
+            HexAction::Read {
+                token,
+                address,
+                length,
+            } => {
+                self.request_bytes(address, length, ByteDestination::HexPage { token }, context);
+            }
+            HexAction::Decode { address, bytes } => self.decode_loaded_bytes(address, bytes),
+        }
+    }
+
+    fn open_hex_section(&mut self, index: usize, context: &egui::Context) {
+        let action = {
+            let Some(info) = &self.info else { return };
+            self.hex.open_section(index, &info.sections)
+        };
+        self.tab = Tab::Hex;
+        if let Some(action) = action {
+            self.handle_hex_action(action, context);
         }
     }
 
     fn schedule_open_follow(&mut self, request: Request, origin: RequestOrigin) {
         if matches!(request, Request::Bytes { .. }) {
-            // Reopening a busy worker must not bind an older byte-read action
-            // to the selection or tab active when Open eventually completes.
-            if origin.selection != self.selection_generation
-                || origin.revision != self.revision
-                || origin.byte_origin.0 != self.selected
-            {
+            if !self.byte_request_current(&request, origin) {
+                self.retire_byte_request(&request, origin);
                 return;
             }
-            self.schedule_request(request);
-            if let Some(pending) = &mut self.pending {
-                pending.byte_origin = origin.byte_origin;
-            }
+            self.send_direct_at(request, origin);
         } else {
             self.schedule_request(request);
         }
@@ -1289,7 +1496,7 @@ impl DesktopApp {
                 WorkerEvent::Reply(reply) => self.receive_worker_reply(*reply, context),
             }
         }
-        self.dispatch_queued();
+        self.dispatch_queued(context);
         self.pump_discovery(context);
         self.pump_analysis(context);
         if self.pending.is_some() || self.discovery_job.is_some() {
@@ -1354,6 +1561,17 @@ impl DesktopApp {
         let _trace_context = crate::performance::context(pending.id);
         let _adoption = crate::performance::span("gui_reply_adoption");
         if let Response::Error { message } = response {
+            if matches!(pending.request, Request::Bytes { .. }) {
+                let origin = RequestOrigin {
+                    selection: pending.selection,
+                    revision: pending.revision,
+                    byte_origin: pending.byte_origin,
+                    bytes: pending.bytes,
+                };
+                self.fail_byte_request(&pending.request, origin, &message);
+                self.dispatch_queued(context);
+                return;
+            }
             self.stop_worker();
             self.status = crop(&message, 4096);
             return;
@@ -1361,6 +1579,63 @@ impl DesktopApp {
         if let Err(error) = self.validate_reply(&response) {
             self.stop_worker();
             self.status = format!("Invalid worker response: {error}; worker stopped");
+            return;
+        }
+        if let Request::Bytes {
+            address: expected,
+            length,
+        } = &pending.request
+        {
+            let Response::Bytes { address, bytes } = response else {
+                self.stop_worker();
+                self.status = "Unexpected worker response; worker stopped".into();
+                return;
+            };
+            if address != *expected
+                || bytes.len() > *length
+                || *length > MAX_BYTE_READ
+                || address.checked_add(*length as u64).is_none()
+            {
+                self.stop_worker();
+                self.status = "Unexpected worker byte response; worker stopped".into();
+                return;
+            }
+            let origin = RequestOrigin {
+                selection: pending.selection,
+                revision: pending.revision,
+                byte_origin: pending.byte_origin,
+                bytes: pending.bytes,
+            };
+            if !self.byte_request_current(&pending.request, origin) {
+                self.retire_byte_request(&pending.request, origin);
+                self.dispatch_queued(context);
+                return;
+            }
+            match pending.bytes.expect("checked byte binding").destination {
+                ByteDestination::Decode => {
+                    self.decoder.set_source(address, bytes);
+                    if self.tab == pending.byte_origin.1 {
+                        self.tab = Tab::Decode;
+                    }
+                    self.status = "Bytes loaded into decoder".into();
+                }
+                ByteDestination::HexPage { token } => {
+                    if bytes.len() != *length {
+                        self.fail_byte_request(
+                            &pending.request,
+                            origin,
+                            "Short Hex page reply. Retry to read this page.",
+                        );
+                    } else if let Err(error) = self.hex.accept(token, address, bytes) {
+                        let message = crop(&error, 4096);
+                        self.hex.fail(token, message.clone());
+                        self.status = message;
+                    } else {
+                        self.status = "Hex page loaded".into();
+                    }
+                }
+            }
+            self.dispatch_queued(context);
             return;
         }
         match (pending.request, response) {
@@ -1774,25 +2049,6 @@ impl DesktopApp {
                 }
             }
             (
-                Request::Bytes {
-                    address: expected,
-                    length,
-                },
-                Response::Bytes { address, bytes },
-            ) if address == expected && bytes.len() <= length => {
-                if pending.selection != self.selection_generation
-                    || pending.revision != self.revision
-                    || pending.byte_origin.0 != self.selected
-                {
-                    return;
-                }
-                self.decoder.set_source(address, bytes);
-                if self.tab == pending.byte_origin.1 {
-                    self.tab = Tab::Decode;
-                }
-                self.status = "Bytes loaded into decoder".into();
-            }
-            (
                 request @ (Request::Strings | Request::StringsWithOptions { .. }),
                 Response::Strings { strings, truncated },
             ) => {
@@ -1836,24 +2092,43 @@ impl DesktopApp {
                 self.status = "Unexpected worker response; worker stopped".into();
             }
         }
-        self.dispatch_queued();
+        self.dispatch_queued(context);
     }
 
-    fn dispatch_queued(&mut self) {
-        // Publish the batch inventory before processing renames/navigation, so
-        // an older batch cannot overwrite a newer acknowledged function name.
-        if self.discovery_job.is_some() {
+    fn dispatch_queued(&mut self, context: &egui::Context) {
+        // Adopt inventory before renames/navigation, then dispatch the newest
+        // byte intent before starting another automatic batch or scan.
+        if self.discovery_job.is_some() || self.pending.is_some() || self.opening.is_some() {
             return;
         }
-        if self.pending.is_none()
-            && let Some(request) = self.queue.pop_front()
-        {
-            self.schedule_request(request);
+        if let Some(request) = self.queue.pop_front() {
+            if self.client.is_none() {
+                self.request(request, context);
+            } else {
+                self.schedule_request(request);
+            }
         }
-        if self.pending.is_none()
-            && let Some((request, origin)) = self.discovery_bytes.take()
-        {
-            self.schedule_open_follow(request, origin);
+        if self.pending.is_some() || self.opening.is_some() || !self.queue.is_empty() {
+            return;
+        }
+        if let Some((request, origin)) = self.discovery_bytes.take() {
+            if !self.byte_request_current(&request, origin) {
+                self.retire_byte_request(&request, origin);
+            } else if self.client.is_some() {
+                self.schedule_open_follow(request, origin);
+            } else if let Some(path) = self.binary_path.clone() {
+                // Open still proves retained identity and hash before this
+                // original consumer/context is allowed to receive anything.
+                let continue_discovery = self.discovery_running;
+                self.start_open_at(path, true, Some(request), origin, context);
+                self.discovery_running = continue_discovery && self.client.is_some();
+            } else {
+                self.fail_byte_request(
+                    &request,
+                    origin,
+                    "No binary is available. Reopen it, then Retry.",
+                );
+            }
         }
     }
 
@@ -3061,6 +3336,7 @@ impl DesktopApp {
                     (Tab::Strings, "Defined Strings"),
                     (Tab::Crypto, "FindCrypt"),
                     (Tab::Decode, "String Decoder"),
+                    (Tab::Hex, "Hex / Memory Map"),
                     (Tab::References, "References"),
                 ] {
                     if ui.selectable_value(&mut self.tab, tab, label).clicked() {
@@ -3215,6 +3491,7 @@ impl DesktopApp {
     fn symbol_tree(&mut self, ui: &mut egui::Ui) {
         let mut function = None;
         let mut read = None;
+        let mut section_index = None;
         let mut scan_strings = false;
         ScrollArea::both()
             .id_salt("symbol-tree-scroll")
@@ -3341,7 +3618,7 @@ impl DesktopApp {
                         egui::CollapsingHeader::new(format!("Sections ({})", info.sections.len()))
                             .default_open(self.program_tree)
                             .show(ui, |ui| {
-                                for section in info.sections.iter().take(512) {
+                                for (index, section) in info.sections.iter().enumerate().take(512) {
                                     if ui
                                         .selectable_label(
                                             false,
@@ -3362,10 +3639,7 @@ impl DesktopApp {
                                         ))
                                         .clicked()
                                     {
-                                        read = Some((
-                                            section.address,
-                                            (section.size.min(128)) as usize,
-                                        ));
+                                        section_index = Some(index);
                                     }
                                 }
                             });
@@ -3379,6 +3653,9 @@ impl DesktopApp {
             self.select_instruction(address);
             self.tab = Tab::Decode;
             self.request(Request::Bytes { address, length }, &context);
+        }
+        if let Some(index) = section_index {
+            self.open_hex_section(index, &context);
         }
         if scan_strings {
             self.request(self.string_request(), &context);
@@ -4315,6 +4592,7 @@ impl DesktopApp {
             Tab::Strings => "Defined Strings",
             Tab::Crypto => "FindCrypt",
             Tab::Decode => "String Decoder",
+            Tab::Hex => "Hex / Memory Map",
             Tab::References => "References",
         };
         let filename = self
@@ -4342,6 +4620,7 @@ impl DesktopApp {
                 (Tab::Strings, "Strings"),
                 (Tab::Crypto, "FindCrypt"),
                 (Tab::Decode, "Decode"),
+                (Tab::Hex, "Hex / Memory Map"),
                 (Tab::References, "References"),
             ] {
                 theme::tab(ui, &mut self.tab, tab, name);
@@ -4566,8 +4845,7 @@ impl DesktopApp {
                     self.open_comment(address);
                 }
                 if let Some((address, bytes)) = decode {
-                    self.decoder.set_source(address, bytes);
-                    self.tab = Tab::Decode;
+                    self.decode_loaded_bytes(address, bytes);
                 }
             }
             Tab::Strings => {
@@ -4684,6 +4962,19 @@ impl DesktopApp {
                 if let Some((address, length)) = read {
                     self.select_instruction(address);
                     self.request(Request::Bytes { address, length }, &context);
+                }
+            }
+            Tab::Hex => {
+                let action = {
+                    let sections = self
+                        .info
+                        .as_ref()
+                        .map(|info| info.sections.as_slice())
+                        .unwrap_or(&[]);
+                    self.hex.show(ui, sections)
+                };
+                if let Some(action) = action {
+                    self.handle_hex_action(action, &context);
                 }
             }
             Tab::Decode => {
@@ -5040,6 +5331,7 @@ mod tests {
             selection: app.selection_generation,
             revision: app.revision,
             byte_origin: (app.selected, app.tab),
+            bytes: None,
         };
         app.string_minimum = 12;
         app.receive(
@@ -5068,6 +5360,7 @@ mod tests {
             selection: app.selection_generation,
             revision: app.revision,
             byte_origin: (app.selected, app.tab),
+            bytes: None,
         };
         let functions = app.info.as_ref().unwrap().functions.clone();
         let function_request = pending(Request::Discover);
@@ -5108,6 +5401,7 @@ mod tests {
                 selection: app.selection_generation,
                 revision: app.revision,
                 byte_origin: (app.selected, app.tab),
+                bytes: None,
             }
         }
         let mut app = keyboard_app();
@@ -5190,6 +5484,7 @@ mod tests {
                 selection: app.selection_generation,
                 revision: app.revision,
                 byte_origin: (app.selected, app.tab),
+                bytes: None,
             },
             Response::Renamed {
                 address: 0x1000,
@@ -5322,6 +5617,11 @@ mod tests {
                 selection: app.selection_generation,
                 revision: app.revision,
                 byte_origin: (app.selected, app.tab),
+                bytes: Some(ByteBinding {
+                    generation: app.generation,
+                    intent: app.byte_intent,
+                    destination: ByteDestination::Decode,
+                }),
             };
             match changed {
                 1 => app.tab = Tab::Strings,
@@ -5380,6 +5680,7 @@ mod tests {
                 selection: app.selection_generation,
                 revision: app.revision,
                 byte_origin: (app.selected, app.tab),
+                bytes: None,
             };
             let mut analysis = report.clone();
             if !valid {
@@ -5603,27 +5904,30 @@ mod tests {
 
     #[test]
     fn typing_shortcut_characters_in_a_filter_does_not_execute_commands() {
-        let context = egui::Context::default();
-        let mut app = keyboard_app();
-        keyboard_frame(&context, &mut app, vec![]);
-        context.memory_mut(|memory| memory.request_focus(egui::Id::unique("function-filter")));
-        keyboard_frame(&context, &mut app, vec![]);
-        keyboard_frame(
-            &context,
-            &mut app,
-            vec![
-                key_event(egui::Key::L, egui::Modifiers::NONE),
-                key_event(egui::Key::G, egui::Modifiers::NONE),
-                key_event(egui::Key::Semicolon, egui::Modifiers::NONE),
-                key_event(egui::Key::Space, egui::Modifiers::NONE),
-                egui::Event::Text("lg; ".into()),
-            ],
-        );
-        assert_eq!(app.function_filter, "lg; ");
-        assert!(app.browser_dialog.is_none());
-        assert!(!app.annotations_open);
-        assert!(app.tab == Tab::Listing);
-        assert!(!app.dirty());
+        for tab in [Tab::Listing, Tab::Hex] {
+            let context = egui::Context::default();
+            let mut app = keyboard_app();
+            app.tab = tab;
+            keyboard_frame(&context, &mut app, vec![]);
+            context.memory_mut(|memory| memory.request_focus(egui::Id::unique("function-filter")));
+            keyboard_frame(&context, &mut app, vec![]);
+            keyboard_frame(
+                &context,
+                &mut app,
+                vec![
+                    key_event(egui::Key::L, egui::Modifiers::NONE),
+                    key_event(egui::Key::G, egui::Modifiers::NONE),
+                    key_event(egui::Key::Semicolon, egui::Modifiers::NONE),
+                    key_event(egui::Key::Space, egui::Modifiers::NONE),
+                    egui::Event::Text("lg; ".into()),
+                ],
+            );
+            assert_eq!(app.function_filter, "lg; ");
+            assert!(app.browser_dialog.is_none());
+            assert!(!app.annotations_open);
+            assert!(app.tab == tab);
+            assert!(!app.dirty());
+        }
     }
 
     #[test]
@@ -6154,6 +6458,7 @@ mod tests {
                 selection: app.selection_generation,
                 revision: app.revision,
                 byte_origin: (app.selected, app.tab),
+                bytes: None,
             },
             Response::Graph {
                 view: original_view,
@@ -6529,6 +6834,7 @@ mod tests {
                 selection: app.selection_generation,
                 revision: app.revision,
                 byte_origin: (app.selected, app.tab),
+                bytes: None,
             },
             Response::Decompiled {
                 address: 0x1000,
@@ -6962,6 +7268,7 @@ mod tests {
             selection: 1,
             revision: 0,
             byte_origin: (None, Tab::Listing),
+            bytes: None,
         };
         app.receive(
             pending,
@@ -6984,6 +7291,7 @@ mod tests {
             selection: 2,
             revision: 0,
             byte_origin: (None, Tab::Listing),
+            bytes: None,
         };
         app.revision = 1;
         app.receive(
@@ -7011,6 +7319,7 @@ mod tests {
             selection: 0,
             revision: 0,
             byte_origin: (None, Tab::Listing),
+            bytes: None,
         });
         let frame = |app: &mut DesktopApp| {
             let mut output = context.run_ui(
@@ -7129,6 +7438,7 @@ mod tests {
             selection: app.selection_generation,
             revision: app.revision,
             byte_origin: (app.selected, app.tab),
+            bytes: None,
         };
         app.start_auto_analysis();
         app.pending = Some(pending(&app, Request::Graph { address: 0x1000 }));
@@ -7221,6 +7531,7 @@ mod tests {
             selection: app.selection_generation,
             revision: app.revision,
             byte_origin: (app.selected, app.tab),
+            bytes: None,
         });
         app.request(
             Request::Bytes {
@@ -7293,6 +7604,7 @@ mod tests {
             selection: app.selection_generation,
             revision: app.revision,
             byte_origin: (app.selected, app.tab),
+            bytes: None,
         });
         app.navigate(0x1040, true, &context);
         assert!(matches!(
@@ -7335,6 +7647,7 @@ mod tests {
             selection: app.selection_generation,
             revision: app.revision,
             byte_origin: (app.selected, app.tab),
+            bytes: None,
         });
         for stage in [
             AnalysisStage::Seeds,
@@ -7386,6 +7699,7 @@ mod tests {
             selection: 0,
             revision: 0,
             byte_origin: (None, Tab::Listing),
+            bytes: None,
         });
         app.receive_worker_reply(
             WorkerResponse {
@@ -7409,6 +7723,7 @@ mod tests {
             selection: 0,
             revision: 0,
             byte_origin: (None, Tab::Listing),
+            bytes: None,
         });
         app.receive_worker_reply(
             WorkerResponse {
@@ -7432,6 +7747,7 @@ mod tests {
             selection: 0,
             revision: 0,
             byte_origin: (None, Tab::Listing),
+            bytes: None,
         };
         app.revision += 1;
         app.receive(
@@ -7464,6 +7780,7 @@ mod tests {
                 selection: app.selection_generation,
                 revision: app.revision,
                 byte_origin: (app.selected, app.tab),
+                bytes: None,
             };
             app.receive(pending, Response::Graph { view }, &context);
             assert_eq!(app.selected, Some(pc));
@@ -7473,6 +7790,669 @@ mod tests {
             assert!(app.reference_focus.is_none());
             assert!(app.tab == Tab::Listing);
         }
+    }
+
+    /// No worker process is needed to exercise delivery order. A pending
+    /// function request holds the real GUI queue while tests deliver byte replies.
+    fn hex_app() -> DesktopApp {
+        let mut app = semantic_app();
+        app.info.as_mut().unwrap().sections = vec![
+            SectionInfo {
+                name: ".text".into(),
+                address: 0x1000,
+                size: 0x2200,
+                file_offset: 0,
+                file_size: 0x2200,
+                executable: true,
+            },
+            SectionInfo {
+                name: ".data".into(),
+                address: 0x8000,
+                size: 0x100,
+                file_offset: 0x2200,
+                file_size: 32,
+                executable: false,
+            },
+        ];
+        app.info.as_mut().unwrap().file_len = 0x2220;
+        app.pending = Some(Pending {
+            id: 99,
+            request: Request::Graph { address: 0x1000 },
+            started: Instant::now(),
+            selection: app.selection_generation,
+            revision: app.revision,
+            byte_origin: (app.selected, app.tab),
+            bytes: None,
+        });
+        app
+    }
+
+    fn deferred_bytes(app: &mut DesktopApp) -> Pending {
+        let (request, origin) = app.discovery_bytes.take().expect("deferred byte action");
+        Pending {
+            id: 100,
+            request,
+            started: Instant::now(),
+            selection: origin.selection,
+            revision: origin.revision,
+            byte_origin: origin.byte_origin,
+            bytes: origin.bytes,
+        }
+    }
+
+    fn data_page(value: u8) -> Vec<u8> {
+        let mut bytes = vec![0; 0x100];
+        bytes[..32].fill(value);
+        bytes
+    }
+
+    fn byte_payload(pending: &Pending, value: u8) -> Response {
+        let Request::Bytes { address, length } = pending.request else {
+            panic!("byte request")
+        };
+        Response::Bytes {
+            address,
+            bytes: if address == 0x8000 && length == 0x100 {
+                data_page(value)
+            } else {
+                vec![value; length]
+            },
+        }
+    }
+
+    fn assert_decoder_source(app: &mut DesktopApp, address: u64, bytes: &[u8]) {
+        let context = egui::Context::default();
+        theme::install(&context);
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| {
+            let _ = app.decoder.show(ui);
+        });
+        output.textures_delta.clear();
+        let text = rendered_text(&output);
+        assert!(
+            text.iter()
+                .any(|text| text == &format!("Source: {address:#x}, {} bytes", bytes.len())),
+            "{text:?}"
+        );
+        assert!(text.iter().any(|text| text == &hex(bytes)), "{text:?}");
+    }
+
+    #[test]
+    fn hex_section_and_decode_actions_preserve_function_context_and_project_state() {
+        let context = egui::Context::default();
+        let mut app = hex_app();
+        app.semantic.select_instruction(0x1004);
+        app.history = vec![0x1040, 0x1000];
+        app.history_index = 1;
+        let selected = app.selected;
+        let address_field = app.address.clone();
+        let selection = app.selection_generation;
+        let revision = app.revision;
+        let history = app.history.clone();
+        let code = app.decompiled.clone();
+        let mappings = serde_json::to_string(&app.semantic.mappings).unwrap();
+        let semantic_addresses = app.semantic.addresses.clone();
+        let view = serde_json::to_string(&app.view).unwrap();
+        let listing = serde_json::to_string(&app.listing).unwrap();
+        let dirty = app.dirty();
+        app.open_hex_section(1, &context);
+        assert!(app.tab == Tab::Hex);
+        let pending = deferred_bytes(&mut app);
+        assert!(matches!(
+            pending.request,
+            Request::Bytes {
+                address: 0x8000,
+                length: 0x100
+            }
+        ));
+        let response = byte_payload(&pending, 0x41);
+        app.receive(pending, response, &context);
+        assert_eq!(
+            app.hex.loaded_page(),
+            Some((0x8000, data_page(0x41).as_slice()))
+        );
+        assert!(app.tab == Tab::Hex);
+        app.handle_hex_action(
+            HexAction::Decode {
+                address: 0x8002,
+                bytes: vec![0x41; 3],
+            },
+            &context,
+        );
+        assert!(app.tab == Tab::Decode);
+        assert_decoder_source(&mut app, 0x8002, &[0x41; 3]);
+        assert_eq!(app.selected, selected);
+        assert_eq!(app.address, address_field);
+        assert_eq!(app.selection_generation, selection);
+        assert_eq!(app.revision, revision);
+        assert_eq!(app.history, history);
+        assert_eq!(app.history_index, 1);
+        assert_eq!(app.decompiled, code);
+        assert_eq!(
+            serde_json::to_string(&app.semantic.mappings).unwrap(),
+            mappings
+        );
+        assert_eq!(app.semantic.addresses, semantic_addresses);
+        assert_eq!(serde_json::to_string(&app.view).unwrap(), view);
+        assert_eq!(serde_json::to_string(&app.listing).unwrap(), listing);
+        assert_eq!(app.dirty(), dirty);
+        assert!(app.canvas.is_some());
+        assert!(app.highlighted.is_some());
+    }
+
+    #[test]
+    fn hex_destination_never_depends_on_the_tab_active_when_bytes_arrive() {
+        let context = egui::Context::default();
+        let mut app = hex_app();
+        app.decode_loaded_bytes(0x1010, vec![0xde, 0xad]);
+        app.open_hex_section(1, &context);
+        let pending = deferred_bytes(&mut app);
+        app.tab = Tab::Strings;
+        let response = byte_payload(&pending, 0x42);
+        app.receive(pending, response, &context);
+        assert!(app.tab == Tab::Strings);
+        assert_eq!(
+            app.hex.loaded_page(),
+            Some((0x8000, data_page(0x42).as_slice()))
+        );
+        assert_decoder_source(&mut app, 0x1010, &[0xde, 0xad]);
+
+        // A normal Request::Bytes still means Decode, even while Hex is visible.
+        app.tab = Tab::Hex;
+        app.request(
+            Request::Bytes {
+                address: 0x1000,
+                length: 2,
+            },
+            &context,
+        );
+        let pending = deferred_bytes(&mut app);
+        let response = byte_payload(&pending, 0x43);
+        app.receive(pending, response, &context);
+        assert!(app.tab == Tab::Decode);
+        assert_decoder_source(&mut app, 0x1000, &[0x43; 2]);
+        assert_eq!(
+            app.hex.loaded_page(),
+            Some((0x8000, data_page(0x42).as_slice()))
+        );
+    }
+
+    #[test]
+    fn stale_hex_page_and_its_late_error_cannot_replace_a_newer_page() {
+        let context = egui::Context::default();
+        for error in [false, true] {
+            for completed in [false, true] {
+                let mut app = hex_app();
+                app.open_hex_section(0, &context);
+                let old = deferred_bytes(&mut app);
+                app.open_hex_section(1, &context);
+                let mut new = Some(deferred_bytes(&mut app));
+                if completed {
+                    let pending = new.take().unwrap();
+                    let response = byte_payload(&pending, 0x42);
+                    app.receive(pending, response, &context);
+                } else {
+                    app.status = "new page pending".into();
+                }
+                app.tab = Tab::References;
+                let response = if error {
+                    Response::Error {
+                        message: "old page failed".into(),
+                    }
+                } else {
+                    byte_payload(&old, 0x41)
+                };
+                app.receive(old, response, &context);
+                assert!(app.tab == Tab::References);
+                assert_eq!(
+                    app.pending.as_ref().unwrap().id,
+                    99,
+                    "late errors must not stop the worker"
+                );
+                if let Some(pending) = new {
+                    assert!(
+                        app.hex.is_loading(),
+                        "an old error must not cancel the new pending page"
+                    );
+                    assert_eq!(app.status, "new page pending");
+                    let response = byte_payload(&pending, 0x42);
+                    app.receive(pending, response, &context);
+                }
+                assert_eq!(
+                    app.hex.loaded_page(),
+                    Some((0x8000, data_page(0x42).as_slice()))
+                );
+                assert_eq!(app.status, "Hex page loaded");
+                assert!(app.tab == Tab::References);
+            }
+        }
+    }
+
+    #[test]
+    fn a_hex_copy_and_an_instruction_copy_both_supersede_old_decoder_reads() {
+        let context = egui::Context::default();
+        for from_hex in [false, true] {
+            let mut app = hex_app();
+            app.request(
+                Request::Bytes {
+                    address: 0x1000,
+                    length: 4,
+                },
+                &context,
+            );
+            let old = deferred_bytes(&mut app);
+            if from_hex {
+                app.open_hex_section(1, &context);
+                let page = deferred_bytes(&mut app);
+                let response = byte_payload(&page, 0x55);
+                app.receive(page, response, &context);
+                app.handle_hex_action(
+                    HexAction::Decode {
+                        address: 0x8000,
+                        bytes: vec![0x55; 2],
+                    },
+                    &context,
+                );
+            } else {
+                app.decode_loaded_bytes(0x1004, vec![0x55; 2]);
+            }
+            let copied = if from_hex { 0x8000 } else { 0x1004 };
+            let intent = app.byte_intent;
+            let response = byte_payload(&old, 0x11);
+            app.receive(old, response, &context);
+            assert_decoder_source(&mut app, copied, &[0x55; 2]);
+            assert!(app.tab == Tab::Decode);
+            assert_eq!(app.byte_intent, intent);
+            assert_eq!(app.pending.as_ref().unwrap().id, 99);
+        }
+    }
+
+    #[test]
+    fn byte_context_changes_reject_pages_decoder_payloads_and_late_errors() {
+        let context = egui::Context::default();
+        for page in [false, true] {
+            for changed in 0..4 {
+                for error in [false, true] {
+                    let mut app = hex_app();
+                    app.decode_loaded_bytes(0x1010, vec![0xaa, 0xbb]);
+                    if page {
+                        app.open_hex_section(1, &context);
+                    } else {
+                        app.request(
+                            Request::Bytes {
+                                address: 0x1000,
+                                length: 2,
+                            },
+                            &context,
+                        );
+                    }
+                    let pending = deferred_bytes(&mut app);
+                    match changed {
+                        0 => {
+                            app.generation += 1;
+                            app.clear_views();
+                        }
+                        1 => app.selection_generation += 1,
+                        2 => app.revision += 1,
+                        3 => app.selected = Some(0x1008),
+                        _ => unreachable!(),
+                    }
+                    app.tab = Tab::References;
+                    app.status = "new context".into();
+                    let response = if error {
+                        Response::Error {
+                            message: "old context failed".into(),
+                        }
+                    } else {
+                        byte_payload(&pending, 0x11)
+                    };
+                    app.receive(pending, response, &context);
+                    assert!(app.hex.loaded_page().is_none());
+                    assert!(!app.hex.is_loading(), "a stale current page needs Retry");
+                    assert!(app.tab == Tab::References);
+                    assert_eq!(app.status, "new context");
+                    assert_eq!(app.pending.as_ref().unwrap().id, 99);
+                    if changed != 0 {
+                        assert_decoder_source(&mut app, 0x1010, &[0xaa, 0xbb]);
+                    }
+                }
+            }
+        }
+    }
+
+    fn retry_hex_page(app: &mut DesktopApp, context: &egui::Context) {
+        let frame = |app: &mut DesktopApp, events| {
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1000.0, 720.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| app.main_panel(ui),
+            );
+            output.textures_delta.clear();
+            output
+        };
+        let _ = frame(app, vec![]);
+        let output = frame(app, vec![]);
+        let point = output
+            .shapes
+            .iter()
+            .find_map(|shape| {
+                if let egui::epaint::Shape::Text(text) = &shape.shape
+                    && text.galley.text() == "Retry"
+                {
+                    Some(text.pos + text.galley.size() * 0.5)
+                } else {
+                    None
+                }
+            })
+            .expect("failed pages expose an explicit Retry button");
+        let _ = frame(app, pointer_events(point));
+    }
+
+    #[test]
+    fn short_page_and_byte_errors_require_an_explicit_retry_without_stopping_analysis() {
+        let context = egui::Context::default();
+        theme::install(&context);
+        for error in [false, true] {
+            let mut app = hex_app();
+            app.open_hex_section(1, &context);
+            let pending = deferred_bytes(&mut app);
+            let response = if error {
+                Response::Error {
+                    message: "page unavailable".into(),
+                }
+            } else {
+                Response::Bytes {
+                    address: 0x8000,
+                    bytes: vec![1; 0xff],
+                }
+            };
+            app.receive(pending, response, &context);
+            assert!(
+                app.hex.loaded_page().is_none(),
+                "a short page must never be padded or adopted"
+            );
+            assert!(!app.hex.is_loading());
+            assert_eq!(app.pending.as_ref().unwrap().id, 99);
+            let intent = app.byte_intent;
+            for _ in 0..3 {
+                let mut output = context.run_ui(egui::RawInput::default(), |ui| app.main_panel(ui));
+                output.textures_delta.clear();
+                assert!(
+                    app.discovery_bytes.is_none(),
+                    "painting a failed page must not retry"
+                );
+            }
+            assert_eq!(app.byte_intent, intent);
+            retry_hex_page(&mut app, &context);
+            let retry = deferred_bytes(&mut app);
+            let response = byte_payload(&retry, 0x33);
+            app.receive(retry, response, &context);
+            assert_eq!(
+                app.hex.loaded_page(),
+                Some((0x8000, data_page(0x33).as_slice()))
+            );
+        }
+    }
+
+    #[test]
+    fn cancelling_a_page_drops_queued_bytes_and_retry_gets_a_fresh_intent() {
+        let context = egui::Context::default();
+        theme::install(&context);
+        let mut app = hex_app();
+        app.open_hex_section(1, &context);
+        let old = deferred_bytes(&mut app);
+        let old_intent = app.byte_intent;
+        app.stop_worker();
+        assert!(!app.hex.is_loading());
+        assert!(app.discovery_bytes.is_none());
+        for _ in 0..3 {
+            let mut output = context.run_ui(egui::RawInput::default(), |ui| app.main_panel(ui));
+            output.textures_delta.clear();
+        }
+        assert!(app.discovery_bytes.is_none());
+        // Hold a replacement worker operation while the explicit retry queues.
+        app.pending = hex_app().pending;
+        retry_hex_page(&mut app, &context);
+        assert!(app.byte_intent > old_intent);
+        let retry = deferred_bytes(&mut app);
+        let response = byte_payload(&old, 0x11);
+        app.receive(old, response, &context);
+        assert!(
+            app.hex.is_loading(),
+            "cancelled delivery cannot finish the retry"
+        );
+        let response = byte_payload(&retry, 0x66);
+        app.receive(retry, response, &context);
+        assert_eq!(
+            app.hex.loaded_page(),
+            Some((0x8000, data_page(0x66).as_slice()))
+        );
+    }
+
+    #[test]
+    fn busy_worker_page_clicks_coalesce_without_reopening_and_keep_the_original_origin() {
+        let context = egui::Context::default();
+        for request in [
+            Request::Graph { address: 0x1000 },
+            Request::Decompile { address: 0x1000 },
+            Request::Strings,
+            Request::Crypto,
+            Request::Rename {
+                address: 0x1000,
+                name: "entry".into(),
+            },
+            Request::Bytes {
+                address: 0x1000,
+                length: 2,
+            },
+        ] {
+            let mut app = hex_app();
+            app.pending.as_mut().unwrap().request = request;
+            app.worker_epoch = 17;
+            app.queue.push_back(Request::Decompile { address: 0x1000 });
+            let selection = app.selection_generation;
+            let revision = app.revision;
+            let selected = app.selected;
+            app.open_hex_section(0, &context);
+            let old_intent = app.byte_intent;
+            app.open_hex_section(1, &context);
+            let (request, origin) = app.discovery_bytes.as_ref().unwrap();
+            assert!(matches!(
+                request,
+                Request::Bytes {
+                    address: 0x8000,
+                    length: 0x100
+                }
+            ));
+            assert!(origin.bytes.unwrap().intent > old_intent);
+            assert!(matches!(
+                origin.bytes.unwrap().destination,
+                ByteDestination::HexPage { .. }
+            ));
+            assert_eq!(origin.selection, selection);
+            assert_eq!(origin.revision, revision);
+            assert_eq!(origin.byte_origin.0, selected);
+            assert!(origin.byte_origin.1 == Tab::Hex);
+            assert_eq!(app.pending.as_ref().unwrap().id, 99);
+            assert_eq!(app.worker_epoch, 17);
+            assert!(app.opening.is_none());
+            assert_eq!(app.queue.len(), 1);
+            app.tab = Tab::Crypto;
+            let (request, origin) = app.discovery_bytes.take().unwrap();
+            app.selection_generation += 1;
+            app.pending = None;
+            app.schedule_open_follow(request, origin);
+            assert!(app.pending.is_none());
+            assert!(!app.hex.is_loading());
+            assert!(app.tab == Tab::Crypto);
+        }
+    }
+
+    #[test]
+    fn opening_and_adoption_defer_bytes_without_replacing_function_followups() {
+        let context = egui::Context::default();
+        for opening in [false, true] {
+            let mut app = hex_app();
+            if opening {
+                app.opening = Some(Opening {
+                    path: PathBuf::from("retained-image"),
+                    preserve: true,
+                    follow: Some(Request::Decompile { address: 0x1000 }),
+                    revision: app.revision,
+                    follow_origin: app.request_origin(),
+                });
+            } else {
+                app.pending = None;
+                app.discovery_job = Some(mpsc::sync_channel(1).1);
+            }
+            app.open_hex_section(0, &context);
+            app.open_hex_section(1, &context);
+            assert!(matches!(
+                app.discovery_bytes,
+                Some((
+                    Request::Bytes {
+                        address: 0x8000,
+                        length: 0x100
+                    },
+                    _
+                ))
+            ));
+            if opening {
+                assert!(matches!(
+                    app.opening.as_ref().unwrap().follow,
+                    Some(Request::Decompile { address: 0x1000 })
+                ));
+            } else {
+                assert!(app.discovery_job.is_some());
+                assert!(app.opening.is_none());
+            }
+        }
+
+        // A navigation action arriving during a byte-triggered reopen moves the
+        // original byte consumer into the same deferred slot rather than losing it.
+        let mut app = hex_app();
+        app.open_hex_section(1, &context);
+        let (read, origin) = app.discovery_bytes.take().unwrap();
+        app.opening = Some(Opening {
+            path: PathBuf::from("retained-image"),
+            preserve: true,
+            follow: Some(read),
+            revision: app.revision,
+            follow_origin: origin,
+        });
+        app.request(Request::Decompile { address: 0x1000 }, &context);
+        let (read, deferred) = app.discovery_bytes.as_ref().unwrap();
+        assert!(matches!(
+            read,
+            Request::Bytes {
+                address: 0x8000,
+                length: 0x100
+            }
+        ));
+        assert_eq!(deferred.bytes.unwrap().intent, origin.bytes.unwrap().intent);
+        assert_eq!(deferred.selection, origin.selection);
+        assert_eq!(deferred.revision, origin.revision);
+        assert!(deferred.byte_origin.1 == origin.byte_origin.1);
+    }
+
+    #[test]
+    fn invalid_byte_ranges_do_not_interrupt_a_busy_worker_or_enter_the_queue() {
+        let context = egui::Context::default();
+        let mut app = hex_app();
+        for (address, length) in [(0x1000, 0), (0x1000, MAX_BYTE_READ + 1), (u64::MAX, 2)] {
+            app.request(Request::Bytes { address, length }, &context);
+            assert!(app.discovery_bytes.is_none());
+            assert!(app.opening.is_none());
+            assert_eq!(app.pending.as_ref().unwrap().id, 99);
+            assert!(app.status.contains("Invalid byte read range"));
+        }
+    }
+
+    #[test]
+    fn malformed_stale_bytes_and_wrong_request_ids_still_stop_the_worker() {
+        let context = egui::Context::default();
+        for malformed in 0..3 {
+            let mut app = hex_app();
+            app.open_hex_section(1, &context);
+            let old = deferred_bytes(&mut app);
+            app.decode_loaded_bytes(0x1000, vec![0x90]);
+            let response = match malformed {
+                0 => Response::Bytes {
+                    address: 0x8001,
+                    bytes: vec![0; 0x100],
+                },
+                1 => Response::Bytes {
+                    address: 0x8000,
+                    bytes: vec![0; 0x101],
+                },
+                _ => Response::Crypto {
+                    matches: vec![],
+                    truncated: false,
+                },
+            };
+            app.receive(old, response, &context);
+            assert!(
+                app.pending.is_none(),
+                "protocol violations remain fatal even for stale reads"
+            );
+            assert!(app.status.contains("worker stopped"));
+            assert_decoder_source(&mut app, 0x1000, &[0x90]);
+        }
+        let mut app = hex_app();
+        app.receive_worker_reply(
+            WorkerResponse {
+                id: 98,
+                response: Response::Bytes {
+                    address: 0x1000,
+                    bytes: vec![0],
+                },
+            },
+            &context,
+        );
+        assert!(app.pending.is_none());
+        assert!(app.status.contains("unexpected request ID"));
+    }
+
+    #[test]
+    fn hex_pages_survive_ordinary_tab_paints_and_never_request_on_idle_frames() {
+        let context = egui::Context::default();
+        theme::install(&context);
+        let mut app = hex_app();
+        app.open_hex_section(1, &context);
+        let pending = deferred_bytes(&mut app);
+        let response = byte_payload(&pending, 0x77);
+        app.receive(pending, response, &context);
+        app.pending = None;
+        let intent = app.byte_intent;
+        for tab in [
+            Tab::Decode,
+            Tab::Listing,
+            Tab::Hex,
+            Tab::References,
+            Tab::Hex,
+        ] {
+            app.tab = tab;
+            for _ in 0..3 {
+                let mut output = context.run_ui(egui::RawInput::default(), |ui| app.main_panel(ui));
+                output.textures_delta.clear();
+                assert!(app.discovery_bytes.is_none());
+                assert!(app.pending.is_none());
+                assert!(app.opening.is_none());
+            }
+            assert_eq!(
+                app.hex.loaded_page(),
+                Some((0x8000, data_page(0x77).as_slice()))
+            );
+        }
+        assert_eq!(app.byte_intent, intent);
+        app.clear_views();
+        assert!(app.hex.loaded_page().is_none());
+        assert!(!app.hex.is_loading());
     }
 
     #[test]
@@ -7487,6 +8467,7 @@ mod tests {
             Tab::Strings,
             Tab::Crypto,
             Tab::Decode,
+            Tab::Hex,
             Tab::References,
         ] {
             app.tab = tab;
@@ -7519,6 +8500,7 @@ mod tests {
                 selection: 0,
                 revision: 0,
                 byte_origin: (None, Tab::Listing),
+                bytes: None,
             },
             Response::Decompiled {
                 address: 0x1000,
@@ -7559,6 +8541,7 @@ mod tests {
                     selection: 0,
                     revision: 0,
                     byte_origin: (None, Tab::Listing),
+                    bytes: None,
                 },
                 Response::Decompiled {
                     address: 0x1000,

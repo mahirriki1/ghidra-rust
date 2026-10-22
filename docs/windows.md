@@ -120,13 +120,21 @@ its hosted build; Windows test results come from local runs.
    Double-click a direct call name and return with **Alt+Left**.
 3. In Strings, find `aGVsbG8gcmV2ZXJzZXI=` and decode Base64 to `hello reverser`.
    Run FindCrypt and check the AES S-box result.
+   Open **Hex / Memory Map**, select a section, page and jump by virtual address,
+   then select bytes with click/Shift-click and use **Decode selection**. Check
+   that zero-filled tails have no file offset, gap jumps preserve the current
+   page, text-field focus suppresses global shortcuts, and switching tabs retains
+   a completed page. Page during discovery and verify cancellation requires
+   **Retry** without repeatedly reopening the worker.
 4. Save a project to a local writable directory with **Include binary in project**
    enabled. Add a comment and save again to exercise replacement. Close the binary
    after checking the comment in Listing, Graph and Decompiler and filtering it
    in **View → Annotations**. Save a local rename too; after reopening, refresh
    the function to check that its verified name is replayed.
    Reopen the `.grproj`; verify annotations, saved graph/pseudocode, and
-   selection. If discovery ran before saving, verify References and Data accesses
+   selection. Hex browsing alone must not mark the project dirty, and its page
+   and byte selection must not be restored. If discovery ran before saving,
+   verify References and Data accesses
    show **Saved analysis** on reopen. Run Discover to replace them with fresh
    results; **Analysis → Rediscover from scratch** starts another pass. Refresh
    the function to exercise a new worker for the embedded input.
