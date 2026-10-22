@@ -38,6 +38,7 @@ struct Capture {
     calls: BTreeMap<OpId, u64>,
     locals: crate::local_symbols::Locals,
     tokens: Vec<SemanticToken>,
+    prototype: Option<crate::signatures::InferredSignature>,
 }
 
 type Shared = Arc<Mutex<Capture>>;
@@ -49,6 +50,9 @@ struct CaptureAction {
     capture: Shared,
     executable: ExecutableRanges,
     renames: Vec<LocalRename>,
+    signature_context: String,
+    signature_owned: bool,
+    abi: String,
 }
 
 impl CaptureAction {
@@ -95,7 +99,14 @@ impl Action for CaptureAction {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         capture.operations.clear();
-        capture.locals = crate::local_symbols::capture(data, architecture, &self.renames)?;
+        capture.prototype = Some(crate::signatures::capture(data, architecture, &self.abi));
+        capture.locals = crate::local_symbols::capture(
+            data,
+            architecture,
+            &self.renames,
+            &self.signature_context,
+            self.signature_owned,
+        )?;
         if capture.locals.variables.is_empty() && capture.locals.warnings.is_empty() {
             capture.locals.warnings = self
                 .renames
@@ -164,7 +175,24 @@ pub fn render_with_locals(
     sections: &[SectionInfo],
     renames: &[LocalRename],
 ) -> Result<(String, Vec<CodeMapping>, SemanticInfo)> {
+    render_with_context(program, address, sections, renames, "", false)
+}
+
+pub fn render_with_context(
+    program: &mut Program,
+    address: u64,
+    sections: &[SectionInfo],
+    renames: &[LocalRename],
+    signature_context: &str,
+    signature_owned: bool,
+) -> Result<(String, Vec<CodeMapping>, SemanticInfo)> {
     crate::semantic::validate_renames(renames, Some(address)).map_err(Error::Lowlevel)?;
+    if signature_context.len() > 96 || (signature_owned && signature_context.is_empty()) {
+        return Err(Error::Lowlevel(
+            "Invalid signature rendering context".into(),
+        ));
+    }
+    let abi = program.language_id().to_string();
     let capture = Shared::default();
     let executable = ExecutableRanges::new(sections).map_err(Error::Lowlevel)?;
     let returned = ReturnedAction::default();
@@ -201,6 +229,9 @@ pub fn render_with_locals(
             capture: Arc::clone(&capture),
             executable,
             renames: renames.to_vec(),
+            signature_context: signature_context.into(),
+            signature_owned,
+            abi,
         }),
     );
     let engine = crate::performance::span("engine_decompile_inclusive");
@@ -230,6 +261,7 @@ pub fn render_with_locals(
         text.push_str(TRUNCATION_TRAILER);
     }
     let semantics = SemanticInfo {
+        prototype: capture.prototype.take(),
         tokens: std::mem::take(&mut capture.tokens),
         locals: std::mem::take(&mut capture.locals.variables),
         warnings: std::mem::take(&mut capture.locals.warnings),

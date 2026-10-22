@@ -203,6 +203,11 @@ pub struct Session {
         deserialize_with = "crate::bounded::vec::<_, _, { crate::semantic::MAX_LOCAL_RENAMES }>"
     )]
     pub local_renames: Vec<crate::semantic::LocalRename>,
+    #[serde(
+        default,
+        deserialize_with = "crate::bounded::vec::<_, _, { crate::signatures::MAX_SIGNATURES }>"
+    )]
+    pub signatures: Vec<crate::signatures::FunctionSignature>,
 }
 
 impl Session {
@@ -212,7 +217,29 @@ impl Session {
             binary_sha256: sha256,
             annotations: BTreeMap::new(),
             local_renames: Vec::new(),
+            signatures: Vec::new(),
         }
+    }
+
+    /// Minimum format that can preserve every annotation in this session.
+    pub fn needed_version(&self) -> u32 {
+        if !self.signatures.is_empty()
+            || self
+                .local_renames
+                .iter()
+                .any(|r| r.identity.engine == crate::semantic::SIGNATURE_LOCAL_FINGERPRINT)
+        {
+            3
+        } else if !self.local_renames.is_empty() {
+            2
+        } else {
+            1
+        }
+    }
+
+    /// Never downgrade a session after removing annotations or editing locals.
+    pub fn upgrade_version(&mut self) {
+        self.version = self.version.max(self.needed_version());
     }
 
     pub fn load(path: &Path, expected_sha256: &str) -> Result<Self, String> {
@@ -283,6 +310,13 @@ impl Session {
         {
             return Err("Local rename function is not executable file-backed code".into());
         }
+        if self
+            .signatures
+            .iter()
+            .any(|s| !executable.contains(s.function))
+        {
+            return Err("Signature function is not executable file-backed code".into());
+        }
         Ok(())
     }
 
@@ -294,6 +328,11 @@ impl Session {
         for rename in &self.local_renames {
             if !ranges.contains(rename.identity.function) {
                 return Err("Local rename function is outside mapped memory".into());
+            }
+        }
+        for signature in &self.signatures {
+            if !ranges.contains(signature.function) {
+                return Err("Signature function is outside mapped memory".into());
             }
         }
         for annotation in self.annotations.values() {
@@ -402,16 +441,22 @@ impl Session {
     }
 
     pub(crate) fn validate(&self) -> Result<(), String> {
-        if !matches!(self.version, 1 | 2) {
+        if !matches!(self.version, 1..=3) {
             return Err(format!(
-                "Unsupported session version {} (expected 1 or 2)",
+                "Unsupported session version {} (expected 1 to 3)",
                 self.version
             ));
         }
         if self.version == 1 && !self.local_renames.is_empty() {
             return Err("Session v1 cannot contain local names; use version 2".into());
         }
+        if self.version < self.needed_version() {
+            return Err(
+                "Session signatures and signature-context local names require version 3".into(),
+            );
+        }
         crate::semantic::validate_renames(&self.local_renames, None)?;
+        crate::signatures::validate_signatures(&self.signatures)?;
         validate_fingerprint(&self.binary_sha256)?;
         if self.annotations.len() > MAX_ANNOTATIONS {
             return Err("Session annotation count exceeds the 10000 annotation limit".into());
@@ -721,6 +766,159 @@ pub fn fingerprint(path: &Path) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn signature(function: u64) -> crate::signatures::FunctionSignature {
+        use crate::signatures::{
+            FunctionSignature, SignatureBase, SignatureParameter, SignatureType,
+        };
+        FunctionSignature {
+            function,
+            engine: crate::signatures::SIGNATURE_FINGERPRINT.into(),
+            abi: "saved-abi".into(),
+            return_type: SignatureType {
+                base: SignatureBase::I32,
+                pointer_depth: 0,
+            },
+            parameters: vec![SignatureParameter {
+                name: "buffer".into(),
+                ty: SignatureType {
+                    base: SignatureBase::U8,
+                    pointer_depth: 1,
+                },
+            }],
+        }
+    }
+
+    fn local_rename(engine: &str) -> crate::semantic::LocalRename {
+        serde_json::from_value(serde_json::json!({
+            "identity": {
+                "function": 0x1000, "engine": engine, "storage": "stack",
+                "offset": 0, "size": 4, "verification": "a".repeat(64)
+            },
+            "name": "saved_local"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn signatures_round_trip_and_versions_preserve_pending_annotations() {
+        let directory = TestDirectory::new();
+        let path = directory.path("signatures.json");
+        let hash = "a".repeat(64);
+        let mut session = Session::new(hash.clone());
+        assert_eq!(session.needed_version(), 1);
+        session
+            .local_renames
+            .push(local_rename(crate::semantic::LOCAL_FINGERPRINT));
+        session.upgrade_version();
+        assert_eq!(session.version, 2);
+        session.signatures.push(signature(0x1000));
+        // Structurally valid incompatible overrides must survive export/import.
+        session.signatures[0].engine = "older-engine".into();
+        session.upgrade_version();
+        assert_eq!(session.version, 3);
+        session.save(&path, &directory.protection()).unwrap();
+        let loaded = Session::load(&path, &hash).unwrap();
+        assert_eq!(loaded.signatures, session.signatures);
+        session.signatures.clear();
+        session.upgrade_version();
+        assert_eq!(session.version, 3);
+        session.local_renames.clear();
+        session
+            .local_renames
+            .push(local_rename(crate::semantic::SIGNATURE_LOCAL_FINGERPRINT));
+        assert_eq!(session.needed_version(), 3);
+        session.save(&path, &directory.protection()).unwrap();
+        assert_eq!(Session::load(&path, &hash).unwrap().version, 3);
+        for version in [1, 2] {
+            let bytes =
+                format!(r#"{{"version":{version},"binary_sha256":"{hash}","annotations":{{}}}}"#);
+            fs::write(&path, bytes).unwrap();
+            let legacy = Session::load(&path, &hash).unwrap();
+            assert!(legacy.signatures.is_empty() && legacy.local_renames.is_empty());
+        }
+    }
+
+    #[test]
+    fn signatures_and_context_local_identities_cannot_use_legacy_versions() {
+        let directory = TestDirectory::new();
+        let path = directory.path("misversioned.json");
+        let hash = "a".repeat(64);
+        for version in [1, 2] {
+            let mut session = Session::new(hash.clone());
+            session.version = version;
+            session.signatures.push(signature(0x1000));
+            fs::write(&path, serde_json::to_vec(&session).unwrap()).unwrap();
+            assert!(
+                Session::load(&path, &hash)
+                    .unwrap_err()
+                    .contains("version 3")
+            );
+            session.signatures.clear();
+            session
+                .local_renames
+                .push(local_rename(crate::semantic::SIGNATURE_LOCAL_FINGERPRINT));
+            fs::write(&path, serde_json::to_vec(&session).unwrap()).unwrap();
+            assert!(Session::load(&path, &hash).is_err());
+        }
+    }
+
+    #[test]
+    fn signature_json_bounds_apply_before_accepting_a_session() {
+        let mut session = Session::new("a".repeat(64));
+        session.version = 3;
+        session.signatures = (0..=crate::signatures::MAX_SIGNATURES)
+            .map(|i| signature(0x1000 + i as u64))
+            .collect();
+        let error = serde_json::from_slice::<Session>(&serde_json::to_vec(&session).unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("64-element limit"), "{error}");
+        session.signatures = vec![signature(0x1000)];
+        let parameter = session.signatures[0].parameters[0].clone();
+        session.signatures[0].parameters = vec![parameter; crate::signatures::MAX_PARAMETERS + 1];
+        assert!(serde_json::from_slice::<Session>(&serde_json::to_vec(&session).unwrap()).is_err());
+        session.signatures = (0..9)
+            .map(|i| {
+                let mut signature = signature(0x1000 + i);
+                signature.parameters = (0..32)
+                    .map(|p| {
+                        let mut parameter = signature.parameters[0].clone();
+                        parameter.name = format!("arg{p}");
+                        parameter
+                    })
+                    .collect();
+                signature
+            })
+            .collect();
+        assert!(session.validate().is_err());
+    }
+
+    #[test]
+    fn signatures_require_exact_executable_file_backed_addresses() {
+        let mut session = Session::new("a".repeat(64));
+        session.version = 3;
+        session.signatures.push(signature(0x1000));
+        let sections = vec![SectionInfo {
+            name: ".text".into(),
+            address: 0x1000,
+            size: 16,
+            file_offset: 0,
+            file_size: 8,
+            executable: true,
+        }];
+        session.validate_ranges(&sections).unwrap();
+        session.signatures[0].function = 0x1007;
+        session.validate_ranges(&sections).unwrap();
+        for function in [0xfff, 0x1008, 0x1010, u64::MAX] {
+            session.signatures[0].function = function;
+            assert!(session.validate_ranges(&sections).is_err(), "{function:#x}");
+        }
+        session.signatures[0].function = 0x1000;
+        let mut sections = sections;
+        sections[0].executable = false;
+        assert!(session.validate_ranges(&sections).is_err());
+    }
 
     #[test]
     fn export_rechecks_active_project_identity_after_temporary_file_is_written() {
@@ -1101,7 +1299,7 @@ mod tests {
                 .unwrap_err()
                 .contains("Invalid session JSON")
         );
-        for version in [0, 3, u32::MAX] {
+        for version in [0, 4, u32::MAX] {
             fs::write(
                 &path,
                 format!(r#"{{"version":{version},"binary_sha256":"{hash}","annotations":{{}}}}"#),
@@ -1161,7 +1359,7 @@ mod tests {
             "decode_payload"
         );
         let saved = fs::read(&path).unwrap();
-        replacement.version = 3;
+        replacement.version = 4;
         assert!(replacement.save(&path, &directory.protection()).is_err());
         assert_eq!(fs::read(&path).unwrap(), saved);
         assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 2);
