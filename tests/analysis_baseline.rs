@@ -2,172 +2,26 @@
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod common;
 mod inventory;
+mod measurement;
 
 use ghidra_rust::client::{WorkerClient, WorkerEvent};
 use ghidra_rust::model::{Request, Response};
 use ghidra_rust::{project, selection, session};
+use measurement::{Memory, SAMPLE_INTERVAL, Sampler, birth};
 use object::{Object, ObjectSymbol};
-use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-const SAMPLE_INTERVAL: Duration = Duration::from_millis(10);
 const REPEATS: usize = 3;
-const MAX_PROCESSES: usize = 16;
-const MAX_THREADS: usize = 256;
 
-#[derive(Clone, Copy, Debug, Serialize)]
-struct Memory {
-    processes: usize,
-    rss_kib: u64,
-    pss_kib: u64,
+trait BaselineRequest {
+    fn request(&mut self, worker: &mut WorkerClient, request: Request) -> (Response, f64, Memory);
 }
 
-struct Sampler {
-    last: Instant,
-    samples: usize,
-    peak_rss_kib: u64,
-    peak_pss_kib: u64,
-    max_processes: usize,
-    // Birth ticks distinguish our descendants from later PID reuse. We never
-    // signal a sampled PID; WorkerClient owns termination and reaping.
-    children: BTreeMap<u32, u64>,
-}
-
-fn birth(pid: u32) -> Option<u64> {
-    process_state(pid).map(|state| state.0)
-}
-
-fn process_state(pid: u32) -> Option<(u64, char)> {
-    let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
-        Ok(stat) => stat,
-        Err(error)
-            if error.kind() == std::io::ErrorKind::NotFound
-                || error.raw_os_error() == Some(libc::ESRCH) =>
-        {
-            return None;
-        }
-        Err(error) => panic!("Cannot inspect process {pid}: {error}"),
-    };
-    // comm can contain spaces and ')'; fields after the final ')' start at3.
-    let mut fields = stat
-        .rsplit_once(')')
-        .expect("Kernel process comm")
-        .1
-        .split_whitespace();
-    let state = fields.next().unwrap().chars().next().unwrap();
-    let ticks = fields
-        .nth(18)
-        .unwrap()
-        .parse()
-        .expect("Kernel process birth ticks");
-    Some((ticks, state))
-}
-
-fn process_tree() -> Vec<u32> {
-    let mut pending = VecDeque::from([std::process::id()]);
-    let mut processes = BTreeSet::new();
-    while let Some(pid) = pending.pop_front() {
-        if !processes.insert(pid) {
-            continue;
-        }
-        assert!(
-            processes.len() <= MAX_PROCESSES,
-            "Unexpected process count in baseline"
-        );
-        let tasks = match fs::read_dir(format!("/proc/{pid}/task")) {
-            Ok(tasks) => tasks,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => panic!("Cannot enumerate baseline process threads: {error}"),
-        };
-        // The worker is spawned from a test thread, not necessarily the thread
-        // group leader. Reading only /task/<pid>/children misses that worker.
-        for (index, task) in tasks.enumerate() {
-            assert!(index < MAX_THREADS, "Unexpected thread count in baseline");
-            let path = task.unwrap().path().join("children");
-            let children = match fs::read_to_string(path) {
-                Ok(children) => children,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => panic!("Cannot enumerate baseline children: {error}"),
-            };
-            for child in children.split_whitespace() {
-                pending.push_back(child.parse().expect("Kernel child PID"));
-            }
-        }
-    }
-    processes.into_iter().collect()
-}
-
-fn kib(text: &str, key: &str) -> u64 {
-    let value = text
-        .lines()
-        .find_map(|line| line.strip_prefix(key))
-        .unwrap_or_else(|| panic!("Missing {key} memory metric"));
-    let mut fields = value.split_whitespace();
-    let amount = fields.next().unwrap().parse().expect("Kernel memory count");
-    assert_eq!(fields.next(), Some("kB"));
-    amount
-}
-
-impl Sampler {
-    fn new() -> Self {
-        Self {
-            last: Instant::now(),
-            samples: 0,
-            peak_rss_kib: 0,
-            peak_pss_kib: 0,
-            max_processes: 0,
-            children: BTreeMap::new(),
-        }
-    }
-
-    fn sample(&mut self) -> Memory {
-        let mut memory = Memory {
-            processes: 0,
-            rss_kib: 0,
-            pss_kib: 0,
-        };
-        for pid in process_tree() {
-            let Some((start, state)) = process_state(pid) else {
-                continue;
-            };
-            if pid != std::process::id() {
-                self.children.insert(pid, start);
-            }
-            if matches!(state, 'Z' | 'X') {
-                continue;
-            }
-            let maps = match fs::read_to_string(format!("/proc/{pid}/smaps_rollup")) {
-                Ok(maps) => maps,
-                // A process which exited during enumeration has no resident
-                // pages to attribute. Permission failures must not become zero.
-                Err(_)
-                    if process_state(pid).is_none_or(|(_, state)| matches!(state, 'Z' | 'X')) =>
-                {
-                    continue;
-                }
-                Err(error) => panic!("Cannot measure process {pid}: {error}"),
-            };
-            if birth(pid) != Some(start) {
-                continue;
-            }
-            memory.processes += 1;
-            memory.rss_kib = memory.rss_kib.checked_add(kib(&maps, "Rss:")).unwrap();
-            memory.pss_kib = memory.pss_kib.checked_add(kib(&maps, "Pss:")).unwrap();
-        }
-        assert!(memory.processes > 0);
-        self.last = Instant::now();
-        self.samples += 1;
-        self.peak_rss_kib = self.peak_rss_kib.max(memory.rss_kib);
-        self.peak_pss_kib = self.peak_pss_kib.max(memory.pss_kib);
-        self.max_processes = self.max_processes.max(memory.processes);
-        memory
-    }
-
+impl BaselineRequest for Sampler {
     fn request(&mut self, worker: &mut WorkerClient, request: Request) -> (Response, f64, Memory) {
         let start = Instant::now();
         let id = worker.send(request).unwrap();
@@ -335,7 +189,7 @@ fn profile_contained_analysis_client() {
         let input_sha256 = session::fingerprint(&fixture.path).unwrap();
         let input_bytes = fs::metadata(&fixture.path).unwrap().len();
         for repeat in 1..=REPEATS {
-            let mut sampler = Sampler::new();
+            let mut sampler = Sampler::new(std::process::id());
             let before_start = sampler.sample();
             let start = Instant::now();
             let mut worker = WorkerClient::start_using_executable(

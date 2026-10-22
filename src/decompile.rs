@@ -22,6 +22,10 @@ use ghidra_decompiler::space::SpaceRef;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
+/// Appended to decompiler text cut at the prototype size limit.
+pub const TRUNCATION_TRAILER: &str =
+    "\n/* Decompiler output truncated at the 2 MiB prototype limit. */\n";
+
 const MAX_CAPTURED_OPS: usize = 131_072;
 const MAX_STATEMENT_DEPTH: usize = 256;
 const TEXT_BUDGET: usize = MAX_DECOMPILED_BYTES - 100;
@@ -223,7 +227,7 @@ pub fn render_with_locals(
     let mappings = flatten(std::mem::take(&mut capture.spans), &text);
     flattening.finish(mappings.len() as u64);
     if capture.truncated {
-        text.push_str("\n/* Decompiler output truncated at the 2 MiB prototype limit. */\n");
+        text.push_str(TRUNCATION_TRAILER);
     }
     let semantics = SemanticInfo {
         tokens: std::mem::take(&mut capture.tokens),

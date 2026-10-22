@@ -97,7 +97,9 @@ independent decoder comparison, not a Ghidra differential run.
 On x86-64 it also compares the original global read/write fixture's source PCs,
 access kinds and widths against GNU objdump's resolved RIP-relative operands.
 Ghidra differential runs require a separately available built runtime; these
-tests do not build or change the read-only source checkout.
+tests do not build or change the read-only source checkout. The
+[differential benchmark](#differential-comparison-with-ghidra) below is the
+cross-tool workflow.
 
 No improvement over Ghidra follows from these numbers or from using Rust.
 A cross-tool comparison must use identical input hashes and selected addresses,
@@ -105,6 +107,149 @@ comparable pass scope/settings, native platform details, process-tree memory,
 and complete timings including each tool's startup and analysis. A separate
 desktop measurement must include the actual GUI and its workers before making
 desktop efficiency claims.
+
+## Differential comparison with Ghidra
+
+The opt-in Linux x86-64 differential benchmark analyzes identical inputs with
+the production contained worker and with a separately installed Ghidra, then
+reports quality and cost side by side. It measures; it does not establish that
+either tool is better. Download and verify an official
+[Ghidra release](https://github.com/NationalSecurityAgency/ghidra/releases)
+outside this repository (the benchmark was developed against 12.1.4 with
+OpenJDK 27), then run:
+
+```sh
+GHIDRA_RUST_BENCH_GHIDRA_HOME="$HOME/tools/ghidra_12.1.4_PUBLIC" \
+GHIDRA_RUST_BENCH_REPEATS=3 \
+  cargo +1.98.1 test --release --locked --test ghidra_differential \
+  benchmark_against_ghidra -- --exact --ignored --nocapture --test-threads=1
+```
+
+GCC, binutils (`strip`, `objdump`), Python 3, bubblewrap and a Java runtime
+accepted by the selected Ghidra are required. `JAVA_HOME` is honored when set.
+Optional variables:
+
+- `GHIDRA_RUST_BENCH_REPEATS`: 1–20 repetitions per tool and input (default 3).
+- `GHIDRA_RUST_BENCH_CASE`: one corpus case, for example `O2-pie-stripped`.
+- `GHIDRA_RUST_BENCH_INPUT`: a trusted external x86-64 ELF analyzed in place
+  instead of the corpus. It has no ground truth, so only cross-tool overlap,
+  decompilation outcomes and cost are reported.
+- `GHIDRA_RUST_BENCH_ADDRESSES`: up to 32 comma-separated `0x` virtual
+  addresses to decompile in the external input (default: its entry point).
+
+Each run writes a new `target/ghidra-differential/run-*` directory containing
+generated inputs, `truth-*.json`, one directory per tool run (request, export,
+process log, and Ghidra's headless and script logs), `suite.json`, and the
+comparator's `report.json` and `report.txt`. Ghidra's per-run project, settings,
+cache and temporary directories are deleted after each run is measured. The test fails after writing every
+report if any run failed, timed out or produced no export; failures are kept.
+
+### Corpus and ground truth
+
+`tests/fixtures/differential/` holds original C: dense and sparse switches,
+indirect and tail calls, standard and custom no-return calls, recursion,
+static helpers, globals, strings, and 300 distinct functions reachable only
+through a retained pointer table. GCC builds it at `-O0` and `-O2`, PIE and
+non-PIE (`-Wall -Wextra -Werror`, no `-g`); `strip --strip-all` produces a
+stripped copy of each, giving eight inputs. The generated binaries are never
+executed. Truth comes from the unstripped build: defined `STT_FUNC` symbols in
+executable sections (aliases merged) and direct `call` instructions decoded by
+GNU objdump. The harness checks that stripping left the entry point and every
+allocated section's address, size and contents unchanged, so this truth also
+applies to the stripped copy. Truth also records which constructs survived
+compilation (indirect jumps, indirect calls, direct tail jumps); source text
+alone does not establish them.
+
+Before either tool runs, the harness fixes up to 32 decompilation targets per
+configuration: every authored construct function and `main`, then evenly spaced
+members of the 300-function bank. Both tools receive the same ordered list.
+
+### What each tool runs
+
+The ghidra-rust arm re-executes the test binary as a fresh client process per
+repetition. It starts the production bubblewrap-contained worker; missing
+containment is a failure, never an unrestricted fallback. It opens the input,
+then runs resumable discovery from the production inventory and entry point to
+queue exhaustion (300-second ceiling). Truth symbols and requested addresses are
+not seeds. Inventories and call evidence are frozen before decompilation, because
+decompilation can name or create functions. A requested address absent from the
+frozen inventory is `not_discovered`; no function is forced into existence.
+Requests keep the production 30-second deadline. A timed-out or failed worker is
+not reused, so later targets are `not_attempted_after_failure`.
+
+The Ghidra arm runs `support/analyzeHeadless` with a fresh project, settings,
+cache and temporary directories under the run directory, removes inherited JVM
+option variables, and passes `-loader ElfLoader -loader-loadLibraries false
+-max-cpu 1 -analysisTimeoutPerFile 300` with a 2 GiB heap. Ghidra's **default
+analyzer selection** is used and every analyzer option is recorded. This profile
+(`ghidra-default-analyzers-cpu1`) is not a matched scope: Ghidra runs many more
+analyses than ghidra-rust's direct-call discovery. `scripts/ghidra/DifferentialExport.java`
+is original benchmark tooling executed by that installation as a pre- and
+post-analysis script; the desktop never loads it, and it adds no Java dependency
+to the application. Its pre-script verifies the imported program's SHA-256.
+Its post-script freezes the function and call inventories, then decompiles the
+requested set with a 30-second timeout each.
+
+Ghidra rebases ELF images (64-bit PIE to `0x100000` by default). Exports use
+**canonical RVAs** relative to the minimum `PT_LOAD` address. Ghidra addresses
+are first corrected by `image base − ELF original image base`, and the script
+fails if that original base differs from the independently parsed `PT_LOAD`
+minimum. Exports keep raw addresses, which the comparator checks against each
+RVA. Reported executable blocks are compared with the ELF's section addresses
+and file offsets.
+
+### Quality metrics
+
+Function matching is exact entry-address equality; names, nearest addresses and
+pseudocode similarity never establish a match. The **primary scope** is the
+authored `bench_*` functions and `main`, including compiler-created clones such
+as `.cold` parts. Recall is the fraction of their entries a tool reports.
+Precision counts only tool entries inside nonzero authored symbol extents; an
+entry elsewhere is not proven false merely because corpus symbols do not
+describe it. Zero denominators are reported as unavailable. C runtime startup
+functions form a separate runtime-recall stratum, and the report includes
+whole-image symbol recall and the number of entries outside all symbols.
+
+Call metrics compare exact (source instruction, literal destination) pairs for
+direct `call` instructions inside primary extents, separately for PLT and internal
+destinations. Thunks are not followed. Ghidra can override a jump's flow into a
+call during analysis (tail calls, PLT jumps); the script labels those
+`flow_override`, and the comparator counts them without scoring them as calls.
+Indirect calls are excluded from call truth.
+
+Each requested decompilation has exactly one status: `success`,
+`not_discovered`, `timeout`, `error`, `cancelled`, `output_truncated` or
+`not_attempted_after_failure`. Success is also reported relative to discovered
+targets. For targets where both tools succeed untruncated, the comparator strips
+comments and whitespace and renames identifiers by first occurrence, keeping
+keywords, operators, literals and strings. It reports normalized exact matches
+and token-trigram Dice similarity. This is **diagnostic text similarity, not
+semantic equivalence or decompiler correctness**. Exports retain at most 256 KiB
+of C per function and 8 MiB per run.
+
+### Cost metrics and limits
+
+Wall time runs from process spawn to exit. It includes the Rust client and
+worker startup, or the JVM launcher, script compilation, import, analysis,
+export and project deletion. Exports add per-phase timings from each tool's own
+clock. Ghidra's pure import time is not available from script boundaries. The
+reported JVM uptime at the pre-script covers JVM startup, import and preparation.
+Memory uses the same `/proc` sampler as the baseline, rooted at each launched
+process: it follows every descendant, including bubblewrap supervisors, the JVM
+and Ghidra's native decompiler. It records the peak contemporaneous RSS/PSS sum,
+sample count, largest gap and collection time. Distributions use nearest-rank
+percentiles; with three repetitions p95 is the maximum. Raw values are retained.
+
+Repetitions interleave the two tools for each input and alternate which tool
+starts per input. Application caches are fresh per run; filesystem caches are
+uncontrolled. Ghidra runs **without** the worker's sandbox, so external inputs
+must be trusted. Its 2 GiB heap limit is not equivalent to the worker's 2 GiB
+address-space limit. The Ghidra release and the pinned engine's upstream
+decompiler baseline differ. Results describe this corpus, compiler and host.
+Other compilers, C++, PE, Mach-O, AArch64 and real-world programs need separate
+inputs before broader conclusions. `python3 -I scripts/compare-ghidra-benchmark.py
+--suite SUITE.json --format table` re-renders a report; `--rust`, `--ghidra` and
+optional `--truth` compare one export pair as JSON.
 
 ## Native Windows phase tracing and desktop sampling
 
