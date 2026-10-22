@@ -404,6 +404,7 @@ pub fn operation(request: &crate::model::Request) -> &'static str {
         Decompile { .. } | DecompileWithLocals { .. } => "decompile",
         Discover | DiscoverBatch { .. } => "discover",
         SyncFunctions { .. } => "sync_functions",
+        SyncSignatures { .. } => "sync_signatures",
         Rename { .. } => "rename",
         Bytes { .. } => "bytes",
         Strings | StringsWithOptions { .. } => "strings",

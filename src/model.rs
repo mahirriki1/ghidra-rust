@@ -618,6 +618,15 @@ pub enum Request {
         )]
         functions: Vec<FunctionInfo>,
     },
+    /// Complete prototype state, accepted only before this worker analyzes code.
+    SyncSignatures {
+        binary_sha256: String,
+        context: String,
+        #[serde(
+            deserialize_with = "crate::bounded::vec::<_, _, { crate::signatures::MAX_SIGNATURES }>"
+        )]
+        signatures: Vec<crate::signatures::FunctionSignature>,
+    },
     Rename {
         address: u64,
         name: String,
@@ -631,6 +640,13 @@ pub enum Request {
         minimum_length: usize,
     },
     Crypto,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignatureStatus {
+    pub function: u64,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -661,6 +677,14 @@ pub enum Response {
         batch: DiscoveryBatch,
     },
     FunctionsSynced,
+    SignaturesSynced {
+        binary_sha256: String,
+        context: String,
+        #[serde(
+            deserialize_with = "crate::bounded::vec::<_, _, { crate::signatures::MAX_SIGNATURES }>"
+        )]
+        unapplied: Vec<SignatureStatus>,
+    },
     Progress {
         progress: AnalysisProgress,
     },

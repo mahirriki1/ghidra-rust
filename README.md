@@ -170,9 +170,32 @@ Absent, ambiguous, changed or incompatible identities remain saved and visibly
 **not applied**; refresh cannot redirect them to a different variable. Ctrl+Z
 undoes local renames alongside other annotations. At most 64 overrides per
 function and 4,096 per session are supported. JSON v1 annotations remain readable;
-annotations containing local names use v2 so older clients reject them. Engine
+annotations containing legacy local names use v2 so older clients reject them. Engine
 cache mismatches retain overrides for inspection, but incompatible identities
 are never applied automatically.
+
+Use **Signature…** above the Decompiler, its function context menu, or the
+annotation editor to edit the current function. The structured editor starts
+from engine-recovered types; unsupported inferred types stay visible and require
+an explicit supported choice.
+
+Function signature editing supports `void`, signed and unsigned 8/16/32/64-bit
+integers, and pointers to these types with at most four pointer levels. Scalar
+`void` is a return type only. Signatures use the current binary's ABI; alternate
+calling conventions, floating-point types, aggregates, arrays and variadic
+prototypes are unsupported. Each signature has at most 32 named parameters, using
+distinct C identifiers of 1–64 ASCII bytes. A session holds at most 64 function
+signatures, 256 parameters in total, and 48 KiB of serialized signature data.
+All saved signatures are installed before any caller analysis; known direct
+calls use the callee's types and ordered parameters. Indirect calls, external
+imports and thunk propagation are outside this support. Apply, remove and undo
+verify a fresh worker and replay the complete state before committing the edit.
+These edits clear graph, decompiler and discovery/reference results; byte-based
+string and crypto scans remain. A canceled or failed edit retains the committed
+state and attempts one fresh recovery. Saved incompatible or missing-entry
+overrides remain available and visibly **not applied**. Signatures and local identities recovered under signature context
+use JSON v3; JSON v1/v2 remain readable. This is a bounded function-prototype
+editor, not general type or variable-storage editing.
 
 ## Current workflow
 
@@ -267,7 +290,8 @@ UPX PE layout, not every packer or modified stub.
 ## Project files
 
 **File → Save project** or **Ctrl+S** creates a single SQLite `.grproj` file.
-It stores function names, local-variable name overrides, comments, decoded annotations, the known function list,
+It stores function names, local-variable name overrides, function signatures,
+comments, decoded annotations, the known function list,
 the current function's graph/listing and pseudocode, string/crypto scan results,
 committed discovery results (per-function status, call and data references, and
 counters), and the selected address. It is a snapshot of these results; it does
@@ -276,9 +300,10 @@ previously visited functions. The engine reopens the binary before accepting sav
 results. Reopened references are labeled **Saved analysis**; **Discover** replaces
 them with a fresh run instead of resuming from saved statuses. Saved function
 lists retain their saved-result provenance until recomputed. Projects are written
-as version 3; earlier releases reject them, while version 1 and 2 projects still open.
-The semantic-token upgrade refreshes older analysis caches while retaining their
-annotations and embedded binary; rerun discovery to rebuild saved references.
+as version 4; earlier releases reject them, while version 1–3 projects still open.
+The signature-context upgrade refreshes older graph, decompiler and discovery
+caches while retaining their annotations and embedded binary; rerun discovery
+to rebuild saved references.
 Graph exits and call targets outside every mapped section, such as a fallthrough
 past the end of `.text` after a no-return call, are saved as unresolved.
 
@@ -289,7 +314,10 @@ project explicitly asks you to locate the binary and verifies its SHA-256.
 Stored source paths are display hints and are never opened automatically.
 **Save project as** creates another copy. Saved graph/pseudocode is marked
 **Saved analysis**; **Analysis → Refresh function** recomputes it. A changed
-engine fingerprint discards cached results and retains compatible annotations.
+engine or signature fingerprint discards affected cached results and retains
+annotations, including pending signature overrides. Graph, decompiler and
+discovery caches are bound to the complete saved signature state, including
+parameter names, types, order and ABI.
 
 Saving builds and syncs a new database beside the destination, then replaces the
 destination atomically. A complete project needs no `.rep`, WAL, or other database
@@ -308,8 +336,8 @@ C++ and Rust binaries use the supported machine-code analysis path. Available
 symbol demangling comes from the upstream engine; MSVC demangling, sophisticated
 class/trait recovery, and reconstruction of original source are not provided.
 Decompiler location links refer to machine instructions in the current function;
-they do not provide source-level variable/type editing or recovery of the
-original source language.
+they do not recover the original source language. Function signature editing
+has the limited prototype scope described above.
 
 ## Responsiveness and boundaries
 
@@ -438,9 +466,10 @@ imported API prototypes, library signature matching, delay imports, and Windows
 Control Flow Guard substitutions remain incomplete. Known hexadecimal addresses remain navigable.
 The PE integration tests check named exports and recovery after exports are removed.
 
-The architecture/ABI, confirmed-call, ARM64 PE and semantic-token fingerprints invalidate
-older saved graph/decompiler caches when a project reopens; compatible annotations are
-retained. Project v3 and JSON v2 preserve local renames; older formats remain readable.
+The architecture/ABI, confirmed-call, ARM64 PE, semantic-token and signature
+fingerprints invalidate older saved graph/decompiler caches when a project
+reopens; compatible annotations are retained. Project v4 and JSON v3 preserve
+signatures and local renames; older formats remain readable.
 When comparing
 against a Ghidra project, compare the recorded executable SHA-256 and the selected
 function address. An installed program can change at the same path after an update.
@@ -451,6 +480,6 @@ can still remain blocked, but repeated cancellations cannot accumulate reader th
 Final publication is not relative to retained directory handles; same-user parent
 directory substitutions and Windows delete-sharing renames remain residual races.
 Existing Java plugins, a general plugin SDK, Python scripting, a user-facing CLI,
-debugger integration, type editing, arbitrary variable-storage editing, automatic custom decryption, and
+debugger integration, general type editing, arbitrary variable-storage editing, automatic custom decryption, and
 Ghidra project import are later work. Performance improvements over Ghidra have
 not yet been measured.

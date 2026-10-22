@@ -61,6 +61,7 @@ fn protocol(
             crate::limits::begin_request()?;
         }
         let request_id = request.id;
+        let signature_sync = matches!(request.request, Request::SyncSignatures { .. });
         let _trace_context = crate::performance::context(request_id);
         let execution = crate::performance::span(crate::performance::operation(&request.request));
         let result =
@@ -102,6 +103,11 @@ fn protocol(
                 }
             }
         };
+        // A rejected prototype installation may have mutated engine type locks.
+        // No request may observe that worker's partial state.
+        if signature_sync && matches!(response, Response::Error { .. }) {
+            loaded = None;
+        }
         execution.finish(0);
         crate::performance::event(
             "request_result_error",
