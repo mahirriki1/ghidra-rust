@@ -114,6 +114,10 @@ plain text while retaining the complete pseudocode for copying.
 - **G:** go to a hexadecimal address or an exact known function/label name.
 - **;:** open the comment editor at the selected address.
 - **Space:** switch Listing / Function Graph.
+- **X:** show references to the selection's exact target: a decompiler call
+  token's target, the call and data targets of the selected instructions, or else
+  the selected address or function. When a selection has several targets, the
+  **References** tab lists them for an explicit choice.
 - **Alt+Left / Alt+Right:** history, also available through the top arrow buttons.
 - **Ctrl+S / Ctrl+Z:** save project / undo an annotation outside text editors
   (Command on macOS).
@@ -246,6 +250,21 @@ editor, not general type or variable-storage editing.
   pointers, and values carried across branches or calls are unresolved. Coverage
   is limited to the functions examined in committed discovery batches in this
   session.
+- Right-click an instruction in the Listing or Function Graph, a decompiler
+  expression, a function name, or a Functions entry and choose **Xrefs to…**, or
+  press **X**. Targets come only from decoded call sites, a decompiler call
+  token's engine target, and confirmed call/data evidence at that exact
+  instruction; a decompiler expression mapped to several
+  instructions offers each distinct target. **References** then inspects that
+  exact address independently of the displayed function until **Current
+  function** is chosen, or enter an exact hex address and press **Show xrefs**.
+  Filter calls by direction or accesses by read/write, and filter rows by known
+  function name or hexadecimal address. Names only filter and label rows; they
+  never create references. Opening a call or access site records that exact
+  instruction in Back/Forward history. Right-click a string for confirmed
+  accesses that begin exactly at its first byte; accesses to later bytes and
+  pointers to the string are not recorded. An empty result does not establish
+  that no references exist.
 - Scan mapped bytes for ASCII and a printable ASCII subset of UTF-16LE strings.
   The tree shows **not scanned** until a scan runs. This is not complete Unicode
   or Rust string-slice recovery. **Analysis notes** shows loading and coverage limits.

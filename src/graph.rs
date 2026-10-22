@@ -53,6 +53,9 @@ pub struct GraphCanvas {
     needs_initial_view: bool,
     reveal: Option<u64>,
     comment_key: Option<(u64, u64)>,
+    /// The instruction under the last secondary click, kept while its context
+    /// menu stays open and the pointer moves. Reset with the function.
+    context: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -85,6 +88,7 @@ impl GraphCanvas {
             needs_initial_view: true,
             reveal: None,
             comment_key: None,
+            context: None,
         }
     }
 
@@ -116,15 +120,18 @@ impl GraphCanvas {
         view: &FunctionView,
         selected: Option<u64>,
     ) -> Option<GraphAction> {
-        self.show_selected(ui, view, selected, &BTreeSet::new())
+        self.show_selected(ui, view, selected, &BTreeSet::new(), |_, _| {})
     }
 
+    /// `menu` fills the canvas context menu for the instruction captured by
+    /// the opening secondary click, or `None` outside every block.
     pub fn show_selected(
         &mut self,
         ui: &mut egui::Ui,
         view: &FunctionView,
         selected: Option<u64>,
         related: &BTreeSet<u64>,
+        menu: impl FnOnce(&mut egui::Ui, Option<u64>),
     ) -> Option<GraphAction> {
         if self.function != view.address {
             *self = Self::new(view);
@@ -250,6 +257,10 @@ impl GraphCanvas {
             }
         }
         let mut clicked = None;
+        let secondary = response.secondary_clicked();
+        if secondary {
+            self.context = None;
+        }
         for node in &self.layout.nodes {
             let rect = Rect::from_min_max(screen(node.rect.min), screen(node.rect.max));
             if !rect.intersects(canvas) {
@@ -369,7 +380,18 @@ impl GraphCanvas {
                 let address = node.hit_at(pos2(world.x, world.y), self.zoom, first_row);
                 clicked = Some(instruction_action(view, address, response.double_clicked()));
             }
+            if secondary
+                && let Some(pointer) = response.interact_pointer_pos()
+                && rect.contains(pointer)
+            {
+                let world = ((pointer - canvas.min) - self.pan) / self.zoom;
+                let address = node.hit_at(pos2(world.x, world.y), self.zoom, first_row);
+                self.context = Some(address);
+                clicked = Some(GraphAction::Select(address));
+            }
         }
+        let context = self.context;
+        response.context_menu(|ui| menu(ui, context));
         clicked
     }
 
