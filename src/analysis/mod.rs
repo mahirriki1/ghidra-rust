@@ -324,20 +324,13 @@ impl LoadedProgram {
         if info.format == "ELF" && !info.functions_truncated {
             rejected |= recover_elf_main(&mut program, &mut info, &target, &snapshot)?;
         }
-        let mut no_return = {
-            let alignment = target.instruction_alignment;
-            let sections = &info.sections;
-            crate::no_return::NoReturnIndex::build(
-                &program,
-                &info.format,
-                target.pointer_bytes as u32,
-                &pe_imports,
-                |address| {
-                    address.is_multiple_of(alignment)
-                        && executable(sections, address, alignment as usize)
-                },
-            )
-        };
+        let mut no_return = crate::no_return::NoReturnIndex::build(
+            &program,
+            &info.format,
+            target.pointer_bytes as u32,
+            &pe_imports,
+            |address| crate::call_analysis::code_address(&info, address),
+        );
         if info.format == "ELF" {
             no_return.add_startup_slots(
                 crate::elf_startup::libc_start_slots(&snapshot, &info.architecture)
@@ -824,8 +817,13 @@ impl LoadedProgram {
             let sections = &self.info.sections;
             let pe_ranges = &self.pe_ranges;
             let mut walk = decoding.measure(|| {
-                let mut walk = Walk::new(&self.program, sections, address, Some(&mut data))?
-                    .with_no_return(&self.no_return);
+                let mut walk = Walk::new(
+                    &self.program,
+                    sections,
+                    address,
+                    &self.no_return,
+                    Some(&mut data),
+                )?;
                 walk.run(
                     &self.program,
                     &Bounds {
@@ -1582,9 +1580,8 @@ pub(crate) mod tests {
             &BTreeMap::new(),
             |_| true,
         ));
-        let mut walk = Walk::new(&loaded.program, &loaded.info.sections, 0x1000, None)
-            .unwrap()
-            .with_no_return(&index);
+        let mut walk =
+            Walk::new(&loaded.program, &loaded.info.sections, 0x1000, &index, None).unwrap();
         walk.run(
             &loaded.program,
             &Bounds {
@@ -2246,7 +2243,7 @@ pub(crate) mod tests {
             }];
             let is_function = |address| known.contains(&address);
             let mut remaining = MAX_INSTRUCTIONS;
-            let mut walk = Walk::new(&program, &sections, 0x1000, None).unwrap();
+            let mut walk = Walk::new(&program, &sections, 0x1000, &Arc::default(), None).unwrap();
             walk.run(
                 &program,
                 &Bounds {
@@ -2305,7 +2302,7 @@ pub(crate) mod tests {
             executable: true,
         }];
         let mut remaining = MAX_INSTRUCTIONS;
-        let mut walk = Walk::new(&program, &sections, 0x1000, None).unwrap();
+        let mut walk = Walk::new(&program, &sections, 0x1000, &Arc::default(), None).unwrap();
         walk.run(
             &program,
             &Bounds {
@@ -2388,7 +2385,7 @@ pub(crate) mod tests {
             executable: true,
         }];
         let mut remaining = MAX_INSTRUCTIONS;
-        let mut walk = Walk::new(&program, &sections, 0x1000, None).unwrap();
+        let mut walk = Walk::new(&program, &sections, 0x1000, &Arc::default(), None).unwrap();
         walk.run(
             &program,
             &Bounds {

@@ -10,7 +10,7 @@ use crate::model::*;
 /// Saved discovery format and evidence semantics. A different value discards a
 /// project's saved discovery while keeping its other cached results.
 pub const DISCOVERY_FINGERPRINT: &str =
-    "discovery-v1-calls-v1-data-v1-switch-v1-patterns-v1-noreturn-v1";
+    "discovery-v1-calls-v1-data-v1-switch-v1-patterns-v2-noreturn-v1";
 
 /// Committed discovery results as stored in a project. After loading they are
 /// display-only: Discover starts a fresh queue instead of trusting saved
@@ -210,13 +210,17 @@ pub struct PatternPhase {
     /// Where the next scan step continues; `None` once complete.
     pub cursor: Option<u64>,
     pub scanned_bytes: u64,
-    pub matches: usize,
-    pub validated: usize,
     pub admitted: usize,
     pub partial: bool,
     interruptions: usize,
     /// Consecutive steps that neither advanced nor admitted nor decoded.
     stalls: usize,
+    /// Accepted replies, including coverage preparation and worker rebuilds.
+    steps: usize,
+    /// Coverage identities already accepted from the current worker. A fresh
+    /// worker must rebuild them, so the set is scoped to its epoch.
+    coverage_epoch: Option<u64>,
+    covered: BTreeSet<u64>,
 }
 
 #[derive(Default)]
@@ -468,13 +472,7 @@ impl Discovery {
         }
         // Entries are never removed, so an inventory admitted by an earlier
         // commit only repeats no-ops and the sticky cap.
-        let key = (inventory.epoch, inventory.revision);
-        if self.admitted != Some(key) {
-            for function in functions {
-                self.admit(function.address);
-            }
-            self.admitted = Some(key);
-        }
+        self.admit_inventory(inventory);
         self.batches += 1;
         let report = &mut self.report;
         let update = &batch.analysis;
@@ -520,9 +518,11 @@ impl Discovery {
             .patterns
             .as_ref()
             .ok_or("A pattern-scan step returned no scan")?;
-        let phase = self.patterns.as_mut().ok_or("No pattern scan is pending")?;
+        let phase = self.patterns.as_ref().ok_or("No pattern scan is pending")?;
         let cursor = phase.cursor.ok_or("The pattern scan is already complete")?;
         let analysis = &batch.analysis;
+        let same_coverage_epoch = phase.coverage_epoch == Some(batch.binding.epoch);
+        let progress = pattern_scan_progress(info, cursor, scan)?;
         if !batch.outcomes.is_empty()
             || analysis.functions_examined != 0
             || analysis.decode_attempts != 0
@@ -532,35 +532,77 @@ impl Discovery {
             || analysis.failed_functions != 0
             || analysis.data.is_some()
             || scan.next.is_some_and(|next| next < cursor)
+            || scan.scanned_bytes > MAX_PATTERN_SCAN_BYTES
+            || scan.matches > MAX_PATTERN_MATCHES
+            || scan.validated > MAX_PATTERN_VALIDATIONS
             || scan.admitted.len() > MAX_PATTERN_ADMISSIONS
+            || scan.covered.len() > MAX_PATTERN_COVERAGE
             || scan.admitted.len() > scan.validated
             || scan.validated > scan.matches
             || scan.admitted.windows(2).any(|pair| pair[0] >= pair[1])
+            || scan.covered.windows(2).any(|pair| pair[0] >= pair[1])
+            || scan.covered.iter().any(|&address| {
+                !self.entries.contains_key(&address)
+                    || function_at(inventory.functions(), address).is_none()
+                    || same_coverage_epoch && phase.covered.contains(&address)
+            })
             || scan.admitted.iter().any(|&address| {
                 address < cursor
                     || self.entries.contains_key(&address)
                     || !crate::call_analysis::code_address(info, address)
                     || function_at(inventory.functions(), address).is_none()
             })
+            || !progress
         {
             return Err("Invalid function-start pattern scan".into());
         }
-        let progressed =
-            scan.next != Some(cursor) || !scan.admitted.is_empty() || scan.covered != 0;
-        phase.stalls = if progressed { 0 } else { phase.stalls + 1 };
+        let scanned_bytes = phase
+            .scanned_bytes
+            .checked_add(scan.scanned_bytes)
+            .ok_or("Function-start scan byte counter overflow")?;
+        let admitted = phase
+            .admitted
+            .checked_add(scan.admitted.len())
+            .ok_or("Function-start admission counter overflow")?;
+        let steps = phase
+            .steps
+            .checked_add(1)
+            .ok_or("Function-start step counter overflow")?;
+        let stalls =
+            if scan.next != Some(cursor) || !scan.admitted.is_empty() || !scan.covered.is_empty() {
+                0
+            } else {
+                phase
+                    .stalls
+                    .checked_add(1)
+                    .ok_or("Function-start stall counter overflow")?
+            };
+        let phase = self.patterns.as_mut().expect("validated pattern phase");
+        if phase.coverage_epoch != Some(batch.binding.epoch) {
+            phase.coverage_epoch = Some(batch.binding.epoch);
+            phase.covered.clear();
+        }
+        phase.covered.extend(scan.covered.iter().copied());
+        phase.stalls = stalls;
+        phase.steps = steps;
         phase.cursor = scan.next;
-        if phase.stalls >= MAX_DISCOVERY_INTERRUPTION_ATTEMPTS {
+        if phase.stalls >= MAX_DISCOVERY_INTERRUPTION_ATTEMPTS
+            || phase.steps >= MAX_PATTERN_SCAN_STEPS && phase.cursor.is_some()
+        {
             phase.cursor = None;
             phase.partial = true;
         }
-        phase.scanned_bytes = phase.scanned_bytes.saturating_add(scan.scanned_bytes);
-        phase.matches = phase.matches.saturating_add(scan.matches);
-        phase.validated = phase.validated.saturating_add(scan.validated);
-        phase.admitted = phase.admitted.saturating_add(scan.admitted.len());
+        phase.scanned_bytes = scanned_bytes;
+        phase.admitted = admitted;
         phase.partial |= scan.partial;
         phase.interruptions = 0;
         self.flight = None;
         self.report.partial |= batch.truncated;
+        self.admit_inventory(inventory);
+        Ok(())
+    }
+
+    fn admit_inventory(&mut self, inventory: &WorkerInventory) {
         let key = (inventory.epoch, inventory.revision);
         if self.admitted != Some(key) {
             for function in inventory.functions() {
@@ -568,7 +610,6 @@ impl Discovery {
             }
             self.admitted = Some(key);
         }
-        Ok(())
     }
 
     /// Reconstructs a batch reply's complete inventory from `base`, the last
@@ -630,6 +671,77 @@ impl Discovery {
         }
         saved
     }
+}
+
+/// Validates cursor movement in the scan's file-backed executable byte space.
+/// Virtual-address gaps cost no scan bytes, while a resume inside the current
+/// chunk may be ahead of `scanned_bytes` because that chunk must be rescanned.
+fn pattern_scan_progress(
+    info: &BinaryInfo,
+    cursor: u64,
+    scan: &PatternScan,
+) -> Result<bool, String> {
+    let (cursor_offset, total) = pattern_scan_offset(info, cursor)?;
+    let valid = match scan.next {
+        Some(next) if next == cursor => scan.scanned_bytes == 0,
+        Some(next) => {
+            let backed = info
+                .sections
+                .iter()
+                .any(|section| section.executable && section.backs(next, 1));
+            let (next_offset, next_total) = pattern_scan_offset(info, next)?;
+            let advanced = next_offset.checked_sub(cursor_offset);
+            let uncharged = advanced.and_then(|advanced| advanced.checked_sub(scan.scanned_bytes));
+            next_total == total
+                && next > cursor
+                && backed
+                && (scan.scanned_bytes != 0 || scan.matches != 0)
+                && uncharged.is_some_and(|bytes| {
+                    bytes < PATTERN_SCAN_CHUNK_BYTES as u64 && (bytes == 0 || scan.matches != 0)
+                })
+        }
+        None => {
+            let remaining = total
+                .checked_sub(cursor_offset)
+                .ok_or("Function-start scan cursor exceeds its byte space")?;
+            scan.scanned_bytes <= remaining && (scan.partial || scan.scanned_bytes == remaining)
+        }
+    };
+    Ok(valid)
+}
+
+/// Returns the number of executable file-backed bytes before `address` and the
+/// total scan extent. Sections are validated as ordered and non-overlapping at
+/// load time; checked sums keep reply adoption fail-closed if that ever changes.
+fn pattern_scan_offset(info: &BinaryInfo, address: u64) -> Result<(u64, u64), String> {
+    let mut before = 0u64;
+    let mut offset = None;
+    for section in info
+        .sections
+        .iter()
+        .filter(|section| section.executable && section.file_size != 0)
+    {
+        let length = section.size.min(section.file_size);
+        let end = section
+            .address
+            .checked_add(length)
+            .ok_or("Function-start scan section address overflow")?;
+        if offset.is_none() {
+            if address <= section.address {
+                offset = Some(before);
+            } else if address < end {
+                offset = Some(
+                    before
+                        .checked_add(address - section.address)
+                        .ok_or("Function-start scan offset overflow")?,
+                );
+            }
+        }
+        before = before
+            .checked_add(length)
+            .ok_or("Function-start scan byte extent overflow")?;
+    }
+    Ok((offset.unwrap_or(before), before))
 }
 
 /// Test helper: adopts a batch carrying a complete inventory and commits it.
@@ -716,6 +828,39 @@ mod tests {
         }
     }
 
+    fn pattern_state(info: &BinaryInfo) -> Discovery {
+        let mut state = Discovery::new(None, info.functions.iter().map(|f| f.address), false);
+        for entry in state.entries.values_mut() {
+            entry.status = Status::Done;
+        }
+        state.pending.clear();
+        state.start_patterns();
+        state
+    }
+
+    fn pattern_reply(
+        binding: DiscoveryBinding,
+        info: &BinaryInfo,
+        next: Option<u64>,
+        covered: Vec<u64>,
+    ) -> DiscoveryBatch {
+        DiscoveryBatch {
+            binding,
+            inventory: InventoryChange::Replace {
+                revision: binding.batch,
+                functions: info.functions.clone(),
+            },
+            truncated: false,
+            analysis: CallAnalysis::default(),
+            outcomes: vec![],
+            patterns: Some(PatternScan {
+                next,
+                covered,
+                ..Default::default()
+            }),
+        }
+    }
+
     #[test]
     fn the_pattern_scan_runs_after_seeds_and_admits_only_new_inventory_starts() {
         let mut info = info(1);
@@ -791,6 +936,7 @@ mod tests {
         assert!(commit_replacement(&mut state, &info, &backwards).is_err());
         let mut done = reply(vec![], None);
         done.binding = binding;
+        done.patterns.as_mut().unwrap().scanned_bytes = 0xff000;
         commit_replacement(&mut state, &info, &done).unwrap();
         assert!(state.begin(1, 1, 0).is_none());
         assert!(!state.scanning() && !state.partial());
@@ -831,6 +977,209 @@ mod tests {
             commit_replacement(&mut state, &info, &stalled).unwrap();
         }
         assert!(state.patterns.as_ref().unwrap().partial && state.partial());
+    }
+
+    #[test]
+    fn pattern_coverage_must_be_distinct_within_each_worker_epoch() {
+        let info = info(2);
+        let mut state = pattern_state(&info);
+        let first = state.begin(1, 7, 0).unwrap();
+        let Request::DiscoverBatch { binding, .. } = first else {
+            panic!()
+        };
+        let covered = vec![info.functions[0].address];
+        commit_replacement(
+            &mut state,
+            &info,
+            &pattern_reply(binding, &info, Some(0), covered.clone()),
+        )
+        .unwrap();
+
+        let repeated = state.begin(1, 7, 0).unwrap();
+        let Request::DiscoverBatch { binding, .. } = repeated else {
+            panic!()
+        };
+        let repeated = pattern_reply(binding, &info, Some(0), covered);
+        for _ in 0..3 {
+            assert!(commit_replacement(&mut state, &info, &repeated).is_err());
+            let phase = state.patterns.as_ref().unwrap();
+            assert_eq!(phase.cursor, Some(0));
+            assert_eq!(phase.covered.len(), 1, "a rejected reply is atomic");
+        }
+    }
+
+    #[test]
+    fn pattern_preparation_can_span_batches_and_restart_in_a_new_epoch() {
+        let info = info(2);
+        let mut state = pattern_state(&info);
+        for &address in &[info.functions[0].address, info.functions[1].address] {
+            let request = state.begin(1, 11, 0).unwrap();
+            let Request::DiscoverBatch { binding, .. } = request else {
+                panic!()
+            };
+            commit_replacement(
+                &mut state,
+                &info,
+                &pattern_reply(binding, &info, Some(0), vec![address]),
+            )
+            .unwrap();
+        }
+        assert_eq!(state.patterns.as_ref().unwrap().covered.len(), 2);
+
+        // A replacement worker has no coverage state, so replaying the same
+        // identities is necessary and valid once in its new epoch.
+        let request = state.begin(1, 12, 0).unwrap();
+        let Request::DiscoverBatch { binding, .. } = request else {
+            panic!()
+        };
+        commit_replacement(
+            &mut state,
+            &info,
+            &pattern_reply(
+                binding,
+                &info,
+                Some(0),
+                info.functions.iter().map(|f| f.address).collect(),
+            ),
+        )
+        .unwrap();
+        let phase = state.patterns.as_ref().unwrap();
+        assert_eq!(phase.coverage_epoch, Some(12));
+        assert_eq!(phase.covered.len(), 2);
+        assert!(!phase.partial);
+    }
+
+    #[test]
+    fn pattern_scan_counters_are_bounded_and_overflow_is_atomic() {
+        let info = info(0);
+        let mut state = pattern_state(&info);
+        let request = state.begin(1, 1, 0).unwrap();
+        let Request::DiscoverBatch { binding, .. } = request else {
+            panic!()
+        };
+        let mut oversized = pattern_reply(binding, &info, None, vec![]);
+        oversized.patterns.as_mut().unwrap().scanned_bytes = MAX_PATTERN_SCAN_BYTES + 1;
+        oversized.patterns.as_mut().unwrap().partial = true;
+        assert!(commit_replacement(&mut state, &info, &oversized).is_err());
+        assert_eq!(state.patterns.as_ref().unwrap().scanned_bytes, 0);
+
+        state.patterns.as_mut().unwrap().scanned_bytes = u64::MAX;
+        let mut overflow = pattern_reply(binding, &info, Some(0x1001), vec![]);
+        overflow.patterns.as_mut().unwrap().scanned_bytes = 1;
+        assert!(commit_replacement(&mut state, &info, &overflow).is_err());
+        assert_eq!(state.patterns.as_ref().unwrap().scanned_bytes, u64::MAX);
+    }
+
+    #[test]
+    fn pattern_cursor_progress_is_charged_in_executable_bytes() {
+        let mut info = info(0);
+        info.sections = vec![
+            SectionInfo {
+                name: ".text".into(),
+                address: 0x1000,
+                size: MAX_PATTERN_SCAN_BYTES,
+                file_offset: 0,
+                file_size: MAX_PATTERN_SCAN_BYTES,
+                executable: true,
+            },
+            SectionInfo {
+                name: ".far".into(),
+                address: 0x1_0000_0000,
+                size: 0x1000,
+                file_offset: MAX_PATTERN_SCAN_BYTES,
+                file_size: 0x1000,
+                executable: true,
+            },
+        ];
+        info.file_len = MAX_PATTERN_SCAN_BYTES + 0x1000;
+
+        let mut state = pattern_state(&info);
+        let request = state.begin(1, 1, 0).unwrap();
+        let Request::DiscoverBatch { binding, .. } = request else {
+            panic!()
+        };
+        let mut across_gap = pattern_reply(binding, &info, Some(0x1_0000_0000), vec![]);
+        across_gap.patterns.as_mut().unwrap().scanned_bytes = MAX_PATTERN_SCAN_BYTES;
+        commit_replacement(&mut state, &info, &across_gap).unwrap();
+        assert_eq!(state.patterns.as_ref().unwrap().cursor, Some(0x1_0000_0000));
+
+        let request = state.begin(1, 1, 0).unwrap();
+        let Request::DiscoverBatch { binding, .. } = request else {
+            panic!()
+        };
+        let mut done = pattern_reply(binding, &info, None, vec![]);
+        done.patterns.as_mut().unwrap().scanned_bytes = 0x1000;
+        commit_replacement(&mut state, &info, &done).unwrap();
+        assert!(!state.scanning());
+        assert_eq!(
+            state.patterns.as_ref().unwrap().scanned_bytes,
+            MAX_PATTERN_SCAN_BYTES + 0x1000
+        );
+    }
+
+    #[test]
+    fn pattern_cursor_rejects_free_or_overlong_forward_jumps() {
+        let info = info(0);
+        let mut state = pattern_state(&info);
+        let request = state.begin(1, 1, 0).unwrap();
+        let Request::DiscoverBatch { binding, .. } = request else {
+            panic!()
+        };
+
+        // Moving through the unmapped prefix without any scan or match work
+        // used to reset the stall counter indefinitely one address at a time.
+        let free = pattern_reply(binding, &info, Some(0x1000), vec![]);
+        assert!(commit_replacement(&mut state, &info, &free).is_err());
+        assert_eq!(state.patterns.as_ref().unwrap().cursor, Some(0));
+
+        // An uncharged match resume must remain inside the one current chunk.
+        let mut overlong = pattern_reply(
+            binding,
+            &info,
+            Some(0x1000 + PATTERN_SCAN_CHUNK_BYTES as u64),
+            vec![],
+        );
+        let scan = overlong.patterns.as_mut().unwrap();
+        scan.matches = 1;
+        scan.validated = 1;
+        assert!(commit_replacement(&mut state, &info, &overlong).is_err());
+        assert_eq!(state.patterns.as_ref().unwrap().cursor, Some(0));
+    }
+
+    #[test]
+    fn pattern_cursor_accepts_a_match_resume_inside_the_current_chunk() {
+        let info = info(0);
+        let mut state = pattern_state(&info);
+        let request = state.begin(1, 1, 0).unwrap();
+        let Request::DiscoverBatch { binding, .. } = request else {
+            panic!()
+        };
+        let mut resumed = pattern_reply(binding, &info, Some(0x1020), vec![]);
+        let scan = resumed.patterns.as_mut().unwrap();
+        scan.matches = MAX_PATTERN_VALIDATIONS + 1;
+        scan.validated = MAX_PATTERN_VALIDATIONS;
+        commit_replacement(&mut state, &info, &resumed).unwrap();
+        assert_eq!(state.patterns.as_ref().unwrap().cursor, Some(0x1020));
+        assert_eq!(state.patterns.as_ref().unwrap().scanned_bytes, 0);
+    }
+
+    #[test]
+    fn pattern_reply_limit_contains_plausible_fabricated_progress() {
+        let info = info(0);
+        let mut state = pattern_state(&info);
+        state.patterns.as_mut().unwrap().steps = MAX_PATTERN_SCAN_STEPS - 1;
+        let request = state.begin(1, 1, 0).unwrap();
+        let Request::DiscoverBatch { binding, .. } = request else {
+            panic!()
+        };
+        let mut resumed = pattern_reply(binding, &info, Some(0x1001), vec![]);
+        let scan = resumed.patterns.as_mut().unwrap();
+        scan.matches = 1;
+        scan.validated = 1;
+        commit_replacement(&mut state, &info, &resumed).unwrap();
+        let phase = state.patterns.as_ref().unwrap();
+        assert_eq!(phase.steps, MAX_PATTERN_SCAN_STEPS);
+        assert!(phase.cursor.is_none() && phase.partial);
     }
 
     #[test]
