@@ -171,7 +171,7 @@ impl Patterns {
                             _ => action(item, &mut start, &mut align)?,
                         }
                     }
-                    if let Some(start) = start.flatten() {
+                    if let Some(start) = start {
                         for (values, masks, marker) in sequences {
                             push(
                                 &mut patterns,
@@ -201,7 +201,7 @@ impl Patterns {
                             }
                         }
                     }
-                    let Some(start) = start.flatten() else {
+                    let Some(start) = start else {
                         continue;
                     };
                     // As Ghidra's PatternPairSet: thresholds count fixed bits.
@@ -272,11 +272,10 @@ fn push(
     Ok(())
 }
 
-/// Records a match action. `start` becomes `Some(None)` for actions that
-/// never nominate a function here.
+/// Records a match action; only supported `funcstart` actions nominate a function.
 fn action(
     item: &Element<'_>,
-    start: &mut Option<Option<FunctionStart>>,
+    start: &mut Option<FunctionStart>,
     align: &mut Option<(usize, u32)>,
 ) -> Result<(), String> {
     match item.name {
@@ -300,11 +299,9 @@ fn action(
                     _ => return Err(format!("Unsupported funcstart {name}={value:?}")),
                 }
             }
-            *start = Some(supported.then_some(nominated));
+            *start = supported.then_some(nominated);
         }
-        "codeboundary" | "possiblefuncstart" | "setcontext" => {
-            start.get_or_insert(None);
-        }
+        "codeboundary" | "possiblefuncstart" | "setcontext" => {}
         "align" => {
             let mark = item.number("mark")? as usize;
             let bits = item.number("bits")?;

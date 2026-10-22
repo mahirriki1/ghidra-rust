@@ -66,7 +66,7 @@ impl Container {
     /// names with leading underscores removed. Only container decorations
     /// are removed: ELF symbol versions and `@plt`, PE `__imp_` and x86
     /// stdcall `@bytes` suffixes. C++ decorated names stay intact.
-    fn normalize(self, name: &str, import: bool) -> String {
+    fn normalize(self, name: &str, import: bool) -> &str {
         let mut name = name;
         match self {
             Self::Elf => {
@@ -87,11 +87,11 @@ impl Container {
             }
             Self::MachO => {}
         }
-        name.trim_start_matches('_').to_owned()
+        name.trim_start_matches('_')
     }
 
     fn matches(self, name: &str, import: bool) -> bool {
-        self.names().contains(self.normalize(name, import).as_str())
+        self.names().contains(self.normalize(name, import))
     }
 }
 
@@ -268,31 +268,45 @@ impl NoReturnIndex {
             return None;
         }
         let decoded = program.disassemble(target, count).ok()?;
-        let code = program.pcode(target, count).ok()?;
-        if decoded.len() != count || code.len() != count {
+        if decoded.len() != count {
             return None;
         }
-        if arm64 {
-            if !decoded
-                .iter()
-                .zip(&code)
-                .zip(["ADRP", "LDR", "BR"])
-                .enumerate()
-                .all(|(i, ((instruction, pcode), mnemonic))| {
+        // Reject other function entries before requesting engine p-code.
+        let slot = if arm64 {
+            if !decoded.iter().zip(["ADRP", "LDR", "BR"]).enumerate().all(
+                |(i, (instruction, mnemonic))| {
                     instruction.address == target + i as u64 * 4
                         && instruction.length == 4
-                        && pcode.address == instruction.address
-                        && pcode.length == 4
                         && instruction.bytes.len() == 4
                         && instruction.mnemonic.eq_ignore_ascii_case(mnemonic)
-                })
-            {
+                },
+            ) {
                 return None;
             }
             let words = std::array::from_fn(|i| {
                 u32::from_le_bytes(decoded[i].bytes.as_slice().try_into().unwrap())
             });
-            let slot = crate::pe_symbols::aarch64_veneer_slot(target, words)?;
+            crate::pe_symbols::aarch64_veneer_slot(target, words)?
+        } else {
+            let instruction = &decoded[0];
+            if instruction.address != target
+                || instruction.length != 6
+                || !instruction.mnemonic.eq_ignore_ascii_case("JMP")
+            {
+                return None;
+            }
+            crate::pe_symbols::x86_thunk_slot(target, &instruction.bytes, self.pointer_bytes)?
+        };
+        let code = program.pcode(target, count).ok()?;
+        if code.len() != count {
+            return None;
+        }
+        if arm64 {
+            if !code.iter().zip(&decoded).all(|(pcode, instruction)| {
+                pcode.address == instruction.address && pcode.length == 4
+            }) {
+                return None;
+            }
             // The exact instruction encoding fixes register flow. Also require
             // the expected load and final indirect branch in engine p-code.
             if !code[1].operations.iter().any(|op| {
@@ -307,19 +321,13 @@ impl NoReturnIndex {
             }
             Some(slot)
         } else {
-            let instruction = &decoded[0];
             let pcode = &code[0];
-            if instruction.address != target
-                || instruction.length != 6
-                || pcode.address != target
+            if pcode.address != target
                 || pcode.length != 6
-                || !instruction.mnemonic.eq_ignore_ascii_case("JMP")
                 || pcode.operations.last()?.opcode != OpCode::Branchind
             {
                 return None;
             }
-            let slot =
-                crate::pe_symbols::x86_thunk_slot(target, &instruction.bytes, self.pointer_bytes)?;
             (self.read_slot(pcode, pcode.operations.len() - 1)? == slot).then_some(slot)
         }
     }

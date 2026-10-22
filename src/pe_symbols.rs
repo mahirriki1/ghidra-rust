@@ -438,7 +438,9 @@ pub(crate) fn register_aarch64_import_thunks_budgeted(
     Ok(complete)
 }
 
-fn mapped_bytes<'a>(
+/// The file-backed bytes of `[address, address + size)` within one section
+/// whose executability matches `executable`.
+pub(crate) fn mapped_bytes<'a>(
     snapshot: &'a [u8],
     sections: &[SectionInfo],
     address: u64,

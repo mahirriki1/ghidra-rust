@@ -14,9 +14,12 @@ use ghidra_decompiler::opcodes::OpCode;
 use ghidra_decompiler::program::{FunctionSource, InstructionPcode, PcodeVarnode, Program};
 use object::Endianness;
 use object::elf;
+
 use object::read::elf::{
     ElfFile64, FileHeader, ProgramHeader, Rela, SectionHeader, Sym, SymbolTable,
 };
+
+use crate::data_analysis::mask;
 
 const LIBC_START_MAIN: &str = "__libc_start_main";
 /// Contiguous bytes the entry path may span.
@@ -206,14 +209,6 @@ pub(crate) fn libc_start_slots(bytes: &[u8], architecture: &str) -> BTreeSet<u64
     relocations(bytes, architecture)
         .map(|r| r.libc_slots)
         .unwrap_or_default()
-}
-
-fn mask(size: u32) -> u64 {
-    if size >= 8 {
-        u64::MAX
-    } else {
-        (1u64 << (size * 8)) - 1
-    }
 }
 
 /// Register and temporary values along one straight-line path. Writes that

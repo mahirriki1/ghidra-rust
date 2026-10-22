@@ -127,8 +127,13 @@ pub(super) fn recover_graph_budgeted(
     no_return: &Arc<crate::no_return::NoReturnIndex>,
     mut data: Option<&mut crate::data_analysis::DataCollector<'_>>,
 ) -> Result<GraphRecovery, String> {
-    let mut walk =
-        Walk::new(program, bounds.sections, entry, data.as_deref_mut())?.with_no_return(no_return);
+    let mut walk = Walk::new(
+        program,
+        bounds.sections,
+        entry,
+        no_return,
+        data.as_deref_mut(),
+    )?;
     walk.run(program, bounds, remaining, data.as_deref_mut());
     walk.finish(data)
 }
@@ -145,13 +150,41 @@ pub(super) fn recover_graph_switched(
     no_return: &Arc<crate::no_return::NoReturnIndex>,
     mut data: Option<&mut crate::data_analysis::DataCollector<'_>>,
 ) -> Result<GraphRecovery, String> {
-    let mut walk =
-        Walk::new(program, bounds.sections, entry, data.as_deref_mut())?.with_no_return(no_return);
+    recover_walk_switched(
+        program,
+        bounds,
+        entry,
+        remaining,
+        budget,
+        no_return,
+        data.as_deref_mut(),
+    )?
+    .finish(data)
+}
+
+/// Completes the same switch-aware walk without constructing display blocks
+/// and edges, so coverage can retain every decoded instruction's interval.
+pub(super) fn recover_walk_switched(
+    program: &mut Program,
+    bounds: &Bounds<'_>,
+    entry: u64,
+    remaining: &mut usize,
+    budget: &mut SwitchBudget,
+    no_return: &Arc<crate::no_return::NoReturnIndex>,
+    mut data: Option<&mut crate::data_analysis::DataCollector<'_>>,
+) -> Result<Walk, String> {
+    let mut walk = Walk::new(
+        program,
+        bounds.sections,
+        entry,
+        no_return,
+        data.as_deref_mut(),
+    )?;
     walk.run(program, bounds, remaining, data.as_deref_mut());
     if walk.switches(program, bounds.sections, budget) {
-        walk.run(program, bounds, remaining, data.as_deref_mut());
+        walk.run(program, bounds, remaining, data);
     }
-    walk.finish(data)
+    Ok(walk)
 }
 
 /// Engine switch recoveries one request may start. Each is synchronous, so
@@ -201,6 +234,7 @@ impl Walk {
         program: &Program,
         sections: &[SectionInfo],
         entry: u64,
+        no_return: &Arc<crate::no_return::NoReturnIndex>,
         data: Option<&mut crate::data_analysis::DataCollector<'_>>,
     ) -> Result<Self, String> {
         let alignment = crate::architecture::instruction_alignment(program.language_id());
@@ -229,14 +263,8 @@ impl Walk {
             call_evidence: Vec::new(),
             indirect: BTreeSet::new(),
             switched: BTreeSet::new(),
-            no_return: Arc::default(),
+            no_return: Arc::clone(no_return),
         })
-    }
-
-    /// Ends blocks at calls this index recognizes as never returning.
-    pub(super) fn with_no_return(mut self, index: &Arc<crate::no_return::NoReturnIndex>) -> Self {
-        self.no_return = Arc::clone(index);
-        self
     }
 
     pub(super) fn run(

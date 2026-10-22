@@ -41,6 +41,21 @@ pub const MAX_DISCOVERY_INTERRUPTION_ATTEMPTS: usize = 2;
 /// Sixteen worst-case JSON-escaped 256-byte names fit below 60 KiB requests.
 pub const MAX_DISCOVERY_SYNC_FUNCTIONS: usize = 16;
 pub const MAX_ANALYSIS_INSTRUCTIONS: usize = 16_384;
+/// Executable bytes inspected by one function-start pattern request.
+pub const MAX_PATTERN_SCAN_BYTES: u64 = 1024 * 1024;
+/// Pattern matching is chunked so a match flood has a local bound.
+pub const PATTERN_SCAN_CHUNK_BYTES: usize = 64 * 1024;
+pub const MAX_PATTERN_MATCHES_PER_CHUNK: usize = 4_096;
+pub const MAX_PATTERN_MATCHES: usize =
+    MAX_PATTERN_MATCHES_PER_CHUNK * (MAX_PATTERN_SCAN_BYTES as usize / PATTERN_SCAN_CHUNK_BYTES);
+pub const MAX_PATTERN_VALIDATIONS: usize = 128;
+/// Parent-accepted pattern replies in one discovery phase. Normal scans need at
+/// most 128 replies for a maximum-size image; the larger cap leaves room for
+/// coverage preparation and match resumes while containing fabricated progress.
+pub const MAX_PATTERN_SCAN_STEPS: usize = 4_096;
+/// Every prepared function consumes at least one decode attempt. The identities
+/// let the parent reject repeated coverage claims from one worker epoch.
+pub const MAX_PATTERN_COVERAGE: usize = MAX_ANALYSIS_INSTRUCTIONS;
 /// Shared per-batch and session aggregate evidence caps. Reaching an aggregate
 /// cap marks coverage partial; seed processing can still continue.
 pub const MAX_CALL_REFERENCES: usize = 16_384;
@@ -302,8 +317,10 @@ pub struct PatternScan {
     /// Strictly increasing new function starts.
     #[serde(deserialize_with = "crate::bounded::vec::<_, _, { MAX_PATTERN_ADMISSIONS }>")]
     pub admitted: Vec<u64>,
-    /// Established functions decoded to learn which bytes are already code.
-    pub covered: usize,
+    /// Strictly increasing established function entries decoded to learn which
+    /// bytes are already code. Each identity may appear once per worker epoch.
+    #[serde(deserialize_with = "crate::bounded::vec::<_, _, { MAX_PATTERN_COVERAGE }>")]
+    pub covered: Vec<u64>,
     /// Limits or failures left part of the scan unexamined.
     pub partial: bool,
 }
@@ -719,5 +736,15 @@ mod tests {
             .map(|a| function(a, ""))
             .collect();
         assert!(validate_functions(&many, 1, false).is_err());
+    }
+
+    #[test]
+    fn pattern_coverage_reply_is_bounded_while_decoding() {
+        let scan = PatternScan {
+            covered: vec![0; MAX_PATTERN_COVERAGE + 1],
+            ..Default::default()
+        };
+        let encoded = serde_json::to_value(scan).unwrap();
+        assert!(serde_json::from_value::<PatternScan>(encoded).is_err());
     }
 }
