@@ -18,6 +18,7 @@ mod elf_startup;
 pub mod file_dialog;
 pub mod function_patterns;
 pub mod graph;
+mod hex_ui;
 pub mod highlight;
 mod inventory;
 pub mod limits;
