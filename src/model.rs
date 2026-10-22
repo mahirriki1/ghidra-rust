@@ -381,6 +381,17 @@ pub struct SectionInfo {
     pub executable: bool,
 }
 
+impl SectionInfo {
+    /// Whether `[address, address + length)` lies in this section's
+    /// file-backed bytes.
+    pub fn backs(&self, address: u64, length: u64) -> bool {
+        address
+            .checked_sub(self.address)
+            .and_then(|offset| offset.checked_add(length))
+            .is_some_and(|end| end <= self.size.min(self.file_size))
+    }
+}
+
 /// Identity of an opened file, independent of its current pathname.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileIdentity {
@@ -485,6 +496,35 @@ pub struct Edge {
 pub struct CallSite {
     pub address: u64,
     pub target: Option<u64>,
+    /// Why the call never returns; its block then has no successor. Absent
+    /// in projects saved before no-return analysis.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_return: Option<NoReturnEvidence>,
+}
+
+/// The identity that establishes a call never returns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum NoReturnEvidence {
+    /// The target is a named no-return function or import stub.
+    NamedTarget,
+    /// The call reads, directly or through an exact thunk, the import address
+    /// table slot of a named no-return import (or a verified ELF startup slot).
+    ImportSlot { slot: u64 },
+}
+
+impl NoReturnEvidence {
+    pub fn description(self) -> String {
+        match self {
+            Self::NamedTarget => {
+                "Does not return: original function/import identity matches the no-return list"
+                    .into()
+            }
+            Self::ImportSlot { slot } => {
+                format!("Does not return: named import through slot {slot:#x}")
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

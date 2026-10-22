@@ -39,6 +39,8 @@ pub struct LoadedProgram {
     inventory: crate::inventory::Inventory,
     /// Instructions decoded from established functions in this worker.
     coverage: Coverage,
+    /// Calls that never return, from the image's own symbols and imports.
+    no_return: Arc<crate::no_return::NoReturnIndex>,
 }
 
 /// Engine functions a discovery pass named, and whether it changed the engine
@@ -59,17 +61,18 @@ fn warning(warnings: &mut Vec<String>, message: impl Into<String>) {
     }
 }
 
+/// Whether `address` is in the section's virtual extent, including any
+/// zero-filled tail beyond its file-backed bytes.
 fn mapped(section: &SectionInfo, address: u64) -> bool {
     address >= section.address && address - section.address < section.size
 }
 
+/// Whether `length` bytes (at least one) at `address` are file-backed code.
 fn executable(sections: &[SectionInfo], address: u64, length: usize) -> bool {
-    sections.iter().any(|section| {
-        section.executable
-            && mapped(section, address)
-            && address - section.address < section.file_size
-            && (length as u64) <= section.file_size.min(section.size) - (address - section.address)
-    })
+    let length = (length as u64).max(1);
+    sections
+        .iter()
+        .any(|section| section.executable && section.backs(address, length))
 }
 
 #[cfg(test)]
@@ -316,6 +319,37 @@ impl LoadedProgram {
         if info.format == "ELF" && !info.functions_truncated {
             rejected |= recover_elf_main(&mut program, &mut info, &target, &snapshot)?;
         }
+        let mut no_return = {
+            let alignment = target.instruction_alignment;
+            let sections = &info.sections;
+            crate::no_return::NoReturnIndex::build(
+                &program,
+                &info.format,
+                target.pointer_bytes as u32,
+                &pe_imports,
+                |address| {
+                    address.is_multiple_of(alignment)
+                        && executable(sections, address, alignment as usize)
+                },
+            )
+        };
+        if info.format == "ELF" {
+            no_return.add_startup_slots(
+                crate::elf_startup::libc_start_slots(&snapshot, &info.architecture)
+                    .into_iter()
+                    .filter(|&slot| {
+                        info.sections
+                            .iter()
+                            .any(|section| section.backs(slot, target.pointer_bytes as u64))
+                    }),
+            );
+        }
+        if no_return.incomplete || !crate::no_return::mark_engine(&mut program, &no_return) {
+            warning(
+                &mut info.warnings,
+                "No-return recognition is incomplete; some calls that never return keep a fallthrough.",
+            );
+        }
         let mut inventory = crate::inventory::Inventory::default();
         inventory.certify(&info.functions, !rejected);
         if !info.entry.is_multiple_of(target.instruction_alignment)
@@ -337,6 +371,7 @@ impl LoadedProgram {
             info,
             inventory,
             coverage: Coverage::default(),
+            no_return: Arc::new(no_return),
         })
     }
 
@@ -400,6 +435,7 @@ impl LoadedProgram {
                 address,
                 &self.pe_ranges,
                 &mut remaining,
+                &self.no_return,
                 None,
             )?
         } else {
@@ -411,6 +447,7 @@ impl LoadedProgram {
                 &self.pe_ranges,
                 &mut remaining,
                 &mut SwitchBudget::new(),
+                &self.no_return,
                 None,
             )?
         };
@@ -778,7 +815,8 @@ impl LoadedProgram {
             let sections = &self.info.sections;
             let pe_ranges = &self.pe_ranges;
             let mut walk = decoding.measure(|| {
-                let mut walk = Walk::new(&self.program, sections, address, Some(&mut data))?;
+                let mut walk = Walk::new(&self.program, sections, address, Some(&mut data))?
+                    .with_no_return(&self.no_return);
                 walk.run(
                     &self.program,
                     sections,
@@ -987,6 +1025,7 @@ impl LoadedProgram {
                 &self.pe_ranges,
                 &mut budget,
                 &mut switches,
+                &self.no_return,
                 None,
             );
             remaining -= MAX_INSTRUCTIONS - budget;
@@ -1090,7 +1129,8 @@ impl LoadedProgram {
                         }
                         scan.validated += 1;
                         let mut budget = MAX_INSTRUCTIONS;
-                        let mut walk = Walk::new(&self.program, &self.info.sections, start, None)?;
+                        let mut walk = Walk::new(&self.program, &self.info.sections, start, None)?
+                            .with_no_return(&self.no_return);
                         walk.run(
                             &self.program,
                             &self.info.sections,
@@ -1167,6 +1207,7 @@ impl LoadedProgram {
         let mut pending = VecDeque::from([entry]);
         let mut visited = BTreeSet::new();
         let mut targets = BTreeSet::from([entry]);
+        let mut no_return_targets = BTreeSet::new();
         // The decompiler can follow a tail branch into another known function.
         // Resolve imports from those exact CFG call targets as well, with a
         // fixed work budget. Never treat arbitrary byte matches as code entries.
@@ -1177,20 +1218,35 @@ impl LoadedProgram {
             if !visited.insert(address) {
                 continue;
             }
-            let Ok(view) = recover_graph_with_ranges(
+            let mut remaining = MAX_INSTRUCTIONS;
+            let Ok(recovered) = recover_graph_budgeted(
                 &self.program,
                 &self.info.sections,
-                &self.info.functions,
+                &|pc| function_at(&self.info.functions, pc).is_some(),
                 address,
                 &self.pe_ranges,
+                &mut remaining,
+                &self.no_return,
+                None,
             ) else {
                 continue;
             };
-            for target in view.calls.iter().filter_map(|call| call.target) {
+            // Naming uses every bounded decoded call, including those omitted
+            // from the displayed graph by its separate block limit.
+            no_return_targets.extend(
+                recovered
+                    .calls
+                    .iter()
+                    .map(|(call, _)| call)
+                    .filter(|call| call.no_return.is_some())
+                    .filter_map(|call| call.target),
+            );
+            for target in recovered.calls.iter().filter_map(|(call, _)| call.target) {
                 if targets.len() < crate::pe_symbols::MAX_THUNK_TARGETS {
                     targets.insert(target);
                 }
             }
+            let view = recovered.view;
             let blocks: BTreeSet<_> = view.blocks.iter().map(|block| block.address).collect();
             for target in view.edges.iter().filter_map(|edge| edge.target) {
                 if !blocks.contains(&target)
@@ -1205,22 +1261,26 @@ impl LoadedProgram {
             }
         }
         if self.target.name == "AArch64" {
-            return crate::pe_symbols::register_aarch64_import_thunks(
+            crate::pe_symbols::register_aarch64_import_thunks(
                 &mut self.program,
                 &self.pe_imports,
                 &self.snapshot,
                 &self.info.sections,
                 &targets,
-            );
+            )?;
+        } else {
+            crate::pe_symbols::register_import_thunks(
+                &mut self.program,
+                &self.pe_imports,
+                &self.snapshot,
+                &self.info.sections,
+                &targets,
+                self.target.pointer_bytes,
+            )?;
         }
-        crate::pe_symbols::register_import_thunks(
-            &mut self.program,
-            &self.pe_imports,
-            &self.snapshot,
-            &self.info.sections,
-            &targets,
-            self.target.pointer_bytes,
-        )
+        // An unmarked thunk only keeps the decompiler's ordinary call flow.
+        crate::no_return::mark_targets(&mut self.program, no_return_targets);
+        Ok(())
     }
 
     fn synchronize_function_name(&mut self, address: u64, name: &str) -> Result<(), String> {
@@ -1739,6 +1799,7 @@ fn recover_graph_counted(
         entry,
         pe_ranges,
         &mut remaining,
+        &Arc::default(),
         None,
     )?;
     Ok((recovered.view, MAX_INSTRUCTIONS - remaining))
@@ -1815,6 +1876,7 @@ const PATTERN_CHUNK_BYTES: usize = 64 * 1024;
 const PATTERN_MATCHES: usize = 4_096;
 const PATTERN_VALIDATIONS: usize = 128;
 
+#[allow(clippy::too_many_arguments)]
 fn recover_graph_budgeted(
     program: &Program,
     sections: &[SectionInfo],
@@ -1822,9 +1884,11 @@ fn recover_graph_budgeted(
     entry: u64,
     pe_ranges: &[(u64, u64)],
     remaining: &mut usize,
+    no_return: &Arc<crate::no_return::NoReturnIndex>,
     mut data: Option<&mut crate::data_analysis::DataCollector<'_>>,
 ) -> Result<GraphRecovery, String> {
-    let mut walk = Walk::new(program, sections, entry, data.as_deref_mut())?;
+    let mut walk =
+        Walk::new(program, sections, entry, data.as_deref_mut())?.with_no_return(no_return);
     walk.run(
         program,
         sections,
@@ -1848,9 +1912,11 @@ fn recover_graph_switched(
     pe_ranges: &[(u64, u64)],
     remaining: &mut usize,
     budget: &mut SwitchBudget,
+    no_return: &Arc<crate::no_return::NoReturnIndex>,
     mut data: Option<&mut crate::data_analysis::DataCollector<'_>>,
 ) -> Result<GraphRecovery, String> {
-    let mut walk = Walk::new(program, sections, entry, data.as_deref_mut())?;
+    let mut walk =
+        Walk::new(program, sections, entry, data.as_deref_mut())?.with_no_return(no_return);
     walk.run(
         program,
         sections,
@@ -1911,6 +1977,7 @@ struct Walk {
     indirect: BTreeSet<u64>,
     /// Branch/destination pairs established by an engine jump table.
     switched: BTreeSet<(u64, u64)>,
+    no_return: Arc<crate::no_return::NoReturnIndex>,
 }
 
 impl Walk {
@@ -1946,7 +2013,14 @@ impl Walk {
             call_evidence: Vec::new(),
             indirect: BTreeSet::new(),
             switched: BTreeSet::new(),
+            no_return: Arc::default(),
         })
+    }
+
+    /// Ends blocks at calls this index recognizes as never returning.
+    fn with_no_return(mut self, index: &Arc<crate::no_return::NoReturnIndex>) -> Self {
+        self.no_return = Arc::clone(index);
+        self
     }
 
     fn run(
@@ -2063,7 +2137,16 @@ impl Walk {
                 data.inspect(entry, &pcode);
             }
             let call_start = self.calls.len();
-            let (next, terminal, indirect) = flow(&pcode, next_address, &mut self.calls, warnings);
+            let no_return = &self.no_return;
+            let (next, terminal, indirect) = flow(
+                &pcode,
+                next_address,
+                &mut self.calls,
+                warnings,
+                &mut |code, operation| {
+                    no_return.call(program, code, operation, sections, remaining)
+                },
+            );
             self.call_evidence.extend(
                 self.calls[call_start..]
                     .iter()
@@ -2106,7 +2189,7 @@ impl Walk {
 
     /// Whether this walk is strong enough evidence that `entry` starts a
     /// function no established code contains: every instruction decoded and
-    /// lies outside `coverage`, every path ends in a return or an explicit
+    /// lies outside `coverage`, every path ends in a return, a known no-return call or an explicit
     /// branch to an established function, and direct calls reach code.
     fn complete_function(
         &self,
@@ -2115,11 +2198,11 @@ impl Walk {
         is_code: &dyn Fn(u64) -> bool,
         min_instructions: usize,
     ) -> bool {
-        let returns = self
+        let terminal_exit = self
             .nodes
             .values()
             .any(|node| node.terminal && node.next.is_empty());
-        returns
+        terminal_exit
             && self.nodes.len() >= min_instructions.max(1)
             && self.indirect.is_empty()
             && self.pending.is_empty()
@@ -2347,7 +2430,18 @@ impl Walk {
                 address: entry,
                 blocks,
                 edges,
-                calls: self.calls,
+                // Evidence is shown only where its block is; every call stays
+                // listed for navigation.
+                calls: self
+                    .calls
+                    .into_iter()
+                    .map(|mut call| {
+                        if !assigned.contains(&call.address) {
+                            call.no_return = None;
+                        }
+                        call
+                    })
+                    .collect(),
                 warnings: std::mem::take(warnings),
             },
             calls: self.call_evidence,
@@ -2364,12 +2458,14 @@ fn flow(
     fallthrough: u64,
     calls: &mut Vec<CallSite>,
     warnings: &mut Vec<String>,
+    no_return: &mut dyn FnMut(&InstructionPcode, usize) -> Option<NoReturnEvidence>,
 ) -> (Vec<(Option<u64>, EdgeKind)>, bool, bool) {
     let mut transfer = None;
     let mut indirect = false;
     let mut internal = false;
     let call_start = calls.len();
-    for operation in &code.operations {
+    let mut call_operation = None;
+    for (index, operation) in code.operations.iter().enumerate() {
         let direct = operation
             .inputs
             .first()
@@ -2391,7 +2487,9 @@ fn flow(
                     } else {
                         None
                     },
+                    no_return: None,
                 });
+                call_operation = Some(index);
             }
             OpCode::Branch | OpCode::Cbranch => {
                 if operation.inputs.first().is_some_and(|v| v.space == "const") {
@@ -2439,6 +2537,15 @@ fn flow(
         (vec![(None, EdgeKind::Unknown)], true, false)
     } else if let Some(edges) = transfer {
         (edges, true, indirect)
+    } else if let Some(call) = calls.get_mut(call_start)
+        && let Some(operation) = call_operation
+        // A call to its own fallthrough reads the program counter.
+        && call.target != Some(fallthrough)
+        && let Some(evidence) = no_return(code, operation)
+    {
+        // The following bytes are not this call's successor.
+        call.no_return = Some(evidence);
+        (Vec::new(), true, false)
     } else {
         (vec![(Some(fallthrough), EdgeKind::Branch)], false, false)
     }
@@ -2471,6 +2578,7 @@ pub(crate) mod tests {
             upx_packed: false,
             inventory: Default::default(),
             coverage: Coverage::default(),
+            no_return: Arc::default(),
         }
     }
 
@@ -2493,6 +2601,136 @@ pub(crate) mod tests {
             ..Default::default()
         };
         crate::pe_symbols::register(&mut loaded.program, &metadata, 8).unwrap();
+    }
+
+    #[test]
+    fn no_return_calls_preserve_other_paths_and_ignore_later_renames() {
+        // JNE 0x1007; CALL 0x1020; RET. The RET is reachable by the branch,
+        // even though the call itself cannot fall through to it.
+        let mut bytes = vec![0x75, 5, 0xe8, 0x19, 0, 0, 0, 0xc3];
+        bytes.resize(0x21, 0xc3);
+        let mut loaded = raw_x86(bytes);
+        bulk_functions(&mut loaded, [(0x1020, "exit".into())].into_iter());
+        loaded.no_return = Arc::new(crate::no_return::NoReturnIndex::build(
+            &loaded.program,
+            "ELF",
+            8,
+            &BTreeMap::new(),
+            |_| true,
+        ));
+        loaded
+            .synchronize_function_name(0x1020, "renamed_exit")
+            .unwrap();
+        let view = loaded.graph(0x1000).unwrap();
+        assert_eq!(view.calls[0].no_return, Some(NoReturnEvidence::NamedTarget));
+        let call_block = view
+            .blocks
+            .iter()
+            .find(|b| b.instructions.last().unwrap().address == 0x1002)
+            .unwrap();
+        assert!(
+            !view
+                .edges
+                .iter()
+                .any(|edge| edge.source == call_block.address)
+        );
+        assert!(view.blocks.iter().any(|b| b.address == 0x1007));
+
+        // Renaming a returning function to a listed name does not create evidence.
+        let mut loaded = raw_x86(vec![0xe8, 1, 0, 0, 0, 0xc3, 0xc3]);
+        bulk_functions(&mut loaded, [(0x1006, "helper".into())].into_iter());
+        loaded.no_return = Arc::new(crate::no_return::NoReturnIndex::build(
+            &loaded.program,
+            "ELF",
+            8,
+            &BTreeMap::new(),
+            |_| true,
+        ));
+        loaded.synchronize_function_name(0x1006, "abort").unwrap();
+        let view = loaded.graph(0x1000).unwrap();
+        assert_eq!(view.calls[0].no_return, None);
+        assert!(
+            view.blocks
+                .iter()
+                .flat_map(|b| &b.instructions)
+                .any(|i| i.address == 0x1005)
+        );
+    }
+
+    #[test]
+    fn no_return_does_not_override_call_to_own_fallthrough_or_internal_flow() {
+        // The engine lowers a literal CALL-next to a branch. Use the normal
+        // CALL p-code form with an explicit next-instruction target to cover
+        // the flow guard independently of that SLEIGH optimization.
+        let loaded = raw_x86(vec![0xe8, 0x1b, 0, 0, 0, 0xc3]);
+        let mut code = loaded.program.pcode(0x1000, 1).unwrap().pop().unwrap();
+        code.operations
+            .iter_mut()
+            .find(|op| op.opcode == OpCode::Call)
+            .unwrap()
+            .inputs[0]
+            .offset = 0x1005;
+        let mut calls = Vec::new();
+        let mut warnings = Vec::new();
+        let (edges, terminal, _) = flow(&code, 0x1005, &mut calls, &mut warnings, &mut |_, _| {
+            Some(NoReturnEvidence::NamedTarget)
+        });
+        assert!(!terminal);
+        assert_eq!(edges, [(Some(0x1005), EdgeKind::Branch)]);
+        assert_eq!(calls[0].no_return, None);
+        // Force a non-fallthrough target and internal p-code flow. Neither
+        // an address match nor a prototype may override ambiguous machine flow.
+        let call = code
+            .operations
+            .iter_mut()
+            .find(|op| op.opcode == OpCode::Call)
+            .unwrap();
+        call.inputs[0].offset = 0x1020;
+        code.operations
+            .push(ghidra_decompiler::program::PcodeOperation {
+                opcode: OpCode::Cbranch,
+                output: None,
+                inputs: vec![ghidra_decompiler::program::PcodeVarnode {
+                    space: "const".into(),
+                    offset: 1,
+                    size: 8,
+                }],
+                space: None,
+            });
+        calls.clear();
+        let (edges, terminal, _) = flow(&code, 0x1005, &mut calls, &mut warnings, &mut |_, _| {
+            Some(NoReturnEvidence::NamedTarget)
+        });
+        assert!(terminal && calls.is_empty());
+        assert_eq!(edges, [(None, EdgeKind::Unknown)]);
+    }
+
+    #[test]
+    fn no_return_terminal_can_establish_a_pattern_candidate() {
+        let mut bytes = vec![0xe8, 0x1b, 0, 0, 0];
+        bytes.resize(0x21, 0xc3);
+        let mut loaded = raw_x86(bytes);
+        bulk_functions(&mut loaded, [(0x1020, "abort".into())].into_iter());
+        let index = Arc::new(crate::no_return::NoReturnIndex::build(
+            &loaded.program,
+            "ELF",
+            8,
+            &BTreeMap::new(),
+            |_| true,
+        ));
+        let mut walk = Walk::new(&loaded.program, &loaded.info.sections, 0x1000, None)
+            .unwrap()
+            .with_no_return(&index);
+        walk.run(
+            &loaded.program,
+            &loaded.info.sections,
+            &|pc| pc == 0x1020,
+            &[],
+            &mut 16,
+            None,
+        );
+        assert_eq!(walk.nodes.len(), 1);
+        assert!(walk.complete_function(&Coverage::default(), &|pc| pc == 0x1020, &|_| true, 1));
     }
 
     #[test]
@@ -3051,6 +3289,7 @@ pub(crate) mod tests {
             upx_packed: false,
             inventory: Default::default(),
             coverage: Coverage::default(),
+            no_return: Arc::default(),
         };
         loaded.resolve_import_thunks(0x1000).unwrap();
         assert!(
@@ -3293,7 +3532,7 @@ pub(crate) mod tests {
         };
         let mut calls = Vec::new();
         let mut warnings = Vec::new();
-        let (edges, terminal, _) = flow(&code, 0x1002, &mut calls, &mut warnings);
+        let (edges, terminal, _) = flow(&code, 0x1002, &mut calls, &mut warnings, &mut |_, _| None);
         assert!(terminal);
         assert_eq!(edges, vec![(None, EdgeKind::Unknown)]);
         assert!(warnings[0].contains("internal p-code branches"));

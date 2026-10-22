@@ -81,6 +81,47 @@ Conventional UPX PE detection still prevents discovery and decompilation of the
 packed stub. Listing, CFG, strings, and byte inspection remain available. The
 desktop neither unpacks nor executes the input.
 
+## No-return calls
+
+Calls to named functions such as `exit`, `abort`, `__stack_chk_fail`, and
+`ExitProcess` end their CFG block with no successor. Their actual call sites
+and direct targets remain available for discovery and navigation. A separate
+branch can still reach code after the call. The graph header and call list show
+**[no return]**; listing hover text and call-list hover text explain the evidence.
+This prevents padding or a neighbouring function after such a call from being
+claimed as part of its caller, including during function-start pattern validation.
+
+Recognition uses the binary's original function symbols/import stubs and the
+Ghidra list for its container, with the explicit native exclusions and
+supplements documented in [the data provenance](../data/no-return/README.md).
+Names compare exactly after narrow container-specific decoration removal;
+substrings, analyst renames, and demangled leaf names never establish evidence.
+At most 4,096 named entries and import slots are retained per image; omissions
+are reported in Analysis notes. Reopening the worker rebuilds the index from
+the immutable binary, independently of saved analysis and synchronized names.
+
+PE calls through a named IAT slot, a conventional x86 `JMP [IAT]` thunk, or an
+exact ARM64 `ADRP/LDR/BR` veneer can also establish no-return behavior. The IAT
+slot stays data, and an indirect call's runtime address remains unresolved.
+Extra thunk decodes, including failed checks, consume the walk's instruction
+budget. The verified `__libc_start_main` slots from the x86-64 ELF startup
+recognizer are supported even when `main` already has a symbol. Other ELF
+`-fno-plt` calls and register-carried import pointers remain unsupported.
+
+The engine's public prototype flag is set for recognized named functions and
+resolved PE thunks before decompilation. This improves pseudocode for those
+calls; direct IAT-call termination is currently a desktop CFG guarantee only.
+The pinned engine, executable formats, compiler output, and ABI still limit
+what pseudocode can recover. No engine cache or dependency was changed.
+
+Wrapper inference is deferred: a custom function whose only action is calling
+`exit` does not automatically become no-return in its callers. Suspicious bytes
+after an unresolved call, recursive cycles, and decode failures are not proof.
+Exceptions and longjmp-style nonlocal destinations are not reconstructed.
+Old graph/discovery caches refresh under the new fingerprints; annotations and
+the SQLite schema remain compatible. Saved markers retain saved-analysis
+provenance and never seed live classification.
+
 ## Stripped ELF startup
 
 Stripped executables have no symbol for `main`. In a dynamically linked x86-64
@@ -368,7 +409,7 @@ metadata fixtures cover isolated runtime entries, fragments, a real named import
 call and an unresolved veneer branch through production worker containment.
 
 Cross-block constant propagation, speculative operand references, exception
-flow, no-return analysis, and complete stripped-function recovery are not
+flow, inferred no-return wrappers, and complete stripped-function recovery are not
 supplied by this pass. Existing engine behavior may still expose some of these
 constructs during decompilation; this pass does not establish their missing
 targets for the desktop's independent CFG. Switch tables are the exception

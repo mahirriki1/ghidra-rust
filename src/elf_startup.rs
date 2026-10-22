@@ -200,6 +200,14 @@ fn relocations<'a>(bytes: &'a [u8], architecture: &str) -> Result<Relocations<'a
     Ok(relocations)
 }
 
+/// Verified glibc startup import slots, also used when `main` already has a
+/// symbol. Failure to recognize the relocation layout establishes no slots.
+pub(crate) fn libc_start_slots(bytes: &[u8], architecture: &str) -> BTreeSet<u64> {
+    relocations(bytes, architecture)
+        .map(|r| r.libc_slots)
+        .unwrap_or_default()
+}
+
 fn mask(size: u32) -> u64 {
     if size >= 8 {
         u64::MAX

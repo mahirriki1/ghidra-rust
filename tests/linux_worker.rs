@@ -881,3 +881,123 @@ fn function_start_patterns_recover_callbacks_without_false_starts() {
         }
     }
 }
+
+// Calls to functions that never return end their block: the bytes after
+// them, often the next function, are not their successor. Truth comes from
+// the unstripped twin's symbol extents; stripped discovery never sees it.
+#[test]
+fn no_return_calls_end_blocks_and_keep_neighbours_separate() {
+    use ghidra_rust::model::NoReturnEvidence;
+    let directory = tempfile::tempdir().unwrap();
+    let source = Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/noreturn.c"
+    ));
+    for flags in [
+        ["-O0", "-fno-pie", "-no-pie"],
+        ["-O0", "-fPIE", "-pie"],
+        ["-O2", "-fno-pie", "-no-pie"],
+        ["-O2", "-fPIE", "-pie"],
+    ] {
+        let name = flags.join("");
+        let args = [&flags[..], &["-fstack-protector-all"]].concat();
+        let reference = compile(
+            directory.path(),
+            &format!("{name}-symbols"),
+            source,
+            &args,
+            false,
+        );
+        let extent = |function: &str| {
+            let bytes = std::fs::read(&reference).unwrap();
+            let image = object::File::parse(bytes.as_slice()).unwrap();
+            let symbol = image
+                .symbols()
+                .find(|symbol| symbol.name().ok() == Some(function))
+                .unwrap_or_else(|| panic!("{function} symbol"));
+            symbol.address()..symbol.address() + symbol.size()
+        };
+        let [die_exit, die_abort, after_abort, guarded] =
+            ["die_exit", "die_abort", "after_abort", "guarded"].map(extent);
+
+        let (mut worker, _) = open(&reference);
+        for function in [&die_exit, &die_abort, &guarded] {
+            let Response::Graph { view } = request(
+                &mut worker,
+                Request::Graph {
+                    address: function.start,
+                },
+            ) else {
+                panic!("{name}: no graph");
+            };
+            // Every decoded instruction stays inside the function itself.
+            for block in &view.blocks {
+                for instruction in &block.instructions {
+                    assert!(
+                        function.contains(&instruction.address),
+                        "{name}: {:#x} outside {function:x?}",
+                        instruction.address
+                    );
+                }
+            }
+            let ended: Vec<_> = view
+                .calls
+                .iter()
+                .filter(|c| c.no_return.is_some())
+                .collect();
+            assert!(!ended.is_empty(), "{name}: {:?}", view.calls);
+            for call in ended {
+                assert_eq!(call.no_return, Some(NoReturnEvidence::NamedTarget));
+                let block = view
+                    .blocks
+                    .iter()
+                    .find(|b| b.instructions.iter().any(|i| i.address == call.address))
+                    .unwrap();
+                assert_eq!(block.instructions.last().unwrap().address, call.address);
+                assert!(!view.edges.iter().any(|edge| edge.source == block.address));
+            }
+            assert!(
+                !view
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("another known function")),
+                "{name}: {:?}",
+                view.warnings
+            );
+        }
+        let response = request(
+            &mut worker,
+            Request::Decompile {
+                address: die_exit.start,
+            },
+        );
+        let Response::Decompiled { text, .. } = response else {
+            panic!("{name}: {response:?}");
+        };
+        assert!(!text.contains("puts"), "{name}: {text}");
+
+        // Stripped: a neighbour after a no-return call is its own function,
+        // recovered from its prologue, and owns its own calls.
+        let binary = compile(directory.path(), &name, source, &args, true);
+        let (mut worker, info) = open(&binary);
+        let (functions, state) = discover_batches(&mut worker, &info, true);
+        let report = state.snapshot();
+        for owner in [&die_exit, &die_abort] {
+            assert!(
+                report
+                    .references
+                    .iter()
+                    .filter(|r| r.caller == owner.start)
+                    .all(|r| owner.contains(&r.address)),
+                "{name}: {:?}",
+                report.references
+            );
+        }
+        if flags[0] == "-O0" {
+            assert!(
+                functions.iter().any(|f| f.address == after_abort.start),
+                "{name}: after_abort not recovered"
+            );
+        }
+    }
+}

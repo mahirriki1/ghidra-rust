@@ -93,6 +93,14 @@ only from them. `tests/linux_worker.rs` builds stripped `-O0`/`-O2`, PIE and
 non-PIE copies and checks that every pattern-derived function exists in the
 unstripped twin, and that `-O0` recovers all five.
 
+`noreturn.c` is an original fixture for [no-return calls](../../docs/analysis.md#no-return-calls).
+The Linux worker test compiles `-O0`/`-O2`, PIE and non-PIE, with stack protection,
+and checks that `exit`, `abort`, and stack-failure calls end their blocks without
+claiming neighbouring instructions. Stripped copies exercise discovery and
+separate recovery of a callback after a no-return call. The binaries are never
+executed. Synthetic x86/x64 IAT calls and ARM64 import veneers have separate
+engine/worker regression coverage.
+
 ## AArch64
 
 `aarch64.S` is original assembly with explicit little-endian instruction words.

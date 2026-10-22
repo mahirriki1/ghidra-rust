@@ -34,14 +34,14 @@ impl Target {
             }
         }
         let pe = image.format() == BinaryFormat::Pe;
-        let (name, language, pointer_bytes, instruction_alignment) = match image.architecture() {
+        let (name, language) = match image.architecture() {
             Architecture::I386 => {
                 let language = if pe { "x86:LE:32:default:windows" } else { "x86:LE:32:default:gcc" };
-                ("x86", language, 4, 1)
+                ("x86", language)
             }
             Architecture::X86_64 => {
                 let language = if pe { "x86:LE:64:default:windows" } else { "x86:LE:64:default:gcc" };
-                ("x86-64", language, 8, 1)
+                ("x86-64", language)
             }
             Architecture::Aarch64 if image.is_64() => {
                 let language = match image.format() {
@@ -49,17 +49,29 @@ impl Target {
                     BinaryFormat::MachO => "AARCH64:LE:64:AppleSilicon:default",
                     _ => "AARCH64:LE:64:v8A:default",
                 };
-                ("AArch64", language, 8, 4)
+                ("AArch64", language)
             }
             Architecture::Arm => return Err("ARM/Thumb is not supported yet: instruction-mode context and interworking require additional loader support.".into()),
             other => return Err(format!("Unsupported architecture {other:?}; supported architectures are x86, x86-64, and little-endian AArch64 (64-bit ABI).")),
         };
+        let (pointer_bytes, instruction_alignment) = properties(name).expect("supported name");
         Ok(Self {
             name,
             language,
-            pointer_bytes,
+            pointer_bytes: pointer_bytes as i32,
             instruction_alignment,
         })
+    }
+}
+
+/// Pointer width and instruction alignment of a supported architecture, by
+/// the display name `BinaryInfo::architecture` reports.
+pub(crate) fn properties(name: &str) -> Option<(u64, u64)> {
+    match name {
+        "x86" => Some((4, 1)),
+        "x86-64" => Some((8, 1)),
+        "AArch64" => Some((8, 4)),
+        _ => None,
     }
 }
 
