@@ -162,8 +162,8 @@ still need function-start patterns or broader pointer analysis.
 
 Functions reached only through pointer tables or callbacks have no direct call.
 On x86-64 ELF and PE, once every queued function has been walked, discovery scans
-executable file-backed sections (except `.plt*`) with Ghidra's function-start
-byte patterns: the GCC set for ELF, the Windows set for PE, vendored unchanged
+all executable file-backed sections with Ghidra's function-start byte patterns:
+the GCC set for ELF, the Windows set for PE, vendored unchanged
 with their [provenance](../data/function-starts/README.md). A match is only a
 candidate. It is admitted as a `FUN_` function only when:
 
@@ -184,13 +184,28 @@ rejected. Admitted starts become ordinary discovery seeds, so their direct
 calls are followed. `codeboundary`, `possiblefuncstart`, `setcontext` and
 patterns that require an existing function never create one. Before scanning,
 the worker decodes any established function it has not walked, so a restarted
-worker still judges candidates against all known code.
+worker still judges candidates against all known code. Replies identify at most
+16,384 newly covered entries; the parent verifies that each is a known inventory
+entry and accepts it only once per worker epoch. A replacement worker may rebuild
+the same coverage in bounded batches under its new epoch. The parent also checks
+scan cursors against the ordered file-backed executable byte space: address gaps
+cost no scan bytes, forward cursors must land in that space, and an uncharged
+resume may advance only within the current 64 KiB match chunk. Coverage-only
+preparation is accounted by those distinct function identities
+rather than by a cursor allowance, so a full 262,144-entry inventory can be
+rebuilt across multiple bounded replies and worker epochs. Cursor work has a
+separate parent-owned ceiling of 256 accepted replies, including at most 64
+uncharged match-point resumes. The parent also permits at most 2,097,152 complete
+inventory rows to be reconstructed and validated during the pattern phase; this
+check runs before an expensive adoption. Reaching any cumulative limit ends the
+phase explicitly partial. Worker-reported match, validation, and byte counters do
+not replenish the parent-owned allowances.
 
-Each scan step covers at most 1 MiB, 4,096 matches per 64 KiB chunk, 128
-validated candidates, 128 admissions and 16,384 decode attempts, then resumes
-from where it stopped. A match flood, an interrupted or stalled step, or a full
-inventory leaves the scan partial. Optimized code without a recognizable
-prologue (for example GCC `-O2` leaf functions) is not recovered. AArch64,
+Each scan step covers at most 1 MiB, 4,096 matches per 64 KiB chunk (65,536 in
+one reply), 128 validated candidates, 128 admissions and 16,384 decode attempts,
+then resumes from where it stopped. A match flood, an interrupted or stalled
+step, or a full inventory leaves the scan partial. Optimized code without a
+recognizable prologue (for example GCC `-O2` leaf functions) is not recovered. AArch64,
 32-bit x86 and Mach-O have no pattern set yet. Function rows do not yet record
 which evidence created them; the discovery summary reports the number of
 pattern-derived starts.

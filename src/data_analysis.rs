@@ -65,7 +65,7 @@ struct Known {
     carried: bool,
 }
 
-fn mask(size: u32) -> u64 {
+pub(crate) fn mask(size: u32) -> u64 {
     if size >= 8 {
         u64::MAX
     } else {

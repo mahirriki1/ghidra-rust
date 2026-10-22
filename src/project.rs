@@ -836,12 +836,18 @@ pub(crate) fn validate_view(
             return Err("Graph edge source is not a basic block".into());
         }
         if edge.evidence.is_some() {
-            // Switch evidence describes an established branch destination.
+            // Switch evidence describes an engine-established code
+            // destination, so preserve the worker's aligned executable-backed
+            // rule when validating both live replies and cached projects.
             let target = edge
                 .target
                 .filter(|_| edge.kind == EdgeKind::Branch)
                 .ok_or("Graph switch evidence lacks a branch destination")?;
-            mapped(ranges, target)?;
+            if !crate::call_analysis::code_address(info, target) {
+                return Err(
+                    "Graph switch destination is not aligned executable file-backed code".into(),
+                );
+            }
         }
     }
     Ok(())
@@ -1543,9 +1549,21 @@ mod tests {
             evidence: None,
         });
         assert!(data.validate().unwrap_err().contains("not a basic block"));
-        // Switch evidence must name a mapped branch destination.
+        // Switch evidence must name aligned executable file-backed code. The
+        // same validator handles untrusted worker replies and cached projects.
         let switch = |target, kind| {
             let mut data = original.clone();
+            data.info.architecture = "AArch64".into();
+            data.info.file_len = 18;
+            data.info.sections[0].size = 0x20;
+            data.info.sections.push(SectionInfo {
+                name: ".data".into(),
+                address: 0x2000,
+                size: 8,
+                file_offset: 14,
+                file_size: 4,
+                executable: false,
+            });
             let view = data.view.as_mut().unwrap();
             view.blocks.push(crate::model::BasicBlock {
                 address: 0x1000,
@@ -1557,16 +1575,62 @@ mod tests {
                 kind,
                 evidence: Some(crate::model::EdgeEvidence::EngineJumpTable),
             });
-            data.validate()
+            let ranges = MappedRanges::new(&data.info.sections).unwrap();
+            let reply = validate_view(view, &ranges, &data.info);
+            (reply, data.validate())
         };
         for (target, kind, error) in [
             (None, EdgeKind::Branch, "lacks a branch destination"),
             (Some(0x1000), EdgeKind::True, "lacks a branch destination"),
-            (Some(0x9000), EdgeKind::Branch, "unmapped"),
+            (Some(0x9000), EdgeKind::Branch, "executable file-backed"),
+            (Some(0x1001), EdgeKind::Branch, "aligned executable"),
+            (Some(0x2000), EdgeKind::Branch, "executable file-backed"),
+            (Some(0x1010), EdgeKind::Branch, "executable file-backed"),
         ] {
-            assert!(switch(target, kind).unwrap_err().contains(error));
+            let (reply, cached) = switch(target, kind);
+            assert!(reply.unwrap_err().contains(error));
+            assert!(cached.unwrap_err().contains(error));
         }
-        switch(Some(0x1000), EdgeKind::Branch).unwrap();
+        let (reply, cached) = switch(Some(0x1000), EdgeKind::Branch);
+        reply.unwrap();
+        cached.unwrap();
+        // Ordinary cached control-flow targets retain the longstanding mapped
+        // rule; only engine jump-table evidence receives the stronger check.
+        for target in [0x1001, 0x1010, 0x2000] {
+            let mut ordinary = original.clone();
+            ordinary.info.architecture = "AArch64".into();
+            ordinary.info.file_len = 18;
+            ordinary.info.sections[0].size = 0x20;
+            ordinary.info.sections.push(SectionInfo {
+                name: ".data".into(),
+                address: 0x2000,
+                size: 8,
+                file_offset: 14,
+                file_size: 4,
+                executable: false,
+            });
+            ordinary
+                .view
+                .as_mut()
+                .unwrap()
+                .blocks
+                .push(crate::model::BasicBlock {
+                    address: 0x1000,
+                    instructions: vec![],
+                });
+            ordinary
+                .view
+                .as_mut()
+                .unwrap()
+                .edges
+                .push(crate::model::Edge {
+                    source: 0x1000,
+                    target: Some(target),
+                    kind: EdgeKind::Branch,
+                    evidence: None,
+                });
+            ordinary.validate().unwrap();
+        }
         // Graphs saved before switch recovery carry no evidence field.
         let legacy: crate::model::Edge =
             serde_json::from_str(r#"{"source":4096,"target":4101,"kind":"Branch"}"#).unwrap();
