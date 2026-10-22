@@ -25,6 +25,7 @@ use crate::session::{Annotation, BinaryProtection, Session};
 use crate::signature_ui::{DraftParameter, SignatureAction, SignatureEditor};
 use crate::signatures::{self, FunctionSignature};
 use crate::theme;
+use crate::xrefs::{AccessFilter, CallDirection, CallRow, TargetKind, TargetSet, XrefTarget};
 
 const DEADLINE: Duration = Duration::from_secs(30);
 const HISTORY_LIMIT: usize = 32;
@@ -69,6 +70,7 @@ enum Shortcut {
     Forward,
     Save,
     Undo,
+    Xrefs,
 }
 
 fn shortcut(event: &egui::Event) -> Option<Shortcut> {
@@ -93,6 +95,7 @@ fn shortcut(event: &egui::Event) -> Option<Shortcut> {
             egui::Key::G => Some(Shortcut::GoTo),
             egui::Key::Semicolon => Some(Shortcut::Comment),
             egui::Key::Space => Some(Shortcut::ToggleGraph),
+            egui::Key::X => Some(Shortcut::Xrefs),
             _ => None,
         };
     }
@@ -153,6 +156,43 @@ fn replay_addresses(worker: &[FunctionInfo], desired: &[FunctionInfo]) -> VecDeq
         })
         .map(|function| function.address)
         .collect()
+}
+
+/// Explicit target choices for one selection, bound to the state they came from.
+struct XrefChoices {
+    key: XrefKey,
+    set: TargetSet,
+}
+
+/// Generation, selection, annotation revision and reference-evidence revision.
+type XrefKey = (u64, u64, u64, u64);
+
+/// Filtered References rows, recomputed only when an input changes.
+#[derive(Clone, PartialEq)]
+struct ReferenceRowsKey {
+    generation: u64,
+    references: u64,
+    revision: u64,
+    data: bool,
+    scope: Option<u64>,
+    explicit: bool,
+    direction: CallDirection,
+    access: AccessFilter,
+    filter: String,
+}
+
+struct ReferenceRows {
+    key: ReferenceRowsKey,
+    calls: Vec<CallRow>,
+    data: Vec<usize>,
+}
+
+/// Decompiler context captured by the opening secondary click.
+#[derive(Clone)]
+struct DecompilerMenu {
+    key: XrefKey,
+    local: Option<crate::semantic::SemanticToken>,
+    targets: TargetSet,
 }
 
 struct DiscoveryPublication {
@@ -392,8 +432,18 @@ pub struct DesktopApp {
     analyze_prompt: Option<AnalyzePrompt>,
     analysis_plan: Option<AnalysisPlan>,
     reference_data: bool,
-    reference_target: Option<u64>,
+    /// Explicitly inspected address; `None` follows the displayed function.
+    xref_target: Option<XrefTarget>,
     reference_query: String,
+    reference_filter: String,
+    reference_direction: CallDirection,
+    reference_access: AccessFilter,
+    reference_rows: Option<ReferenceRows>,
+    /// Advances whenever `call_index` changes, invalidating captured targets.
+    reference_revision: u64,
+    xref_choices: Option<XrefChoices>,
+    /// Direct target of a decompiler call token chosen by the user.
+    selected_call: Option<u64>,
     analysis_progress: Option<AnalysisProgress>,
     progress_events: usize,
     reference_focus: Option<(u64, u64)>,
@@ -515,8 +565,15 @@ impl DesktopApp {
             analyze_prompt: None,
             analysis_plan: None,
             reference_data: false,
-            reference_target: None,
+            xref_target: None,
             reference_query: String::new(),
+            reference_filter: String::new(),
+            reference_direction: CallDirection::All,
+            reference_access: AccessFilter::All,
+            reference_rows: None,
+            reference_revision: 0,
+            xref_choices: None,
+            selected_call: None,
             analysis_progress: None,
             progress_events: 0,
             reference_focus: None,
@@ -681,10 +738,15 @@ impl DesktopApp {
         self.saved_references = false;
         self.analyze_prompt = None;
         self.analysis_plan = None;
-        self.call_index = None;
+        self.set_call_index(None);
         self.reference_data = false;
-        self.reference_target = None;
+        self.xref_target = None;
         self.reference_query.clear();
+        self.reference_filter.clear();
+        self.reference_direction = CallDirection::All;
+        self.reference_access = AccessFilter::All;
+        self.xref_choices = None;
+        self.selected_call = None;
         self.reference_focus = None;
         self.undisplayed_call = None;
         self.browser_dialog = None;
@@ -1165,8 +1227,15 @@ impl DesktopApp {
         }
     }
 
+    fn set_call_index(&mut self, index: Option<crate::call_analysis::CallIndex>) {
+        self.call_index = index;
+        self.reference_revision = self.reference_revision.wrapping_add(1);
+        self.reference_rows = None;
+    }
+
     fn navigate(&mut self, address: u64, record: bool, context: &egui::Context) {
         self.reference_focus = None;
+        self.selected_call = None;
         self.undisplayed_call = None;
         self.selection_generation = self.selection_generation.wrapping_add(1);
         crate::performance::navigation_begin(self.selection_generation);
@@ -1206,6 +1275,8 @@ impl DesktopApp {
     }
 
     fn select_instruction(&mut self, address: u64) {
+        self.selected_call = None;
+        self.xref_choices = None;
         self.pending_comment_scroll = Some(address);
         self.selected_local = None;
         self.decompiler_rename_context = false;
@@ -1220,10 +1291,15 @@ impl DesktopApp {
     }
 
     fn select_decompiled_byte(&mut self, byte: usize) {
+        self.xref_choices = None;
         self.pending_comment_scroll = None;
         self.decompiler_rename_context = true;
         self.selected_local = match self.semantic_info.token_at(byte).map(|t| &t.kind) {
             Some(TokenKind::Local { local }) => *local,
+            _ => None,
+        };
+        self.selected_call = match self.semantic_info.token_at(byte).map(|t| &t.kind) {
+            Some(TokenKind::Call { target }) => Some(*target),
             _ => None,
         };
         let Some(primary) = self.semantic.select_code(byte) else {
@@ -1302,12 +1378,14 @@ impl DesktopApp {
         self.discovery_summary = None;
         self.discovery_saved = None;
         self.saved_references = false;
-        self.call_index = None;
+        self.set_call_index(None);
         self.request(Request::Discover, context);
     }
 
     fn start_discovery(&mut self, context: &egui::Context) {
-        let Some(info) = &self.info else { return };
+        if self.info.is_none() {
+            return;
+        }
         if !self.discovery_running {
             crate::performance::event("discovery_action_begin", self.generation);
         }
@@ -1315,10 +1393,11 @@ impl DesktopApp {
             // Saved results are display-only; a fresh run replaces them.
             if self.saved_references {
                 self.saved_references = false;
-                self.call_index = None;
+                self.set_call_index(None);
                 self.discovery_summary = None;
                 self.discovery_saved = None;
             }
+            let Some(info) = &self.info else { return };
             // Only copy addresses here; queue construction, validation and all
             // reference sorting/indexing happen in parent background jobs.
             let seeds: Vec<_> = info.functions.iter().map(|f| f.address).collect();
@@ -1376,7 +1455,7 @@ impl DesktopApp {
         self.discovery_saved = Some(update.saved);
         match update.publication {
             Ok(Some(publication)) => {
-                self.call_index = Some(publication.index);
+                self.set_call_index(Some(publication.index));
                 let changed = publication.functions.is_some();
                 if let Some(info) = &mut self.info {
                     if let Some(functions) = publication.functions {
@@ -1969,6 +2048,7 @@ impl DesktopApp {
                         self.comment_rows_key = None;
                         self.semantic_info = SemanticInfo::default();
                         self.selected_local = None;
+                        self.selected_call = None;
                         self.decompiler_rename_context = false;
                         self.pending_code_scroll = None;
                         self.pending_comment_scroll = None;
@@ -1994,12 +2074,14 @@ impl DesktopApp {
                         self.decompiled_lines.clear();
                         self.semantic_info = SemanticInfo::default();
                         self.selected_local = None;
+                        self.selected_call = None;
                         self.decompiler_rename_context = false;
                         self.status = format!("Invalid decompiler source mappings: {error}");
                         return;
                     }
                     self.semantic_info = semantics;
                     self.selected_local = None;
+                    self.selected_call = None;
                     self.decompiler_rename_context = false;
                     self.semantic.mappings = mappings;
                     self.comment_rows_key = None;
@@ -2233,7 +2315,7 @@ impl DesktopApp {
                         " · direct references analyzed"
                     }
                 );
-                self.call_index = Some(crate::call_analysis::CallIndex::new(analysis));
+                self.set_call_index(Some(crate::call_analysis::CallIndex::new(analysis)));
                 self.cached_functions = false;
                 self.inventory_synced = false;
                 if let Some(info) = &mut self.info {
@@ -2657,7 +2739,7 @@ impl DesktopApp {
         self.crypto_truncated = data.crypto_truncated;
         self.rebuild_string_filter();
         if let Some(saved) = data.discovery {
-            self.call_index = discovery_index;
+            self.set_call_index(discovery_index);
             self.discovery_summary = Some(discovery_summary(
                 "Saved discovery",
                 saved.report.functions_examined,
@@ -2991,6 +3073,7 @@ impl DesktopApp {
                         self.comment_rows_key = None;
                         self.semantic_info = SemanticInfo::default();
                         self.selected_local = None;
+                        self.selected_call = None;
                         self.decompiler_rename_context = false;
                         self.pending_code_scroll = None;
                         self.pending_comment_scroll = None;
@@ -3280,6 +3363,7 @@ impl DesktopApp {
         self.semantic.clear();
         self.semantic_info = SemanticInfo::default();
         self.selected_local = None;
+        self.selected_call = None;
         self.decompiler_rename_context = false;
         self.pending_code_scroll = None;
         self.pending_comment_scroll = None;
@@ -3295,7 +3379,7 @@ impl DesktopApp {
         self.discovery_running = false;
         self.discovery_summary = None;
         self.saved_references = false;
-        self.call_index = None;
+        self.set_call_index(None);
         self.reference_focus = None;
         self.undisplayed_call = None;
         self.analysis_plan = None;
@@ -3575,6 +3659,7 @@ impl DesktopApp {
             self.semantic.clear();
             self.semantic_info = SemanticInfo::default();
             self.selected_local = None;
+            self.selected_call = None;
             self.decompiler_rename_context = false;
             self.pending_code_scroll = None;
             self.pending_comment_scroll = None;
@@ -3661,6 +3746,7 @@ impl DesktopApp {
             self.comment_rows_key = None;
             self.semantic_info = SemanticInfo::default();
             self.selected_local = None;
+            self.selected_call = None;
             self.decompiler_rename_context = false;
             self.pending_code_scroll = None;
             self.pending_comment_scroll = None;
@@ -3732,6 +3818,7 @@ impl DesktopApp {
             Some(Shortcut::Forward) => self.history_step(true, context),
             Some(Shortcut::Save) => self.save_project(false, context),
             Some(Shortcut::Undo) => self.undo(context),
+            Some(Shortcut::Xrefs) => self.show_selection_xrefs(),
             _ => {}
         }
         if action.is_some() {
@@ -4260,6 +4347,7 @@ impl DesktopApp {
         }
         ui.label(RichText::new("Address       Name").monospace().weak());
         let mut navigate = None;
+        let mut xrefs = None;
         let row_height = ui.text_style_height(&egui::TextStyle::Body) + 6.0;
         ScrollArea::vertical()
             .id_salt("function-list")
@@ -4296,12 +4384,22 @@ impl DesktopApp {
                                 self.annotations_open = true;
                                 ui.close();
                             }
+                            if ui.button("Xrefs to this function").clicked() {
+                                xrefs = Some(function.address);
+                                ui.close();
+                            }
                         });
                     }
                 }
             });
         if let Some(address) = navigate {
             self.navigate(address, true, ui.ctx());
+        }
+        if let Some(address) = xrefs {
+            self.open_xrefs(XrefTarget {
+                address,
+                kind: TargetKind::Function,
+            });
         }
     }
 
@@ -4353,7 +4451,21 @@ impl DesktopApp {
     }
 
     fn navigate_annotation(&mut self, address: u64, record: bool, context: &egui::Context) {
+        self.navigate_location(address, None, record, context);
+    }
+
+    /// Opens `address`, inside `owner` when that is known from evidence.
+    /// Recorded history keeps the exact departure and destination
+    /// instructions and their observed owners for Back/Forward.
+    fn navigate_location(
+        &mut self,
+        address: u64,
+        owner: Option<u64>,
+        record: bool,
+        context: &egui::Context,
+    ) {
         self.update_comment_rows();
+        let explicit = owner.is_some();
         let current_owner = self
             .view
             .as_ref()
@@ -4370,7 +4482,8 @@ impl DesktopApp {
                         .any(|m| m.addresses.contains(&address))
             })
             .map(|view| view.address);
-        let owner = current_owner
+        let owner = owner
+            .or(current_owner)
             .or_else(|| self.comment_owners.get(&address).copied())
             .unwrap_or(address);
         if record {
@@ -4403,6 +4516,9 @@ impl DesktopApp {
                 self.history.remove(0);
             }
             self.history_index = self.history.len().saturating_sub(1);
+            if owner != address {
+                self.comment_owners.insert(address, owner);
+            }
             self.comment_owners.retain(|pc, _| {
                 self.history.contains(pc)
                     || self
@@ -4438,6 +4554,10 @@ impl DesktopApp {
             self.pending_listing_scroll = self.listing.iter().position(|i| i.address == address);
             if let Some(canvas) = &mut self.canvas {
                 canvas.reveal_instruction(address);
+            }
+            if explicit {
+                self.reference_focus = None;
+                self.undisplayed_call = self.pending_listing_scroll.is_none().then_some(address);
             }
         } else {
             self.navigate(owner, false, context);
@@ -4597,6 +4717,13 @@ impl DesktopApp {
                     self.open_comment(entry);
                     ui.close();
                 }
+                if ui.button("Xrefs to this function").clicked() {
+                    self.open_xrefs(XrefTarget {
+                        address: entry,
+                        kind: TargetKind::Function,
+                    });
+                    ui.close();
+                }
             });
             if let Some(status) = self
                 .signature_unapplied
@@ -4646,6 +4773,7 @@ impl DesktopApp {
         let mut edit_comment = None;
         let mut select_comment = None;
         let mut rename_local_byte = None;
+        let mut xrefs = None;
         let mut scroll = ScrollArea::both()
             .id_salt("decompiler-text")
             .auto_shrink([false, false]);
@@ -4759,43 +4887,59 @@ impl DesktopApp {
                         }
                     }
                 }
-                let local_token = pointer_byte
-                    .and_then(|byte| self.semantic_info.token_at(byte))
-                    .filter(|t| matches!(t.kind, TokenKind::Local { .. }))
-                    .cloned();
-                // Egui retains context menus after the pointer leaves the row.
-                let menu_id = response.id.with("local-token");
+                // Egui retains context menus after the pointer leaves the row,
+                // so capture the clicked token and its exact targets once.
+                let menu_id = response.id.with("decompiler-menu");
                 if response.secondary_clicked() {
-                    context.data_mut(|d| {
-                        d.insert_temp(
-                            menu_id,
-                            (self.selection_generation, self.revision, local_token),
-                        )
-                    });
+                    let token = pointer_byte.and_then(|byte| self.semantic_info.token_at(byte));
+                    let local = token
+                        .filter(|t| matches!(t.kind, TokenKind::Local { .. }))
+                        .cloned();
+                    let targets = match (token.map(|t| &t.kind), pointer_byte, &self.view) {
+                        (Some(TokenKind::Call { target }), _, _) => TargetSet::single(XrefTarget {
+                            address: *target,
+                            kind: TargetKind::CallTarget,
+                        }),
+                        (_, Some(byte), Some(view)) => crate::xrefs::instruction_targets(
+                            Some(view),
+                            self.call_index.as_ref(),
+                            view.address,
+                            self.semantic.addresses_at(byte).iter().copied(),
+                        ),
+                        _ => TargetSet::default(),
+                    };
+                    let menu = DecompilerMenu {
+                        key: self.xref_key(),
+                        local,
+                        targets,
+                    };
+                    context.data_mut(|d| d.insert_temp(menu_id, menu));
                 }
-                let local_token = context
-                    .data(|d| {
-                        d.get_temp::<(u64, u64, Option<crate::semantic::SemanticToken>)>(menu_id)
-                    })
-                    .filter(|(selection, revision, _)| {
-                        *selection == self.selection_generation && *revision == self.revision
-                    })
-                    .and_then(|(_, _, token)| token);
-                if let Some(token) = local_token {
+                let menu = context
+                    .data(|d| d.get_temp::<DecompilerMenu>(menu_id))
+                    .filter(|menu| menu.key == self.xref_key());
+                if let Some(menu) = menu {
+                    let function = self.view.as_ref().map(|view| view.address);
                     response.context_menu(|ui| {
-                        if matches!(token.kind, TokenKind::Local { local: Some(_) }) {
-                            if ui.button("Rename local variable…  L").clicked() {
-                                rename_local_byte = Some(token.start);
-                                ui.close();
+                        if let Some(token) = &menu.local {
+                            if matches!(token.kind, TokenKind::Local { local: Some(_) }) {
+                                if ui.button("Rename local variable…  L").clicked() {
+                                    rename_local_byte = Some(token.start);
+                                    ui.close();
+                                }
+                            } else {
+                                ui.label("Renaming unsupported: no verified storage identity");
                             }
-                        } else {
-                            ui.label("Renaming unsupported: no verified storage identity");
+                            ui.separator();
                         }
+                        xref_menu_items(ui, &menu.targets, function, &mut xrefs);
                     });
                 }
             }
         });
-        if let Some(target) = navigate {
+        if let Some(target) = xrefs {
+            self.open_xrefs(target);
+        } else if let Some(target) = navigate {
             self.navigate(target, true, &context);
         } else if let Some(address) = edit_comment {
             self.open_comment(address);
@@ -4923,17 +5067,133 @@ impl DesktopApp {
         }
     }
 
+    /// Opens the exact source instruction of reference evidence in its owner,
+    /// recording that instruction rather than the owner's entry in history.
     fn navigate_reference(&mut self, caller: u64, pc: u64, context: &egui::Context) {
+        self.navigate_location(pc, Some(caller), true, context);
         self.tab = Tab::Listing;
-        self.navigate(caller, true, context);
-        self.reference_focus = Some((caller, pc));
+    }
+
+    fn xref_key(&self) -> XrefKey {
+        (
+            self.generation,
+            self.selection_generation,
+            self.revision,
+            self.reference_revision,
+        )
+    }
+
+    /// Inspects references to exactly `target`, independent of the displayed
+    /// function, until Current function is chosen.
+    fn open_xrefs(&mut self, target: XrefTarget) {
+        self.xref_choices = None;
+        self.xref_target = Some(target);
+        self.reference_query = format!("{:x}", target.address);
+        self.reference_filter.clear();
+        let data_address = self
+            .info
+            .as_ref()
+            .is_some_and(|info| !crate::call_analysis::code_address(info, target.address));
+        self.reference_data = match self.call_index.as_ref() {
+            _ if target.kind.prefers_data() || data_address => true,
+            Some(index) => match crate::xrefs::counts(index, target.address) {
+                (0, data) => data > 0,
+                _ => false,
+            },
+            None => false,
+        };
+        self.tab = Tab::References;
+    }
+
+    /// Exact targets of the current selection: a chosen call token, else the
+    /// call and data evidence of every selected instruction in the displayed
+    /// function, else the selected address itself.
+    fn selection_xref_targets(&self) -> TargetSet {
+        if let Some(target) = self.selected_call {
+            return TargetSet::single(XrefTarget {
+                address: target,
+                kind: TargetKind::CallTarget,
+            });
+        }
+        let mut set = TargetSet::default();
+        let pcs: Vec<u64> = if self.semantic.addresses.is_empty() {
+            self.selected.into_iter().collect()
+        } else {
+            self.semantic.addresses.iter().copied().collect()
+        };
+        if let Some(view) = &self.view {
+            set = crate::xrefs::instruction_targets(
+                Some(view),
+                self.call_index.as_ref(),
+                view.address,
+                pcs.iter().copied().filter(|pc| {
+                    *pc == view.address
+                        || self.listing.binary_search_by_key(pc, |i| i.address).is_ok()
+                        || self
+                            .semantic
+                            .mappings
+                            .iter()
+                            .any(|m| m.addresses.contains(pc))
+                }),
+            );
+        }
+        if set.targets.is_empty() {
+            let function = self.view.as_ref().map(|view| view.address);
+            if let Some(address) = self.selected.or(function) {
+                let entry = Some(address) == function
+                    || self
+                        .info
+                        .as_ref()
+                        .is_some_and(|info| function_at(&info.functions, address).is_some());
+                set = TargetSet::single(XrefTarget {
+                    address,
+                    kind: if entry {
+                        TargetKind::Function
+                    } else {
+                        TargetKind::Address
+                    },
+                });
+            }
+        }
+        set
+    }
+
+    fn show_selection_xrefs(&mut self) {
+        let set = self.selection_xref_targets();
+        match set.targets.as_slice() {
+            [] => self.status = "Select an instruction, function or address first".into(),
+            [target] if set.omitted() == 0 => self.open_xrefs(*target),
+            _ => {
+                self.xref_choices = Some(XrefChoices {
+                    key: self.xref_key(),
+                    set,
+                });
+                self.tab = Tab::References;
+            }
+        }
+    }
+
+    /// Display label for an exact function entry; never reference evidence.
+    fn reference_name(&self, address: u64) -> Option<&str> {
+        let function = function_at(&self.info.as_ref()?.functions, address)?;
+        Some(
+            self.session
+                .as_ref()
+                .and_then(|s| s.annotations.get(&address))
+                .map(|a| a.label.as_str())
+                .filter(|n| !n.is_empty())
+                .unwrap_or(&function.name),
+        )
     }
 
     fn read_data_reference(&mut self, target: u64, size: u32, context: &egui::Context) {
         // This action requests bytes; a memory target never becomes a function
         // or a guessed instruction/pseudocode link. Retain code selection and
         // project context; Decode carries the byte source's own exact address.
-        self.reference_target = Some(target);
+        self.xref_target = Some(XrefTarget {
+            address: target,
+            kind: TargetKind::DataAccess,
+        });
         self.reference_query = format!("{target:x}");
         self.request(
             Request::Bytes {
@@ -4944,7 +5204,185 @@ impl DesktopApp {
         );
     }
 
-    fn data_references_panel(&mut self, ui: &mut egui::Ui) {
+    /// Target controls, explicit choices and the inspected scope shared by
+    /// the call and data views. Returns the scope address and whether it was
+    /// chosen explicitly rather than followed from the displayed function.
+    fn reference_scope(&mut self, ui: &mut egui::Ui) -> Option<(u64, bool)> {
+        let mut open = None;
+        ui.horizontal(|ui| {
+            let response = ui.add(
+                TextEdit::singleline(&mut self.reference_query)
+                    .hint_text("Exact hex address")
+                    .desired_width(130.0)
+                    .char_limit(18),
+            );
+            let entered =
+                response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+            if ui
+                .small_button("Show xrefs")
+                .on_hover_text("References to exactly this address")
+                .clicked()
+                || entered
+            {
+                match parse_address(&self.reference_query) {
+                    Ok(address) => open = Some(address),
+                    Err(error) => self.status = error,
+                }
+            }
+            if ui
+                .add_enabled(
+                    self.xref_target.is_some(),
+                    egui::Button::new("Current function").small(),
+                )
+                .on_hover_text("Follow the displayed function again")
+                .clicked()
+            {
+                self.xref_target = None;
+                self.reference_query.clear();
+            }
+        });
+        if let Some(address) = open {
+            let function = self
+                .info
+                .as_ref()
+                .is_some_and(|info| function_at(&info.functions, address).is_some());
+            self.open_xrefs(XrefTarget {
+                address,
+                kind: if function {
+                    TargetKind::Function
+                } else {
+                    TargetKind::Address
+                },
+            });
+        }
+        if self
+            .xref_choices
+            .as_ref()
+            .is_some_and(|choices| choices.key != self.xref_key())
+        {
+            self.xref_choices = None;
+        }
+        if let Some(choices) = &self.xref_choices {
+            let mut chosen = None;
+            let mut dismiss = false;
+            ui.group(|ui| {
+                ui.label("The selection has several exact targets. Choose one:");
+                for target in &choices.set.targets {
+                    let name = self
+                        .reference_name(target.address)
+                        .map_or(String::new(), |name| format!("  {}", crop(name, 60)));
+                    if ui
+                        .button(format!(
+                            "{} {:x}{name}",
+                            target.kind.label(),
+                            target.address
+                        ))
+                        .clicked()
+                    {
+                        chosen = Some(*target);
+                    }
+                }
+                if choices.set.omitted() > 0 {
+                    ui.weak(format!(
+                        "{} further targets omitted; select fewer instructions",
+                        choices.set.omitted()
+                    ));
+                }
+                if ui.small_button("Dismiss").clicked() {
+                    dismiss = true;
+                }
+            });
+            if let Some(target) = chosen {
+                self.open_xrefs(target);
+            } else if dismiss {
+                self.xref_choices = None;
+            }
+        }
+        if let Some(target) = self.xref_target {
+            let name = self
+                .reference_name(target.address)
+                .map_or(String::new(), |name| format!("  {}", crop(name, 80)));
+            ui.label(
+                RichText::new(format!(
+                    "References to {} {:#x}{name}",
+                    target.kind.label(),
+                    target.address
+                ))
+                .monospace()
+                .color(theme::BLUE),
+            );
+            if target.kind == TargetKind::StringStart {
+                ui.weak("Accesses beginning exactly at this string's first byte. Accesses to later bytes, address-only uses and loaded pointers are not recorded by this analysis.");
+            }
+            Some((target.address, true))
+        } else if let Some(function) = self.view.as_ref().map(|view| view.address) {
+            let name = self
+                .reference_name(function)
+                .map_or(String::new(), |name| format!("  {}", crop(name, 80)));
+            ui.label(RichText::new(format!("Function {function:#x}{name}")).monospace());
+            Some((function, false))
+        } else {
+            ui.weak("Select a function, use X on a selection, or enter an exact address.");
+            None
+        }
+    }
+
+    /// Rows for the current inputs, recomputed only when one changes.
+    fn refresh_reference_rows(&mut self, scope: u64, explicit: bool) {
+        let key = ReferenceRowsKey {
+            generation: self.generation,
+            references: self.reference_revision,
+            revision: self.revision,
+            data: self.reference_data,
+            scope: Some(scope),
+            explicit,
+            direction: self.reference_direction,
+            access: self.reference_access,
+            filter: self.reference_filter.clone(),
+        };
+        if self
+            .reference_rows
+            .as_ref()
+            .is_some_and(|rows| rows.key == key)
+        {
+            return;
+        }
+        let Some(index) = &self.call_index else {
+            self.reference_rows = None;
+            return;
+        };
+        let filter = crate::xrefs::TextFilter::new(&self.reference_filter);
+        let name = |address| self.reference_name(address);
+        let (calls, data) = if self.reference_data {
+            let scope = if explicit {
+                crate::xrefs::DataScope::StartingAt(scope)
+            } else {
+                crate::xrefs::DataScope::From(scope)
+            };
+            (
+                Vec::new(),
+                crate::xrefs::data_rows(index, scope, self.reference_access, &filter, name),
+            )
+        } else {
+            (
+                crate::xrefs::call_rows(index, scope, self.reference_direction, &filter, name),
+                Vec::new(),
+            )
+        };
+        self.reference_rows = Some(ReferenceRows { key, calls, data });
+    }
+
+    fn reference_filter_field(&mut self, ui: &mut egui::Ui) {
+        ui.add(
+            TextEdit::singleline(&mut self.reference_filter)
+                .hint_text("Filter by known name or hex address")
+                .desired_width(220.0)
+                .char_limit(256),
+        )
+        .on_hover_text("Names are display labels only; they never create references");
+    }
+
+    fn data_references_panel(&mut self, ui: &mut egui::Ui, scope: Option<(u64, bool)>) {
         let context = ui.ctx().clone();
         let Some(index) = &self.call_index else {
             ui.weak("Data accesses have not been analyzed in this session. Run discovery to compute them.");
@@ -4973,39 +5411,29 @@ impl DesktopApp {
             "{} unresolved addresses · {} omitted accesses · {} unsupported instructions",
             data.unresolved_accesses, data.omitted_accesses, data.unsupported_instructions
         ));
+        let Some((address, explicit)) = scope else {
+            return;
+        };
         ui.horizontal(|ui| {
-            ui.add(
-                TextEdit::singleline(&mut self.reference_query)
-                    .hint_text("Hex target address")
-                    .desired_width(130.0)
-                    .char_limit(18),
-            );
-            if ui.small_button("Find accesses").clicked() {
-                match parse_address(&self.reference_query) {
-                    Ok(address) => self.reference_target = Some(address),
-                    Err(error) => self.status = error,
-                }
-            }
-            if ui.small_button("Current function").clicked() {
-                self.reference_target = None;
-            }
+            ui.selectable_value(&mut self.reference_access, AccessFilter::All, "All");
+            ui.selectable_value(&mut self.reference_access, AccessFilter::Read, "Reads");
+            ui.selectable_value(&mut self.reference_access, AccessFilter::Write, "Writes");
+            self.reference_filter_field(ui);
         });
-        let rows = if let Some(target) = self.reference_target {
-            ui.label(format!("Accesses starting at {target:#x}"));
-            index.data_incoming.get(&target)
-        } else if let Some(function) = self.view.as_ref().map(|view| view.address) {
-            ui.label(format!("Accesses from function {function:#x}"));
-            index.data_outgoing.get(&function)
+        self.refresh_reference_rows(address, explicit);
+        let (Some(index), Some(rows)) = (&self.call_index, &self.reference_rows) else {
+            return;
+        };
+        let Some(data) = &index.report.data else {
+            return;
+        };
+        let rows = rows.data.as_slice();
+        ui.label(if explicit {
+            format!("{} accesses starting at {address:#x}", rows.len())
         } else {
-            ui.weak("Select a function or enter an exact target address.");
-            None
-        }
-        .map(Vec::as_slice)
-        .unwrap_or(&[]);
-        ui.weak(format!(
-            "{} matching accesses · an empty result does not establish absence of references",
-            rows.len()
-        ));
+            format!("{} accesses from this function", rows.len())
+        });
+        ui.weak("An empty result does not establish absence of references.");
         let mut source = None;
         let mut read = None;
         let mut target = None;
@@ -5026,7 +5454,10 @@ impl DesktopApp {
                     if ui.small_button("Refs").on_hover_text("Show accesses beginning at this exact address").clicked() {
                         target = Some(reference.target);
                     }
-                    if ui.button(format!("{:x} @ {:x}", reference.function, reference.address))
+                    let name = self
+                        .reference_name(reference.function)
+                        .map_or(String::new(), |name| format!(" {}", crop(name, 40)));
+                    if ui.button(format!("{:x}{name} @ {:x}", reference.function, reference.address))
                         .on_hover_text("Open the source function and select this decoded memory-access instruction").clicked() {
                         source = Some((reference.function, reference.address));
                     }
@@ -5038,8 +5469,10 @@ impl DesktopApp {
         } else if let Some((address, size)) = read {
             self.read_data_reference(address, size, &context);
         } else if let Some(address) = target {
-            self.reference_target = Some(address);
-            self.reference_query = format!("{address:x}");
+            self.open_xrefs(XrefTarget {
+                address,
+                kind: TargetKind::DataAccess,
+            });
         }
     }
 
@@ -5060,9 +5493,14 @@ impl DesktopApp {
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.reference_data, false, "Calls");
             ui.selectable_value(&mut self.reference_data, true, "Data accesses");
+            if let (Some(index), Some(target)) = (&self.call_index, self.xref_target) {
+                let (calls, data) = crate::xrefs::counts(index, target.address);
+                ui.weak(format!("{calls} calls · {data} accesses to this address"));
+            }
         });
+        let scope = self.reference_scope(ui);
         if self.reference_data {
-            self.data_references_panel(ui);
+            self.data_references_panel(ui, scope);
             return;
         }
         let Some(index) = &self.call_index else {
@@ -5091,87 +5529,66 @@ impl DesktopApp {
             "{} unresolved calls · {} failed function walks · {} fallthrough calls excluded",
             report.unresolved_calls, report.failed_functions, report.skipped_fallthrough_calls
         ));
-        let Some(function) = self.view.as_ref().map(|view| view.address) else {
-            ui.label("Select a function to inspect its incoming and outgoing calls.");
+        let Some((address, explicit)) = scope else {
             return;
         };
-        ui.label(RichText::new(format!("Function {function:#x}")).monospace());
-        let incoming = index
-            .incoming
-            .get(&function)
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
-        let outgoing = index
-            .outgoing
-            .get(&function)
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
-        let count = incoming.len() + outgoing.len();
-        ui.label(format!(
-            "{} incoming · {} outgoing",
-            incoming.len(),
-            outgoing.len()
-        ));
-        let name = |address| {
-            self.info
-                .as_ref()
-                .and_then(|info| {
-                    info.functions
-                        .binary_search_by_key(&address, |f| f.address)
-                        .ok()
-                        .map(|i| &info.functions[i])
-                })
-                .map(|function| {
-                    self.session
-                        .as_ref()
-                        .and_then(|s| s.annotations.get(&address))
-                        .map(|a| a.label.as_str())
-                        .filter(|n| !n.is_empty())
-                        .unwrap_or(&function.name)
-                })
-                .unwrap_or("function")
+        let (incoming, outgoing) = (
+            index.incoming.get(&address).map_or(0, Vec::len),
+            index.outgoing.get(&address).map_or(0, Vec::len),
+        );
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.reference_direction, CallDirection::All, "All");
+            ui.selectable_value(
+                &mut self.reference_direction,
+                CallDirection::Incoming,
+                format!("Incoming {incoming}"),
+            );
+            ui.selectable_value(
+                &mut self.reference_direction,
+                CallDirection::Outgoing,
+                format!("Outgoing {outgoing}"),
+            );
+            self.reference_filter_field(ui);
+        });
+        self.refresh_reference_rows(address, explicit);
+        let (Some(index), Some(rows)) = (&self.call_index, &self.reference_rows) else {
+            return;
         };
+        let report = &index.report;
+        let rows = rows.calls.as_slice();
+        ui.label(format!("{} matching calls", rows.len()));
+        ui.weak("An empty result does not establish absence of references.");
         let mut source = None;
         let mut target = None;
+        let mut inspect = None;
         let row_height = ui.text_style_height(&egui::TextStyle::Body) + 6.0;
         ScrollArea::both().id_salt("call-references").show_rows(
             ui,
             row_height,
-            count,
-            |ui, rows| {
-                for row in rows {
-                    let is_incoming = row < incoming.len();
-                    let reference = &report.references[if is_incoming {
-                        incoming[row]
+            rows.len(),
+            |ui, visible| {
+                for row in visible {
+                    let CallRow {
+                        reference,
+                        incoming,
+                    } = rows[row];
+                    let reference = &report.references[reference];
+                    let counterpart = if incoming {
+                        reference.caller
                     } else {
-                        outgoing[row - incoming.len()]
-                    }];
+                        reference.target
+                    };
                     ui.horizontal(|ui| {
-                        ui.weak(if is_incoming { "From" } else { "To" });
+                        ui.weak(if incoming { "From" } else { "To" });
                         if ui
                             .button(format!(
-                                "{:x} {}",
-                                if is_incoming {
-                                    reference.caller
-                                } else {
-                                    reference.target
-                                },
-                                crop(
-                                    name(if is_incoming {
-                                        reference.caller
-                                    } else {
-                                        reference.target
-                                    }),
-                                    60
-                                )
+                                "{counterpart:x} {}",
+                                crop(self.reference_name(counterpart).unwrap_or("function"), 60)
                             ))
+                            .on_hover_text("Open this function")
                             .clicked()
                         {
-                            target = Some(if is_incoming {
-                                reference.caller
-                            } else {
-                                reference.target
-                            });
+                            target = Some(counterpart);
                         }
                         if ui
                             .button(format!("at {:x}", reference.address))
@@ -5182,6 +5599,13 @@ impl DesktopApp {
                         {
                             source = Some((reference.caller, reference.address));
                         }
+                        if ui
+                            .small_button("Xrefs")
+                            .on_hover_text("Show references to this function")
+                            .clicked()
+                        {
+                            inspect = Some(counterpart);
+                        }
                     });
                 }
             },
@@ -5190,6 +5614,11 @@ impl DesktopApp {
             self.navigate_reference(caller, pc, &context);
         } else if let Some(address) = target {
             self.navigate(address, true, &context);
+        } else if let Some(address) = inspect {
+            self.open_xrefs(XrefTarget {
+                address,
+                kind: TargetKind::Function,
+            });
         }
     }
 
@@ -5241,6 +5670,7 @@ impl DesktopApp {
             Tab::References => self.references_panel(ui),
             Tab::Graph => {
                 let mut navigate = None;
+                let mut xrefs = None;
                 if let Some(view) = &self.view {
                     for warning in view.warnings.iter().take(3) {
                         ui.colored_label(theme::WARNING, warning);
@@ -5300,9 +5730,37 @@ impl DesktopApp {
                             (self.generation, self.revision),
                             &self.annotation_browser.comments,
                         );
-                        if let Some(action) =
-                            canvas.show_selected(ui, view, self.selected, &self.semantic.addresses)
-                        {
+                        let call_index = self.call_index.as_ref();
+                        let menu = |ui: &mut egui::Ui, pc: Option<u64>| {
+                            let call = pc.and_then(|pc| {
+                                view.calls
+                                    .iter()
+                                    .find(|call| call.address == pc)
+                                    .and_then(|call| call.target)
+                            });
+                            if let Some(target) = call
+                                && ui.button(format!("Go to {target:x}")).clicked()
+                            {
+                                navigate = Some(target);
+                                ui.close();
+                            }
+                            let targets = pc.map_or_else(TargetSet::default, |pc| {
+                                crate::xrefs::instruction_targets(
+                                    Some(view),
+                                    call_index,
+                                    view.address,
+                                    [pc],
+                                )
+                            });
+                            xref_menu_items(ui, &targets, Some(view.address), &mut xrefs);
+                        };
+                        if let Some(action) = canvas.show_selected(
+                            ui,
+                            view,
+                            self.selected,
+                            &self.semantic.addresses,
+                            menu,
+                        ) {
                             match action {
                                 GraphAction::Select(address) => self.select_instruction(address),
                                 GraphAction::Navigate(target) => navigate = Some(target),
@@ -5314,11 +5772,14 @@ impl DesktopApp {
                     ui.label("Function Graph");
                     ui.weak("Select a function from the left to display its control flow.");
                 }
-                if let Some(address) = navigate {
+                if let Some(target) = xrefs {
+                    self.open_xrefs(target);
+                } else if let Some(address) = navigate {
                     self.navigate(address, true, &context);
                 }
             }
             Tab::Listing => {
+                let mut listing_xrefs = None;
                 if let Some(pc) = self.undisplayed_call {
                     ui.colored_label(theme::WARNING, format!("Referenced instruction {pc:#x} is outside this bounded source graph. Use Go to inspect its address."));
                 }
@@ -5336,11 +5797,21 @@ impl DesktopApp {
                         .and_then(|info| function_at(&info.functions, view.address))
                         .map(|f| f.name.as_str())
                         .unwrap_or("function");
+                    let entry = view.address;
                     ui.label(
                         RichText::new(format!("{}  ·  {:x}", crop(name, 120), view.address))
                             .monospace()
                             .color(theme::BLUE),
-                    );
+                    )
+                    .context_menu(|ui| {
+                        if ui.button("Xrefs to this function").clicked() {
+                            listing_xrefs = Some(XrefTarget {
+                                address: entry,
+                                kind: TargetKind::Function,
+                            });
+                            ui.close();
+                        }
+                    });
                     ui.separator();
                 }
                 ui.label(
@@ -5441,6 +5912,21 @@ impl DesktopApp {
                                 decode = Some((instruction.address, instruction.bytes.clone()));
                                 ui.close();
                             }
+                            if let Some(view) = &self.view {
+                                ui.separator();
+                                let targets = crate::xrefs::instruction_targets(
+                                    Some(view),
+                                    self.call_index.as_ref(),
+                                    view.address,
+                                    [instruction.address],
+                                );
+                                xref_menu_items(
+                                    ui,
+                                    &targets,
+                                    Some(view.address),
+                                    &mut listing_xrefs,
+                                );
+                            }
                         });
                     }
                 });
@@ -5455,6 +5941,9 @@ impl DesktopApp {
                 }
                 if let Some((address, bytes)) = decode {
                     self.decode_loaded_bytes(address, bytes);
+                }
+                if let Some(target) = listing_xrefs {
+                    self.open_xrefs(target);
                 }
             }
             Tab::Strings => {
@@ -5496,8 +5985,9 @@ impl DesktopApp {
                 {
                     self.rebuild_string_filter();
                 }
-                ui.weak("Click a string to load its source bytes into the decoder");
+                ui.weak("Click a string to load its source bytes into the decoder; right-click for confirmed accesses at its exact start");
                 let mut read = None;
+                let mut xrefs = None;
                 let row = ui.text_style_height(&egui::TextStyle::Monospace) + 6.0;
                 ScrollArea::vertical().id_salt("strings-list").show_rows(
                     ui,
@@ -5506,18 +5996,22 @@ impl DesktopApp {
                     |ui, rows| {
                         for index in rows {
                             let string = &self.strings[self.filtered_strings[index]];
-                            if ui
-                                .button(
-                                    RichText::new(format!(
-                                        "{:08x}  {}  {}",
-                                        string.address,
-                                        string.encoding,
-                                        crop(&string.text, 240)
-                                    ))
-                                    .monospace(),
-                                )
-                                .clicked()
-                            {
+                            let response = ui.button(
+                                RichText::new(format!(
+                                    "{:08x}  {}  {}",
+                                    string.address,
+                                    string.encoding,
+                                    crop(&string.text, 240)
+                                ))
+                                .monospace(),
+                            );
+                            response.context_menu(|ui| {
+                                if ui.button("Data accesses at this exact start").clicked() {
+                                    xrefs = Some(string.address);
+                                    ui.close();
+                                }
+                            });
+                            if response.clicked() {
                                 let length = if string.encoding.contains("16") {
                                     string.text.encode_utf16().count().saturating_mul(2)
                                 } else {
@@ -5534,6 +6028,11 @@ impl DesktopApp {
                 if let Some((address, length)) = read {
                     self.select_instruction(address);
                     self.request(Request::Bytes { address, length }, &context);
+                } else if let Some(address) = xrefs {
+                    self.open_xrefs(XrefTarget {
+                        address,
+                        kind: TargetKind::StringStart,
+                    });
                 }
             }
             Tab::Crypto => {
@@ -5884,6 +6383,42 @@ fn edit_size(edit: &Edit) -> usize {
                     })
                     .sum::<usize>()
         })
+}
+
+/// Context entries for exact reference targets; each is its own explicit
+/// choice, so a multi-target selection never silently picks one.
+fn xref_menu_items(
+    ui: &mut egui::Ui,
+    targets: &TargetSet,
+    function: Option<u64>,
+    chosen: &mut Option<XrefTarget>,
+) {
+    for target in &targets.targets {
+        if ui
+            .button(format!(
+                "Xrefs to {} {:x}",
+                target.kind.label(),
+                target.address
+            ))
+            .clicked()
+        {
+            *chosen = Some(*target);
+            ui.close();
+        }
+    }
+    if targets.omitted() > 0 {
+        ui.weak(format!("{} more targets omitted", targets.omitted()));
+    }
+    if let Some(function) = function
+        && targets.targets.iter().all(|t| t.address != function)
+        && ui.button("Xrefs to this function").clicked()
+    {
+        *chosen = Some(XrefTarget {
+            address: function,
+            kind: TargetKind::Function,
+        });
+        ui.close();
+    }
 }
 
 fn parse_address(text: &str) -> Result<u64, String> {
@@ -6563,7 +7098,7 @@ mod tests {
         let semantic_addresses = app.semantic.addresses.clone();
         app.read_data_reference(0x1080, 4, &context);
         assert_eq!(app.selected, selected);
-        assert_eq!(app.reference_target, Some(0x1080));
+        assert_eq!(app.xref_target.map(|t| t.address), Some(0x1080));
         assert_eq!(app.view.as_ref().unwrap().address, function);
         assert_eq!(app.history, history);
         assert_eq!(app.selection_generation, generation);
@@ -6680,12 +7215,15 @@ mod tests {
             }
         }
         app.reference_data = true;
-        app.reference_target = Some(0x1080);
+        app.xref_target = Some(XrefTarget {
+            address: 0x1080,
+            kind: TargetKind::DataAccess,
+        });
         app.reference_query = "1080".into();
         app.clear_views();
         assert!(app.call_index.is_none());
         assert!(!app.reference_data);
-        assert!(app.reference_target.is_none());
+        assert!(app.xref_target.is_none());
         assert!(app.reference_query.is_empty());
     }
 
@@ -7603,6 +8141,474 @@ mod tests {
             output.textures_delta.clear();
             assert!(app.pending_code_scroll.is_none());
         }
+    }
+
+    /// `semantic_app` with a call at 0x1004 and two accesses at 0x1008.
+    fn xref_app() -> DesktopApp {
+        let mut app = semantic_app();
+        app.view.as_mut().unwrap().calls = vec![CallSite {
+            address: 0x1004,
+            target: Some(0x1040),
+            no_return: None,
+        }];
+        let data = |target, access| DataReference {
+            function: 0x1000,
+            address: 0x1008,
+            target,
+            size: 4,
+            access,
+            provenance: DataProvenance::InstructionLocal,
+        };
+        app.set_call_index(Some(crate::call_analysis::CallIndex::new(CallAnalysis {
+            references: vec![
+                CallReference {
+                    caller: 0x1000,
+                    address: 0x1004,
+                    target: 0x1040,
+                },
+                CallReference {
+                    caller: 0x1040,
+                    address: 0x1044,
+                    target: 0x1040,
+                },
+            ],
+            data: Some(DataAnalysis {
+                references: vec![
+                    data(0x2000, DataAccess::Read),
+                    data(0x2010, DataAccess::Write),
+                ],
+                ..Default::default()
+            }),
+            functions_examined: 2,
+            decode_attempts: 8,
+            ..Default::default()
+        })));
+        app
+    }
+
+    fn secondary_events(point: egui::Pos2) -> Vec<egui::Event> {
+        let button = |pressed| egui::Event::PointerButton {
+            pos: point,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        vec![
+            egui::Event::PointerMoved(point),
+            button(true),
+            button(false),
+        ]
+    }
+
+    #[test]
+    fn selection_xrefs_use_exact_evidence_and_require_explicit_choices() {
+        let mut app = xref_app();
+        // A call instruction resolves to its decoded target only.
+        app.select_instruction(0x1004);
+        app.show_selection_xrefs();
+        assert_eq!(
+            app.xref_target,
+            Some(XrefTarget {
+                address: 0x1040,
+                kind: TargetKind::CallTarget
+            })
+        );
+        assert!(app.tab == Tab::References && !app.reference_data);
+        // Two accesses from one instruction offer both and pick neither.
+        app.xref_target = None;
+        app.select_instruction(0x1008);
+        app.show_selection_xrefs();
+        assert!(app.xref_target.is_none());
+        let choices = app.xref_choices.as_ref().unwrap();
+        assert_eq!(
+            choices
+                .set
+                .targets
+                .iter()
+                .map(|t| t.address)
+                .collect::<Vec<_>>(),
+            [0x2000, 0x2010]
+        );
+        // A decompiler expression mapped to several PCs merges their targets.
+        app.select_decompiled_byte(app.decompiled.find("return").unwrap());
+        app.show_selection_xrefs();
+        let choices = app.xref_choices.as_ref().unwrap();
+        assert_eq!(
+            choices
+                .set
+                .targets
+                .iter()
+                .map(|t| t.address)
+                .collect::<Vec<_>>(),
+            [0x1040, 0x2000, 0x2010]
+        );
+        app.open_xrefs(choices.set.targets[2]);
+        assert!(app.xref_choices.is_none() && app.reference_data);
+        assert_eq!(app.xref_target.unwrap().address, 0x2010);
+        // Without operand evidence the exact selected address is inspected.
+        app.select_instruction(0x1000);
+        app.show_selection_xrefs();
+        assert_eq!(app.xref_target.unwrap().kind, TargetKind::Function);
+        app.selected = Some(0x10f0);
+        app.semantic.addresses.clear();
+        app.show_selection_xrefs();
+        assert_eq!(
+            app.xref_target,
+            Some(XrefTarget {
+                address: 0x10f0,
+                kind: TargetKind::Address
+            })
+        );
+        // Text never establishes a target: duplicate labels keep exact calls.
+        for address in [0x1000, 0x1040] {
+            app.edit_annotation(
+                address,
+                Annotation {
+                    label: "dup".into(),
+                    ..Default::default()
+                },
+            );
+        }
+        app.select_instruction(0x1004);
+        app.show_selection_xrefs();
+        assert_eq!(app.xref_target.unwrap().address, 0x1040);
+    }
+
+    #[test]
+    fn decompiler_call_tokens_resolve_directly_and_legacy_text_does_not() {
+        let source = "void f() { helper(); }";
+        let mut app = call_navigation_app(source);
+        let call = source.find("helper").unwrap();
+        app.semantic_info.tokens = vec![crate::semantic::SemanticToken {
+            start: call,
+            end: call + "helper".len(),
+            kind: TokenKind::Call { target: 0x1040 },
+        }];
+        app.select_decompiled_byte(call + 1);
+        app.show_selection_xrefs();
+        assert_eq!(
+            app.xref_target,
+            Some(XrefTarget {
+                address: 0x1040,
+                kind: TargetKind::CallTarget
+            })
+        );
+        // Legacy text without tokens or mappings has no call evidence; the
+        // name "helper" is never looked up.
+        let mut legacy = call_navigation_app(source);
+        legacy.select_decompiled_byte(call + 1);
+        assert!(legacy.selected_call.is_none());
+        legacy.show_selection_xrefs();
+        assert_eq!(legacy.xref_target.unwrap().address, 0x1000);
+    }
+
+    #[test]
+    fn xref_shortcut_respects_focus_dialogs_repeats_and_file_jobs() {
+        // Each press is released so egui does not report the next as a repeat.
+        let tap = |modifiers| {
+            let press = key_event(egui::Key::X, modifiers);
+            let egui::Event::Key {
+                key,
+                physical_key,
+                modifiers,
+                ..
+            } = press
+            else {
+                unreachable!()
+            };
+            vec![
+                press,
+                egui::Event::Key {
+                    key,
+                    physical_key,
+                    pressed: false,
+                    repeat: false,
+                    modifiers,
+                },
+            ]
+        };
+        let x = || tap(egui::Modifiers::NONE);
+        let context = egui::Context::default();
+        let mut app = xref_app();
+        app.select_instruction(0x1004);
+        keyboard_frame(&context, &mut app, vec![]);
+        context.memory_mut(|memory| memory.request_focus(egui::Id::unique("function-filter")));
+        keyboard_frame(&context, &mut app, vec![]);
+        let mut typed = x();
+        typed.insert(1, egui::Event::Text("x".into()));
+        keyboard_frame(&context, &mut app, typed);
+        assert_eq!(app.function_filter, "x");
+        assert!(app.xref_target.is_none() && app.tab == Tab::Listing);
+        context.memory_mut(|memory| memory.surrender_focus(egui::Id::unique("function-filter")));
+        let (_sender, receiver) = mpsc::sync_channel(1);
+        app.file_job = Some(receiver);
+        keyboard_frame(&context, &mut app, x());
+        assert!(app.xref_target.is_none());
+        app.file_job = None;
+        app.begin_go_to();
+        keyboard_frame(&context, &mut app, x());
+        assert!(app.xref_target.is_none());
+        app.browser_dialog = None;
+        let repeat = egui::Event::Key {
+            key: egui::Key::X,
+            physical_key: Some(egui::Key::X),
+            pressed: true,
+            repeat: true,
+            modifiers: egui::Modifiers::NONE,
+        };
+        keyboard_frame(&context, &mut app, vec![repeat]);
+        assert!(app.xref_target.is_none());
+        keyboard_frame(&context, &mut app, tap(egui::Modifiers::SHIFT));
+        assert!(app.xref_target.is_none());
+        keyboard_frame(&context, &mut app, x());
+        assert_eq!(app.xref_target.unwrap().address, 0x1040);
+        assert!(app.tab == Tab::References);
+    }
+
+    #[test]
+    fn listing_and_graph_context_menus_offer_each_exact_target() {
+        for (tab, name) in [(Tab::Listing, "listing"), (Tab::Graph, "graph")] {
+            let context = egui::Context::default();
+            theme::install(&context);
+            let mut app = xref_app();
+            app.tab = tab;
+            let screen = Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000.0, 700.0),
+            ));
+            let frame = |app: &mut DesktopApp, events| {
+                let mut output = context.run_ui(
+                    egui::RawInput {
+                        screen_rect: screen,
+                        events,
+                        time: Some(1.0),
+                        ..Default::default()
+                    },
+                    |ui| app.main_panel(ui),
+                );
+                output.textures_delta.clear();
+                output
+            };
+            let output = frame(&mut app, vec![]);
+            let point = text_position(&output, "00001008", 3);
+            frame(&mut app, secondary_events(point));
+            // The captured instruction survives pointer movement over the menu.
+            let output = frame(
+                &mut app,
+                vec![egui::Event::PointerMoved(egui::pos2(990.0, 690.0))],
+            );
+            let text = rendered_text(&output);
+            for item in [
+                "Xrefs to data access target 2000",
+                "Xrefs to data access target 2010",
+                "Xrefs to this function",
+            ] {
+                assert!(text.iter().any(|t| t == item), "{name} {item}");
+            }
+            assert!(!text.iter().any(|t| t.contains("call target 1040")));
+            let point = text_position(&output, "Xrefs to data access target 2010", 0);
+            frame(&mut app, pointer_events(point));
+            assert_eq!(
+                app.xref_target,
+                Some(XrefTarget {
+                    address: 0x2010,
+                    kind: TargetKind::DataAccess
+                }),
+                "{name}"
+            );
+            assert!(app.tab == Tab::References && app.reference_data);
+            assert_eq!(app.view.as_ref().unwrap().address, 0x1000);
+        }
+    }
+
+    #[test]
+    fn explicit_xrefs_filter_rows_and_keep_saved_provenance_visible() {
+        let context = egui::Context::default();
+        theme::install(&context);
+        let mut app = xref_app();
+        app.saved_references = true;
+        app.open_xrefs(XrefTarget {
+            address: 0x1040,
+            kind: TargetKind::Function,
+        });
+        // Independent of the displayed function.
+        assert_eq!(app.view.as_ref().unwrap().address, 0x1000);
+        let frame = |app: &mut DesktopApp| {
+            let mut output =
+                context.run_ui(egui::RawInput::default(), |ui| app.references_panel(ui));
+            output.textures_delta.clear();
+            rendered_text(&output)
+        };
+        let text = frame(&mut app);
+        assert!(text.iter().any(|t| t.starts_with("Saved analysis")));
+        assert!(
+            text.iter()
+                .any(|t| t == "References to function 0x1040  next")
+        );
+        // Two calls to it (one recursive) and its own outgoing call.
+        assert!(text.iter().any(|t| t == "3 matching calls"));
+        assert!(
+            text.iter()
+                .any(|t| t.contains("does not establish absence"))
+        );
+        app.reference_direction = CallDirection::Outgoing;
+        assert!(frame(&mut app).iter().any(|t| t == "1 matching calls"));
+        app.reference_direction = CallDirection::All;
+        app.reference_filter = "entry".into();
+        assert!(frame(&mut app).iter().any(|t| t == "1 matching calls"));
+        app.reference_filter = "0x1044".into();
+        assert!(frame(&mut app).iter().any(|t| t == "2 matching calls"));
+        app.reference_filter = "missing".into();
+        assert!(frame(&mut app).iter().any(|t| t == "0 matching calls"));
+        // Rows recompute when names change, not only when the query does.
+        app.reference_filter = "renamed".into();
+        frame(&mut app);
+        app.edit_annotation(
+            0x1000,
+            Annotation {
+                label: "renamed".into(),
+                ..Default::default()
+            },
+        );
+        assert!(frame(&mut app).iter().any(|t| t == "1 matching calls"));
+        // Data view: exact-start string accesses with access filtering.
+        app.reference_filter.clear();
+        app.open_xrefs(XrefTarget {
+            address: 0x2010,
+            kind: TargetKind::StringStart,
+        });
+        assert!(app.reference_data);
+        let text = frame(&mut app);
+        assert!(
+            text.iter()
+                .any(|t| t.contains("exactly at this string's first byte"))
+        );
+        assert!(text.iter().any(|t| t == "1 accesses starting at 0x2010"));
+        app.reference_access = AccessFilter::Read;
+        assert!(
+            frame(&mut app)
+                .iter()
+                .any(|t| t == "0 accesses starting at 0x2010")
+        );
+        // Current function resets to the displayed function's own accesses.
+        app.reference_access = AccessFilter::All;
+        app.xref_target = None;
+        assert!(
+            frame(&mut app)
+                .iter()
+                .any(|t| t == "2 accesses from this function")
+        );
+    }
+
+    #[test]
+    fn selection_changes_and_invalidation_drop_captured_xref_targets() {
+        // Choices belong to the selection that produced them.
+        let mut app = xref_app();
+        app.select_instruction(0x1008);
+        app.show_selection_xrefs();
+        assert!(app.xref_choices.is_some());
+        app.select_instruction(0x1004);
+        assert!(app.xref_choices.is_none());
+        app.select_instruction(0x1008);
+        app.show_selection_xrefs();
+        app.select_decompiled_byte(0);
+        assert!(app.xref_choices.is_none());
+        // A chosen call token does not outlive its pseudocode.
+        let source = "void f() { helper(); }";
+        let call = source.find("helper").unwrap();
+        let mut app = call_navigation_app(source);
+        app.semantic_info.tokens = vec![crate::semantic::SemanticToken {
+            start: call,
+            end: call + "helper".len(),
+            kind: TokenKind::Call { target: 0x1040 },
+        }];
+        app.select_decompiled_byte(call);
+        assert_eq!(app.selected_call, Some(0x1040));
+        app.invalidate_signature_analysis();
+        assert!(app.selected_call.is_none());
+        assert!(
+            app.selection_xref_targets()
+                .targets
+                .iter()
+                .all(|t| t.kind != TargetKind::CallTarget)
+        );
+    }
+
+    #[test]
+    fn decompiler_menu_offers_every_mapped_target_until_state_changes() {
+        let context = egui::Context::default();
+        theme::install(&context);
+        let mut app = xref_app();
+        let frame = |app: &mut DesktopApp, events| {
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800.0, 600.0),
+                    )),
+                    events,
+                    time: Some(1.0),
+                    ..Default::default()
+                },
+                |ui| app.side_panel(ui),
+            );
+            output.textures_delta.clear();
+            output
+        };
+        let output = frame(&mut app, vec![]);
+        let byte = app.decompiled.find("return").unwrap() + 2;
+        let point = text_position(&output, "return", byte);
+        frame(&mut app, secondary_events(point));
+        let text = rendered_text(&frame(&mut app, vec![]));
+        for item in [
+            "Xrefs to call target 1040",
+            "Xrefs to data access target 2000",
+            "Xrefs to data access target 2010",
+        ] {
+            assert!(text.iter().any(|t| t == item), "{item}");
+        }
+        // An annotation edit expires the captured targets.
+        app.edit_annotation(
+            0x1004,
+            Annotation {
+                comment: "changed".into(),
+                ..Default::default()
+            },
+        );
+        let text = rendered_text(&frame(&mut app, vec![]));
+        assert!(!text.iter().any(|t| t.starts_with("Xrefs to")));
+    }
+
+    #[test]
+    fn xref_choices_and_targets_expire_with_their_state() {
+        let context = egui::Context::default();
+        let mut app = xref_app();
+        app.select_instruction(0x1008);
+        app.show_selection_xrefs();
+        assert!(app.xref_choices.is_some());
+        // New evidence (discovery, restore, signature invalidation) expires choices.
+        app.invalidate_signature_analysis();
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| app.references_panel(ui));
+        output.textures_delta.clear();
+        assert!(app.xref_choices.is_none());
+        let mut app = xref_app();
+        app.select_instruction(0x1008);
+        app.show_selection_xrefs();
+        app.navigate(0x1040, true, &context);
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| app.references_panel(ui));
+        output.textures_delta.clear();
+        assert!(app.xref_choices.is_none());
+        // Closing the binary clears every contextual reference state.
+        app.open_xrefs(XrefTarget {
+            address: 0x2000,
+            kind: TargetKind::DataAccess,
+        });
+        app.reference_filter = "x".into();
+        app.reference_access = AccessFilter::Write;
+        app.clear_binary();
+        assert!(app.xref_target.is_none() && app.xref_choices.is_none());
+        assert!(app.reference_filter.is_empty() && app.reference_access == AccessFilter::All);
+        assert!(app.reference_rows.is_none() && app.call_index.is_none());
     }
 
     #[test]
@@ -8738,6 +9744,8 @@ mod tests {
             let mut app = semantic_app();
             let view = app.view.clone().unwrap();
             app.auto_decompile = false;
+            // From another function, the caller is loaded before selecting.
+            app.navigate(0x1040, true, &context);
             app.navigate_reference(0x1000, pc, &context);
             assert!(app.semantic.mappings.is_empty());
             assert!(app.view.is_none());
@@ -8757,7 +9765,53 @@ mod tests {
             assert_eq!(app.undisplayed_call, (pc == 0x104c).then_some(pc));
             assert!(app.reference_focus.is_none());
             assert!(app.tab == Tab::Listing);
+
+            // Within the displayed caller, selection is immediate.
+            let mut app = semantic_app();
+            app.navigate_reference(0x1000, pc, &context);
+            assert_eq!(app.view.as_ref().unwrap().address, 0x1000);
+            assert_eq!(app.selected, Some(pc));
+            assert_eq!(app.pending_listing_scroll, (pc == 0x1004).then_some(1));
+            assert_eq!(app.undisplayed_call, (pc == 0x104c).then_some(pc));
+            assert!(app.reference_focus.is_none() && app.queue.is_empty());
         }
+    }
+
+    #[test]
+    fn reference_history_records_exact_source_instructions_and_owners() {
+        let context = egui::Context::default();
+        let mut app = semantic_app();
+        let caller = app.view.clone().unwrap();
+        app.auto_decompile = false;
+        app.select_instruction(0x1008);
+        // A callsite in another function is recorded as its exact instruction.
+        app.navigate_reference(0x1040, 0x1044, &context);
+        assert_eq!(app.history, [0x1008, 0x1044]);
+        assert_eq!(app.reference_focus, Some((0x1040, 0x1044)));
+        assert_eq!(app.comment_owners.get(&0x1044), Some(&0x1040));
+        assert_eq!(app.comment_owners.get(&0x1008), Some(&0x1000));
+        // Back returns to the departure instruction inside its own owner.
+        app.history_step(false, &context);
+        assert_eq!(app.history_index, 0);
+        assert_eq!(app.reference_focus, Some((0x1000, 0x1008)));
+        app.receive(
+            Pending {
+                id: 1,
+                request: Request::Graph { address: 0x1000 },
+                started: Instant::now(),
+                selection: app.selection_generation,
+                revision: app.revision,
+                byte_origin: (app.selected, app.tab),
+                bytes: None,
+            },
+            Response::Graph { view: caller },
+            &context,
+        );
+        assert_eq!(app.selected, Some(0x1008));
+        // Forward reopens the recorded owner, not a guessed function at the PC.
+        app.history_step(true, &context);
+        assert_eq!(app.reference_focus, Some((0x1040, 0x1044)));
+        assert_eq!(app.history, [0x1008, 0x1044]);
     }
 
     /// No worker process is needed to exercise delivery order. A pending
