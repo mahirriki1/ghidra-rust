@@ -40,8 +40,11 @@ impl Inventory {
         let Request::DiscoverBatch { inventory_base, .. } = request else {
             return Err("not a discovery batch request".into());
         };
-        let (adopted, changed) =
-            state.commit_reply(info, self.adopted.as_ref(), *inventory_base, batch)?;
+        let Some((adopted, changed)) =
+            state.commit_reply(info, self.adopted.as_ref(), *inventory_base, batch)?
+        else {
+            return Ok(false);
+        };
         self.adopted = Some(adopted);
         Ok(changed)
     }

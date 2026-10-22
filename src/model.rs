@@ -49,10 +49,18 @@ pub const MAX_PATTERN_MATCHES_PER_CHUNK: usize = 4_096;
 pub const MAX_PATTERN_MATCHES: usize =
     MAX_PATTERN_MATCHES_PER_CHUNK * (MAX_PATTERN_SCAN_BYTES as usize / PATTERN_SCAN_CHUNK_BYTES);
 pub const MAX_PATTERN_VALIDATIONS: usize = 128;
-/// Parent-accepted pattern replies in one discovery phase. Normal scans need at
-/// most 128 replies for a maximum-size image; the larger cap leaves room for
-/// coverage preparation and match resumes while containing fabricated progress.
-pub const MAX_PATTERN_SCAN_STEPS: usize = 4_096;
+/// Parent-accepted replies that perform pattern cursor work. Coverage-only
+/// preparation is accounted separately by its distinct function identities.
+/// A maximum-size image needs at most 128 ordinary 1 MiB scan replies.
+pub const MAX_PATTERN_CURSOR_STEPS: usize = 256;
+/// Cursor replies that claim an uncharged match-point resume. Keeping this
+/// separate prevents coverage preparation from replenishing the smaller bound.
+pub const MAX_PATTERN_RESUME_STEPS: usize = 64;
+/// Complete inventory rows the parent will reconstruct and validate while the
+/// pattern phase is active. Unchanged inventories cost no rows. This admits an
+/// initial full inventory and several replacement-worker epochs while bounding
+/// repeated full replacements or tiny deltas that force complete validation.
+pub const MAX_PATTERN_INVENTORY_VALIDATION_ROWS: usize = MAX_FUNCTIONS * 8;
 /// Every prepared function consumes at least one decode attempt. The identities
 /// let the parent reject repeated coverage claims from one worker epoch.
 pub const MAX_PATTERN_COVERAGE: usize = MAX_ANALYSIS_INSTRUCTIONS;

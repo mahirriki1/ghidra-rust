@@ -1674,13 +1674,15 @@ impl DesktopApp {
                     let committed =
                         state.commit_reply(&validation, base.as_ref(), inventory_base, &mut batch);
                     commit.finish(0);
-                    let publication = committed.map(|(inventory, changed)| {
-                        let _index = crate::performance::span("parent_reference_index");
-                        Some(DiscoveryPublication {
-                            functions: changed.then(|| inventory.functions().to_vec()),
-                            inventory,
-                            truncated: batch.truncated,
-                            index: crate::call_analysis::CallIndex::new(state.snapshot()),
+                    let publication = committed.map(|adopted| {
+                        adopted.map(|(inventory, changed)| {
+                            let _index = crate::performance::span("parent_reference_index");
+                            DiscoveryPublication {
+                                functions: changed.then(|| inventory.functions().to_vec()),
+                                inventory,
+                                truncated: batch.truncated,
+                                index: crate::call_analysis::CallIndex::new(state.snapshot()),
+                            }
                         })
                     });
                     let saving = crate::performance::span("parent_discovery_snapshot");
