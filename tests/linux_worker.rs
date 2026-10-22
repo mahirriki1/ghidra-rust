@@ -640,3 +640,131 @@ fn elf_startup_recovery_requires_complete_evidence() {
     let (_, info) = open(&unknown);
     assert!(!info.functions.iter().any(|f| f.name == "main"));
 }
+
+// Jump-table destinations come from engine flow analysis of the switch. The
+// case-only callee is reachable through them alone, so its call reference and
+// stripped-build discovery both depend on that recovery.
+#[test]
+fn switch_tables_extend_graphs_and_discovery() {
+    use ghidra_rust::model::{EdgeEvidence, EdgeKind};
+    let directory = tempfile::tempdir().unwrap();
+    let source = Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/switch.c"
+    ));
+    for flags in [["-O2", "-fno-pie", "-no-pie"], ["-O2", "-fPIE", "-pie"]] {
+        let name = flags.join("");
+        let reference = compile(
+            directory.path(),
+            &format!("{name}-symbols"),
+            source,
+            &flags,
+            false,
+        );
+        let [dense, case_only, computed] =
+            ["dense", "case_only", "computed"].map(|name| symbol(&reference, name));
+        let (mut worker, _) = open(&reference);
+        let Response::Graph { view } = request(&mut worker, Request::Graph { address: dense })
+        else {
+            panic!("{name}: no switch graph");
+        };
+        let switched: Vec<_> = view
+            .edges
+            .iter()
+            .filter(|edge| edge.evidence == Some(EdgeEvidence::EngineJumpTable))
+            .collect();
+        // Seven cases; the default is the bounds check's ordinary branch.
+        assert!(switched.len() >= 6, "{name}: {:?}", view.edges);
+        assert!(switched.iter().all(|edge| edge.kind == EdgeKind::Branch));
+        let branch = switched[0].source;
+        assert!(switched.iter().all(|edge| edge.source == branch));
+        assert!(
+            !view
+                .edges
+                .iter()
+                .any(|edge| edge.source == branch && edge.target.is_none()),
+            "{name}: complete table keeps an unresolved successor"
+        );
+        let case = view
+            .blocks
+            .iter()
+            .find(|block| {
+                switched
+                    .iter()
+                    .any(|edge| edge.target == Some(block.address))
+                    && block
+                        .instructions
+                        .iter()
+                        .any(|i| view.calls.iter().any(|c| c.address == i.address))
+            })
+            .map(|block| block.address);
+        assert!(case.is_some(), "{name}: no case block with a call");
+        assert!(
+            view.calls.iter().any(|call| call.target == Some(case_only)),
+            "{name}: {:?}",
+            view.calls
+        );
+        // Flow-only recovery leaves the function ready for decompilation.
+        let response = request(&mut worker, Request::Decompile { address: dense });
+        let Response::Decompiled { text, .. } = response else {
+            panic!("{name}: switch function did not decompile: {response:?}");
+        };
+        assert!(text.contains("case_only("), "{name}: {text}");
+        // A computed tail jump through an unknown pointer stays unresolved.
+        let Response::Graph { view } = request(&mut worker, Request::Graph { address: computed })
+        else {
+            panic!("{name}: no computed-jump graph");
+        };
+        assert!(view.edges.iter().all(|edge| edge.evidence.is_none()));
+        assert!(
+            view.edges
+                .iter()
+                .any(|edge| edge.kind == EdgeKind::Unknown && edge.target.is_none())
+        );
+        assert!(
+            view.warnings
+                .iter()
+                .any(|w| w.contains("has unresolved targets")),
+            "{name}: {:?}",
+            view.warnings
+        );
+        let Response::Functions { analysis, .. } = request(&mut worker, Request::Discover) else {
+            panic!("{name}: discovery failed");
+        };
+        assert!(
+            analysis
+                .references
+                .iter()
+                .any(|r| r.caller == dense && r.target == case_only),
+            "{name}"
+        );
+
+        // Stripped: main is recovered, dense is discovered from it, and
+        // case_only only through the switch.
+        let binary = compile(directory.path(), &name, source, &flags, true);
+        let (mut worker, info) = open(&binary);
+        assert!(!info.functions.iter().any(|f| f.address == case_only));
+        let Response::Functions {
+            functions,
+            analysis,
+            ..
+        } = request(&mut worker, Request::Discover)
+        else {
+            panic!("{name}: stripped discovery failed");
+        };
+        analysis.validate(&info, &functions).unwrap();
+        for address in [dense, case_only, computed] {
+            assert!(
+                functions.iter().any(|f| f.address == address),
+                "{name}: {address:#x} not discovered"
+            );
+        }
+        assert!(
+            analysis
+                .references
+                .iter()
+                .any(|r| r.caller == dense && r.target == case_only)
+        );
+        assert!(!analysis.references.iter().any(|r| r.caller == computed));
+    }
+}

@@ -114,9 +114,33 @@ invented: the handoff remains an indirect call.
 This recognizes conventional glibc startup. AArch64 (pending original dynamic
 fixtures), i386, static and static-PIE executables, musl's `_start_c` helper,
 sectionless (`sstrip`) files, and wrapper-based startup variants are not
-recognized. Functions reachable only through pointer tables, as callbacks, or
-through jump tables still need function-start patterns, broader pointer
-analysis or switch recovery.
+recognized. Functions reachable only through pointer tables or as callbacks
+still need function-start patterns or broader pointer analysis.
+
+## Switch tables
+
+A computed jump such as `jmp *table(,%rdi,8)` has no destination in its own
+encoding. When the instruction walk of a known function reaches one, the worker
+runs the engine's flow analysis with jump-table recovery for that function, as
+Ghidra's switch analyzer does, without the rest of decompilation. Each table
+must belong to the exact decoded indirect jump, and each destination must be an
+aligned file-backed executable address; duplicates are merged. The walk then
+resumes from those destinations under the same instruction budget, so calls in
+switch cases become ordinary call evidence for discovery. In the graph these
+edges are labeled `S`.
+
+A table the engine marks partial, one at its 256-entry limit, or one with any
+rejected destination keeps an additional unresolved successor and a warning.
+A jump without a recovered table stays unresolved, as does every jump through
+an unknown register or pointer. Engine flow may follow at most 2,048
+instructions per recovery; at most 32 tables and 1,024 entries are copied out.
+One request starts at most 32 recoveries and none after 5 seconds of recovery
+time; later functions keep their unresolved jumps with a warning, and their
+discovery outcome is partial. Destinations are never promoted to new functions,
+and a destination that is another known function's entry remains an external
+exit. Detected packed images skip recovery. Projects saved earlier remain
+readable; the changed engine fingerprint discards their cached results while
+keeping annotations.
 
 ## Direct data accesses
 
@@ -139,8 +163,8 @@ omitted instructions; any write invalidates overlapping register aliases such as
 `Wn` within `Xn`. Loaded values are never treated as known, so pointer chasing
 stays unresolved, and `ADRP; LDR` resolves the slot that is read, not the
 pointer stored there. Address formation alone (`LEA`, `ADR`, `ADRP`, or call
-arguments) still creates no reference. Jump tables and values carried across
-branches require later analysis. Internal p-code branches, processor-specific
+arguments) still creates no reference. Table entries read by switch recovery
+and values carried across branches are not reported as data references. Internal p-code branches, processor-specific
 user operations and unsupported semantics omit the whole instruction with
 partial coverage. Control-flow operands are excluded. This is memory-access
 evidence, not data-object or pointer classification.
@@ -306,11 +330,12 @@ public APIs from the unchanged pinned engine. Original assembly and synthetic PE
 metadata fixtures cover isolated runtime entries, fragments, a real named import
 call and an unresolved veneer branch through production worker containment.
 
-Switch/jump-table recovery, cross-block constant propagation, speculative operand
-references, exception flow, no-return analysis, and complete stripped-function
-recovery are not supplied by this pass. Existing engine behavior may still expose
-some of these constructs during decompilation; this pass does not establish
-their missing targets for the desktop's independent CFG.
+Cross-block constant propagation, speculative operand references, exception
+flow, no-return analysis, and complete stripped-function recovery are not
+supplied by this pass. Existing engine behavior may still expose some of these
+constructs during decompilation; this pass does not establish their missing
+targets for the desktop's independent CFG. Switch tables are the exception
+described above.
 
 No speed or memory improvement over Ghidra is claimed. Comparisons must measure
 end-to-end time and total memory, including workers and duplicated image bytes,
