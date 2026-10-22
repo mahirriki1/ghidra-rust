@@ -295,7 +295,9 @@ fn resume_initial_thread(process_id: u32) -> io::Result<()> {
         return Err(if suspended == u32::MAX {
             io::Error::last_os_error()
         } else {
-            io::Error::other("Worker initial thread was not suspended exactly once")
+            io::Error::other(format!(
+                "Worker initial thread was not suspended exactly once (ResumeThread returned {suspended})"
+            ))
         });
     }
     Ok(())
