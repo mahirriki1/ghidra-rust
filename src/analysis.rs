@@ -37,6 +37,8 @@ pub struct LoadedProgram {
     upx_packed: bool,
     pub info: BinaryInfo,
     inventory: crate::inventory::Inventory,
+    /// Instructions decoded from established functions in this worker.
+    coverage: Coverage,
 }
 
 /// Engine functions a discovery pass named, and whether it changed the engine
@@ -334,6 +336,7 @@ impl LoadedProgram {
             upx_packed,
             info,
             inventory,
+            coverage: Coverage::default(),
         })
     }
 
@@ -456,6 +459,37 @@ impl LoadedProgram {
                 binding,
                 inventory_base,
                 seeds,
+                patterns: Some(cursor),
+            } => {
+                self.check_unpacked()?;
+                if !seeds.is_empty() {
+                    return Err("A pattern-scan batch has no seeds".into());
+                }
+                let certificate = self.inventory.take_certificate(&self.info.functions);
+                let (scan, discovered) = self.scan_patterns(cursor, progress)?;
+                self.update_batch_inventory(certificate, &BTreeSet::new(), discovered)?;
+                let inventory = self
+                    .inventory
+                    .publish(inventory_base, &self.info.functions)?;
+                Ok(Response::DiscoveryBatch {
+                    batch: DiscoveryBatch {
+                        binding,
+                        inventory,
+                        truncated: self.info.functions_truncated,
+                        analysis: CallAnalysis {
+                            partial: self.info.functions_truncated,
+                            ..Default::default()
+                        },
+                        outcomes: Vec::new(),
+                        patterns: Some(scan),
+                    },
+                })
+            }
+            Request::DiscoverBatch {
+                binding,
+                inventory_base,
+                seeds,
+                patterns: None,
             } => {
                 self.check_unpacked()?;
                 if seeds.is_empty()
@@ -500,6 +534,7 @@ impl LoadedProgram {
                         truncated: self.info.functions_truncated,
                         analysis,
                         outcomes,
+                        patterns: None,
                     },
                 })
             }
@@ -789,6 +824,9 @@ impl LoadedProgram {
             report.decode_attempts += available - remaining;
             match recovered {
                 Ok(recovered) => {
+                    if admitted {
+                        self.coverage.add(address, &recovered.intervals);
+                    }
                     report.partial |= recovered.partial;
                     outcomes.push(DiscoveryOutcome {
                         address,
@@ -896,6 +934,210 @@ impl LoadedProgram {
             .map(|(address, name)| FunctionInfo { address, name })
             .collect();
         Ok((report, outcomes, Discovered { added, opaque }))
+    }
+
+    /// One bounded step of the function-start pattern scan from `cursor`.
+    /// Established functions this worker has not decoded are walked first, so
+    /// candidates inside existing code are rejected. Candidates are examined in
+    /// address order; each admitted start's code joins the coverage at once.
+    fn scan_patterns(
+        &mut self,
+        cursor: u64,
+        progress: &mut dyn FnMut(AnalysisProgress) -> Result<(), String>,
+    ) -> Result<(PatternScan, Discovered), String> {
+        let _span = crate::performance::span("discovery_function_patterns");
+        let mut scan = PatternScan {
+            next: Some(cursor),
+            ..Default::default()
+        };
+        let mut discovered = Discovered {
+            added: Vec::new(),
+            opaque: false,
+        };
+        let Some(set) =
+            crate::function_patterns::PatternSet::select(self.target.name, &self.info.format)
+        else {
+            scan.next = None;
+            return Ok((scan, discovered));
+        };
+        let patterns = set.patterns()?;
+        let mut remaining = MAX_ANALYSIS_INSTRUCTIONS;
+        let mut switches = SwitchBudget::new();
+        // Coverage first: a candidate is judged against all established code.
+        let unwalked: Vec<_> = self
+            .info
+            .functions
+            .iter()
+            .map(|function| function.address)
+            .filter(|address| !self.coverage.walked.contains(address))
+            .collect();
+        for address in unwalked {
+            if remaining < MAX_INSTRUCTIONS {
+                scan.partial = true;
+                return Ok((scan, discovered));
+            }
+            let functions = &self.info.functions;
+            let is_function = |candidate| function_at(functions, candidate).is_some();
+            let mut budget = MAX_INSTRUCTIONS;
+            let recovered = recover_graph_switched(
+                &mut self.program,
+                &self.info.sections,
+                &is_function,
+                address,
+                &self.pe_ranges,
+                &mut budget,
+                &mut switches,
+                None,
+            );
+            remaining -= MAX_INSTRUCTIONS - budget;
+            let intervals = recovered.map(|r| r.intervals).unwrap_or_default();
+            self.coverage.add(address, &intervals);
+            scan.covered += 1;
+        }
+        if self.coverage.incomplete {
+            scan.partial = true;
+            scan.next = None;
+            return Ok((scan, discovered));
+        }
+        progress(AnalysisProgress {
+            stage: AnalysisStage::Calls,
+            functions_examined: 0,
+            decode_attempts: MAX_ANALYSIS_INSTRUCTIONS - remaining,
+        })?;
+        let mut name_bytes = self
+            .info
+            .functions
+            .iter()
+            .map(|function| json_escaped_len(&function.name))
+            .fold(0usize, usize::saturating_add)
+            .min(MAX_FUNCTION_NAME_JSON_BYTES);
+        let mut added = BTreeMap::new();
+        let mut sections: Vec<_> = self
+            .info
+            .sections
+            .iter()
+            .filter(|section| {
+                section.executable
+                    && section.file_size > 0
+                    // Import stubs are not function starts.
+                    && !section.name.starts_with(".plt")
+            })
+            .collect();
+        sections.sort_by_key(|section| section.address);
+        let alignment = self.target.instruction_alignment;
+        let mut matches = Vec::new();
+        scan.next = 'scan: {
+            for section in sections {
+                let length = section.size.min(section.file_size);
+                let Some(end) = section.address.checked_add(length) else {
+                    continue;
+                };
+                if end <= cursor {
+                    continue;
+                }
+                let Some(bytes) = usize::try_from(section.file_offset)
+                    .ok()
+                    .and_then(|offset| {
+                        self.snapshot
+                            .get(offset..offset.checked_add(usize::try_from(length).ok()?)?)
+                    })
+                else {
+                    continue;
+                };
+                let mut position = cursor.saturating_sub(section.address) as usize;
+                while position < bytes.len() {
+                    if scan.scanned_bytes >= PATTERN_SCAN_BYTES {
+                        break 'scan Some(section.address + position as u64);
+                    }
+                    let chunk = (bytes.len() - position).min(PATTERN_CHUNK_BYTES);
+                    matches.clear();
+                    // A flood of matches in one chunk is left unexamined.
+                    scan.partial |= !patterns.scan(
+                        bytes,
+                        section.address,
+                        position..position + chunk,
+                        &mut matches,
+                        PATTERN_MATCHES,
+                    );
+                    scan.matches += matches.len();
+                    for found in &matches {
+                        let start = found.start;
+                        let pattern = &patterns.patterns[found.pattern];
+                        let known = |address| {
+                            added.contains_key(&address)
+                                || function_at(&self.info.functions, address).is_some()
+                        };
+                        if known(start)
+                            || !start.is_multiple_of(alignment)
+                            || start >= end
+                            || self.coverage.contains(start)
+                            || self
+                                .pe_ranges
+                                .iter()
+                                .any(|&(low, high)| low < start && start < high)
+                            || pattern.start.after_defined
+                                && start != section.address
+                                && !self.coverage.ends_at(start)
+                        {
+                            continue;
+                        }
+                        if remaining < MAX_INSTRUCTIONS
+                            || scan.validated == PATTERN_VALIDATIONS
+                            || scan.admitted.len() == MAX_PATTERN_ADMISSIONS
+                        {
+                            // Unexamined, not rejected: resume at this match.
+                            break 'scan Some(found.at);
+                        }
+                        scan.validated += 1;
+                        let mut budget = MAX_INSTRUCTIONS;
+                        let mut walk = Walk::new(&self.program, &self.info.sections, start, None)?;
+                        walk.run(
+                            &self.program,
+                            &self.info.sections,
+                            &|address| address != start && known(address),
+                            &self.pe_ranges,
+                            &mut budget,
+                            None,
+                        );
+                        remaining -= MAX_INSTRUCTIONS - budget;
+                        let sections = &self.info.sections;
+                        let is_code = |address: u64| {
+                            address.is_multiple_of(alignment)
+                                && executable(sections, address, alignment as usize)
+                        };
+                        if !walk.complete_function(
+                            &self.coverage,
+                            &known,
+                            &is_code,
+                            pattern.start.min_instructions,
+                        ) {
+                            continue;
+                        }
+                        if !admit_discovered(
+                            &mut self.program,
+                            self.info.functions.len(),
+                            &mut added,
+                            &mut name_bytes,
+                            start,
+                        )? {
+                            scan.partial = true;
+                            break 'scan None;
+                        }
+                        self.coverage.add(start, &walk.intervals());
+                        scan.admitted.push(start);
+                    }
+                    position += chunk;
+                    scan.scanned_bytes += chunk as u64;
+                }
+            }
+            None
+        };
+        scan.admitted.sort_unstable();
+        discovered.added = added
+            .into_iter()
+            .map(|(address, name)| FunctionInfo { address, name })
+            .collect();
+        Ok((scan, discovered))
     }
 
     fn check_code(&self, address: u64) -> Result<(), String> {
@@ -1506,7 +1748,72 @@ struct GraphRecovery {
     view: FunctionView,
     calls: Vec<(CallSite, u64)>,
     partial: bool,
+    /// Every decoded instruction's byte range, including any the view omits.
+    intervals: Vec<(u64, u64)>,
 }
+
+const EXTERNAL_EXIT: &str = "A path reaches another known function entry or PE runtime-region start; displayed as an external/tail exit.";
+
+/// Merged byte ranges of instructions decoded from established functions.
+/// Pattern candidates must not start or run inside them.
+#[derive(Default)]
+struct Coverage {
+    ranges: BTreeMap<u64, u64>,
+    /// Functions whose walks contributed, so each is decoded once per worker.
+    walked: BTreeSet<u64>,
+    /// Ranges were dropped at the limit; nothing may rely on absence.
+    incomplete: bool,
+}
+
+impl Coverage {
+    const MAX_RANGES: usize = 1 << 20;
+
+    fn add(&mut self, function: u64, intervals: &[(u64, u64)]) {
+        self.walked.insert(function);
+        for &(start, end) in intervals {
+            let (mut start, mut end) = (start, end);
+            // Absorb every range that overlaps or touches [start, end).
+            while let Some((&other, &other_end)) = self.ranges.range(..=end).next_back() {
+                if other_end < start {
+                    break;
+                }
+                start = start.min(other);
+                end = end.max(other_end);
+                self.ranges.remove(&other);
+            }
+            if self.ranges.len() == Self::MAX_RANGES {
+                self.incomplete = true;
+                continue;
+            }
+            self.ranges.insert(start, end);
+        }
+    }
+
+    fn contains(&self, address: u64) -> bool {
+        self.overlaps(address, address.saturating_add(1))
+    }
+
+    fn overlaps(&self, start: u64, end: u64) -> bool {
+        self.ranges
+            .range(..end)
+            .next_back()
+            .is_some_and(|(_, &other_end)| other_end > start)
+    }
+
+    /// Whether established code ends exactly at `address`.
+    fn ends_at(&self, address: u64) -> bool {
+        self.ranges
+            .range(..address)
+            .next_back()
+            .is_some_and(|(_, &end)| end == address)
+    }
+}
+
+/// Executable bytes, matches, candidate walks per pattern-scan request.
+const PATTERN_SCAN_BYTES: u64 = 1024 * 1024;
+const PATTERN_CHUNK_BYTES: usize = 64 * 1024;
+const PATTERN_MATCHES: usize = 4_096;
+const PATTERN_VALIDATIONS: usize = 128;
 
 fn recover_graph_budgeted(
     program: &Program,
@@ -1682,10 +1989,7 @@ impl Walk {
                         .binary_search_by_key(&address, |range| range.0)
                         .is_ok())
             {
-                warning(
-                    warnings,
-                    "A path reaches another known function entry or PE runtime-region start; displayed as an external/tail exit.",
-                );
+                warning(warnings, EXTERNAL_EXIT);
                 continue;
             }
             if let Some((&start, node)) = nodes.range(..=address).next_back()
@@ -1793,6 +2097,53 @@ impl Walk {
         }
     }
 
+    fn intervals(&self) -> Vec<(u64, u64)> {
+        self.nodes
+            .iter()
+            .map(|(&address, node)| (address, address + node.instruction.bytes.len() as u64))
+            .collect()
+    }
+
+    /// Whether this walk is strong enough evidence that `entry` starts a
+    /// function no established code contains: every instruction decoded and
+    /// lies outside `coverage`, every path ends in a return or an explicit
+    /// branch to an established function, and direct calls reach code.
+    fn complete_function(
+        &self,
+        coverage: &Coverage,
+        is_function: &dyn Fn(u64) -> bool,
+        is_code: &dyn Fn(u64) -> bool,
+        min_instructions: usize,
+    ) -> bool {
+        let returns = self
+            .nodes
+            .values()
+            .any(|node| node.terminal && node.next.is_empty());
+        returns
+            && self.nodes.len() >= min_instructions.max(1)
+            && self.indirect.is_empty()
+            && self.pending.is_empty()
+            && self.warnings.iter().all(|warning| warning == EXTERNAL_EXIT)
+            && self.nodes.iter().all(|(&address, node)| {
+                let end = address + node.instruction.bytes.len() as u64;
+                !coverage.overlaps(address, end)
+                    && node.next.iter().all(|&(target, kind)| match target {
+                        Some(target) if self.nodes.contains_key(&target) => true,
+                        // Only an explicit jump may leave for another function;
+                        // running into one is not a function boundary.
+                        Some(target) => {
+                            node.terminal && kind == EdgeKind::Branch && is_function(target)
+                        }
+                        None => false,
+                    })
+            })
+            && self.calls.iter().all(|call| {
+                call.target.is_none_or(|target| {
+                    is_code(target) && (is_function(target) || !coverage.contains(target))
+                })
+            })
+    }
+
     /// Asks the engine for this function's switch tables when the walk has
     /// unresolved indirect jumps, and queues validated destinations. Returns
     /// whether any destination was queued.
@@ -1891,6 +2242,7 @@ impl Walk {
         mut self,
         mut data: Option<&mut crate::data_analysis::DataCollector<'_>>,
     ) -> Result<GraphRecovery, String> {
+        let intervals = self.intervals();
         let Walk {
             entry,
             nodes,
@@ -2000,6 +2352,7 @@ impl Walk {
             },
             calls: self.call_evidence,
             partial,
+            intervals,
         })
     }
 }
@@ -2117,6 +2470,7 @@ pub(crate) mod tests {
             pe_imports: BTreeMap::new(),
             upx_packed: false,
             inventory: Default::default(),
+            coverage: Coverage::default(),
         }
     }
 
@@ -2464,6 +2818,7 @@ pub(crate) mod tests {
                     binding,
                     inventory_base: base,
                     seeds: vec![seed],
+                    patterns: None,
                 })
                 .unwrap()
             else {
@@ -2695,6 +3050,7 @@ pub(crate) mod tests {
             pe_imports: symbols.imports,
             upx_packed: false,
             inventory: Default::default(),
+            coverage: Coverage::default(),
         };
         loaded.resolve_import_thunks(0x1000).unwrap();
         assert!(
@@ -2746,6 +3102,75 @@ pub(crate) mod tests {
                 .any(|e| e.target.is_none() && e.kind == EdgeKind::Unknown)
         );
         assert!(!view.edges.iter().any(|e| e.target == Some(0x100a)));
+    }
+
+    #[test]
+    fn coverage_merges_ranges_and_reports_instruction_ends() {
+        let mut coverage = Coverage::default();
+        coverage.add(
+            0x1000,
+            &[(0x1000, 0x1004), (0x1004, 0x1006), (0x1010, 0x1012)],
+        );
+        assert_eq!(coverage.ranges.len(), 2);
+        assert!(coverage.contains(0x1005) && !coverage.contains(0x1006));
+        assert!(coverage.overlaps(0x0fff, 0x1001) && !coverage.overlaps(0x1006, 0x1010));
+        assert!(coverage.ends_at(0x1006) && coverage.ends_at(0x1012));
+        assert!(!coverage.ends_at(0x1004) && !coverage.ends_at(0x1010));
+        // A bridging range joins its neighbours.
+        coverage.add(0x1006, &[(0x1006, 0x1010)]);
+        assert_eq!(
+            coverage.ranges.into_iter().collect::<Vec<_>>(),
+            [(0x1000, 0x1012)]
+        );
+    }
+
+    #[test]
+    fn pattern_candidates_need_complete_independent_code() {
+        let check = |bytes: &[u8], coverage: &Coverage, known: &[u64]| {
+            let program =
+                Program::from_raw_bytes(bytes.to_vec(), "x86:LE:64:default:gcc", 0x1000).unwrap();
+            let sections = vec![SectionInfo {
+                name: ".text".into(),
+                address: 0x1000,
+                size: bytes.len() as u64,
+                file_offset: 0,
+                file_size: bytes.len() as u64,
+                executable: true,
+            }];
+            let is_function = |address| known.contains(&address);
+            let mut remaining = MAX_INSTRUCTIONS;
+            let mut walk = Walk::new(&program, &sections, 0x1000, None).unwrap();
+            walk.run(&program, &sections, &is_function, &[], &mut remaining, None);
+            let is_code = |address| (0x1000..0x1000 + bytes.len() as u64).contains(&address);
+            walk.complete_function(coverage, &is_function, &is_code, 0)
+        };
+        let empty = Coverage::default();
+        // push rbp; mov rbp,rsp; pop rbp; ret
+        let frame = [0x55, 0x48, 0x89, 0xe5, 0x5d, 0xc3];
+        assert!(check(&frame, &empty, &[]));
+        // Its bytes already belong to decoded code.
+        let mut covered = Coverage::default();
+        covered.add(0x2000, &[(0x1004, 0x1005)]);
+        assert!(!check(&frame, &covered, &[]));
+        // push rbp; jmp rax: an unresolved indirect jump.
+        assert!(!check(&[0x55, 0xff, 0xe0], &empty, &[]));
+        // push rbp; nop; then a known function: running into it is no exit.
+        assert!(!check(&[0x55, 0x90, 0xc3], &empty, &[0x1002]));
+        // push rbp; je +1; ret; ret: both paths return.
+        assert!(check(&[0x55, 0x74, 0x01, 0xc3, 0xc3], &empty, &[]));
+        // A path ending in an explicit jump to a known function is accepted
+        // beside a return, but a call into the middle of decoded code is not.
+        assert!(check(
+            &[0x74, 0x01, 0xc3, 0xeb, 0x00, 0xc3],
+            &empty,
+            &[0x1005]
+        ));
+        let mut interior = Coverage::default();
+        interior.add(0x1000, &[(0x1006, 0x100a)]);
+        // call 0x1007; ret; padding.
+        let call = [0xe8, 0x02, 0x00, 0x00, 0x00, 0xc3, 0x90, 0x90, 0x90, 0x90];
+        assert!(!check(&call, &interior, &[]));
+        assert!(check(&call, &empty, &[]));
     }
 
     #[test]

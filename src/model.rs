@@ -281,6 +281,31 @@ pub struct DiscoveryBatch {
     /// The examined prefix of the request's seeds; the suffix remains pending.
     #[serde(deserialize_with = "crate::bounded::vec::<_, _, { MAX_ANALYSIS_FUNCTIONS }>")]
     pub outcomes: Vec<DiscoveryOutcome>,
+    /// Present exactly for a pattern-scan request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub patterns: Option<PatternScan>,
+}
+
+/// Function starts admitted by one pattern-scan request.
+pub const MAX_PATTERN_ADMISSIONS: usize = 128;
+
+/// One bounded step of the function-start pattern scan. Admitted starts are
+/// in the reply's inventory and become ordinary discovery seeds.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatternScan {
+    /// Where the next request continues; `None` when the scan is complete.
+    pub next: Option<u64>,
+    pub scanned_bytes: u64,
+    pub matches: usize,
+    /// Candidates whose code was decoded and checked.
+    pub validated: usize,
+    /// Strictly increasing new function starts.
+    #[serde(deserialize_with = "crate::bounded::vec::<_, _, { MAX_PATTERN_ADMISSIONS }>")]
+    pub admitted: Vec<u64>,
+    /// Established functions decoded to learn which bytes are already code.
+    pub covered: usize,
+    /// Limits or failures left part of the scan unexamined.
+    pub partial: bool,
 }
 
 /// UTF-8 byte span in rendered C and its originating machine instructions.
@@ -517,6 +542,10 @@ pub enum Request {
         inventory_base: Option<u64>,
         #[serde(deserialize_with = "crate::bounded::vec::<_, _, { MAX_ANALYSIS_FUNCTIONS }>")]
         seeds: Vec<u64>,
+        /// With no seeds: continue the function-start pattern scan from this
+        /// address instead of walking functions.
+        #[serde(default)]
+        patterns: Option<u64>,
     },
     SyncFunctions {
         #[serde(

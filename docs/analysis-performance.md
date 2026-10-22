@@ -183,7 +183,8 @@ option variables, and passes `-loader ElfLoader -loader-loadLibraries false
 -max-cpu 1 -analysisTimeoutPerFile 300` with a 2 GiB heap. Ghidra's **default
 analyzer selection** is used and every analyzer option is recorded. This profile
 (`ghidra-default-analyzers-cpu1`) is not a matched scope: Ghidra runs many more
-analyses than ghidra-rust's direct-call discovery. `scripts/ghidra/DifferentialExport.java`
+analyses than ghidra-rust's direct-call discovery and function-start patterns.
+`scripts/ghidra/DifferentialExport.java`
 is original benchmark tooling executed by that installation as a pre- and
 post-analysis script; the desktop never loads it, and it adds no Java dependency
 to the application. Its pre-script verifies the imported program's SHA-256.

@@ -1,6 +1,8 @@
 //! Exercise the production bubblewrap path, including the host loader layout.
 #![cfg(target_os = "linux")]
 
+mod inventory;
+
 use ghidra_rust::client::{WorkerClient, WorkerEvent};
 use ghidra_rust::model::{CallAnalysis, DataAccess, Request, Response};
 use ghidra_rust::project::ProjectData;
@@ -766,5 +768,116 @@ fn switch_tables_extend_graphs_and_discovery() {
                 .any(|r| r.caller == dense && r.target == case_only)
         );
         assert!(!analysis.references.iter().any(|r| r.caller == computed));
+    }
+}
+
+/// Runs resumable discovery to completion, as the desktop does, optionally
+/// with the function-start pattern phase. Returns the final inventory.
+fn discover_batches(
+    worker: &mut WorkerClient,
+    info: &ghidra_rust::model::BinaryInfo,
+    patterns: bool,
+) -> (
+    Vec<ghidra_rust::model::FunctionInfo>,
+    ghidra_rust::discovery::Discovery,
+) {
+    let mut state = ghidra_rust::discovery::Discovery::new(
+        ghidra_rust::call_analysis::code_address(info, info.entry).then_some(info.entry),
+        info.functions.iter().map(|function| function.address),
+        info.functions_truncated,
+    );
+    if patterns {
+        state.enable_patterns(info);
+    }
+    let mut inventory = inventory::Inventory::default();
+    let mut functions = info.functions.clone();
+    while let Some(next) = state.begin(1, 1, 0) {
+        let next = inventory.bind(next);
+        let Response::DiscoveryBatch { mut batch } = request(worker, next.clone()) else {
+            panic!("Expected a discovery batch");
+        };
+        inventory
+            .commit(&mut state, info, &next, &mut batch)
+            .unwrap();
+        functions = inventory.functions().to_vec();
+    }
+    assert_eq!(state.remaining(), 0);
+    (functions, state)
+}
+
+// Function-start patterns recover code that no direct call reaches. Every
+// pattern-derived start, and every callee found through one, must be a real
+// function of the unstripped twin; symbols never seed the stripped run.
+#[test]
+fn function_start_patterns_recover_callbacks_without_false_starts() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/callbacks.c"
+    ));
+    for flags in [
+        ["-O0", "-fno-pie", "-no-pie"],
+        ["-O0", "-fPIE", "-pie"],
+        ["-O2", "-fno-pie", "-no-pie"],
+        ["-O2", "-fPIE", "-pie"],
+    ] {
+        let name = flags.join("");
+        let reference = compile(
+            directory.path(),
+            &format!("{name}-symbols"),
+            source,
+            &flags,
+            false,
+        );
+        let truth: BTreeSet<u64> = {
+            let bytes = std::fs::read(&reference).unwrap();
+            let image = object::File::parse(bytes.as_slice()).unwrap();
+            image
+                .symbols()
+                .filter(|symbol| symbol.kind() == object::SymbolKind::Text && symbol.address() != 0)
+                .map(|symbol| symbol.address())
+                .collect()
+        };
+        let binary = compile(directory.path(), &name, source, &flags, true);
+        let (mut worker, info) = open(&binary);
+        let (without, _) = discover_batches(&mut worker, &info, false);
+        let (mut worker, info) = open(&binary);
+        let (with, state) = discover_batches(&mut worker, &info, true);
+        let phase = state.patterns.as_ref().expect("x86-64 ELF uses patterns");
+        assert!(
+            phase.cursor.is_none() && !phase.partial,
+            "{name}: {phase:?}"
+        );
+        let before: BTreeSet<_> = without.iter().map(|f| f.address).collect();
+        let gained: BTreeSet<_> = with
+            .iter()
+            .map(|f| f.address)
+            .filter(|address| !before.contains(address))
+            .collect();
+        let false_starts: Vec<_> = gained.difference(&truth).collect();
+        assert!(
+            false_starts.is_empty(),
+            "{name}: false starts {false_starts:x?}"
+        );
+        let callbacks = [
+            "keep_across_call",
+            "with_locals",
+            "two_calls",
+            "leaf",
+            "scaled",
+        ]
+        .map(|function| symbol(&reference, function));
+        // None of these is reached by a direct call from main.
+        assert!(
+            callbacks.iter().all(|address| !before.contains(address)),
+            "{name}"
+        );
+        let found: Vec<_> = callbacks.iter().filter(|a| gained.contains(a)).collect();
+        eprintln!("{name}: {} of {} callbacks", found.len(), callbacks.len());
+        if flags[0] == "-O0" {
+            // Unoptimized code keeps the frame-pointer prologue everywhere;
+            // `scaled` follows from the recovered callbacks' direct calls.
+            assert_eq!(found.len(), callbacks.len(), "{name}: {gained:x?}");
+        }
     }
 }

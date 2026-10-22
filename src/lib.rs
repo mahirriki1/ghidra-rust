@@ -16,6 +16,7 @@ pub mod decompile;
 pub mod discovery;
 mod elf_startup;
 pub mod file_dialog;
+pub mod function_patterns;
 pub mod graph;
 pub mod highlight;
 mod inventory;
