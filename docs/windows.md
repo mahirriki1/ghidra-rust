@@ -153,6 +153,13 @@ functions, but complete function/name recovery is not guaranteed. Compare file
 SHA-256 values and the same function address against Ghidra; a saved Ghidra program
 may predate an installed application's update.
 
+An intermittent worker-start rejection was observed during local release testing:
+`Worker initial thread was not suspended exactly once`. It did not recur across
+123 subsequent contained worker starts. The cause is unconfirmed; the error now
+includes the actual `ResumeThread` return count for diagnosis. Startup fails
+closed and terminates that worker; the app does not bypass the suspension or Job
+Object checks. Record the returned count if the problem recurs.
+
 If the desktop cannot create an OpenGL context, update the graphics driver from
 the GPU vendor and try a local desktop session. Remote/virtual sessions can expose
 different graphics capabilities. If compilation cannot find `link.exe`, `cl.exe`,

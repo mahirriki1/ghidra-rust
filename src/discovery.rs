@@ -667,7 +667,7 @@ impl Discovery {
     ) -> Result<Option<(WorkerInventory, bool)>, String> {
         let preflight = self.pattern_preflight(base, requested, batch)?;
         if matches!(preflight, PatternPreflight::Exhausted) {
-            return Ok(None);
+            return Err("Function-start pattern work budget exhausted".into());
         }
         let inventory_validation_rows = match preflight {
             PatternPreflight::Pattern(charge) => charge.inventory_validation_rows,
@@ -1368,19 +1368,70 @@ mod tests {
     }
 
     #[test]
-    fn pattern_inventory_work_exhaustion_precedes_expensive_adoption() {
+    fn pattern_inventory_work_exhaustion_fails_closed_and_preserves_prior_commits() {
         let info = info(2);
-        let mut state = pattern_state(&info);
+        let mut state = Discovery::new(
+            Some(info.entry),
+            info.functions.iter().map(|function| function.address),
+            false,
+        );
+        let mut first = batch(state.begin(1, 1, 0).unwrap(), &info);
+        first.analysis.references.push(CallReference {
+            caller: info.entry,
+            address: info.entry,
+            target: info.functions[1].address,
+        });
+        let (inventory, changed) = state
+            .commit_reply(&info, None, None, &mut first)
+            .unwrap()
+            .unwrap();
+        assert!(changed);
+        let prior_references = state.report.references.clone();
+        let prior_functions_examined = state.report.functions_examined;
+        let prior_decode_attempts = state.report.decode_attempts;
+        let prior_batches = state.batches;
+
+        state.start_patterns();
         state.patterns.as_mut().unwrap().inventory_validation_rows =
             MAX_PATTERN_INVENTORY_VALIDATION_ROWS - 1;
-        let request = state.begin(1, 1, 0).unwrap();
+        let request = state.begin(1, 1, inventory.revision()).unwrap();
         let Request::DiscoverBatch { binding, .. } = request else {
             panic!()
         };
         let mut reply = pattern_reply(binding, &info, Some(0), vec![info.entry]);
-        let adopted = state.commit_reply(&info, None, None, &mut reply).unwrap();
-        assert!(adopted.is_none());
-        assert!(matches!(reply.inventory, InventoryChange::Replace { .. }));
+        let InventoryChange::Replace { functions, .. } = &mut reply.inventory else {
+            panic!()
+        };
+        functions[1] = functions[0].clone();
+        reply.analysis.functions_examined = usize::MAX;
+        reply.analysis.references.push(CallReference {
+            caller: u64::MAX,
+            address: u64::MAX,
+            target: u64::MAX,
+        });
+        reply.outcomes.push(DiscoveryOutcome {
+            address: u64::MAX,
+            status: DiscoveryStatus::Done,
+        });
+        let scan = reply.patterns.as_mut().unwrap();
+        scan.matches = MAX_PATTERN_MATCHES + 1;
+        scan.covered = vec![u64::MAX];
+
+        assert_eq!(
+            state
+                .commit_reply(
+                    &info,
+                    Some(&inventory),
+                    Some(inventory.revision()),
+                    &mut reply,
+                )
+                .unwrap_err(),
+            "Function-start pattern work budget exhausted"
+        );
+        let InventoryChange::Replace { functions, .. } = &reply.inventory else {
+            panic!()
+        };
+        assert_eq!(functions[0], functions[1]);
         let phase = state.patterns.as_ref().unwrap();
         assert_eq!(
             phase.inventory_validation_rows,
@@ -1388,6 +1439,13 @@ mod tests {
         );
         assert!(phase.cursor.is_none() && phase.partial);
         assert!(state.flight.is_none());
+        assert_eq!(state.report.references, prior_references);
+        assert_eq!(state.report.functions_examined, prior_functions_examined);
+        assert_eq!(state.report.decode_attempts, prior_decode_attempts);
+        assert_eq!(state.batches, prior_batches);
+        assert_eq!(state.admitted, Some((1, inventory.revision())));
+        assert_eq!(inventory.functions(), info.functions);
+        assert!(state.report.partial);
     }
 
     #[test]
