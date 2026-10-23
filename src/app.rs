@@ -177,10 +177,17 @@ fn next_sync_batch(addresses: &mut VecDeque<u64>, functions: &[FunctionInfo]) ->
     batch
 }
 
-/// Whether discovery may continue after `request` failed: its own name
-/// synchronization is not retried, and legacy full discovery has no batches.
+/// Whether discovery may continue after `request` failed. Reopening, its own
+/// name synchronization and signature replay are not retried, and legacy full
+/// discovery has no batches.
 fn resumes_discovery(request: &Request) -> bool {
-    !matches!(request, Request::SyncFunctions { .. } | Request::Discover)
+    !matches!(
+        request,
+        Request::Open { .. }
+            | Request::SyncFunctions { .. }
+            | Request::SyncSignatures { .. }
+            | Request::Discover
+    )
 }
 
 fn replay_addresses(worker: &[FunctionInfo], desired: &[FunctionInfo]) -> VecDeque<u64> {
@@ -4933,6 +4940,7 @@ impl DesktopApp {
             comment_target.or(code_target),
             |ui, display_row, rect| {
                 let builder = egui::UiBuilder::new()
+                    .id_salt(("code-row", display_row))
                     .max_rect(rect.with_min_x(rect.left() + 6.0))
                     .layout(egui::Layout::left_to_right(egui::Align::Center));
                 ui.scope_builder(builder, |ui| {

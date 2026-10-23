@@ -455,7 +455,8 @@ pub fn rows<R>(
     if let Some(row) = reveal.filter(|row| *row < count) {
         let offset = egui::scroll_area::State::load(ui.ctx(), id)
             .map_or(0.0, |state| state.clamped_offset().y);
-        let height = ui.available_height();
+        // A horizontal scroll bar's gutter hides the bottom of the view.
+        let height = ui.available_height() - ui.spacing().scroll.allocated_width();
         if !row_visible(egui::Rangef::new(offset, offset + height), row_height, row) {
             let content = row_height * count as f32;
             let centered = (row as f32 + 0.5) * row_height - height / 2.0;
