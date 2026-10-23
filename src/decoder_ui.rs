@@ -31,6 +31,8 @@ struct Decoded {
     bytes: Vec<u8>,
     operation: String,
     parameters: String,
+    /// Display preview, computed once rather than on every frame.
+    preview: std::cell::OnceCell<(String, &'static str)>,
 }
 
 enum JobResult {
@@ -101,10 +103,8 @@ impl DecoderPanel {
     pub fn show(&mut self, ui: &mut egui::Ui) -> Option<DecoderAction> {
         self.poll();
         let mut action = None;
-        ui.heading("String decoder");
-        ui.label("Decode selected bytes or paste data. Source bytes are never overwritten.");
         ui.horizontal_wrapped(|ui| {
-            ui.label("Memory address (hex)");
+            ui.label("Address");
             ui.add(
                 TextEdit::singleline(&mut self.address)
                     .desired_width(150.0)
@@ -139,7 +139,9 @@ impl DecoderPanel {
                     source.bytes.len()
                 ));
             } else {
-                ui.weak("Pasted input: copy output or read memory to attach annotations");
+                ui.weak("Pasted input").on_hover_text(
+                    "Copy the output, or read memory to attach decoded annotations to an address.",
+                );
             }
         });
         let max_characters = match self.mode {
@@ -165,7 +167,9 @@ impl DecoderPanel {
         }
         let mut parameters_changed = false;
         ui.horizontal_wrapped(|ui| {
-            ui.label("Operation");
+            ui.label("Operation").on_hover_text(
+                "Hex/Base64 operations transform encoded text. Hex input mode specifies the raw bytes supplied to that operation.",
+            );
             egui::ComboBox::from_id_salt("decoder-operation")
                 .selected_text(operation_name(self.operation))
                 .show_ui(ui, |ui| {
@@ -202,7 +206,11 @@ impl DecoderPanel {
         }
         ui.horizontal(|ui| {
             let ready = self.pending.is_none();
-            if ui.add_enabled(ready, egui::Button::new("Decode")).clicked() {
+            if ui
+                .add_enabled(ready, egui::Button::new("Decode"))
+                .on_hover_text("Decoding never modifies the source bytes")
+                .clicked()
+            {
                 self.start_job(false, ui.ctx());
             }
             if ui
@@ -216,13 +224,15 @@ impl DecoderPanel {
                 ui.label("Working…");
             }
         });
-        ui.weak("Hex/Base64 operations transform encoded text. Hex input mode specifies the raw bytes supplied to that operation.");
         if let Some(error) = &self.error {
             ui.colored_label(crate::theme::ERROR, error);
         }
         if !self.candidates.is_empty() {
             ui.separator();
-            ui.label("Suggestions are unverified. Choose one to preview; readability does not establish correctness.");
+            ui.colored_label(
+                crate::theme::WARNING,
+                "Unverified suggestions: readability does not establish correctness",
+            );
             let mut selected = None;
             for (index, candidate) in self.candidates.iter().enumerate() {
                 if ui.button(&candidate.label).clicked() {
@@ -238,20 +248,23 @@ impl DecoderPanel {
                         "selected suggestion: {}; result unverified",
                         candidate.label
                     ),
+                    preview: Default::default(),
                 });
             }
         }
         if let Some(output) = &self.output {
             ui.separator();
             ui.label(RichText::new(&output.operation).strong());
-            let (preview, encoding) = output_preview(&output.bytes, PREVIEW_CHARACTERS);
-            ui.label(format!("{} output bytes; {encoding}", output.bytes.len()));
+            let (preview, encoding) = output
+                .preview
+                .get_or_init(|| output_preview(&output.bytes, PREVIEW_CHARACTERS));
+            ui.weak(format!("{} output bytes · {encoding}", output.bytes.len()));
             ScrollArea::vertical()
                 .id_salt("decoder-output")
                 .max_height(230.0)
                 .show(ui, |ui| {
                     ui.add(
-                        egui::Label::new(RichText::new(preview).monospace())
+                        egui::Label::new(RichText::new(preview.as_str()).monospace())
                             .selectable(true)
                             .wrap(),
                     );
@@ -388,6 +401,7 @@ impl DecoderPanel {
                             bytes,
                             operation: operation_name(operation).into(),
                             parameters,
+                            preview: Default::default(),
                         })
                     })
                 };
@@ -522,6 +536,7 @@ mod tests {
             bytes: bytes.to_vec(),
             operation: "Base64 decode".into(),
             parameters: "strict validation".into(),
+            preview: Default::default(),
         }))
     }
 
