@@ -28,6 +28,10 @@ use crate::theme;
 use crate::xrefs::{AccessFilter, CallDirection, CallRow, TargetKind, TargetSet, XrefTarget};
 
 const DEADLINE: Duration = Duration::from_secs(30);
+/// Consecutive automatic discovery resumes after unrelated worker failures.
+const MAX_DISCOVERY_RESUMES: u8 = 3;
+/// Decompiler line pitch: denser than table rows, like a code editor.
+const CODE_ROW_HEIGHT: f32 = 18.0;
 const HISTORY_LIMIT: usize = 32;
 const UNDO_BYTES: usize = 4 * 1024 * 1024;
 /// Per-frame work for the function filter, keeping typing responsive.
@@ -147,6 +151,38 @@ fn inventory_name(name: &str) -> &str {
 }
 
 /// Addresses whose displayed inventory entry a freshly opened worker lacks.
+/// The next function-name synchronization from `addresses`, packed by encoded
+/// size so typical names need few worker round trips. Addresses no longer in
+/// the inventory are skipped.
+fn next_sync_batch(addresses: &mut VecDeque<u64>, functions: &[FunctionInfo]) -> Vec<FunctionInfo> {
+    let mut batch = Vec::new();
+    let mut bytes = 0;
+    while let Some(&address) = addresses.front() {
+        if let Some(function) = function_at(functions, address) {
+            let name = inventory_name(&function.name);
+            let size = crate::model::sync_entry_bytes(name);
+            if batch.len() == MAX_DISCOVERY_SYNC_FUNCTIONS
+                || (!batch.is_empty() && bytes + size > crate::model::MAX_SYNC_FUNCTION_BYTES)
+            {
+                break;
+            }
+            bytes += size;
+            batch.push(FunctionInfo {
+                address,
+                name: name.to_owned(),
+            });
+        }
+        addresses.pop_front();
+    }
+    batch
+}
+
+/// Whether discovery may continue after `request` failed: its own name
+/// synchronization is not retried, and legacy full discovery has no batches.
+fn resumes_discovery(request: &Request) -> bool {
+    !matches!(request, Request::SyncFunctions { .. } | Request::Discover)
+}
+
 fn replay_addresses(worker: &[FunctionInfo], desired: &[FunctionInfo]) -> VecDeque<u64> {
     desired
         .iter()
@@ -465,6 +501,12 @@ pub struct DesktopApp {
     pending_code_scroll: Option<usize>,
     pending_comment_scroll: Option<u64>,
     pending_listing_scroll: Option<usize>,
+    /// Automatic discovery resumes since the last committed batch.
+    discovery_resumes: u8,
+    /// Widest Listing row, in monospace characters, for a stable scroll range.
+    listing_chars: usize,
+    /// Widest decompiler display row, in monospace characters.
+    code_chars: usize,
     auto_decompile: bool,
     selected: Option<u64>,
     history: Vec<u64>,
@@ -595,6 +637,9 @@ impl DesktopApp {
             pending_code_scroll: None,
             pending_comment_scroll: None,
             pending_listing_scroll: None,
+            discovery_resumes: 0,
+            listing_chars: 0,
+            code_chars: 0,
             auto_decompile: true,
             selected: None,
             history: Vec::new(),
@@ -791,6 +836,24 @@ impl DesktopApp {
         self.decoder = DecoderPanel::default();
         self.hex = HexPanel::default();
         self.advance_byte_intent();
+    }
+
+    /// Stop the worker after its current request failed. Discovery that the
+    /// failure did not belong to continues on a fresh worker; interrupted
+    /// batches retry within their own limits, and consecutive automatic resumes
+    /// without a committed batch are bounded.
+    fn stop_after_failure(&mut self, resumable: bool, context: &egui::Context) {
+        let resume = resumable
+            && self.discovery_running
+            && self.signature_change.is_none()
+            && self.discovery_resumes < MAX_DISCOVERY_RESUMES;
+        self.stop_worker();
+        if resume && let Some(path) = self.binary_path.clone() {
+            self.discovery_resumes += 1;
+            self.start_open(path, true, None, context);
+            self.discovery_running = self.client.is_some();
+            self.update_discovery_summary();
+        }
     }
 
     fn stop_worker(&mut self) {
@@ -1042,6 +1105,7 @@ impl DesktopApp {
                 let continue_discovery = self.discovery_running;
                 self.start_open(path, true, Some(request), context);
                 self.discovery_running = continue_discovery && self.client.is_some();
+                self.update_discovery_summary();
             }
         } else {
             self.schedule_request(request);
@@ -1389,6 +1453,7 @@ impl DesktopApp {
         if !self.discovery_running {
             crate::performance::event("discovery_action_begin", self.generation);
         }
+        self.discovery_resumes = 0;
         if self.discovery.is_none() && self.discovery_job.is_none() {
             // Saved results are display-only; a fresh run replaces them.
             if self.saved_references {
@@ -1478,6 +1543,7 @@ impl DesktopApp {
                 if changed {
                     self.rebuild_filter();
                 }
+                self.discovery_resumes = 0;
                 self.status = "Discovery batch committed".into();
             }
             Ok(None) => {}
@@ -1503,20 +1569,11 @@ impl DesktopApp {
         }
         if let Some(addresses) = &mut self.discovery_sync {
             let Some(info) = &self.info else { return };
-            while !addresses.is_empty() {
-                // Read current names at send time so a later rename is not replaced.
-                let functions: Vec<_> = addresses
-                    .drain(..addresses.len().min(MAX_DISCOVERY_SYNC_FUNCTIONS))
-                    .filter_map(|address| function_at(&info.functions, address))
-                    .map(|function| FunctionInfo {
-                        address: function.address,
-                        name: inventory_name(&function.name).to_owned(),
-                    })
-                    .collect();
-                if !functions.is_empty() {
-                    self.send_direct(Request::SyncFunctions { functions });
-                    return;
-                }
+            // Read current names at send time so a later rename is not replaced.
+            let functions = next_sync_batch(addresses, &info.functions);
+            if !functions.is_empty() {
+                self.send_direct(Request::SyncFunctions { functions });
+                return;
             }
             self.discovery_sync = None;
         }
@@ -1636,7 +1693,11 @@ impl DesktopApp {
             .as_ref()
             .is_some_and(|pending| pending.started.elapsed() > DEADLINE)
         {
-            self.stop_worker();
+            let resumable = self
+                .pending
+                .as_ref()
+                .is_some_and(|pending| resumes_discovery(&pending.request));
+            self.stop_after_failure(resumable, context);
             self.status =
                 "Analysis exceeded 30 seconds and was stopped. Choose an action to restart.".into();
         }
@@ -1649,7 +1710,11 @@ impl DesktopApp {
             match event {
                 WorkerEvent::Failed(error) => {
                     let signature_failure = self.signature_change.is_some();
-                    self.stop_worker();
+                    let resumable = self
+                        .pending
+                        .as_ref()
+                        .is_some_and(|pending| resumes_discovery(&pending.request));
+                    self.stop_after_failure(resumable, context);
                     if signature_failure {
                         self.signature_error = Some(format!("Signature change failed: {error}"));
                     }
@@ -1680,11 +1745,9 @@ impl DesktopApp {
             if !matches!(
                 pending.request,
                 Request::Discover | Request::DiscoverBatch { .. }
-            ) || (self.progress_events == 1 && progress.stage != AnalysisStage::Seeds)
-                || self.progress_events > MAX_ANALYSIS_FUNCTIONS + 3
-                || progress
-                    .validate_after(self.analysis_progress.as_ref())
-                    .is_err()
+            ) || progress
+                .validate_event(self.progress_events, self.analysis_progress.as_ref())
+                .is_err()
             {
                 self.stop_worker();
                 self.status = "Invalid worker analysis progress; worker stopped".into();
@@ -1704,11 +1767,9 @@ impl DesktopApp {
             _ => None,
         };
         if let Some(analysis) = final_analysis
-            && self.analysis_progress.as_ref().is_none_or(|last| {
-                last.stage != AnalysisStage::Publish
-                    || last.functions_examined != analysis.functions_examined
-                    || last.decode_attempts != analysis.decode_attempts
-            })
+            && analysis
+                .validate_final(self.analysis_progress.as_ref())
+                .is_err()
         {
             self.stop_worker();
             self.status = "Call analysis did not match its final progress; worker stopped".into();
@@ -1736,7 +1797,7 @@ impl DesktopApp {
                 return;
             }
             let signature_failure = self.signature_change.is_some();
-            self.stop_worker();
+            self.stop_after_failure(resumes_discovery(&pending.request), context);
             if signature_failure {
                 self.signature_error =
                     Some(format!("Signature not applied: {}", crop(&message, 4096)));
@@ -2432,6 +2493,7 @@ impl DesktopApp {
                 let continue_discovery = self.discovery_running;
                 self.start_open_at(path, true, Some(request), origin, context);
                 self.discovery_running = continue_discovery && self.client.is_some();
+                self.update_discovery_summary();
             } else {
                 self.fail_byte_request(
                     &request,
@@ -3179,7 +3241,11 @@ impl DesktopApp {
         let mut dismiss = false;
         let modal = egui::Modal::new(egui::Id::unique("auto-analysis")).show(context, |ui| {
             ui.set_width(440.0);
-            ui.heading(if first_open { "Analyze binary?" } else { "Auto Analysis" });
+            ui.heading(if first_open {
+                "Analyze binary?"
+            } else {
+                "Auto Analysis"
+            });
             ui.label(if first_open {
                 format!("{name} has not been analyzed. Analyze it now?")
             } else {
@@ -3189,12 +3255,11 @@ impl DesktopApp {
             ui.add_enabled(
                 !packed,
                 egui::Checkbox::new(&mut options.functions, "Function discovery and references"),
-            );
-            ui.weak(if packed {
-                crate::packing::UPX_ANALYSIS_ERROR
-            } else {
-                "Follows confirmed direct calls and indexes call and data references."
-            });
+            )
+            .on_hover_text("Follows confirmed direct calls and indexes call and data references.");
+            if packed {
+                ui.colored_label(theme::WARNING, crate::packing::UPX_ANALYSIS_ERROR);
+            }
             ui.checkbox(&mut options.strings, "Defined strings");
             ui.add_enabled_ui(options.strings, |ui| {
                 ui.horizontal(|ui| {
@@ -3206,14 +3271,16 @@ impl DesktopApp {
                     );
                 });
             });
-            ui.checkbox(&mut options.crypto, "FindCrypt constants");
-            ui.weak("Heuristic matches for standardized cryptographic constants.");
-            ui.add_space(8.0);
-            ui.weak("Analysis runs in the background while you browse. Cancel it from the Analysis menu.");
+            ui.checkbox(&mut options.crypto, "FindCrypt constants")
+                .on_hover_text("Heuristic matches for standardized cryptographic constants.");
+            ui.add_space(4.0);
+            ui.weak("Runs in the background; cancel from the Analysis menu.");
             ui.separator();
             ui.horizontal(|ui| {
                 let selected = options.functions && !packed || options.strings || options.crypto;
-                analyze = ui.add_enabled(selected, egui::Button::new("Analyze")).clicked();
+                analyze = ui
+                    .add_enabled(selected, egui::Button::new("Analyze"))
+                    .clicked();
                 dismiss = ui
                     .button(if first_open { "Not now" } else { "Cancel" })
                     .clicked();
@@ -3319,19 +3386,10 @@ impl DesktopApp {
             let Some(info) = &self.info else {
                 return;
             };
-            while !addresses.is_empty() {
-                let functions = addresses
-                    .drain(..addresses.len().min(MAX_DISCOVERY_SYNC_FUNCTIONS))
-                    .filter_map(|address| function_at(&info.functions, address))
-                    .map(|function| FunctionInfo {
-                        address: function.address,
-                        name: inventory_name(&function.name).to_owned(),
-                    })
-                    .collect::<Vec<_>>();
-                if !functions.is_empty() {
-                    self.send_direct(Request::SyncFunctions { functions });
-                    return;
-                }
+            let functions = next_sync_batch(addresses, &info.functions);
+            if !functions.is_empty() {
+                self.send_direct(Request::SyncFunctions { functions });
+                return;
             }
             self.discovery_sync = None;
         }
@@ -4052,12 +4110,25 @@ impl DesktopApp {
             });
             ui.menu_button("Help", |ui| {
                 ui.label("Ghidra / Rust — native prototype");
-                ui.weak("x86 / x86-64 / AArch64 · limited analysis and signature coverage");
-                ui.weak("Save .grproj projects or export JSON annotations. Java plugins are not supported.");
-                ui.label("L: rename function / label · G: go to · ;: comment");
-                ui.label("Space: Listing / Graph · Alt+Left/Right: history");
-                ui.label("Ctrl+S: save project · Ctrl+Z: undo annotation");
-                ui.weak("Shortcuts pause while typing or using a dialog. Signature parameters are renamed through Signature….");
+                ui.weak("x86 / x86-64 / AArch64 · limited analysis coverage");
+                ui.separator();
+                egui::Grid::new("shortcuts").num_columns(2).spacing([16.0, 2.0]).show(ui, |ui| {
+                    for (keys, action) in [
+                        ("L", "Rename function / label / local"),
+                        ("G", "Go to address or name"),
+                        (";", "Edit comment"),
+                        ("X", "Xrefs to selection"),
+                        ("Space", "Toggle Listing / Graph"),
+                        ("Alt+Left / Right", "Back / forward"),
+                        ("Ctrl+S", "Save project"),
+                        ("Ctrl+Z", "Undo annotation"),
+                    ] {
+                        ui.label(RichText::new(keys).monospace().color(theme::ACCENT));
+                        ui.label(action);
+                        ui.end_row();
+                    }
+                });
+                ui.weak("Shortcuts pause while typing or in dialogs.");
             });
             crate::window_chrome::menu_bar_controls(ui);
         });
@@ -4126,12 +4197,17 @@ impl DesktopApp {
             .frame(theme::inner_frame())
             .show(ui, |ui| {
                 ui.set_min_height(ui.available_height());
-                theme::dock_header(ui, "Program", false, |ui| {if self.cached_functions || self.cached_strings || self.cached_crypto {ui.weak("Saved analysis").on_hover_text("Some tree results were loaded from the project. Recompute the corresponding analysis to verify them.");}});
-                ui.horizontal(|ui| {
-                    theme::tab(ui, &mut self.program_tree, false, "Symbol Tree");
-                    theme::tab(ui, &mut self.program_tree, true, "Program Trees");
-                });
-                ui.separator();
+                let cached = self.cached_functions || self.cached_strings || self.cached_crypto;
+                theme::dock_tabs(
+                    ui,
+                    &mut self.program_tree,
+                    &[(false, "Symbol Tree"), (true, "Program Trees")],
+                    |ui| {
+                        if cached {
+                            ui.weak("Saved").on_hover_text("Some tree results were loaded from the project. Recompute the corresponding analysis to verify them.");
+                        }
+                    },
+                );
                 self.symbol_tree(ui);
             });
         self.function_panel(ui);
@@ -4312,9 +4388,28 @@ impl DesktopApp {
     }
 
     fn function_panel(&mut self, ui: &mut egui::Ui) {
+        let filtered = self.step_filter(FILTER_FRAME_BUDGET);
+        if !filtered {
+            ui.ctx().request_repaint();
+        }
         theme::dock_header(ui, "Functions", false, |ui| {
+            ui.weak(if filtered {
+                self.filtered_functions.len().to_string()
+            } else {
+                format!("Filtering… {}", self.filtered_functions.len())
+            });
             if self.cached_functions {
-                ui.weak("Saved analysis").on_hover_text("Function names and addresses loaded from the project. Discover functions to recompute.");
+                ui.weak("Saved analysis").on_hover_text(
+                    "Function names and addresses loaded from the project. Discover functions to recompute.",
+                );
+            }
+            if self
+                .info
+                .as_ref()
+                .is_some_and(|info| info.functions_truncated)
+            {
+                ui.colored_label(theme::WARNING, "Partial")
+                    .on_hover_text("Loading or discovery reached a budget or encountered incomplete flow. Known entries are retained; see References and Analysis notes for coverage.");
             }
         });
         if ui
@@ -4322,76 +4417,80 @@ impl DesktopApp {
                 TextEdit::singleline(&mut self.function_filter)
                     .id(egui::Id::unique("function-filter"))
                     .hint_text("Filter name or address")
+                    .desired_width(f32::INFINITY)
                     .char_limit(256),
             )
             .changed()
         {
             self.restart_filter();
         }
-        if self.step_filter(FILTER_FRAME_BUDGET) {
-            ui.weak(format!("{} functions", self.filtered_functions.len()));
-        } else {
-            ui.weak(format!(
-                "Filtering… {} matches",
-                self.filtered_functions.len()
-            ));
-            ui.ctx().request_repaint();
-        }
-        if self
-            .info
-            .as_ref()
-            .is_some_and(|info| info.functions_truncated)
-        {
-            ui.colored_label(theme::WARNING, "Partial function list")
-                .on_hover_text("Loading or discovery reached a budget or encountered incomplete flow. Known entries are retained; see References and Analysis notes for coverage.");
-        }
-        ui.label(RichText::new("Address       Name").monospace().weak());
+        let Some(info) = &self.info else {
+            return;
+        };
+        let glyph = theme::glyph_width(ui);
+        let digits = theme::address_digits(info.functions.last().map_or(0, |f| f.address));
+        let name_x = (digits + 2) as f32 * glyph;
+        theme::column_header(ui, &[("Address", 0.0), ("Name", name_x)], 0.0);
         let mut navigate = None;
         let mut xrefs = None;
-        let row_height = ui.text_style_height(&egui::TextStyle::Body) + 6.0;
-        ScrollArea::vertical()
-            .id_salt("function-list")
-            .auto_shrink([false, false])
-            .show_rows(ui, row_height, self.filtered_functions.len(), |ui, rows| {
-                if let Some(info) = &self.info {
-                    for row in rows {
-                        let function = &info.functions[self.filtered_functions[row]];
-                        let label = self
-                            .session
-                            .as_ref()
-                            .and_then(|session| session.annotations.get(&function.address))
-                            .map(|annotation| annotation.label.as_str())
-                            .filter(|label| !label.is_empty())
-                            .unwrap_or(&function.name);
-                        let response = ui
-                            .add(
-                                egui::Button::selectable(
-                                    self.view
-                                        .as_ref()
-                                        .is_some_and(|view| view.address == function.address),
-                                    RichText::new(format!("{:08x}  {}", function.address, label))
-                                        .monospace(),
-                                )
-                                .truncate(),
-                            )
-                            .on_hover_text(format!("{:x}  {}", function.address, label));
-                        if response.clicked() {
-                            navigate = Some(function.address);
-                        }
-                        response.context_menu(|ui| {
-                            if ui.button("Rename / comment…").clicked() {
-                                navigate = Some(function.address);
-                                self.annotations_open = true;
-                                ui.close();
-                            }
-                            if ui.button("Xrefs to this function").clicked() {
-                                xrefs = Some(function.address);
-                                ui.close();
-                            }
-                        });
-                    }
+        let mut annotate = None;
+        let displayed = self.view.as_ref().map(|view| view.address);
+        theme::rows::<()>(
+            ui,
+            "function-list",
+            self.filtered_functions.len(),
+            theme::ROW_HEIGHT,
+            0.0,
+            None,
+            |ui, row, rect| {
+                let function = &info.functions[self.filtered_functions[row]];
+                let label = self
+                    .session
+                    .as_ref()
+                    .and_then(|session| session.annotations.get(&function.address))
+                    .map(|annotation| annotation.label.as_str())
+                    .filter(|label| !label.is_empty())
+                    .unwrap_or(&function.name);
+                let response = theme::row_response(
+                    ui,
+                    ui.scope_id().with(("function-row", function.address)),
+                    rect,
+                    displayed == Some(function.address),
+                    false,
+                );
+                theme::cell_text(
+                    ui,
+                    rect,
+                    RichText::new(format!("{:0digits$x}", function.address)).monospace(),
+                    theme::MUTED,
+                );
+                theme::cell_text(
+                    ui,
+                    rect.with_min_x(rect.left() + name_x),
+                    RichText::new(label).monospace(),
+                    theme::TEXT,
+                );
+                let response = response.on_hover_text(format!("{:x}  {}", function.address, label));
+                if response.clicked() {
+                    navigate = Some(function.address);
                 }
-            });
+                response.context_menu(|ui| {
+                    if ui.button("Rename / comment…").clicked() {
+                        annotate = Some(function.address);
+                        ui.close();
+                    }
+                    if ui.button("Xrefs to this function").clicked() {
+                        xrefs = Some(function.address);
+                        ui.close();
+                    }
+                });
+                None
+            },
+        );
+        if let Some(address) = annotate {
+            navigate = Some(address);
+            self.annotations_open = true;
+        }
         if let Some(address) = navigate {
             self.navigate(address, true, ui.ctx());
         }
@@ -4440,6 +4539,42 @@ impl DesktopApp {
                 }
             }
         }
+        let digits = theme::address_digits(self.listing.last().map_or(0, |i| i.address));
+        let operands = theme::listing_columns(digits)[3];
+        self.listing_chars = self
+            .listing
+            .iter()
+            .map(|instruction| {
+                let comment = self
+                    .annotation_browser
+                    .comments
+                    .get(&instruction.address)
+                    .map_or(0, |comment| comment.chars().count() + 4);
+                operands + instruction.operands.chars().count() + comment
+            })
+            .max()
+            .unwrap_or(0);
+        self.code_chars = self
+            .comment_rows
+            .rows
+            .iter()
+            .map(|row| match *row {
+                CodeRow::Source(index) => {
+                    self.decompiled_lines.get(index).map_or(0, |&(start, end)| {
+                        self.decompiled
+                            .get(start..end)
+                            .map_or(0, |line| line.chars().take(2001).count())
+                    })
+                }
+                CodeRow::Comment(address) => self
+                    .annotation_browser
+                    .comments
+                    .get(&address)
+                    .map_or(0, |comment| comment.chars().count() + 14),
+                CodeRow::UnmappedHeading => 0,
+            })
+            .max()
+            .unwrap_or(0);
         self.comment_owners.retain(|pc, _| {
             self.history.contains(pc)
                 || self
@@ -4703,11 +4838,14 @@ impl DesktopApp {
                 .as_ref()
                 .and_then(|info| function_at(&info.functions, view.address));
             let name = function.map(|f| f.name.as_str()).unwrap_or("function");
-            let response = ui.label(
-                RichText::new(format!("{}  ·  {:x}", crop(name, 100), view.address))
-                    .monospace()
-                    .color(theme::BLUE),
-            );
+            let row = ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("{}  {:x}", crop(name, 100), view.address))
+                        .monospace()
+                        .color(theme::BLUE),
+                )
+            });
+            let response = row.inner;
             response.context_menu(|ui| {
                 if ui.button("Edit signature…").clicked() {
                     self.begin_signature_editor();
@@ -4749,10 +4887,8 @@ impl DesktopApp {
             } else if self.semantic_info.prototype.is_some() {
                 ui.weak("Inferred signature");
             }
-            ui.separator();
         }
         if self.decompiled.is_empty() {
-            ui.add_space(8.0);
             if self
                 .info
                 .as_ref()
@@ -4767,16 +4903,12 @@ impl DesktopApp {
                 });
             }
         }
-        let row = ui.text_style_height(&egui::TextStyle::Monospace);
         let mut navigate = None;
         let mut select_code = None;
         let mut edit_comment = None;
         let mut select_comment = None;
         let mut rename_local_byte = None;
         let mut xrefs = None;
-        let mut scroll = ScrollArea::both()
-            .id_salt("decompiler-text")
-            .auto_shrink([false, false]);
         let code_target = self.pending_code_scroll.take().map(|target| {
             self.comment_rows
                 .source_rows
@@ -4788,156 +4920,170 @@ impl DesktopApp {
             .pending_comment_scroll
             .take()
             .and_then(|address| self.comment_rows.comment_rows.get(&address).copied());
-        if let Some(target) = comment_target.or(code_target) {
-            scroll =
-                scroll.vertical_scroll_offset(target as f32 * (row + ui.spacing().item_spacing.y));
-        }
-        scroll.show_rows(ui, row, self.comment_rows.rows.len(), |ui, rows| {
-            for display_row in rows {
-                let index = match self.comment_rows.rows[display_row] {
-                    CodeRow::Source(index) => index,
-                    CodeRow::UnmappedHeading => {
-                        ui.colored_label(theme::WARNING, "Comments without visible code");
-                        continue;
-                    }
-                    CodeRow::Comment(address) => {
-                        if let Some(preview) = self.annotation_browser.comments.get(&address) {
-                            let response = ui
-                                .add(
-                                    egui::Label::new(
-                                        RichText::new(format!("// {address:08x}: {preview}"))
-                                            .monospace()
-                                            .color(theme::SYNTAX_COMMENT),
+        let glyph = theme::glyph_width(ui);
+        theme::rows::<()>(
+            ui,
+            (
+                "decompiler-text",
+                self.view.as_ref().map(|view| view.address),
+            ),
+            self.comment_rows.rows.len(),
+            CODE_ROW_HEIGHT,
+            self.code_chars as f32 * glyph + 12.0,
+            comment_target.or(code_target),
+            |ui, display_row, rect| {
+                let builder = egui::UiBuilder::new()
+                    .max_rect(rect.with_min_x(rect.left() + 6.0))
+                    .layout(egui::Layout::left_to_right(egui::Align::Center));
+                ui.scope_builder(builder, |ui| {
+                    let index = match self.comment_rows.rows[display_row] {
+                        CodeRow::Source(index) => index,
+                        CodeRow::UnmappedHeading => {
+                            ui.colored_label(theme::WARNING, "Comments without visible code");
+                            return;
+                        }
+                        CodeRow::Comment(address) => {
+                            if let Some(preview) = self.annotation_browser.comments.get(&address) {
+                                let response = ui
+                                    .add(
+                                        egui::Label::new(
+                                            RichText::new(format!("// {address:08x}: {preview}"))
+                                                .monospace()
+                                                .color(theme::SYNTAX_COMMENT),
+                                        )
+                                        .sense(egui::Sense::click())
+                                        .wrap_mode(egui::TextWrapMode::Extend),
                                     )
-                                    .sense(egui::Sense::click())
-                                    .wrap_mode(egui::TextWrapMode::Extend),
-                                )
-                                .on_hover_text("Double-click to view or edit the full comment");
-                            if response.clicked() {
-                                select_comment = Some(address);
-                            }
-                            if response.double_clicked() {
-                                edit_comment = Some(address);
-                            }
-                            response.context_menu(|ui| {
-                                if ui.button("Edit comment…").clicked() {
+                                    .on_hover_text("Double-click to view or edit the full comment");
+                                if response.clicked() {
+                                    select_comment = Some(address);
+                                }
+                                if response.double_clicked() {
                                     edit_comment = Some(address);
-                                    ui.close();
                                 }
-                            });
-                        }
-                        continue;
-                    }
-                };
-                let (start, end) = self.decompiled_lines[index];
-                let line = self.decompiled[start..end].trim_end_matches(['\n', '\r']);
-                let visible = line
-                    .char_indices()
-                    .nth(2000)
-                    .map_or(line.len(), |(at, _)| at);
-                let Some(highlighted) = &self.highlighted else {
-                    continue;
-                };
-                let mut job = highlighted.selected_line_job(
-                    &self.decompiled,
-                    start..start + visible,
-                    13.0,
-                    &self.semantic.ranges,
-                );
-                if visible < line.len() {
-                    job.append(
-                        "…",
-                        0.0,
-                        egui::TextFormat {
-                            font_id: egui::FontId::monospace(13.0),
-                            color: theme::TEXT,
-                            ..Default::default()
-                        },
-                    );
-                }
-                let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
-                let response = ui.add(
-                    egui::Label::new(galley.clone())
-                        .selectable(true)
-                        .wrap_mode(egui::TextWrapMode::Extend),
-                );
-                let mut pointer_byte = None;
-                if response.hovered()
-                    && let Some(pointer) = context.pointer_hover_pos()
-                {
-                    let cursor = galley.cursor_from_pos(pointer - response.rect.min);
-                    let byte = line[..visible]
-                        .char_indices()
-                        .nth(cursor.index.0)
-                        .map_or(visible, |(at, _)| at);
-                    pointer_byte = (byte < visible).then_some(start + byte);
-                    if byte < visible && (response.clicked() || response.secondary_clicked()) {
-                        select_code = Some(start + byte);
-                    }
-                    if byte < visible
-                        && let Some(target) = self.decompiler_call_target(start + byte)
-                    {
-                        let clicked = response.double_clicked();
-                        response
-                            .clone()
-                            .on_hover_cursor(egui::CursorIcon::PointingHand)
-                            .on_hover_text(format!("Double-click to go to {target:#x}"));
-                        if clicked {
-                            navigate = Some(target);
-                        }
-                    }
-                }
-                // Egui retains context menus after the pointer leaves the row,
-                // so capture the clicked token and its exact targets once.
-                let menu_id = response.id.with("decompiler-menu");
-                if response.secondary_clicked() {
-                    let token = pointer_byte.and_then(|byte| self.semantic_info.token_at(byte));
-                    let local = token
-                        .filter(|t| matches!(t.kind, TokenKind::Local { .. }))
-                        .cloned();
-                    let view = self.info.as_ref().zip(self.view.as_ref());
-                    let targets = match (token.map(|t| &t.kind), pointer_byte, view) {
-                        (Some(TokenKind::Call { target }), _, _) => TargetSet::single(XrefTarget {
-                            address: *target,
-                            kind: TargetKind::CallTarget,
-                        }),
-                        (_, Some(byte), Some(view)) => crate::xrefs::instruction_targets(
-                            Some(view),
-                            self.call_index.as_ref(),
-                            view.1.address,
-                            self.semantic.addresses_at(byte).iter().copied(),
-                        ),
-                        _ => TargetSet::default(),
-                    };
-                    let menu = DecompilerMenu {
-                        key: self.xref_key(),
-                        local,
-                        targets,
-                    };
-                    context.data_mut(|d| d.insert_temp(menu_id, menu));
-                }
-                let menu = context
-                    .data(|d| d.get_temp::<DecompilerMenu>(menu_id))
-                    .filter(|menu| menu.key == self.xref_key());
-                if let Some(menu) = menu {
-                    let function = self.view.as_ref().map(|view| view.address);
-                    response.context_menu(|ui| {
-                        if let Some(token) = &menu.local {
-                            if matches!(token.kind, TokenKind::Local { local: Some(_) }) {
-                                if ui.button("Rename local variable…  L").clicked() {
-                                    rename_local_byte = Some(token.start);
-                                    ui.close();
-                                }
-                            } else {
-                                ui.label("Renaming unsupported: no verified storage identity");
+                                response.context_menu(|ui| {
+                                    if ui.button("Edit comment…").clicked() {
+                                        edit_comment = Some(address);
+                                        ui.close();
+                                    }
+                                });
                             }
-                            ui.separator();
+                            return;
                         }
-                        xref_menu_items(ui, &menu.targets, function, &mut xrefs);
-                    });
-                }
-            }
-        });
+                    };
+                    let (start, end) = self.decompiled_lines[index];
+                    let line = self.decompiled[start..end].trim_end_matches(['\n', '\r']);
+                    let visible = line
+                        .char_indices()
+                        .nth(2000)
+                        .map_or(line.len(), |(at, _)| at);
+                    let Some(highlighted) = &self.highlighted else {
+                        return;
+                    };
+                    let mut job = highlighted.selected_line_job(
+                        &self.decompiled,
+                        start..start + visible,
+                        13.0,
+                        &self.semantic.ranges,
+                    );
+                    if visible < line.len() {
+                        job.append(
+                            "…",
+                            0.0,
+                            egui::TextFormat {
+                                font_id: egui::FontId::monospace(13.0),
+                                color: theme::TEXT,
+                                ..Default::default()
+                            },
+                        );
+                    }
+                    let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+                    let response = ui.add(
+                        egui::Label::new(galley.clone())
+                            .selectable(true)
+                            .wrap_mode(egui::TextWrapMode::Extend),
+                    );
+                    let mut pointer_byte = None;
+                    if response.hovered()
+                        && let Some(pointer) = context.pointer_hover_pos()
+                    {
+                        let cursor = galley.cursor_from_pos(pointer - response.rect.min);
+                        let byte = line[..visible]
+                            .char_indices()
+                            .nth(cursor.index.0)
+                            .map_or(visible, |(at, _)| at);
+                        pointer_byte = (byte < visible).then_some(start + byte);
+                        if byte < visible && (response.clicked() || response.secondary_clicked()) {
+                            select_code = Some(start + byte);
+                        }
+                        if byte < visible
+                            && let Some(target) = self.decompiler_call_target(start + byte)
+                        {
+                            let clicked = response.double_clicked();
+                            response
+                                .clone()
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .on_hover_text(format!("Double-click to go to {target:#x}"));
+                            if clicked {
+                                navigate = Some(target);
+                            }
+                        }
+                    }
+                    // Egui retains context menus after the pointer leaves the row,
+                    // so capture the clicked token and its exact targets once.
+                    let menu_id = response.id.with("decompiler-menu");
+                    if response.secondary_clicked() {
+                        let token = pointer_byte.and_then(|byte| self.semantic_info.token_at(byte));
+                        let local = token
+                            .filter(|t| matches!(t.kind, TokenKind::Local { .. }))
+                            .cloned();
+                        let view = self.info.as_ref().zip(self.view.as_ref());
+                        let targets = match (token.map(|t| &t.kind), pointer_byte, view) {
+                            (Some(TokenKind::Call { target }), _, _) => {
+                                TargetSet::single(XrefTarget {
+                                    address: *target,
+                                    kind: TargetKind::CallTarget,
+                                })
+                            }
+                            (_, Some(byte), Some(view)) => crate::xrefs::instruction_targets(
+                                Some(view),
+                                self.call_index.as_ref(),
+                                view.1.address,
+                                self.semantic.addresses_at(byte).iter().copied(),
+                            ),
+                            _ => TargetSet::default(),
+                        };
+                        let menu = DecompilerMenu {
+                            key: self.xref_key(),
+                            local,
+                            targets,
+                        };
+                        context.data_mut(|d| d.insert_temp(menu_id, menu));
+                    }
+                    let menu = context
+                        .data(|d| d.get_temp::<DecompilerMenu>(menu_id))
+                        .filter(|menu| menu.key == self.xref_key());
+                    if let Some(menu) = menu {
+                        let function = self.view.as_ref().map(|view| view.address);
+                        response.context_menu(|ui| {
+                            if let Some(token) = &menu.local {
+                                if matches!(token.kind, TokenKind::Local { local: Some(_) }) {
+                                    if ui.button("Rename local variable…  L").clicked() {
+                                        rename_local_byte = Some(token.start);
+                                        ui.close();
+                                    }
+                                } else {
+                                    ui.label("Renaming unsupported: no verified storage identity");
+                                }
+                                ui.separator();
+                            }
+                            xref_menu_items(ui, &menu.targets, function, &mut xrefs);
+                        });
+                    }
+                });
+                None
+            },
+        );
         if let Some(target) = xrefs {
             self.open_xrefs(target);
         } else if let Some(target) = navigate {
@@ -5209,53 +5355,6 @@ impl DesktopApp {
     /// the call and data views. Returns the scope address and whether it was
     /// chosen explicitly rather than followed from the displayed function.
     fn reference_scope(&mut self, ui: &mut egui::Ui) -> Option<(u64, bool)> {
-        let mut open = None;
-        ui.horizontal(|ui| {
-            let response = ui.add(
-                TextEdit::singleline(&mut self.reference_query)
-                    .hint_text("Exact hex address")
-                    .desired_width(130.0)
-                    .char_limit(18),
-            );
-            let entered =
-                response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
-            if ui
-                .small_button("Show xrefs")
-                .on_hover_text("References to exactly this address")
-                .clicked()
-                || entered
-            {
-                match parse_address(&self.reference_query) {
-                    Ok(address) => open = Some(address),
-                    Err(error) => self.status = error,
-                }
-            }
-            if ui
-                .add_enabled(
-                    self.xref_target.is_some(),
-                    egui::Button::new("Current function").small(),
-                )
-                .on_hover_text("Follow the displayed function again")
-                .clicked()
-            {
-                self.xref_target = None;
-                self.reference_query.clear();
-            }
-        });
-        if let Some(address) = open {
-            let function = self
-                .info
-                .as_ref()
-                .is_some_and(|info| function_at(&info.functions, address).is_some());
-            self.open_xrefs(XrefTarget {
-                address,
-                kind: if function {
-                    TargetKind::Function
-                } else {
-                    TargetKind::Address
-                },
-            });
-        }
         if self
             .xref_choices
             .as_ref()
@@ -5266,8 +5365,8 @@ impl DesktopApp {
         if let Some(choices) = &self.xref_choices {
             let mut chosen = None;
             let mut dismiss = false;
-            ui.group(|ui| {
-                ui.label("The selection has several exact targets. Choose one:");
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Several exact targets:");
                 for target in &choices.set.targets {
                     let name = self
                         .reference_name(target.address)
@@ -5284,10 +5383,8 @@ impl DesktopApp {
                     }
                 }
                 if choices.set.omitted() > 0 {
-                    ui.weak(format!(
-                        "{} further targets omitted; select fewer instructions",
-                        choices.set.omitted()
-                    ));
+                    ui.weak(format!("+{} omitted", choices.set.omitted()))
+                        .on_hover_text("Select fewer instructions to list every target.");
                 }
                 if ui.small_button("Dismiss").clicked() {
                     dismiss = true;
@@ -5313,17 +5410,22 @@ impl DesktopApp {
                 .color(theme::BLUE),
             );
             if target.kind == TargetKind::StringStart {
-                ui.weak("Accesses beginning exactly at this string's first byte. Accesses to later bytes, address-only uses and loaded pointers are not recorded by this analysis.");
+                ui.weak("Only accesses beginning exactly at this string's first byte")
+                    .on_hover_text("Accesses to later bytes, address-only uses and loaded pointers are not recorded by this analysis.");
             }
             Some((target.address, true))
         } else if let Some(function) = self.view.as_ref().map(|view| view.address) {
             let name = self
                 .reference_name(function)
                 .map_or(String::new(), |name| format!("  {}", crop(name, 80)));
-            ui.label(RichText::new(format!("Function {function:#x}{name}")).monospace());
+            ui.label(
+                RichText::new(format!("Function {function:#x}{name}"))
+                    .monospace()
+                    .color(theme::BLUE),
+            );
             Some((function, false))
         } else {
-            ui.weak("Select a function, use X on a selection, or enter an exact address.");
+            theme::empty_state(ui, "Select a function or enter an address");
             None
         }
     }
@@ -5376,8 +5478,8 @@ impl DesktopApp {
     fn reference_filter_field(&mut self, ui: &mut egui::Ui) {
         ui.add(
             TextEdit::singleline(&mut self.reference_filter)
-                .hint_text("Filter by known name or hex address")
-                .desired_width(220.0)
+                .hint_text("Filter name or address")
+                .desired_width(200.0)
                 .char_limit(256),
         )
         .on_hover_text("Names are display labels only; they never create references");
@@ -5386,39 +5488,50 @@ impl DesktopApp {
     fn data_references_panel(&mut self, ui: &mut egui::Ui, scope: Option<(u64, bool)>) {
         let context = ui.ctx().clone();
         let Some(index) = &self.call_index else {
-            ui.weak("Data accesses have not been analyzed in this session. Run discovery to compute them.");
+            theme::empty_state(ui, "Data accesses not analyzed yet. Run discovery.");
             return;
         };
         let Some(data) = &index.report.data else {
-            ui.weak("This result has no data-access analysis. Run discovery again.");
+            theme::empty_state(
+                ui,
+                "No data-access analysis in this result. Run discovery again.",
+            );
             return;
         };
-        ui.weak(format!(
-            "{}{} direct accesses · {} p-code operations charged · {} access candidates",
+        ui.horizontal_wrapped(|ui| {
             if self.saved_references {
-                "Saved analysis · "
-            } else {
-                ""
-            },
-            data.references.len(),
-            data.operations_charged,
-            data.accesses_examined
-        ));
-        ui.weak("Direct memory reads/writes in examined functions. AArch64 register constants are propagated only within a basic block; address-only values and loaded pointers are outside this pass.");
-        if data.partial || index.report.partial {
-            ui.colored_label(theme::WARNING, "Partial access coverage: work limits, unsupported instructions or incomplete function walks.");
-        }
-        ui.weak(format!(
-            "{} unresolved addresses · {} omitted accesses · {} unsupported instructions",
-            data.unresolved_accesses, data.omitted_accesses, data.unsupported_instructions
-        ));
+                ui.colored_label(theme::WARNING, "Saved analysis")
+                    .on_hover_text("Loaded from the project. Run discovery again to recompute.");
+            }
+            ui.weak(format!(
+                "{} direct accesses · {} unresolved · {} omitted · {} unsupported",
+                data.references.len(),
+                data.unresolved_accesses,
+                data.omitted_accesses,
+                data.unsupported_instructions
+            ))
+            .on_hover_text(format!(
+                "Direct memory reads/writes in examined functions; {} p-code operations charged, {} access candidates. AArch64 register constants are propagated only within a basic block; address-only values and loaded pointers are outside this pass.",
+                data.operations_charged, data.accesses_examined
+            ));
+            if data.partial || index.report.partial {
+                ui.colored_label(theme::WARNING, "Partial access coverage")
+                    .on_hover_text("Work limits, unsupported instructions or incomplete function walks.");
+            }
+        });
         let Some((address, explicit)) = scope else {
             return;
         };
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.reference_access, AccessFilter::All, "All");
-            ui.selectable_value(&mut self.reference_access, AccessFilter::Read, "Reads");
-            ui.selectable_value(&mut self.reference_access, AccessFilter::Write, "Writes");
+            theme::tab(ui, &mut self.reference_access, AccessFilter::All, "All");
+            theme::tab(ui, &mut self.reference_access, AccessFilter::Read, "Reads");
+            theme::tab(
+                ui,
+                &mut self.reference_access,
+                AccessFilter::Write,
+                "Writes",
+            );
+            ui.separator();
             self.reference_filter_field(ui);
         });
         self.refresh_reference_rows(address, explicit);
@@ -5429,42 +5542,119 @@ impl DesktopApp {
             return;
         };
         let rows = rows.data.as_slice();
-        ui.label(if explicit {
-            format!("{} accesses starting at {address:#x}", rows.len())
-        } else {
-            format!("{} accesses from this function", rows.len())
+        ui.horizontal(|ui| {
+            ui.label(if explicit {
+                format!("{} accesses starting at {address:#x}", rows.len())
+            } else {
+                format!("{} accesses from this function", rows.len())
+            });
+            ui.weak("·");
+            ui.weak("An empty result does not establish absence of references.");
         });
-        ui.weak("An empty result does not establish absence of references.");
         let mut source = None;
         let mut read = None;
         let mut target = None;
-        let row_height = ui.text_style_height(&egui::TextStyle::Body) + 6.0;
-        ScrollArea::both().id_salt("data-references").show_rows(ui, row_height, rows.len(), |ui, visible| {
-            for row in visible {
+        let glyph = theme::glyph_width(ui);
+        let size_x = 11.0 * glyph;
+        let target_x = size_x + 6.0 * glyph;
+        let source_x = target_x + 18.0 * glyph;
+        theme::column_header(
+            ui,
+            &[
+                ("Access", 0.0),
+                ("Size", size_x),
+                ("Target", target_x),
+                ("Source", source_x),
+            ],
+            0.0,
+        );
+        theme::rows::<()>(
+            ui,
+            "data-references",
+            rows.len(),
+            theme::ROW_HEIGHT,
+            source_x + 60.0 * glyph,
+            None,
+            |ui, row, rect| {
                 let reference = &data.references[rows[row]];
-                ui.horizontal(|ui| {
-                    ui.weak(match reference.access { DataAccess::Read => "Read", DataAccess::Write => "Write" });
-                    if reference.provenance == DataProvenance::Propagated {
-                        ui.weak("propagated").on_hover_text("Pointer built from register constants set earlier in the same basic block");
-                    }
-                    ui.monospace(format!("{}B", reference.size));
-                    if ui.button(format!("{:x}", reference.target))
-                        .on_hover_text("Load exactly the accessed bytes into Decode").clicked() {
-                        read = Some((reference.target, reference.size));
-                    }
-                    if ui.small_button("Refs").on_hover_text("Show accesses beginning at this exact address").clicked() {
-                        target = Some(reference.target);
-                    }
-                    let name = self
-                        .reference_name(reference.function)
-                        .map_or(String::new(), |name| format!(" {}", crop(name, 40)));
-                    if ui.button(format!("{:x}{name} @ {:x}", reference.function, reference.address))
-                        .on_hover_text("Open the source function and select this decoded memory-access instruction").clicked() {
+                let response = theme::row_response(
+                    ui,
+                    ui.scope_id().with(("data-reference", row)),
+                    rect,
+                    false,
+                    false,
+                )
+                .on_hover_text("Click to open the accessing instruction");
+                let cell = |x: f32, width: f32| {
+                    egui::Rect::from_x_y_ranges(
+                        rect.left() + x..=rect.left() + x + width,
+                        rect.y_range(),
+                    )
+                };
+                let (access, color) = match reference.access {
+                    DataAccess::Read => ("Read", theme::EDGE_TRUE),
+                    DataAccess::Write => ("Write", theme::SYNTAX_VARIABLE),
+                };
+                let access = if reference.provenance == DataProvenance::Propagated {
+                    format!("{access}*")
+                } else {
+                    access.to_owned()
+                };
+                theme::cell_text(
+                    ui,
+                    cell(0.0, size_x),
+                    RichText::new(access).monospace(),
+                    color,
+                );
+                theme::cell_text(
+                    ui,
+                    cell(size_x, target_x - size_x),
+                    RichText::new(format!("{}B", reference.size)).monospace(),
+                    theme::MUTED,
+                );
+                theme::cell_text(
+                    ui,
+                    cell(target_x, source_x - target_x),
+                    RichText::new(format!("{:x}", reference.target)).monospace(),
+                    theme::SYNTAX_CONSTANT,
+                );
+                let name = self
+                    .reference_name(reference.function)
+                    .map_or(String::new(), |name| format!(" {}", crop(name, 40)));
+                theme::cell_text(
+                    ui,
+                    rect.with_min_x(rect.left() + source_x),
+                    RichText::new(format!(
+                        "{:x} @ {:x}{name}",
+                        reference.address, reference.function
+                    ))
+                    .monospace(),
+                    theme::TEXT,
+                );
+                if response.clicked() {
+                    source = Some((reference.function, reference.address));
+                }
+                response.context_menu(|ui| {
+                    if ui.button("Go to accessing instruction").clicked() {
                         source = Some((reference.function, reference.address));
+                        ui.close();
+                    }
+                    if ui.button(format!("Decode {} bytes at {:x}", reference.size, reference.target)).clicked() {
+                        read = Some((reference.target, reference.size));
+                        ui.close();
+                    }
+                    if ui.button(format!("Accesses starting at {:x}", reference.target)).clicked() {
+                        target = Some(reference.target);
+                        ui.close();
+                    }
+                    if reference.provenance == DataProvenance::Propagated {
+                        ui.separator();
+                        ui.weak("* Pointer built from register constants set earlier in the same basic block");
                     }
                 });
-            }
-        });
+                None
+            },
+        );
         if let Some((function, pc)) = source {
             self.navigate_reference(function, pc, &context);
         } else if let Some((address, size)) = read {
@@ -5479,57 +5669,99 @@ impl DesktopApp {
 
     fn references_panel(&mut self, ui: &mut egui::Ui) {
         let context = ui.ctx().clone();
-        if ui
-            .add_enabled(
-                self.info.is_some() && self.file_job.is_none(),
-                egui::Button::new("Discover functions and references"),
-            )
-            .clicked()
-        {
-            self.request(Request::Discover, &context);
-        }
-        if let Some(summary) = &self.discovery_summary {
-            ui.weak(summary);
-        }
+        let mut open = None;
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.reference_data, false, "Calls");
-            ui.selectable_value(&mut self.reference_data, true, "Data accesses");
+            if ui
+                .add_enabled(
+                    self.info.is_some() && self.file_job.is_none(),
+                    egui::Button::new("Discover"),
+                )
+                .on_hover_text("Discover functions, calls and data accesses")
+                .clicked()
+            {
+                self.request(Request::Discover, &context);
+            }
+            ui.separator();
+            theme::tab(ui, &mut self.reference_data, false, "Calls");
+            theme::tab(ui, &mut self.reference_data, true, "Data accesses");
+            ui.separator();
+            let response = ui.add(
+                TextEdit::singleline(&mut self.reference_query)
+                    .hint_text("Exact hex address")
+                    .desired_width(130.0)
+                    .char_limit(18),
+            );
+            let entered =
+                response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+            if ui
+                .small_button("Show xrefs")
+                .on_hover_text("References to exactly this address")
+                .clicked()
+                || entered
+            {
+                match parse_address(&self.reference_query) {
+                    Ok(address) => open = Some(address),
+                    Err(error) => self.status = error,
+                }
+            }
+            if ui
+                .add_enabled(
+                    self.xref_target.is_some(),
+                    egui::Button::new("Current function").small(),
+                )
+                .on_hover_text("Follow the displayed function again")
+                .clicked()
+            {
+                self.xref_target = None;
+                self.reference_query.clear();
+            }
             if let (Some(index), Some(target)) = (&self.call_index, self.xref_target) {
                 let (calls, data) = crate::xrefs::counts(index, target.address);
-                ui.weak(format!("{calls} calls · {data} accesses to this address"));
+                ui.weak(format!("{calls} calls · {data} accesses"));
             }
         });
+        if let Some(address) = open {
+            let function = self
+                .info
+                .as_ref()
+                .is_some_and(|info| function_at(&info.functions, address).is_some());
+            self.open_xrefs(XrefTarget {
+                address,
+                kind: if function {
+                    TargetKind::Function
+                } else {
+                    TargetKind::Address
+                },
+            });
+        }
         let scope = self.reference_scope(ui);
         if self.reference_data {
             self.data_references_panel(ui, scope);
             return;
         }
         let Some(index) = &self.call_index else {
-            ui.weak("Call references have not been analyzed in this session. Run discovery to compute them.");
+            theme::empty_state(ui, "Call references not analyzed yet. Run discovery.");
             return;
         };
         let report = &index.report;
-        ui.weak(format!(
-            "{} · {} functions examined · {} decode attempts",
+        ui.horizontal_wrapped(|ui| {
             if self.saved_references {
-                "Saved analysis"
-            } else {
-                "Computed this session"
-            },
-            report.functions_examined,
-            report.decode_attempts
-        ));
-        ui.weak("Confirmed direct calls in examined functions. Unknown indirect targets remain unresolved.");
-        if report.partial {
-            ui.colored_label(
-                theme::WARNING,
-                "Partial call coverage: limits, unresolved flow, or recovery failures.",
-            );
-        }
-        ui.weak(format!(
-            "{} unresolved calls · {} failed function walks · {} fallthrough calls excluded",
-            report.unresolved_calls, report.failed_functions, report.skipped_fallthrough_calls
-        ));
+                ui.colored_label(theme::WARNING, "Saved analysis")
+                    .on_hover_text("Loaded from the project. Run discovery again to recompute.");
+            }
+            ui.weak(format!(
+                "{} functions examined · {} unresolved calls · {} failed walks",
+                report.functions_examined, report.unresolved_calls, report.failed_functions,
+            ))
+            .on_hover_text(format!(
+                "Confirmed direct calls in examined functions; unknown indirect targets remain unresolved. {} decode attempts; {} fallthrough calls excluded.",
+                report.decode_attempts, report.skipped_fallthrough_calls
+            ));
+            if report.partial {
+                ui.colored_label(theme::WARNING, "Partial call coverage")
+                    .on_hover_text("Limits, unresolved flow, or recovery failures.");
+            }
+        });
         let Some((address, explicit)) = scope else {
             return;
         };
@@ -5538,17 +5770,20 @@ impl DesktopApp {
             index.outgoing.get(&address).map_or(0, Vec::len),
         );
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.reference_direction, CallDirection::All, "All");
-            ui.selectable_value(
+            theme::tab(ui, &mut self.reference_direction, CallDirection::All, "All");
+            theme::tab(
+                ui,
                 &mut self.reference_direction,
                 CallDirection::Incoming,
-                format!("Incoming {incoming}"),
+                &format!("Incoming {incoming}"),
             );
-            ui.selectable_value(
+            theme::tab(
+                ui,
                 &mut self.reference_direction,
                 CallDirection::Outgoing,
-                format!("Outgoing {outgoing}"),
+                &format!("Outgoing {outgoing}"),
             );
+            ui.separator();
             self.reference_filter_field(ui);
         });
         self.refresh_reference_rows(address, explicit);
@@ -5557,64 +5792,104 @@ impl DesktopApp {
         };
         let report = &index.report;
         let rows = rows.calls.as_slice();
-        ui.label(format!("{} matching calls", rows.len()));
-        ui.weak("An empty result does not establish absence of references.");
+        ui.horizontal(|ui| {
+            ui.label(format!("{} matching calls", rows.len()));
+            ui.weak("·");
+            ui.weak("An empty result does not establish absence of references.");
+        });
         let mut source = None;
         let mut target = None;
         let mut inspect = None;
-        let row_height = ui.text_style_height(&egui::TextStyle::Body) + 6.0;
-        ScrollArea::both().id_salt("call-references").show_rows(
+        let glyph = theme::glyph_width(ui);
+        let function_x = 6.0 * glyph;
+        let site_x = function_x + 44.0 * glyph;
+        theme::column_header(
             ui,
-            row_height,
+            &[("", 0.0), ("Function", function_x), ("Call site", site_x)],
+            0.0,
+        );
+        theme::rows::<()>(
+            ui,
+            "call-references",
             rows.len(),
-            |ui, visible| {
-                for row in visible {
-                    let CallRow {
-                        reference,
-                        incoming,
-                    } = rows[row];
-                    let reference = &report.references[reference];
-                    let counterpart = if incoming {
-                        reference.caller
-                    } else {
-                        reference.target
-                    };
-                    ui.horizontal(|ui| {
-                        ui.weak(if incoming { "From" } else { "To" });
-                        if ui
-                            .button(format!(
-                                "{counterpart:x} {}",
-                                crop(self.reference_name(counterpart).unwrap_or("function"), 60)
-                            ))
-                            .on_hover_text("Open this function")
-                            .clicked()
-                        {
-                            target = Some(counterpart);
-                        }
-                        if ui
-                            .button(format!("at {:x}", reference.address))
-                            .on_hover_text(
-                                "Open the caller and select this decoded call instruction",
-                            )
-                            .clicked()
-                        {
-                            source = Some((reference.caller, reference.address));
-                        }
-                        if ui
-                            .small_button("Xrefs")
-                            .on_hover_text("Show references to this function")
-                            .clicked()
-                        {
-                            inspect = Some(counterpart);
-                        }
-                    });
+            theme::ROW_HEIGHT,
+            site_x + 20.0 * glyph,
+            None,
+            |ui, row, rect| {
+                let CallRow {
+                    reference,
+                    incoming,
+                } = rows[row];
+                let reference = &report.references[reference];
+                let counterpart = if incoming {
+                    reference.caller
+                } else {
+                    reference.target
+                };
+                let response = theme::row_response(
+                    ui,
+                    ui.scope_id().with(("call-reference", row)),
+                    rect,
+                    false,
+                    false,
+                )
+                .on_hover_text(
+                    "Click to open the call instruction · double-click to open the function",
+                );
+                let cell = |x: f32, width: f32| {
+                    egui::Rect::from_x_y_ranges(
+                        rect.left() + x..=rect.left() + x + width,
+                        rect.y_range(),
+                    )
+                };
+                theme::cell_text(
+                    ui,
+                    cell(0.0, function_x),
+                    if incoming { "From" } else { "To" },
+                    theme::MUTED,
+                );
+                theme::cell_text(
+                    ui,
+                    cell(function_x, site_x - function_x),
+                    RichText::new(format!(
+                        "{counterpart:x} {}",
+                        crop(self.reference_name(counterpart).unwrap_or("function"), 60)
+                    ))
+                    .monospace(),
+                    theme::SYNTAX_FUNCTION,
+                );
+                theme::cell_text(
+                    ui,
+                    rect.with_min_x(rect.left() + site_x),
+                    RichText::new(format!("{:x}", reference.address)).monospace(),
+                    theme::TEXT,
+                );
+                if response.double_clicked() {
+                    target = Some(counterpart);
+                } else if response.clicked() {
+                    source = Some((reference.caller, reference.address));
                 }
+                response.context_menu(|ui| {
+                    if ui.button("Go to call instruction").clicked() {
+                        source = Some((reference.caller, reference.address));
+                        ui.close();
+                    }
+                    if ui.button(format!("Open {counterpart:x}")).clicked() {
+                        target = Some(counterpart);
+                        ui.close();
+                    }
+                    if ui.button("Xrefs to this function").clicked() {
+                        inspect = Some(counterpart);
+                        ui.close();
+                    }
+                });
+                None
             },
         );
-        if let Some((caller, pc)) = source {
-            self.navigate_reference(caller, pc, &context);
-        } else if let Some(address) = target {
+        if let Some(address) = target {
             self.navigate(address, true, &context);
+        } else if let Some((caller, pc)) = source {
+            self.navigate_reference(caller, pc, &context);
         } else if let Some(address) = inspect {
             self.open_xrefs(XrefTarget {
                 address,
@@ -5625,35 +5900,13 @@ impl DesktopApp {
 
     fn main_panel(&mut self, ui: &mut egui::Ui) {
         self.update_comment_rows();
-        let title = match self.tab {
-            Tab::Listing => "Listing",
-            Tab::Graph => "Function Graph",
-            Tab::Strings => "Defined Strings",
-            Tab::Crypto => "FindCrypt",
-            Tab::Decode => "String Decoder",
-            Tab::Hex => "Hex / Memory Map",
-            Tab::References => "References",
-        };
-        let filename = self
-            .info
-            .as_ref()
-            .and_then(|info| std::path::Path::new(&info.path).file_name())
-            .map(|name| name.to_string_lossy());
-        let title = filename.map_or_else(
-            || title.to_owned(),
-            |name| format!("{title}: {}", crop(&name, 90)),
-        );
-        theme::dock_header(ui, &title, true, |ui| {
-            if (matches!(self.tab, Tab::Graph | Tab::Listing) && self.cached_graph)
-                || (self.tab == Tab::Strings && self.cached_strings)
-                || (self.tab == Tab::Crypto && self.cached_crypto)
-            {
-                ui.weak("Saved analysis")
-                    .on_hover_text("Persisted project results. Scan again to recompute.");
-            }
-        });
-        ui.horizontal_wrapped(|ui| {
-            for (tab, name) in [
+        let saved = (matches!(self.tab, Tab::Graph | Tab::Listing) && self.cached_graph)
+            || (self.tab == Tab::Strings && self.cached_strings)
+            || (self.tab == Tab::Crypto && self.cached_crypto);
+        theme::dock_tabs(
+            ui,
+            &mut self.tab,
+            &[
                 (Tab::Listing, "Listing"),
                 (Tab::Graph, "Function Graph"),
                 (Tab::Strings, "Strings"),
@@ -5661,11 +5914,14 @@ impl DesktopApp {
                 (Tab::Decode, "Decode"),
                 (Tab::Hex, "Hex / Memory Map"),
                 (Tab::References, "References"),
-            ] {
-                theme::tab(ui, &mut self.tab, tab, name);
-            }
-        });
-        ui.separator();
+            ],
+            |ui| {
+                if saved {
+                    ui.weak("Saved analysis")
+                        .on_hover_text("Persisted project results. Scan again to recompute.");
+                }
+            },
+        );
         let context = ui.ctx().clone();
         match self.tab {
             Tab::References => self.references_panel(ui),
@@ -5770,9 +6026,7 @@ impl DesktopApp {
                         }
                     }
                 } else {
-                    ui.add_space(40.0);
-                    ui.label("Function Graph");
-                    ui.weak("Select a function from the left to display its control flow.");
+                    theme::empty_state(ui, "Select a function");
                 }
                 if let Some(target) = xrefs {
                     self.open_xrefs(target);
@@ -5783,112 +6037,127 @@ impl DesktopApp {
             Tab::Listing => {
                 let mut listing_xrefs = None;
                 if let Some(pc) = self.undisplayed_call {
-                    ui.colored_label(theme::WARNING, format!("Referenced instruction {pc:#x} is outside this bounded source graph. Use Go to inspect its address."));
+                    ui.colored_label(
+                        theme::WARNING,
+                        format!("{pc:#x} is outside this function's bounded graph"),
+                    )
+                    .on_hover_text("Use Go to inspect the referenced instruction's address.");
                 }
                 if self.info.is_none() {
-                    ui.add_space(32.0);
-                    ui.heading("Code Browser");
-                    ui.weak("Open a binary to begin analysis.");
-                    if ui.button("Open binary…").clicked() {
-                        self.request_intent(Intent::OpenDialog, &context);
-                    }
-                } else if let Some(view) = &self.view {
-                    let name = self
-                        .info
-                        .as_ref()
-                        .and_then(|info| function_at(&info.functions, view.address))
-                        .map(|f| f.name.as_str())
-                        .unwrap_or("function");
-                    let entry = view.address;
-                    ui.label(
-                        RichText::new(format!("{}  ·  {:x}", crop(name, 120), view.address))
-                            .monospace()
-                            .color(theme::BLUE),
-                    )
-                    .context_menu(|ui| {
-                        if ui.button("Xrefs to this function").clicked() {
-                            listing_xrefs = Some(XrefTarget {
-                                address: entry,
-                                kind: TargetKind::Function,
-                            });
-                            ui.close();
+                    theme::empty_state(ui, "No binary loaded");
+                    ui.vertical_centered(|ui| {
+                        if ui.button("Open binary…").clicked() {
+                            self.request_intent(Intent::OpenDialog, &context);
                         }
                     });
-                    ui.separator();
+                    return;
                 }
+                let Some(view) = &self.view else {
+                    theme::empty_state(ui, "Select a function");
+                    return;
+                };
+                let name = self
+                    .info
+                    .as_ref()
+                    .and_then(|info| function_at(&info.functions, view.address))
+                    .map(|f| f.name.as_str())
+                    .unwrap_or("function");
+                let entry = view.address;
                 ui.label(
-                    RichText::new(format!(
-                        "{:<8}  {:<25} {:<10} {}",
-                        "Address", "Bytes", "Mnemonic", "Operands"
-                    ))
-                    .monospace()
-                    .weak(),
+                    RichText::new(format!("{}  {:x}", crop(name, 120), view.address))
+                        .monospace()
+                        .color(theme::BLUE),
+                )
+                .context_menu(|ui| {
+                    if ui.button("Xrefs to this function").clicked() {
+                        listing_xrefs = Some(XrefTarget {
+                            address: entry,
+                            kind: TargetKind::Function,
+                        });
+                        ui.close();
+                    }
+                });
+                let digits = theme::address_digits(self.listing.last().map_or(0, |i| i.address));
+                let columns = theme::listing_columns(digits);
+                let glyph = theme::glyph_width(ui);
+                let (header, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), theme::ROW_HEIGHT),
+                    egui::Sense::hover(),
                 );
-                ui.separator();
                 let mut selected = None;
                 let mut decode = None;
                 let mut navigate = None;
                 let mut annotate = None;
-                let row = ui.text_style_height(&egui::TextStyle::Monospace) + 5.0;
-                let mut scroll = ScrollArea::both().id_salt("instruction-list");
-                if let Some(target) = self.pending_listing_scroll.take() {
-                    scroll = scroll.vertical_scroll_offset(
-                        target as f32 * (row + ui.spacing().item_spacing.y),
-                    );
-                }
-                scroll.show_rows(ui, row, self.listing.len(), |ui, rows| {
-                    for index in rows {
+                let reveal = self.pending_listing_scroll.take();
+                let (_, output) = theme::rows::<()>(
+                    ui,
+                    ("instruction-list", entry),
+                    self.listing.len(),
+                    theme::ROW_HEIGHT,
+                    self.listing_chars as f32 * glyph + 12.0,
+                    reveal,
+                    |ui, index, rect| {
                         let instruction = &self.listing[index];
-                        let mut job = theme::listing_row(
-                            instruction.address,
-                            &hex(&instruction.bytes),
-                            &instruction.mnemonic,
-                            &instruction.operands,
+                        let response = theme::row_response(
+                            ui,
+                            ui.scope_id().with(("listing-row", instruction.address)),
+                            rect,
+                            self.selected == Some(instruction.address),
+                            self.semantic.addresses.contains(&instruction.address),
                         );
-                        if let Some(comment) =
-                            self.annotation_browser.comments.get(&instruction.address)
-                        {
-                            job.append(
-                                &format!("  ; {comment}"),
-                                0.0,
-                                egui::TextFormat {
-                                    font_id: egui::FontId::monospace(13.0),
-                                    color: theme::SYNTAX_COMMENT,
-                                    ..Default::default()
-                                },
+                        if ui.is_rect_visible(rect) {
+                            let mut job = theme::listing_row(
+                                instruction.address,
+                                digits,
+                                &instruction.bytes,
+                                &instruction.mnemonic,
+                                &instruction.operands,
+                            );
+                            if let Some(comment) =
+                                self.annotation_browser.comments.get(&instruction.address)
+                            {
+                                job.append(
+                                    &format!("  ; {comment}"),
+                                    0.0,
+                                    theme::mono_format(theme::SYNTAX_COMMENT),
+                                );
+                            }
+                            let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+                            ui.painter().galley(
+                                egui::pos2(
+                                    rect.left() + 6.0,
+                                    rect.center().y - galley.size().y / 2.0,
+                                ),
+                                galley,
+                                theme::TEXT,
                             );
                         }
-                        let response = ui.add(
-                            egui::Button::selectable(
-                                self.selected == Some(instruction.address)
-                                    || self.semantic.addresses.contains(&instruction.address),
-                                job,
-                            )
-                            .wrap_mode(egui::TextWrapMode::Extend),
-                        );
-                        let response = if let Some(note) = self
+                        let call = view
+                            .calls
+                            .iter()
+                            .find(|call| call.address == instruction.address);
+                        let mut hover = Vec::new();
+                        if instruction.bytes.len() > theme::LISTING_BYTES {
+                            hover.push(hex(&instruction.bytes));
+                        }
+                        if let Some(note) = self
                             .session
                             .as_ref()
                             .and_then(|session| session.annotations.get(&instruction.address))
                         {
-                            response.on_hover_text(format!(
-                                "{}\n{}\nUse ; or Rename / comment… to view the full comment.",
+                            hover.push(format!(
+                                "{}\n{}",
                                 crate::annotation_display::preview(&note.label, 80),
                                 crate::annotation_display::preview(&note.comment, 400)
-                            ))
-                        } else {
+                            ));
+                        }
+                        if let Some(evidence) = call.and_then(|call| call.no_return) {
+                            hover.push(evidence.description());
+                        }
+                        let response = if hover.is_empty() {
                             response
-                        };
-                        let call = self.view.as_ref().and_then(|view| {
-                            view.calls
-                                .iter()
-                                .find(|call| call.address == instruction.address)
-                        });
-                        let response = if let Some(evidence) = call.and_then(|call| call.no_return)
-                        {
-                            response.on_hover_text(evidence.description())
                         } else {
-                            response
+                            response.on_hover_text(hover.join("\n\n"))
                         };
                         if response.clicked() {
                             selected = Some(instruction.address);
@@ -5914,24 +6183,30 @@ impl DesktopApp {
                                 decode = Some((instruction.address, instruction.bytes.clone()));
                                 ui.close();
                             }
-                            if let Some(view) = &self.view {
-                                ui.separator();
-                                let targets = crate::xrefs::instruction_targets(
-                                    self.info.as_ref().map(|info| (info, view)),
-                                    self.call_index.as_ref(),
-                                    view.address,
-                                    [instruction.address],
-                                );
-                                xref_menu_items(
-                                    ui,
-                                    &targets,
-                                    Some(view.address),
-                                    &mut listing_xrefs,
-                                );
-                            }
+                            ui.separator();
+                            let targets = crate::xrefs::instruction_targets(
+                                self.info.as_ref().map(|info| (info, view)),
+                                self.call_index.as_ref(),
+                                view.address,
+                                [instruction.address],
+                            );
+                            xref_menu_items(ui, &targets, Some(view.address), &mut listing_xrefs);
                         });
-                    }
-                });
+                        None
+                    },
+                );
+                let x = |column: usize| columns[column] as f32 * glyph;
+                theme::paint_column_header(
+                    ui,
+                    header,
+                    &[
+                        ("Address", x(0)),
+                        ("Bytes", x(1)),
+                        ("Mnemonic", x(2)),
+                        ("Operands", x(3)),
+                    ],
+                    output.state.clamped_offset().x,
+                );
                 if let Some(address) = selected {
                     self.select_instruction(address);
                 }
@@ -5956,75 +6231,114 @@ impl DesktopApp {
                     {
                         self.request(self.string_request(), &context);
                     }
-                    ui.label("Minimum characters");
+                    ui.label("Min. length");
                     ui.add(
                         egui::DragValue::new(&mut self.string_minimum)
                             .range(MIN_STRING_LENGTH..=MAX_STRING_MINIMUM)
                             .speed(1),
                     );
+                    ui.separator();
+                    if ui
+                        .add(
+                            TextEdit::singleline(&mut self.string_filter)
+                                .hint_text("Filter strings")
+                                .desired_width(200.0)
+                                .char_limit(256),
+                        )
+                        .changed()
+                    {
+                        self.rebuild_string_filter();
+                    }
+                    if self.strings_scanned {
+                        ui.weak(format!(
+                            "{} of {}{}",
+                            self.filtered_strings.len(),
+                            self.strings.len(),
+                            self.strings_minimum_used
+                                .map_or(String::new(), |minimum| format!(" · min. {minimum}"))
+                        ));
+                    }
                 });
-                if self.strings_scanned {
-                    ui.weak(format!(
-                        "{} loaded · {} visible{}",
-                        self.strings.len(),
-                        self.filtered_strings.len(),
-                        self.strings_minimum_used
-                            .map_or(String::new(), |minimum| format!(
-                                " · minimum {minimum} characters"
-                            ))
-                    ));
-                }
                 if self.strings_truncated {
-                    ui.label("Partial scan: up to 10,000 previews and 64 MiB of data. Increase the minimum length and rescan to reduce short-string noise.");
-                }
-                if ui
-                    .add(
-                        TextEdit::singleline(&mut self.string_filter)
-                            .hint_text("Filter loaded strings")
-                            .char_limit(256),
+                    ui.colored_label(
+                        theme::WARNING,
+                        "Partial scan: 10,000 previews / 64 MiB limit",
                     )
-                    .changed()
-                {
-                    self.rebuild_string_filter();
+                    .on_hover_text(
+                        "Increase the minimum length and scan again to reduce short-string noise.",
+                    );
                 }
-                ui.weak("Click a string to load its source bytes into the decoder; right-click for confirmed accesses at its exact start");
                 let mut read = None;
                 let mut xrefs = None;
-                let row = ui.text_style_height(&egui::TextStyle::Monospace) + 6.0;
-                ScrollArea::vertical().id_salt("strings-list").show_rows(
+                let glyph = theme::glyph_width(ui);
+                let digits = self.info.as_ref().map_or(8, |info| {
+                    theme::address_digits(
+                        info.sections
+                            .iter()
+                            .map(|s| s.address.saturating_add(s.size))
+                            .max()
+                            .unwrap_or(0),
+                    )
+                });
+                let type_x = (digits + 2) as f32 * glyph;
+                let text_x = type_x + 10.0 * glyph;
+                theme::column_header(
                     ui,
-                    row,
+                    &[("Address", 0.0), ("Type", type_x), ("String", text_x)],
+                    0.0,
+                );
+                let selected = self.selected;
+                theme::rows::<()>(
+                    ui,
+                    "strings-list",
                     self.filtered_strings.len(),
-                    |ui, rows| {
-                        for index in rows {
-                            let string = &self.strings[self.filtered_strings[index]];
-                            let response = ui.button(
-                                RichText::new(format!(
-                                    "{:08x}  {}  {}",
-                                    string.address,
-                                    string.encoding,
-                                    crop(&string.text, 240)
-                                ))
-                                .monospace(),
-                            );
-                            response.context_menu(|ui| {
-                                if ui.button("Data accesses at this exact start").clicked() {
-                                    xrefs = Some(string.address);
-                                    ui.close();
-                                }
-                            });
-                            if response.clicked() {
-                                let length = if string.encoding.contains("16") {
-                                    string.text.encode_utf16().count().saturating_mul(2)
-                                } else {
-                                    string.text.len()
-                                };
-                                read = Some((
-                                    string.address,
-                                    length.clamp(1, crate::decode::MAX_INPUT),
-                                ));
+                    theme::ROW_HEIGHT,
+                    0.0,
+                    None,
+                    |ui, index, rect| {
+                        let string = &self.strings[self.filtered_strings[index]];
+                        let response = theme::row_response(
+                            ui,
+                            ui.scope_id().with(("string-row", string.address)),
+                            rect,
+                            selected == Some(string.address),
+                            false,
+                        )
+                        .on_hover_text("Click to load into Decode · right-click for accesses");
+                        theme::cell_text(
+                            ui,
+                            rect,
+                            RichText::new(format!("{:0digits$x}", string.address)).monospace(),
+                            theme::MUTED,
+                        );
+                        theme::cell_text(
+                            ui,
+                            rect.with_min_x(rect.left() + type_x),
+                            RichText::new(&string.encoding).monospace(),
+                            theme::SYNTAX_TYPE,
+                        );
+                        theme::cell_text(
+                            ui,
+                            rect.with_min_x(rect.left() + text_x),
+                            RichText::new(crop(&string.text, 240)).monospace(),
+                            theme::SYNTAX_CONSTANT,
+                        );
+                        response.context_menu(|ui| {
+                            if ui.button("Data accesses at this exact start").clicked() {
+                                xrefs = Some(string.address);
+                                ui.close();
                             }
+                        });
+                        if response.clicked() {
+                            let length = if string.encoding.contains("16") {
+                                string.text.encode_utf16().count().saturating_mul(2)
+                            } else {
+                                string.text.len()
+                            };
+                            read =
+                                Some((string.address, length.clamp(1, crate::decode::MAX_INPUT)));
                         }
+                        None
                     },
                 );
                 if let Some((address, length)) = read {
@@ -6039,34 +6353,95 @@ impl DesktopApp {
             }
             Tab::Crypto => {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Cryptographic constants").strong());
                     if ui
-                        .add_enabled(self.info.is_some(), egui::Button::new("Scan"))
+                        .add_enabled(self.info.is_some(), egui::Button::new("Scan constants"))
                         .clicked()
                     {
                         self.request(Request::Crypto, &context);
                     }
+                    ui.weak(format!("{} matches", self.crypto.len()));
+                    ui.separator();
+                    ui.weak("Matches are clues, not proof of algorithm use");
                 });
-                ui.weak("Constant matches are clues; they do not establish algorithm use.");
                 let mut read = None;
-                let row = ui.text_style_height(&egui::TextStyle::Body) + 6.0;
-                ScrollArea::vertical().id_salt("crypto-list").show_rows(
+                let glyph = theme::glyph_width(ui);
+                let digits = theme::address_digits(
+                    self.crypto.iter().map(|hit| hit.address).max().unwrap_or(0),
+                );
+                let widest = |text: fn(&CryptoMatch) -> &str, cap: usize| {
+                    self.crypto
+                        .iter()
+                        .map(|hit| text(hit).chars().count().min(cap))
+                        .max()
+                        .unwrap_or(0)
+                        .max(10) as f32
+                        + 2.0
+                };
+                let algorithm_x = (digits + 2) as f32 * glyph;
+                let signature_x = algorithm_x + widest(|hit| &hit.algorithm, 32) * glyph;
+                let size_x = signature_x + widest(|hit| &hit.signature, 64) * glyph;
+                theme::column_header(
                     ui,
-                    row,
+                    &[
+                        ("Address", 0.0),
+                        ("Algorithm", algorithm_x),
+                        ("Signature", signature_x),
+                        ("Bytes", size_x),
+                    ],
+                    0.0,
+                );
+                let selected = self.selected;
+                theme::rows::<()>(
+                    ui,
+                    "crypto-list",
                     self.crypto.len(),
-                    |ui, rows| {
-                        for index in rows {
-                            let hit = &self.crypto[index];
-                            if ui
-                                .button(format!(
-                                    "{:08x}  {} · {} ({} bytes)",
-                                    hit.address, hit.algorithm, hit.signature, hit.length
-                                ))
-                                .clicked()
-                            {
-                                read = Some((hit.address, hit.length));
-                            }
+                    theme::ROW_HEIGHT,
+                    size_x + 10.0 * glyph,
+                    None,
+                    |ui, index, rect| {
+                        let hit = &self.crypto[index];
+                        let response = theme::row_response(
+                            ui,
+                            ui.scope_id().with(("crypto-row", index)),
+                            rect,
+                            selected == Some(hit.address),
+                            false,
+                        )
+                        .on_hover_text("Click to load the matched bytes into Decode");
+                        let cell = |x: f32, width: f32| {
+                            egui::Rect::from_x_y_ranges(
+                                rect.left() + x..=rect.left() + x + width,
+                                rect.y_range(),
+                            )
+                        };
+                        theme::cell_text(
+                            ui,
+                            cell(0.0, algorithm_x),
+                            RichText::new(format!("{:0digits$x}", hit.address)).monospace(),
+                            theme::MUTED,
+                        );
+                        theme::cell_text(
+                            ui,
+                            cell(algorithm_x, signature_x - algorithm_x),
+                            RichText::new(&hit.algorithm).monospace(),
+                            theme::SYNTAX_TYPE,
+                        );
+                        theme::cell_text(
+                            ui,
+                            cell(signature_x, size_x - signature_x),
+                            RichText::new(&hit.signature).monospace(),
+                            theme::TEXT,
+                        );
+                        theme::cell_text(
+                            ui,
+                            cell(size_x, 10.0 * glyph),
+                            RichText::new(hit.length.to_string()).monospace(),
+                            theme::SYNTAX_CONSTANT,
+                        );
+                        if response.clicked() {
+                            read = Some((hit.address, hit.length));
                         }
+                        None
                     },
                 );
                 if let Some((address, length)) = read {
@@ -6235,16 +6610,17 @@ impl DesktopApp {
                 },
             );
         });
+        // Side docks shrink with the window so the central views keep room.
+        let (left, right) = dock_ranges(ui.available_width());
         egui::Panel::left("navigation-dock-v2")
             .default_size(260.0)
-            .min_size(180.0)
+            .size_range(left)
             .resizable(true)
             .frame(theme::view_frame())
             .show(ui, |ui| self.navigation_panel(ui));
-        let right_width = (ui.available_width() * 0.48).max(280.0);
         egui::Panel::right("decompiler-dock-v2")
-            .default_size(right_width)
-            .min_size(240.0)
+            .default_size(ui.available_width() * 0.48)
+            .size_range(right(ui.available_width()))
             .resizable(true)
             .frame(theme::view_frame())
             .show(ui, |ui| self.side_panel(ui));
@@ -6303,17 +6679,35 @@ impl DesktopApp {
         let Some(capture) = guard.as_mut() else {
             return;
         };
+        if let Some(size) = capture.size.take() {
+            context.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+        }
         // Screenshots show the browser, not the first-open analysis prompt.
-        self.analyze_prompt = None;
+        if self.analyze_prompt.take().is_some() && capture.analyze {
+            self.analysis_options = AnalysisOptions {
+                functions: true,
+                strings: true,
+                crypto: true,
+            };
+            self.start_auto_analysis();
+        }
         let busy = self.pending.is_some()
             || self.opening.is_some()
             || !self.queue.is_empty()
             || self.file_job.is_some()
+            || self.analysis_plan.is_some()
+            || self.discovery_running
             || self.info.is_none();
         if !busy && let Some(address) = capture.goto.take() {
-            if capture.graph {
-                self.tab = Tab::Graph;
-            }
+            self.tab = match capture.tab.as_deref() {
+                Some("graph") => Tab::Graph,
+                Some("strings") => Tab::Strings,
+                Some("crypto") => Tab::Crypto,
+                Some("decode") => Tab::Decode,
+                Some("hex") => Tab::Hex,
+                Some("references") => Tab::References,
+                _ => Tab::Listing,
+            };
             self.navigate(address, true, context);
             return;
         }
@@ -6348,6 +6742,20 @@ fn discovery_summary(
             "complete seed coverage"
         },
     )
+}
+
+/// Width ranges for the navigation dock, given the window width, and for the
+/// decompiler dock, given the width left beside the navigation dock. Both
+/// docks keep a usable minimum but never take the central views' minimum.
+fn dock_ranges(width: f32) -> (egui::Rangef, impl Fn(f32) -> egui::Rangef) {
+    const CENTRAL: f32 = 260.0;
+    let left_max = (width * 0.35).max(120.0);
+    let left = egui::Rangef::new(180.0_f32.min(left_max), left_max);
+    let right = |remaining: f32| {
+        let max = (remaining - CENTRAL).max(160.0);
+        egui::Rangef::new(240.0_f32.min(max), max)
+    };
+    (left, right)
 }
 
 fn is_project_path(path: &std::path::Path) -> bool {
@@ -8051,6 +8459,65 @@ mod tests {
     }
 
     #[test]
+    fn each_function_listing_keeps_its_own_scroll_position() {
+        let context = egui::Context::default();
+        theme::install(&context);
+        let mut app = semantic_app();
+        let function = |entry: u64| -> Vec<Instruction> {
+            (0..2000u64)
+                .map(|row| Instruction {
+                    address: entry + row * 4,
+                    bytes: vec![0x90],
+                    mnemonic: "nop".into(),
+                    operands: String::new(),
+                })
+                .collect()
+        };
+        let frame = |app: &mut DesktopApp| {
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(700.0, 500.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| app.main_panel(ui),
+            );
+            output.textures_delta.clear();
+            rendered_text(&output).join("\n")
+        };
+        app.listing = function(0x1000);
+        app.comment_rows_key = None;
+        app.pending_listing_scroll = Some(1500);
+        frame(&mut app);
+        let text = frame(&mut app);
+        assert!(text.contains(&format!("{:08x}", 0x1000 + 1500 * 4)));
+        assert!(!text.contains("00001000 "));
+        // Another function starts at its first instruction, not at row 1500.
+        app.view.as_mut().unwrap().address = 0x9000;
+        app.listing = function(0x9000);
+        app.comment_rows_key = None;
+        let text = frame(&mut app);
+        assert!(text.contains("00009000 "), "{text}");
+        // Returning restores the earlier function's position.
+        app.view.as_mut().unwrap().address = 0x1000;
+        app.listing = function(0x1000);
+        app.comment_rows_key = None;
+        assert!(frame(&mut app).contains(&format!("{:08x}", 0x1000 + 1500 * 4)));
+    }
+
+    #[test]
+    fn side_docks_leave_the_central_views_room_as_the_window_shrinks() {
+        for width in [700.0_f32, 760.0, 1024.0, 1440.0, 2560.0] {
+            let (left, right) = dock_ranges(width);
+            let right = right(width - left.max);
+            assert!(left.min <= left.max && right.min <= right.max);
+            assert!(width - left.max - right.max >= 260.0, "{width}");
+        }
+    }
+
+    #[test]
     fn narrow_listing_keeps_long_instructions_on_single_scrollable_rows() {
         let context = egui::Context::default();
         theme::install(&context);
@@ -9147,10 +9614,8 @@ mod tests {
         app.tab = Tab::References;
         let mut output = context.run_ui(egui::RawInput::default(), |ui| app.main_panel(ui));
         output.textures_delta.clear();
-        assert!(
-            output.shapes.iter().any(|shape| matches!(&shape.shape,
-            egui::epaint::Shape::Text(text) if text.galley.text().starts_with("Saved analysis ·")))
-        );
+        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+            egui::epaint::Shape::Text(text) if text.galley.text() == "Saved analysis")));
 
         // Discover never resumes or trusts saved statuses; it starts fresh.
         app.request(Request::Discover, &context);

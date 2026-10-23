@@ -73,7 +73,6 @@ impl HexPanel {
         sections: &[SectionInfo],
     ) -> Option<HexAction> {
         let mut action = self.initialize(sections);
-        ui.label(RichText::new("Memory map").strong());
         if sections.is_empty() {
             ui.weak("No mapped sections available.");
         } else if let Some(index) = self.section_table(ui, sections, action.is_none()) {
@@ -157,7 +156,7 @@ impl HexPanel {
         } else if self.loaded.is_some() {
             self.byte_page(ui, sections);
         } else if self.error.is_none() {
-            ui.weak("Choose a nonempty section or enter a mapped virtual address.");
+            ui.weak("Choose a section or enter a mapped address");
         }
         action
     }
@@ -429,82 +428,87 @@ impl HexPanel {
         sections: &[SectionInfo],
         enabled: bool,
     ) -> Option<usize> {
-        let mut chosen = None;
-        let height = (ui.available_height() * 0.28).clamp(48.0, 132.0);
-        let row_height = ui.text_style_height(&egui::TextStyle::Monospace).max(20.0);
-        ScrollArea::horizontal()
-            .id_salt("hex-memory-map-x")
-            .show(ui, |ui| {
-                ui.set_min_width(1030.0);
-                ui.horizontal(|ui| {
-                    table_cell(ui, "Section", 160.0, row_height);
-                    table_cell(ui, "Virtual [start, end)", 300.0, row_height);
-                    table_cell(ui, "File [start, end) / mapped backing", 480.0, row_height);
-                    table_cell(ui, "Exec", 50.0, row_height);
-                });
-                ScrollArea::vertical()
-                    .id_salt("hex-memory-map-y")
-                    .max_height(height)
-                    .auto_shrink([false, true])
-                    .show_rows(ui, row_height, sections.len(), |ui, rows| {
-                        for index in rows {
-                            let section = &sections[index];
-                            let valid = validate_section(section);
-                            ui.push_id(index, |ui| {
-                                ui.horizontal(|ui| {
-                                    let response = ui
-                                        .add_enabled_ui(enabled && valid.is_ok(), |ui| {
-                                            ui.add_sized(
-                                                [160.0, row_height],
-                                                egui::Button::selectable(
-                                                    self.section == Some(index),
-                                                    RichText::new(&section.name).monospace(),
-                                                )
-                                                .truncate(),
-                                            )
-                                        })
-                                        .inner;
-                                    if response.clicked() {
-                                        chosen = Some(index);
-                                    }
-                                    let response = response.on_hover_text(&section.name);
-                                    if let Err(message) = &valid {
-                                        response.on_disabled_hover_text(message);
-                                    }
-                                    let virtual_range = match section
-                                        .address
-                                        .checked_add(section.size)
-                                    {
-                                        Some(end) => format!("{:#x}..{end:#x}", section.address),
-                                        None => "Virtual range overflow".into(),
-                                    };
-                                    table_cell(ui, &virtual_range, 300.0, row_height);
-                                    let file_range = if section.file_size == 0 {
-                                        format!("No file bytes; zero-fill {} B", section.size)
-                                    } else {
-                                        match section.file_offset.checked_add(section.file_size) {
-                                            Some(end) => format!(
-                                                "{:#x}..{end:#x}; backed {} / {} B",
-                                                section.file_offset,
-                                                section.file_size.min(section.size),
-                                                section.size,
-                                            ),
-                                            None => "File range overflow".into(),
-                                        }
-                                    };
-                                    table_cell(ui, &file_range, 480.0, row_height);
-                                    table_cell(
-                                        ui,
-                                        if section.executable { "X" } else { "—" },
-                                        50.0,
-                                        row_height,
-                                    );
-                                })
-                            });
+        let height = (ui.available_height() * 0.28).clamp(48.0, 132.0) + theme::ROW_HEIGHT;
+        let glyph = theme::glyph_width(ui);
+        let columns = [0.0, 20.0 * glyph, 60.0 * glyph, 110.0 * glyph];
+        let width = columns[3] + 6.0 * glyph;
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), height),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                let header = theme::column_header(ui, &[], 0.0);
+                let (chosen, output) = theme::rows(
+                    ui,
+                    "hex-memory-map",
+                    sections.len(),
+                    theme::ROW_HEIGHT,
+                    width,
+                    None,
+                    |ui, index, rect| {
+                        let section = &sections[index];
+                        let valid = validate_section(section);
+                        let usable = enabled && valid.is_ok();
+                        let response = theme::row_response(
+                            ui,
+                            ui.scope_id().with(("hex-section", index)),
+                            rect,
+                            self.section == Some(index),
+                            false,
+                        );
+                        let response = match &valid {
+                            Err(message) => response.on_hover_text(message),
+                            Ok(()) => response.on_hover_text(&section.name),
+                        };
+                        let virtual_range = match section.address.checked_add(section.size) {
+                            Some(end) => format!("{:#x}..{end:#x}", section.address),
+                            None => "Virtual range overflow".into(),
+                        };
+                        let file_range = if section.file_size == 0 {
+                            format!("No file bytes; zero-fill {} B", section.size)
+                        } else {
+                            match section.file_offset.checked_add(section.file_size) {
+                                Some(end) => format!(
+                                    "{:#x}..{end:#x}; backed {} / {} B",
+                                    section.file_offset,
+                                    section.file_size.min(section.size),
+                                    section.size,
+                                ),
+                                None => "File range overflow".into(),
+                            }
+                        };
+                        let color = if usable { theme::TEXT } else { theme::MUTED };
+                        let cells = [
+                            (section.name.as_str(), color),
+                            (virtual_range.as_str(), theme::MUTED),
+                            (file_range.as_str(), theme::MUTED),
+                            (if section.executable { "X" } else { "—" }, color),
+                        ];
+                        for (column, (text, color)) in cells.into_iter().enumerate() {
+                            let right = columns.get(column + 1).copied().unwrap_or(width);
+                            let cell = egui::Rect::from_x_y_ranges(
+                                rect.left() + columns[column]..=rect.left() + right,
+                                rect.y_range(),
+                            );
+                            theme::cell_text(ui, cell, RichText::new(text).monospace(), color);
                         }
-                    });
-            });
-        chosen
+                        (usable && response.clicked()).then_some(index)
+                    },
+                );
+                theme::paint_column_header(
+                    ui,
+                    header,
+                    &[
+                        ("Section", columns[0]),
+                        ("Virtual [start, end)", columns[1]),
+                        ("File [start, end) / mapped backing", columns[2]),
+                        ("Exec", columns[3]),
+                    ],
+                    output.state.clamped_offset().x,
+                );
+                chosen
+            },
+        )
+        .inner
     }
 
     fn byte_page(&mut self, ui: &mut egui::Ui, sections: &[SectionInfo]) {
@@ -534,8 +538,10 @@ impl HexPanel {
                 page.bytes.len()
             ))
             .monospace(),
+        )
+        .on_hover_text(
+            "Click a byte; Shift-click extends the selection within this page. Muted bytes are zero-fill.",
         );
-        ui.weak("Click a byte; Shift-click extends selection within this page. Muted bytes are zero-fill.");
         let font = egui::FontId::monospace(13.0);
         let glyph = ui
             .painter()
@@ -682,14 +688,6 @@ impl HexPanel {
             ui.ctx().request_repaint();
         }
     }
-}
-
-fn table_cell(ui: &mut egui::Ui, text: &str, width: f32, height: f32) {
-    ui.add_sized(
-        [width, height],
-        egui::Label::new(RichText::new(text).monospace().color(theme::MUTED)).truncate(),
-    )
-    .on_hover_text(text);
 }
 
 fn parse_address(text: &str) -> Result<u64, &'static str> {

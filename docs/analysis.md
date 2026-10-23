@@ -338,10 +338,15 @@ not completion percentages. Cancel still terminates the disposable worker and pa
 completed batches. Discover continues it after a worker restart. Interactive
 requests run between batches, without discarding program-wide evidence. On
 restart, inventory entries the fresh worker lacks or names differently (such as
-discovered functions and renames) are replayed in small bounded requests before
-the next batch. Interrupted seeds retry individually at most
-once; a second interruption marks them failed. Errors and timeouts pause the run
-for explicit continuation. Batch replies are bound to their request ID, worker
+discovered functions and renames) are replayed before the next batch in
+requests packed by encoded size (at most 1,024 entries and 48 KiB of entries
+each, below the 60 KiB request limit). Interrupted seeds retry individually at
+most once; a second interruption marks them failed. When an unrelated request
+(such as a decompilation) fails, times out, or ends the worker, a running
+discovery continues on a fresh worker; after three such restarts without a
+committed batch, or when a discovery batch or name replay itself fails, the run
+pauses for explicit continuation. Pattern-scan steps report the same
+`Seeds`/`Publish` progress sequence as seed batches. Batch replies are bound to their request ID, worker
 epoch, binary generation, annotation revision at dispatch, and batch sequence.
 Selection changes and annotation display-name edits do not invalidate machine
 reference evidence from the immutable image. Stale/duplicate replies cannot

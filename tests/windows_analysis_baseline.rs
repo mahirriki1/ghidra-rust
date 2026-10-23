@@ -1355,7 +1355,7 @@ fn replay_inventory(
             "sync_chunk_limit": ghidra_rust::model::MAX_DISCOVERY_SYNC_FUNCTIONS,
         }),
     );
-    for chunk in updates.chunks(ghidra_rust::model::MAX_DISCOVERY_SYNC_FUNCTIONS) {
+    for chunk in ghidra_rust::model::sync_chunks(&updates) {
         assert!(matches!(
             sampler.request(
                 worker,
