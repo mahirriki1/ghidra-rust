@@ -530,12 +530,24 @@ impl LoadedProgram {
                 if !seeds.is_empty() {
                     return Err("A pattern-scan batch has no seeds".into());
                 }
+                // Same progress protocol as seed batches: the scan reports no
+                // examined functions or call-analysis decode work.
+                let empty = AnalysisProgress {
+                    stage: AnalysisStage::Seeds,
+                    functions_examined: 0,
+                    decode_attempts: 0,
+                };
+                progress(empty.clone())?;
                 let certificate = self.inventory.take_certificate(&self.info.functions);
-                let (scan, discovered) = self.scan_patterns(cursor, progress)?;
+                let (scan, discovered) = self.scan_patterns(cursor)?;
                 self.update_batch_inventory(certificate, &BTreeSet::new(), discovered)?;
                 let inventory = self
                     .inventory
                     .publish(inventory_base, &self.info.functions)?;
+                progress(AnalysisProgress {
+                    stage: AnalysisStage::Publish,
+                    ..empty
+                })?;
                 Ok(Response::DiscoveryBatch {
                     batch: DiscoveryBatch {
                         binding,

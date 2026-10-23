@@ -75,7 +75,11 @@ isolation equivalent to the Linux worker.
 
 The workspace follows Ghidra's familiar layout: Symbol/Program Trees and Functions
 on the left, the Listing or Function Graph in the middle, and the Decompiler on
-the right. Long instruction rows stay on one line with horizontal scrolling.
+the right. Long instruction rows stay on one line with horizontal scrolling;
+the Listing's byte column shows up to eight bytes and elides longer encodings
+(hover a row for every byte). Each function keeps its own Listing and decompiler
+scroll position, and side panes shrink with the window so the central views
+stay usable.
 Annotation editing opens in a separate tool window. File selection is built into
 the app and does not require a desktop file-dialog portal.
 On Windows, window controls share the menu row: drag its empty space to move the
@@ -93,8 +97,13 @@ rsvg-convert --width 256 --height 256 docs/images/ghidra-rust-logo.svg -o docs/i
 The window icon is separate from Windows executable-file icon resources.
 
 The default Carbon appearance keeps Ghidra's classic layout in a dense,
-near-black style: editor-style pane tabs, underlined view switchers, soft
-borderless controls, and the dragon's orange as the selection and focus accent.
+near-black style: each pane's views are editor-style tabs in its title strip,
+lists are column-headed tables with full-width row selection, scroll bars sit in
+fixed gutters at view edges, controls are soft and borderless, and the dragon's
+orange marks selection and focus. Instructions related to a selection are tinted
+more softly than the selection itself. Explanations of coverage limits and
+interactions live in tooltips; status lines, errors, and provenance or
+partial-coverage warnings stay visible.
 Listing columns and graph blocks are colored, with slightly rounded blocks.
 Decompiled code uses a One Dark-style palette for keywords, types, function
 names, comments, constants/strings, and identifiers. Highlighting is lexical; semantic
@@ -132,8 +141,9 @@ legacy pseudocode to obtain semantic navigation.
 
 Selecting an instruction in the Listing or Function Graph highlights the
 corresponding pseudocode statement/expression. Clicking a mapped pseudocode
-statement selects its associated instructions, scrolls the listing, and reveals
-the selected CFG block. These links come from the engine's p-code print marks,
+statement selects its associated instructions and reveals the selected CFG
+block; the Listing (or decompiler) scrolls only when the counterpart is out of
+view, and then centers it. These links come from the engine's p-code print marks,
 not line-number or text matching, and are saved in projects. One expression may
 correspond to several instructions. Instructions removed during optimization,
 unmapped declarations, and results outside the bounded graph can have no visible
@@ -241,13 +251,16 @@ editor, not general type or variable-storage editing.
 - Switch between the graph and listing. Read separately requested C-like
   decompilation, inspect outgoing direct calls, and navigate by address. After
   discovery, the **References** tab shows incoming and outgoing confirmed calls
-  for the current function, with navigation to callers, callees, and call sites.
+  for the current function. Click a row to open its call instruction,
+  double-click to open the other function, or right-click for its xrefs.
   **Data accesses** shows direct reads and writes, including x86 memory
   operands, ARM64 literal loads, and ARM64 `ADRP`/`ADD`-style addresses built
-  from register constants within one basic block (labeled *propagated*). Open a
+  from register constants within one basic block (marked `*` after the access kind). Open a
   source instruction or load the accessed bytes into Decode; filter by an exact
   target address to find its accesses. Other register addresses, loaded
-  pointers, and values carried across branches or calls are unresolved. Coverage
+  pointers, and values carried across branches or calls are unresolved. Click a
+  data row to open its instruction; right-click to decode the accessed bytes or
+  list accesses at its target. Coverage
   is limited to the functions examined in committed discovery batches in this
   session.
 - Right-click an instruction in the Listing or Function Graph, a decompiler
@@ -374,7 +387,9 @@ batches, and partial or complete seed coverage. Each batch also reports Seeds,
 Calls, and Publish stages with decode-attempt counts. Its total can grow as calls
 reveal more work. Interactive requests take priority between batches. Cancel keeps
 committed references and the remaining queue; Discover resumes after reopening
-the disposable worker and replaying function context through bounded requests.
+the disposable worker and replaying function context through size-packed
+bounded requests. If an unrelated request fails or times out, discovery
+continues on a fresh worker rather than pausing.
 Interrupted seeds retry individually at most once, then remain failed. Progress
 updates do not extend the worker deadline.
 
