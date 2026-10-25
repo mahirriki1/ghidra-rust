@@ -22,11 +22,11 @@ pub(crate) struct CommentRows {
 }
 
 impl CommentRows {
-    pub fn new(
+    pub fn new<'a>(
         entry: Option<u64>,
         lines: &[(usize, usize)],
         mappings: &[CodeMapping],
-        listing: &[Instruction],
+        listing: impl IntoIterator<Item = &'a Instruction>,
         annotations: &BTreeMap<u64, Annotation>,
     ) -> Self {
         let mut anchors = BTreeMap::new();

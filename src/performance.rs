@@ -411,3 +411,16 @@ pub fn operation(request: &crate::model::Request) -> &'static str {
         Crypto => "crypto",
     }
 }
+
+/// Retained/pinned payloads and preparation are separate from process RSS and
+/// from the navigation frame-submission clock.
+pub fn result_store_usage(
+    usage: crate::result_store::StoreUsage,
+    counters: crate::result_store::StoreCounters,
+) {
+    event("result_store_charged_bytes", usage.charged as u64);
+    event("result_store_pinned_bytes", usage.pinned as u64);
+    event("result_store_uncached_bytes", usage.uncached as u64);
+    event("result_store_preparation_bytes", usage.preparation as u64);
+    event("result_store_evicted_bytes", counters.evicted_bytes);
+}
