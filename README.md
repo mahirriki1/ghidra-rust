@@ -103,7 +103,8 @@ fixed gutters at view edges, controls are soft and borderless, and the dragon's
 orange marks selection and focus. Instructions related to a selection are tinted
 more softly than the selection itself. Explanations of coverage limits and
 interactions live in tooltips; status lines, errors, and provenance or
-partial-coverage warnings stay visible.
+partial-coverage warnings stay visible. The bottom status bar stays on one line;
+hover elided status text or the activity bar for details.
 Listing columns and graph blocks are colored, with slightly rounded blocks.
 Decompiled code uses a One Dark-style palette for keywords, types, function
 names, comments, constants/strings, and identifiers. Highlighting is lexical; semantic
@@ -224,10 +225,10 @@ editor, not general type or variable-storage editing.
   point. PE exports and supported x64/ARM64 exception-table function entries load
   on open, including stripped images. In stripped dynamically linked x86-64 ELF
   executables, `main` is recovered from glibc's startup call to
-  `__libc_start_main` and labeled as analysis-derived in **Analysis notes**
+  `__libc_start_main` and labeled as analysis-derived in the status warning popup
   ([details](docs/analysis.md#stripped-elf-startup)). The list is capped at 262,144 entries and
-  8 MiB of names; large PEs prioritize the entry point, exports, and runtime
-  functions near entry, with a visible partial-list notice. Projects containing
+  8 MiB of names, with 256 bytes per name; large PEs prioritize the entry point,
+  exports, and runtime functions near entry, with a visible partial-list notice. Projects containing
   more than 10,000 functions cannot be opened by releases before this limit.
   **Discover functions** follows confirmed decoded direct calls from known entries
   on every supported architecture in resumable bounded batches. Discover starts or
@@ -280,7 +281,8 @@ editor, not general type or variable-storage editing.
   that no references exist.
 - Scan mapped bytes for ASCII and a printable ASCII subset of UTF-16LE strings.
   The tree shows **not scanned** until a scan runs. This is not complete Unicode
-  or Rust string-slice recovery. **Analysis notes** shows loading and coverage limits.
+  or Rust string-slice recovery. The status warning indicator shows a count only
+  when loading or coverage notes exist; click it to read them.
   The Strings tab defaults to six characters and accepts a minimum from 4 to 64.
   This minimum applies before the 10,000-result cap; the text filter searches only
   loaded results. Increase the minimum and rescan when short-string noise fills the

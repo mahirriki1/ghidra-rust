@@ -165,7 +165,6 @@ pub fn analysis_activity(ui: &mut Ui, task: &str, elapsed: std::time::Duration) 
     response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::Role::ProgressIndicator, ui.is_enabled(), &label)
     });
-    response.on_hover_text("Analysis is running. Use Analysis → Cancel analysis to stop it.");
     if ui.is_rect_visible(track) {
         ui.painter()
             .rect_filled(track, 3, ui.visuals().extreme_bg_color);
@@ -180,7 +179,49 @@ pub fn analysis_activity(ui: &mut Ui, task: &str, elapsed: std::time::Duration) 
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(66));
     }
-    ui.label(RichText::new(label).small());
+    ui.add(egui::Label::new(RichText::new(label).small()).truncate());
+}
+
+/// A compact warning menu with a font-independent triangle, like the history icons.
+pub fn warning_menu<R>(
+    ui: &mut Ui,
+    count: usize,
+    contents: impl FnOnce(&mut Ui) -> R,
+) -> egui::InnerResponse<Option<R>> {
+    // Reserve the icon's space in the button label.
+    let menu = ui.menu_button(
+        RichText::new(format!("    {count}")).color(WARNING),
+        contents,
+    );
+    menu.response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::Role::Button,
+            ui.is_enabled(),
+            format!("{count} warnings"),
+        )
+    });
+    let center = egui::pos2(
+        menu.response.rect.left() + ui.spacing().button_padding.x + 5.0,
+        menu.response.rect.center().y,
+    );
+    let painter = ui.painter();
+    painter.add(egui::Shape::closed_line(
+        vec![
+            center + egui::vec2(0.0, -6.0),
+            center + egui::vec2(6.0, 5.0),
+            center + egui::vec2(-6.0, 5.0),
+        ],
+        Stroke::new(1.0, WARNING),
+    ));
+    painter.line_segment(
+        [
+            center + egui::vec2(0.0, -2.0),
+            center + egui::vec2(0.0, 1.0),
+        ],
+        Stroke::new(1.2, WARNING),
+    );
+    painter.circle_filled(center + egui::vec2(0.0, 3.0), 0.7, WARNING);
+    menu
 }
 
 /// The shared project logo, kept within the existing menu row.
