@@ -50,7 +50,9 @@ decode attempts and at most 2,048 attempts per function. Failed decoding and wor
 omitted from the displayed graph count toward the limits. Calls to their own
 fallthrough address do not seed functions. Constants and unknown indirect
 targets do not seed functions; on x86-64 ELF and PE, strictly validated
-[function-start patterns](analysis.md#function-start-patterns) can. Coverage is partial when these
+[function-start patterns](analysis.md#function-start-patterns) can. x86-64 ELF
+also supports bounded [pointer/init metadata and FDE-corroborated tail recovery](analysis.md#elf-pointers-and-tail-boundaries);
+PE, AArch64 and Mach-O pointer recovery remain unsupported. Coverage is partial when these
 budgets are reached; complete function recovery is not guaranteed. See
 [analysis coverage and provenance](analysis.md) for call references and progress.
 AArch64 PE reads normal packed and supported full unwind records to recover

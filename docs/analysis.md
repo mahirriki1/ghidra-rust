@@ -30,7 +30,8 @@ function inventory in its existing address order. Duplicate entries are examined
 once per session; newly confirmed callees are scheduled for later batches.
 
 Arbitrary constants and unresolved register targets do not create functions;
-function-start patterns are a separate, strictly validated phase described below. Unknown indirect calls and branches remain unresolved.
+pointer metadata/tables (x86-64 ELF) and function-start patterns are separate,
+strictly validated phases described below. Unknown indirect calls and branches remain unresolved.
 Calls are separate from intrafunction control-flow edges. An established call
 instruction is machine-code evidence; it does not reconstruct a source-language
 function boundary or prove that all possible runtime calls have been found.
@@ -156,7 +157,49 @@ This recognizes conventional glibc startup. AArch64 (pending original dynamic
 fixtures), i386, static and static-PIE executables, musl's `_start_c` helper,
 sectionless (`sstrip`) files, and wrapper-based startup variants are not
 recognized. Functions reachable only through pointer tables or as callbacks
-still need function-start patterns or broader pointer analysis.
+use the bounded pointer phase below on x86-64 ELF, or function-start patterns
+where available.
+
+## ELF pointers and tail boundaries
+
+On x86-64 little-endian linked ELF, the same discovery option first admits
+validated `DT_INIT`/`DT_FINI` entries and matching typed init/fini arrays. These
+format-defined entries may have partial CFGs. Exact `ENDBR64; JMP` or
+`JMP` callbacks (rel8/rel32) can establish their forwarding destinations without CRT
+name inference. Then the normal seed queue drains and allocated file-backed
+non-executable data is scanned in native-width aligned slots. A run needs two distinct executable targets;
+nulls, section boundaries and invalid/unsupported slots end it. There is no
+switch-table entry-count minimum for callable tables. After table-derived seeds
+drain, corroborated direct tail jumps from the complete inventory are examined.
+
+ET_EXEC slots use checked absolute addresses; supported RELA records override
+bytes. PIE RELATIVE addends remain in the worker's link-time coordinates.
+Defined function symbols require local binding or non-interposable visibility;
+IFUNC resolvers are never executed. Conflicting relocations poison their slots.
+Malformed tables, unknown relocation write widths and REL/RELR are unsupported;
+dynamic relocation declarations must match the section tables.
+
+Table entries additionally need an exact validated FDE start or a vetted
+function-start pattern, and a complete bounded CFG outside established code.
+The small `.eh_frame` reader supports DWARF32 CIE versions 1/3 with `zR` and
+PC-relative signed 32-bit pointer encoding. Unsupported augmentations/encodings,
+truncation, overlapping ranges or invalid file backing establish no FDE ranges.
+It does not unwind stacks or independently turn every FDE into a function.
+Direct unconditional jumps to exact FDE starts stop before crossing the boundary;
+validated destinations become functions with tail edges, without call references.
+Conditional cold paths retain their existing call coverage. Cold fragments are
+not modeled as separate functions.
+
+Typed source cursors retain pointer-run and pending-validation positions across
+batches and worker replacement. A request has at most 128 candidate attempts,
+128 admissions, 16,384 decode attempts and 2,048 attempts per walk. The parent
+caps cumulative pointer work at 262,144 metadata-record visits, 1,048,576 slots,
+16,384 candidate attempts, 256 cursor replies and 2,097,152 reconstructed inventory
+rows. Source witnesses share a 16,384-entry session ceiling with pattern
+admissions; reaching a limit leaves coverage partial. Fresh workers rebuild
+metadata and established coverage under these same cumulative allowances.
+Instruction address-taking, PE/AArch64 pointer sources and witness persistence
+remain future work. The application remains an experimental subset.
 
 ## Function-start patterns
 
@@ -173,10 +216,11 @@ candidate. It is admitted as a `FUN_` function only when:
   it begins its section (padding alone does not count);
 - its own instruction walk decodes completely within 2,048 instructions with no
   overlap with established code, no unresolved indirect jump, no internal p-code
-  branch, and no warning; every path ends in a return or an explicit jump to a
-  known function (running into another function is rejected), at least one
-  return exists, and every direct call targets executable code outside other
-  functions' interiors; numeric `validcode` sets a minimum instruction count.
+  branch, and no unexplained warning; every path ends in a return, a recognized
+  no-return call or an explicit jump to a known function (running into another
+  function is rejected). Pure tail-only bodies are allowed, and direct calls
+  must target executable code outside other functions' interiors; numeric
+  `validcode` sets a minimum instruction count.
 
 Candidates are examined in address order and each admitted function's code
 joins the established code immediately, so a later match inside it is
@@ -205,10 +249,11 @@ Each scan step covers at most 1 MiB, 4,096 matches per 64 KiB chunk (65,536 in
 one reply), 128 validated candidates, 128 admissions and 16,384 decode attempts,
 then resumes from where it stopped. A match flood, an interrupted or stalled
 step, or a full inventory leaves the scan partial. Optimized code without a
-recognizable prologue (for example GCC `-O2` leaf functions) is not recovered. AArch64,
-32-bit x86 and Mach-O have no pattern set yet. Function rows do not yet record
-which evidence created them; the discovery summary reports the number of
-pattern-derived starts.
+recognizable prologue is not recovered by patterns alone. AArch64, 32-bit x86
+and Mach-O have no pattern set yet. A small function-row glyph records the first
+pattern/pointer admission reason, source address and boundary evidence on hover.
+Witnesses are session-only: project files keep the existing discovery snapshot
+schema, omit witnesses, and retain saved-analysis provenance until recomputation.
 
 ## Switch tables
 

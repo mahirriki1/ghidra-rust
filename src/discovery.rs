@@ -10,7 +10,7 @@ use crate::model::*;
 /// Saved discovery format and evidence semantics. A different value discards a
 /// project's saved discovery while keeping its other cached results.
 pub const DISCOVERY_FINGERPRINT: &str =
-    "discovery-v1-calls-v1-data-v1-switch-v1-patterns-v2-noreturn-v1";
+    "discovery-v1-calls-v1-data-v1-switch-v1-patterns-v2-noreturn-v1-pointers-v1";
 
 /// Committed discovery results as stored in a project. After loading they are
 /// display-only: Discover starts a fresh queue instead of trusting saved
@@ -267,6 +267,7 @@ pub struct Discovery {
     /// Seeds of the batch in flight; empty for a pattern-scan step.
     flight: Option<(DiscoveryBinding, Vec<u64>)>,
     pub patterns: Option<PatternPhase>,
+    pub(crate) pointer_recovery: crate::pointer_discovery::PointerDiscovery,
     sequence: u64,
     /// Worker epoch and inventory revision whose addresses are all admitted.
     admitted: Option<(u64, u64)>,
@@ -321,8 +322,17 @@ impl Discovery {
     /// Adds the pattern phase when [`Self::patterns_apply`].
     pub fn enable_patterns(&mut self, info: &BinaryInfo) {
         if Self::patterns_apply(info) {
-            self.start_patterns();
+            self.start_sources(info.architecture == "x86-64" && info.format == "ELF");
         }
+    }
+
+    /// Starts enabled sources after the caller checks `patterns_apply`. The
+    /// worker independently checks the architecture before pointer recovery.
+    pub fn start_sources(&mut self, elf_pointers: bool) {
+        if elf_pointers {
+            self.pointer_recovery.enable();
+        }
+        self.start_patterns();
     }
 
     pub fn remaining(&self) -> usize {
@@ -341,9 +351,19 @@ impl Discovery {
 
     /// Whether a pattern-scan step remains.
     pub fn scanning(&self) -> bool {
-        self.patterns
-            .as_ref()
-            .is_some_and(|phase| phase.cursor.is_some())
+        self.pointer_recovery.cursor.is_some()
+            || self
+                .patterns
+                .as_ref()
+                .is_some_and(|phase| phase.cursor.is_some())
+    }
+
+    pub fn recovery_accounting(&self) -> crate::model::RecoveryAccounting {
+        self.pointer_recovery.accounting()
+    }
+
+    pub fn admission(&self, address: u64) -> Option<&FunctionAdmission> {
+        self.pointer_recovery.admissions.get(&address)
     }
 
     pub fn status(&self, address: u64) -> Option<Status> {
@@ -352,6 +372,8 @@ impl Discovery {
 
     pub fn partial(&self) -> bool {
         self.capped
+            || self.pointer_recovery.partial
+            || self.pointer_recovery.cursor.is_some()
             || self.report.partial
             || self.report.data.as_ref().is_some_and(|data| data.partial)
             || self.remaining() != 0
@@ -364,6 +386,37 @@ impl Discovery {
     pub fn begin(&mut self, generation: u64, epoch: u64, revision: u64) -> Option<Request> {
         if self.flight.is_some() {
             return None;
+        }
+        if self.pointer_recovery.admissions.len() > MAX_FUNCTION_ADMISSIONS - MAX_PATTERN_ADMISSIONS
+        {
+            if self.pointer_recovery.cursor.take().is_some() {
+                self.pointer_recovery.partial = true;
+            }
+            if let Some(phase) = &mut self.patterns
+                && phase.cursor.take().is_some()
+            {
+                phase.partial = true;
+            }
+        }
+
+        if let Some(cursor) = self.pointer_recovery.cursor
+            && (self.pending.is_empty() || cursor.phase == PointerPhase::Metadata)
+        {
+            self.sequence = self.sequence.checked_add(1)?;
+            let binding = DiscoveryBinding {
+                generation,
+                epoch,
+                revision,
+                batch: self.sequence,
+            };
+            self.flight = Some((binding, Vec::new()));
+            self.pointer_recovery.flight = true;
+            return Some(Request::DiscoverBatch {
+                binding,
+                inventory_base: None,
+                seeds: Vec::new(),
+                patterns: Some(DiscoveryCursor::Pointers(cursor)),
+            });
         }
         if self.pending.is_empty() {
             // Scan only once every known seed has been walked, so candidates
@@ -381,7 +434,7 @@ impl Discovery {
                 binding,
                 inventory_base: None,
                 seeds: Vec::new(),
-                patterns: Some(cursor),
+                patterns: Some(crate::model::DiscoveryCursor::Patterns(cursor)),
             });
         }
         let limit = if self.entries[&self.pending[0]].interruptions > 0 {
@@ -413,6 +466,10 @@ impl Discovery {
     /// interrupted seeds individually, and never more than the shared limit.
     pub fn interrupt(&mut self) {
         if let Some((_, seeds)) = self.flight.take() {
+            if self.pointer_recovery.flight {
+                self.pointer_recovery.interrupt();
+                return;
+            }
             if seeds.is_empty()
                 && let Some(phase) = &mut self.patterns
             {
@@ -465,10 +522,38 @@ impl Discovery {
         if inventory.revision != batch.inventory.revision() {
             return Err("Discovery batch does not match its inventory".into());
         }
+        self.pointer_recovery
+            .check_preparation(batch.recovery_records)?;
         let functions = inventory.functions();
         batch.analysis.validate_evidence(info, functions)?;
         if seeds.is_empty() {
+            if self.pointer_recovery.flight {
+                self.pointer_recovery.validate(info, batch, inventory)?;
+                if batch
+                    .admissions
+                    .iter()
+                    .any(|w| self.entries.contains_key(&w.entry))
+                    || inventory.functions().iter().any(|f| {
+                        !self.entries.contains_key(&f.address)
+                            && batch
+                                .admissions
+                                .binary_search_by_key(&f.address, |w| w.entry)
+                                .is_err()
+                    })
+                {
+                    return Err("Pointer admissions do not match inventory additions".into());
+                }
+
+                self.pointer_recovery
+                    .commit(batch, inventory_validation_rows);
+                self.flight = None;
+                self.admit_inventory(inventory);
+                return Ok(());
+            }
             return self.commit_patterns(info, batch, inventory, inventory_validation_rows);
+        }
+        if batch.pointers.is_some() || !batch.admissions.is_empty() {
+            return Err("Seed batch carries source evidence".into());
         }
         if batch.patterns.is_some() {
             return Err("A seed batch reply carries a pattern scan".into());
@@ -510,6 +595,8 @@ impl Discovery {
         {
             return Err("Discovery evidence belongs to an unexamined function".into());
         }
+        self.pointer_recovery
+            .record_preparation(batch.recovery_records);
         let (_, seeds) = self.flight.take().expect("validated flight");
         for outcome in &batch.outcomes {
             self.entries
@@ -614,6 +701,20 @@ impl Discovery {
         {
             return Err("Invalid function-start pattern scan".into());
         }
+        if batch.pointers.is_some() || batch.recovery_records != 0 {
+            return Err("Pattern batch carries pointer work".into());
+        }
+        crate::pointer_discovery::validate_admissions(
+            info,
+            batch,
+            inventory,
+            &self.pointer_recovery.admissions,
+        )?;
+        if batch.admissions.iter().any(|w| {
+            w.reason != AdmissionReason::Pattern || scan.admitted.binary_search(&w.entry).is_err()
+        }) {
+            return Err("Invalid pattern witness".into());
+        }
         let scanned_bytes = phase
             .scanned_bytes
             .checked_add(scan.scanned_bytes)
@@ -670,6 +771,7 @@ impl Discovery {
         phase.interruptions = 0;
         self.flight = None;
         self.report.partial |= batch.truncated;
+        self.pointer_recovery.retain(batch);
         self.admit_inventory(inventory);
         Ok(())
     }
@@ -695,13 +797,38 @@ impl Discovery {
         requested: Option<u64>,
         batch: &mut DiscoveryBatch,
     ) -> Result<Option<(WorkerInventory, bool)>, String> {
-        let preflight = self.pattern_preflight(base, requested, batch)?;
+        if self
+            .flight
+            .as_ref()
+            .is_none_or(|(binding, _)| *binding != batch.binding)
+        {
+            return Err("Stale discovery batch binding".into());
+        }
+        self.pointer_recovery
+            .check_preparation(batch.recovery_records)?;
+        let pointer_rows = if self.pointer_recovery.flight {
+            if self
+                .flight
+                .as_ref()
+                .is_none_or(|(binding, _)| *binding != batch.binding)
+            {
+                return Err("Stale pointer batch".into());
+            }
+            Some(self.pointer_recovery.preflight(base, requested, batch)?)
+        } else {
+            None
+        };
+        let preflight = if pointer_rows.is_some() {
+            PatternPreflight::SeedBatch
+        } else {
+            self.pattern_preflight(base, requested, batch)?
+        };
         if matches!(preflight, PatternPreflight::Exhausted) {
             return Err("Function-start pattern work budget exhausted".into());
         }
         let inventory_validation_rows = match preflight {
             PatternPreflight::Pattern(charge) => charge.inventory_validation_rows,
-            PatternPreflight::SeedBatch => 0,
+            PatternPreflight::SeedBatch => pointer_rows.unwrap_or(0),
             PatternPreflight::Exhausted => unreachable!(),
         };
         let revision = batch.inventory.revision();
@@ -860,7 +987,7 @@ fn pattern_charge(cursor: u64, scan: &PatternScan, inventory_rows: usize) -> Pat
 /// Rows whose complete reconstructed inventory is cloned and validated by
 /// [`WorkerInventory::adopt`]. Invalid base relationships are left for adoption
 /// to reject and are not mistaken for budget exhaustion.
-fn inventory_validation_rows(
+pub(crate) fn inventory_validation_rows(
     base: Option<&WorkerInventory>,
     requested: Option<u64>,
     epoch: u64,
@@ -1019,6 +1146,9 @@ mod tests {
                 decode_attempts: seeds.len(),
                 ..Default::default()
             },
+            pointers: None,
+            admissions: Vec::new(),
+            recovery_records: 0,
         }
     }
 
@@ -1052,6 +1182,9 @@ mod tests {
                 covered,
                 ..Default::default()
             }),
+            pointers: None,
+            admissions: Vec::new(),
+            recovery_records: 0,
         }
     }
 
@@ -1136,7 +1269,7 @@ mod tests {
     fn the_pattern_scan_runs_after_seeds_and_admits_only_new_inventory_starts() {
         let mut info = info(1);
         let mut state = Discovery::new(Some(info.entry), [], false);
-        state.enable_patterns(&info);
+        state.start_patterns();
         // Seeds first; the scan starts only once the queue is empty.
         let request = state.begin(1, 1, 0).unwrap();
         assert!(matches!(
@@ -1149,7 +1282,7 @@ mod tests {
             let Request::DiscoverBatch {
                 binding,
                 ref seeds,
-                patterns: Some(cursor),
+                patterns: Some(crate::model::DiscoveryCursor::Patterns(cursor)),
                 ..
             } = request
             else {
@@ -1181,6 +1314,9 @@ mod tests {
                 admitted,
                 ..Default::default()
             }),
+            pointers: None,
+            admissions: Vec::new(),
+            recovery_records: 0,
         };
         // Starts must be new functions in the reply's own inventory.
         for invalid in [vec![0x3000], vec![0x2000, 0x2000], vec![0x2001]] {
@@ -1244,6 +1380,9 @@ mod tests {
                     next: Some(0),
                     ..Default::default()
                 }),
+                pointers: None,
+                admissions: Vec::new(),
+                recovery_records: 0,
             };
             commit_replacement(&mut state, &info, &stalled).unwrap();
         }

@@ -34,6 +34,7 @@ pub(super) fn recover_graph_counted(
     let recovered = recover_graph_budgeted(
         program,
         &Bounds {
+            tail_entry: None,
             sections,
             is_function: &|address| function_at(functions, address).is_some(),
             pe_ranges,
@@ -117,6 +118,7 @@ pub(super) struct Bounds<'a> {
     pub(super) sections: &'a [SectionInfo],
     pub(super) is_function: &'a dyn Fn(u64) -> bool,
     pub(super) pe_ranges: &'a [(u64, u64)],
+    pub(super) tail_entry: Option<&'a dyn Fn(u64) -> bool>,
 }
 
 pub(super) fn recover_graph_budgeted(
@@ -278,6 +280,7 @@ impl Walk {
             sections,
             is_function,
             pe_ranges,
+            tail_entry,
         } = *bounds;
         let (entry, alignment) = (self.entry, self.alignment);
         let warnings = &mut self.warnings;
@@ -403,12 +406,19 @@ impl Walk {
             if indirect {
                 self.indirect.insert(address);
             }
-            for (target, _) in &next {
+            for (target, kind) in &next {
                 if let Some(target) = target {
                     if terminal {
                         self.leaders.insert(*target);
                     }
-                    self.pending.push_back(*target);
+                    if *kind == EdgeKind::Branch
+                        && *target != entry
+                        && tail_entry.is_some_and(|test| test(*target))
+                    {
+                        warning(warnings, EXTERNAL_EXIT);
+                    } else {
+                        self.pending.push_back(*target);
+                    }
                 }
             }
             nodes.insert(
@@ -432,46 +442,6 @@ impl Walk {
             .iter()
             .map(|(&address, node)| (address, address + node.instruction.bytes.len() as u64))
             .collect()
-    }
-
-    /// Whether this walk is strong enough evidence that `entry` starts a
-    /// function no established code contains: every instruction decoded and
-    /// lies outside `coverage`, every path ends in a return, a known no-return call or an explicit
-    /// branch to an established function, and direct calls reach code.
-    pub(super) fn complete_function(
-        &self,
-        coverage: &Coverage,
-        is_function: &dyn Fn(u64) -> bool,
-        is_code: &dyn Fn(u64) -> bool,
-        min_instructions: usize,
-    ) -> bool {
-        let terminal_exit = self
-            .nodes
-            .values()
-            .any(|node| node.terminal && node.next.is_empty());
-        terminal_exit
-            && self.nodes.len() >= min_instructions.max(1)
-            && self.indirect.is_empty()
-            && self.pending.is_empty()
-            && self.warnings.iter().all(|warning| warning == EXTERNAL_EXIT)
-            && self.nodes.iter().all(|(&address, node)| {
-                let end = address + node.instruction.bytes.len() as u64;
-                !coverage.overlaps(address, end)
-                    && node.next.iter().all(|&(target, kind)| match target {
-                        Some(target) if self.nodes.contains_key(&target) => true,
-                        // Only an explicit jump may leave for another function;
-                        // running into one is not a function boundary.
-                        Some(target) => {
-                            node.terminal && kind == EdgeKind::Branch && is_function(target)
-                        }
-                        None => false,
-                    })
-            })
-            && self.calls.iter().all(|call| {
-                call.target.is_none_or(|target| {
-                    is_code(target) && (is_function(target) || !coverage.contains(target))
-                })
-            })
     }
 
     /// Asks the engine for this function's switch tables when the walk has

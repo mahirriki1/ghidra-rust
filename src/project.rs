@@ -1484,6 +1484,9 @@ mod tests {
                 decode_attempts: 3,
                 ..Default::default()
             },
+            pointers: None,
+            admissions: Vec::new(),
+            recovery_records: 0,
         };
         crate::discovery::commit_replacement(&mut state, &data.info, &batch).unwrap();
         state.save()
