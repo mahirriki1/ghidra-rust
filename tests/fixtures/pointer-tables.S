@@ -50,8 +50,19 @@ end label_owner
 .globl init_callback
 .type init_callback,@function
 init_callback:
-ret
+endbr64
+#ifndef NO_UNWIND
+jmp crt_forward_target
+#else
+.byte 0xe9
+.long crt_forward_target - . - 4
+#endif
 .size init_callback,.-init_callback
+.globl crt_forward_target
+.type crt_forward_target,@function
+crt_forward_target:
+ret
+.size crt_forward_target,.-crt_forward_target
 .globl fini_callback
 .type fini_callback,@function
 fini_callback:
