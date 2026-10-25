@@ -1,6 +1,6 @@
 [package]
 name = "ghidra-rust"
-version = "0.0.3"
+version = "0.0.40"
 edition = "2024"
 license = "Apache-2.0"
 description = "An experimental native reverse engineering desktop"
