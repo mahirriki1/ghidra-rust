@@ -6440,9 +6440,6 @@ impl DesktopApp {
                 let mut navigate = None;
                 let mut xrefs = None;
                 if let Some(view) = graph_view(&self.graph) {
-                    for warning in view.warnings.iter().take(3) {
-                        ui.colored_label(theme::WARNING, warning);
-                    }
                     if !view.calls.is_empty() {
                         egui::CollapsingHeader::new(format!(
                             "{} direct / unresolved calls",
