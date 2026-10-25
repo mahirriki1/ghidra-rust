@@ -35,6 +35,19 @@ pub struct DiscoverySnapshot {
 }
 
 impl DiscoverySnapshot {
+    /// None means not analyzed/absent from this publication, distinct from a
+    /// completed function with no outgoing evidence.
+    pub fn status(&self, address: u64) -> Option<Status> {
+        [
+            (&self.pending, Status::Pending),
+            (&self.done, Status::Done),
+            (&self.limited, Status::PartialByOwnLimit),
+            (&self.failed, Status::Failed),
+        ]
+        .into_iter()
+        .find_map(|(list, status)| list.binary_search(&address).ok().map(|_| status))
+    }
+
     /// Treats every field as untrusted. Structural consistency only: this does
     /// not establish that the evidence matches the binary's instructions.
     pub fn validate(&self, info: &BinaryInfo) -> Result<(), String> {
@@ -240,6 +253,13 @@ enum PatternPreflight {
     Exhausted,
 }
 
+/// Terminal attempts among the currently admitted functions, not whole-image coverage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FunctionProgress {
+    pub processed: usize,
+    pub total: usize,
+}
+
 #[derive(Default)]
 pub struct Discovery {
     entries: BTreeMap<u64, Entry>,
@@ -317,6 +337,16 @@ impl Discovery {
 
     pub fn remaining(&self) -> usize {
         self.pending.len() + self.flight.as_ref().map_or(0, |(_, seeds)| seeds.len())
+    }
+
+    /// Allocation-free counts. In-flight seeds remain unfinished until adoption;
+    /// failed and limited attempts are terminal, just like successful walks.
+    pub fn progress(&self) -> FunctionProgress {
+        let total = self.entries.len();
+        FunctionProgress {
+            processed: total - self.remaining(),
+            total,
+        }
     }
 
     /// Whether a pattern-scan step remains.
@@ -1019,6 +1049,23 @@ fn pattern_scan_offset(info: &BinaryInfo, address: u64) -> Result<(u64, u64), St
 }
 
 /// Test helper: adopts a batch carrying a complete inventory and commits it.
+impl crate::result_store::Retained for DiscoverySnapshot {
+    fn retained_bytes(&self) -> Option<usize> {
+        use crate::result_store::Bytes;
+        let mut bytes = Bytes::of::<Self>()
+            .plus(self.fingerprint.capacity())
+            .slots::<u64>(self.pending.capacity())
+            .slots::<u64>(self.done.capacity())
+            .slots::<u64>(self.limited.capacity())
+            .slots::<u64>(self.failed.capacity())
+            .slots::<CallReference>(self.report.references.capacity());
+        if let Some(data) = &self.report.data {
+            bytes = bytes.slots::<DataReference>(data.references.capacity());
+        }
+        bytes.total()
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn commit_replacement(
     state: &mut Discovery,
@@ -1139,6 +1186,83 @@ mod tests {
             admissions: Vec::new(),
             recovery_records: 0,
         }
+    }
+
+    #[test]
+    fn live_progress_counts_terminal_attempts_and_growing_inventory() {
+        let mut info = info(2);
+        let mut state = Discovery::new(None, info.functions.iter().map(|f| f.address), false);
+        assert_eq!(
+            state.progress(),
+            FunctionProgress {
+                processed: 0,
+                total: 2
+            }
+        );
+        let request = state.begin(1, 1, 0).unwrap();
+        assert_eq!(
+            state.progress().processed,
+            0,
+            "in-flight work remains unfinished"
+        );
+        let mut first = batch(request, &info);
+        first.outcomes.truncate(1);
+        first.analysis.functions_examined = 1;
+        first.analysis.decode_attempts = 1;
+        commit_replacement(&mut state, &info, &first).unwrap();
+        assert_eq!(
+            state.progress(),
+            FunctionProgress {
+                processed: 1,
+                total: 2
+            }
+        );
+
+        // New inventory grows the denominator without inflating processed counts.
+        info.functions.extend((0..3).map(|index| FunctionInfo {
+            address: 0x1040 + index * 16,
+            name: format!("new{index}"),
+        }));
+        let request = state.begin(1, 1, 0).unwrap();
+        let mut second = batch(request, &info);
+        second.outcomes[0].status = DiscoveryStatus::PartialByOwnLimit;
+        second.analysis.partial = true;
+        commit_replacement(&mut state, &info, &second).unwrap();
+        assert_eq!(
+            state.progress(),
+            FunctionProgress {
+                processed: 2,
+                total: 5
+            }
+        );
+        let request = state.begin(1, 1, 0).unwrap();
+        let mut failed = batch(request, &info);
+        failed.outcomes[0].status = DiscoveryStatus::Failed;
+        failed.analysis.failed_functions = 1;
+        commit_replacement(&mut state, &info, &failed).unwrap();
+        assert_eq!(
+            state.progress(),
+            FunctionProgress {
+                processed: 5,
+                total: 5
+            }
+        );
+        assert!(state.partial());
+
+        // Exhausting interruption retries also constitutes a terminal attempt.
+        let mut state = Discovery::new(None, [0x1000], false);
+        for _ in 0..MAX_DISCOVERY_INTERRUPTION_ATTEMPTS {
+            state.begin(1, 1, 0).unwrap();
+            state.interrupt();
+        }
+        assert_eq!(
+            state.progress(),
+            FunctionProgress {
+                processed: 1,
+                total: 1
+            }
+        );
+        assert_eq!(state.status(0x1000), Some(Status::Failed));
     }
 
     #[test]

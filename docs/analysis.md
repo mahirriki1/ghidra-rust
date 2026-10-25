@@ -486,3 +486,58 @@ using the same executable hash and comparable analysis scope. Native platform
 validation must be reported separately from the architecture of the input image.
 See [analysis measurements](analysis-performance.md) for the opt-in Linux
 client/worker baseline and its explicit scope limits.
+
+## Per-function session results
+
+The desktop retains immutable validated graph/listing and decompilation results
+with their listing indexes, highlighting and base graph geometry. Text, mappings,
+semantic tokens, inferred prototypes and unapplied-local warnings are adopted as
+one result. Mutable cameras, selections, scroll requests and egui ids remain in
+the current view. Exact instruction history is applied before synchronous cache
+adoption. Successful empty pseudocode is distinct from a missing result; failed
+analysis is not cached.
+
+Compatibility uses the verified binary SHA-256, unchanged engine/signature
+fingerprints, the complete committed signature-state digest, ordered inventory
+and effective function-name SHA-256 digests, and complete per-function local
+identity/name digests. Inventory/name/local projections are hashed in a bounded
+background job when their inputs change. Navigation does not hash the inventory.
+Worker request/selection/revision and refresh bindings remain separate from
+cache identity. Restarting the worker retains committed compatible results;
+superseded replies cannot populate the store. Signature staging cannot publish
+under committed state, and failed staging retains committed references.
+
+- Local rename/remove/undo invalidates that function's decompilation only.
+- Function rename/remove/undo conservatively invalidates graph and decompilation
+  results, including callers. Committed references and byte scans remain.
+- Signature acknowledgement invalidates graph, decompilation and discovery;
+  annotations, inventory and byte scans remain.
+- Inventory address changes invalidate graph and decompilation results;
+  committed reference coverage remains attached to its publication.
+- Comment/decoded-note changes retain analysis. JSON imports compare analysis
+  projections, so comment-only imports do not restart analysis.
+- Refresh bypasses the selected function's stored components. Rediscovery
+  replaces saved reference evidence without discarding compatible function results.
+
+One shared discovery snapshot owns published statuses, counters and evidence;
+incoming/outgoing indexes point into it. An absent function, pending work, a
+completed function with no references, partial work and failure stay distinct.
+The mutable bounded discovery continuation is separate from this publication.
+
+The 64 MiB allocation budget covers retained payload capacities, prepared
+presentation, conservative index/key bookkeeping and the committed discovery
+publication. Inactive unpinned components are evicted least recently used.
+Shared snapshots stay charged until their last owner drops, including a project
+save pinning an older discovery snapshot. When pins prevent admission, the
+current bounded graph/code may be displayed without caching; discovery
+publication waits for room. Preparation, current uncached results, worker memory,
+image copies and total GUI RSS are reported separately, not hidden in the cap.
+Annotations are never evicted. Saves also track analysis-result revisions so a
+completed save cannot mark newer results saved.
+
+Misses use the existing warm worker. A stored result reflects engine knowledge
+when computed; analyzing another function can teach the engine shared global
+types, making a later Refresh print different pseudocode. No canonical fresh
+worker replay is performed for each miss. Engine fingerprints are unchanged.
+Project version 4 still persists the displayed function only. Persisting all
+retained functions requires a later project-format migration.

@@ -214,10 +214,17 @@ fn metadata_with_target(
         object.entry()
     };
     let mut info = BinaryInfo {
-        path: path.to_string_lossy().into_owned(), architecture: target.name.into(), format: format.into(),
-        sha256: format!("{:x}", Sha256::digest(bytes)), source_identity: None,
-        entry, file_len: bytes.len() as u64, sections, functions: Vec::new(), functions_truncated: false,
-        warnings: vec!["Prototype analysis: symbols and supported PE function metadata load immediately; deeper function discovery is explicit. Optimized C++/Rust types and source reconstruction are incomplete.".into(), format!("Function lists are capped at {MAX_FUNCTIONS} entries, {} MiB of names, and {MAX_FUNCTION_NAME_BYTES} bytes per name in this prototype.", MAX_FUNCTION_NAME_JSON_BYTES >> 20)],
+        path: path.to_string_lossy().into_owned(),
+        architecture: target.name.into(),
+        format: format.into(),
+        sha256: format!("{:x}", Sha256::digest(bytes)),
+        source_identity: None,
+        entry,
+        file_len: bytes.len() as u64,
+        sections,
+        functions: Vec::new(),
+        functions_truncated: false,
+        warnings: Vec::new(),
     };
     if crate::packing::detect_upx_pe(&info.format, info.entry, &info.sections, bytes) {
         warning(&mut info.warnings, crate::packing::UPX_PACKED_WARNING);
@@ -2652,6 +2659,7 @@ pub(crate) mod tests {
         assert_eq!(info.sections[0].file_offset, 0x100);
         assert_eq!(info.sections[1].address, 0x402000);
         assert_eq!(info.sha256.len(), 64);
+        assert!(info.warnings.is_empty());
         bytes[18..20].copy_from_slice(&243u16.to_le_bytes());
         assert!(
             metadata(Path::new("fixture.elf"), &bytes)

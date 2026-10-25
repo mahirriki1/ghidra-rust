@@ -14,6 +14,7 @@
 #![recursion_limit = "256"]
 mod common;
 mod inventory;
+mod result_measurement;
 
 use ghidra_rust::call_analysis::{CallIndex, code_address};
 use ghidra_rust::client::{WorkerClient, WorkerEvent};
@@ -1152,6 +1153,8 @@ fn warm_aba(
     pair: [u64; 2],
 ) -> WarmResults {
     let mut results = BTreeMap::new();
+    let mut cached = result_measurement::CachedResults::new(info, &discovered.functions);
+    cached.publish(std::sync::Arc::new(discovered.state.save()));
     let mut steps = Vec::new();
     let controlled = !matches!(fixture.expected, Expected::External);
     let context = coverage_context(info, discovered);
@@ -1269,9 +1272,16 @@ fn warm_aba(
             digests: hashes,
             equal_to_previous_same_address: equality,
         });
+        cached.admit(info, view, decompiled);
         // A/B/A can acquire shared global types even with an unchanged function
         // inventory. Preserve every difference; each result was validated above.
     }
+    let cached_visits = cached.measure(pair);
+    let memory = sampler.sample();
+    json_line(
+        &mut sampler.records,
+        &json!({ "phase": "cached_function_visits", "cached_visits": cached_visits, "memory_with_store": memory }),
+    );
     let repeated_address_digests_equal = steps
         .iter()
         .all(|step| step.equal_to_previous_same_address != Some(false));

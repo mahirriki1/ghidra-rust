@@ -80,7 +80,13 @@ def summarize(path):
     for record in accepted:
         if record["elapsed_us"]:
             phases[record["phase"]].append(record["elapsed_us"])
-    return {"file": path.name, "pid": records[0]["pid"] if records else None,
+    cache_events = collections.defaultdict(list)
+    for record in accepted:
+        if record["phase"].startswith(("function_result_", "result_store_")):
+            cache_events[record["phase"]].append(record["value"])
+    return {"cache_events": {name: {"events": len(values), "last_value": values[-1], "max_value": max(values)}
+                             for name, values in sorted(cache_events.items())},
+            "file": path.name, "pid": records[0]["pid"] if records else None,
             "process_complete": complete, "partial_tail": partial_tail,
             "records": len(records), "completed_requests": published,
             "includes_failed_requests": any(r["certified_prefix"] and r["result_error"] == 1 for r in published),
