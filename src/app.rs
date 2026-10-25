@@ -1476,6 +1476,7 @@ impl DesktopApp {
             let entry = crate::call_analysis::code_address(info, info.entry).then_some(info.entry);
             let partial = info.functions_truncated;
             let patterns = crate::discovery::Discovery::patterns_apply(info);
+            let elf_pointers = info.architecture == "x86-64" && info.format == "ELF";
             let generation = self.generation;
             let (sender, receiver) = mpsc::sync_channel(1);
             self.discovery_job = Some(receiver);
@@ -1483,7 +1484,7 @@ impl DesktopApp {
             std::thread::spawn(move || {
                 let mut state = crate::discovery::Discovery::new(entry, seeds, partial);
                 if patterns {
-                    state.start_patterns();
+                    state.start_sources(elf_pointers);
                 }
                 let _ = sender.send(DiscoveryUpdate {
                     generation,
@@ -3263,7 +3264,9 @@ impl DesktopApp {
                 !packed,
                 egui::Checkbox::new(&mut options.functions, "Function discovery and references"),
             )
-            .on_hover_text("Follows confirmed direct calls and indexes call and data references.");
+            .on_hover_text(
+                "Recovers functions from calls, patterns and ELF pointers; indexes references.",
+            );
             if packed {
                 ui.colored_label(theme::WARNING, crate::packing::UPX_ANALYSIS_ERROR);
             }
@@ -4471,13 +4474,30 @@ impl DesktopApp {
                     RichText::new(format!("{:0digits$x}", function.address)).monospace(),
                     theme::MUTED,
                 );
+                let witness = self
+                    .discovery
+                    .as_ref()
+                    .and_then(|state| state.admission(function.address));
+                let marker_width = if witness.is_some() { 12.0 } else { 0.0 };
+                if witness.is_some() {
+                    theme::cell_text(
+                        ui,
+                        rect.with_min_x(rect.left() + name_x),
+                        RichText::new("◆"),
+                        theme::MUTED,
+                    );
+                }
                 theme::cell_text(
                     ui,
-                    rect.with_min_x(rect.left() + name_x),
+                    rect.with_min_x(rect.left() + name_x + marker_width),
                     RichText::new(label).monospace(),
                     theme::TEXT,
                 );
-                let response = response.on_hover_text(format!("{:x}  {}", function.address, label));
+                let detail = witness
+                    .map(|w| format!("\n{}", w.hover_text()))
+                    .unwrap_or_default();
+                let response =
+                    response.on_hover_text(format!("{:x}  {}{}", function.address, label, detail));
                 if response.clicked() {
                     navigate = Some(function.address);
                 }
@@ -9579,6 +9599,9 @@ mod tests {
                 decode_attempts: 2,
                 ..Default::default()
             },
+            pointers: None,
+            admissions: Vec::new(),
+            recovery_records: 0,
         };
         crate::discovery::commit_replacement(&mut state, &info, &batch).unwrap();
         let saved = Arc::new(state.save());
@@ -10062,6 +10085,9 @@ mod tests {
                 }],
                 ..Default::default()
             },
+            pointers: None,
+            admissions: Vec::new(),
+            recovery_records: 0,
         };
         app.discovery = Some(state);
         app.call_index = Some(crate::call_analysis::CallIndex::new(CallAnalysis::default()));

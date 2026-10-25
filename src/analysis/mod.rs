@@ -14,7 +14,9 @@ use sha2::{Digest, Sha256};
 use crate::model::*;
 
 mod cfg;
+mod function_candidates;
 mod patterns;
+mod pointers;
 mod strings;
 
 use cfg::*;
@@ -44,6 +46,7 @@ pub struct LoadedProgram {
     inventory: crate::inventory::Inventory,
     /// Instructions decoded from established functions in this worker.
     coverage: Coverage,
+    pointers: Option<pointers::PointerRecovery>,
     /// Calls that never return, from the image's own symbols and imports.
     no_return: Arc<crate::no_return::NoReturnIndex>,
     signatures: Vec<crate::signatures::FunctionSignature>,
@@ -373,6 +376,7 @@ impl LoadedProgram {
             info,
             inventory,
             coverage: Coverage::default(),
+            pointers: None,
             no_return: Arc::new(no_return),
             signatures: Vec::new(),
             applied_signatures: BTreeSet::new(),
@@ -445,6 +449,7 @@ impl LoadedProgram {
             recover_graph_budgeted(
                 &self.program,
                 &Bounds {
+                    tail_entry: None,
                     sections: &self.info.sections,
                     is_function: &is_function,
                     pe_ranges: &self.pe_ranges,
@@ -458,6 +463,7 @@ impl LoadedProgram {
             recover_graph_switched(
                 &mut self.program,
                 &Bounds {
+                    tail_entry: None,
                     sections: &self.info.sections,
                     is_function: &is_function,
                     pe_ranges: &self.pe_ranges,
@@ -524,7 +530,47 @@ impl LoadedProgram {
                 binding,
                 inventory_base,
                 seeds,
-                patterns: Some(cursor),
+                patterns: Some(DiscoveryCursor::Pointers(cursor)),
+            } => {
+                self.check_unpacked()?;
+                if !seeds.is_empty() {
+                    return Err("A pointer scan has no seeds".into());
+                }
+                let empty = AnalysisProgress {
+                    stage: AnalysisStage::Seeds,
+                    functions_examined: 0,
+                    decode_attempts: 0,
+                };
+                progress(empty.clone())?;
+                let certificate = self.inventory.take_certificate(&self.info.functions);
+                let (scan, discovered, admissions) = self.scan_pointers(cursor)?;
+                self.update_batch_inventory(certificate, &BTreeSet::new(), discovered)?;
+                let inventory = self
+                    .inventory
+                    .publish(inventory_base, &self.info.functions)?;
+                progress(AnalysisProgress {
+                    stage: AnalysisStage::Publish,
+                    ..empty
+                })?;
+                Ok(Response::DiscoveryBatch {
+                    batch: DiscoveryBatch {
+                        binding,
+                        inventory,
+                        truncated: self.info.functions_truncated,
+                        analysis: CallAnalysis::default(),
+                        outcomes: Vec::new(),
+                        patterns: None,
+                        pointers: Some(Box::new(scan)),
+                        admissions,
+                        recovery_records: 0,
+                    },
+                })
+            }
+            Request::DiscoverBatch {
+                binding,
+                inventory_base,
+                seeds,
+                patterns: Some(crate::model::DiscoveryCursor::Patterns(cursor)),
             } => {
                 self.check_unpacked()?;
                 if !seeds.is_empty() {
@@ -558,7 +604,22 @@ impl LoadedProgram {
                             ..Default::default()
                         },
                         outcomes: Vec::new(),
+                        admissions: scan
+                            .admitted
+                            .iter()
+                            .map(|&entry| FunctionAdmission {
+                                entry,
+                                reason: AdmissionReason::Pattern,
+                                source: entry,
+                                owner: None,
+                                encoding: PointerEncoding::Direct,
+                                boundary: BoundaryEvidence::Pattern,
+                                table: None,
+                            })
+                            .collect(),
                         patterns: Some(scan),
+                        pointers: None,
+                        recovery_records: 0,
                     },
                 })
             }
@@ -583,6 +644,7 @@ impl LoadedProgram {
                 let certificate = self.inventory.take_certificate(&self.info.functions);
                 let (analysis, outcomes, discovered) =
                     self.discover_calls(Some(&seeds), progress)?;
+                let recovery_records = self.take_pointer_preparation();
                 let owners = outcomes.iter().map(|outcome| outcome.address).collect();
                 self.update_batch_inventory(certificate, &owners, discovered)?;
                 #[cfg(debug_assertions)]
@@ -612,6 +674,9 @@ impl LoadedProgram {
                         analysis,
                         outcomes,
                         patterns: None,
+                        pointers: None,
+                        admissions: Vec::new(),
+                        recovery_records,
                     },
                 })
             }
@@ -808,6 +873,7 @@ impl LoadedProgram {
         progress: &mut dyn FnMut(AnalysisProgress) -> Result<(), String>,
     ) -> Result<(CallAnalysis, Vec<DiscoveryOutcome>, Discovered), String> {
         let _discovery = crate::performance::span("discovery_decode_cfg_data_admission");
+        self.prepare_pointers();
         // Adapted from Ghidra FunctionAnalyzer's established-call rule and its
         // fallthrough-call exclusion. See NOTICE and docs/analysis.md. Decode
         // through public pinned-engine APIs; never promote arbitrary constants.
@@ -911,6 +977,11 @@ impl LoadedProgram {
                 walk.run(
                     &self.program,
                     &Bounds {
+                        tail_entry: Some(&|a| {
+                            self.pointers
+                                .as_ref()
+                                .is_some_and(|p| p.metadata.fdes.contains_key(&a))
+                        }),
                         sections,
                         is_function: &|candidate| known(&added, candidate),
                         pe_ranges,
@@ -944,6 +1015,11 @@ impl LoadedProgram {
                     pending.run(
                         &self.program,
                         &Bounds {
+                            tail_entry: Some(&|a| {
+                                self.pointers
+                                    .as_ref()
+                                    .is_some_and(|p| p.metadata.fdes.contains_key(&a))
+                            }),
                             sections,
                             is_function: &|candidate| known(&added, candidate),
                             pe_ranges,
@@ -1111,6 +1187,7 @@ impl LoadedProgram {
             let Ok(recovered) = recover_graph_budgeted(
                 &self.program,
                 &Bounds {
+                    tail_entry: None,
                     sections: &self.info.sections,
                     is_function: &|pc| function_at(&self.info.functions, pc).is_some(),
                     pe_ranges: &self.pe_ranges,
@@ -1524,6 +1601,7 @@ pub(crate) mod tests {
             upx_packed: false,
             inventory: Default::default(),
             coverage: Coverage::default(),
+            pointers: None,
             no_return: Arc::default(),
             signatures: Vec::new(),
             applied_signatures: BTreeSet::new(),
@@ -1673,6 +1751,7 @@ pub(crate) mod tests {
         walk.run(
             &loaded.program,
             &Bounds {
+                tail_entry: None,
                 sections: &loaded.info.sections,
                 is_function: &|pc| pc == 0x1020,
                 pe_ranges: &[],
@@ -2242,6 +2321,7 @@ pub(crate) mod tests {
             upx_packed: false,
             inventory: Default::default(),
             coverage: Coverage::default(),
+            pointers: None,
             no_return: Arc::default(),
             signatures: Vec::new(),
             applied_signatures: BTreeSet::new(),
@@ -2339,6 +2419,7 @@ pub(crate) mod tests {
             walk.run(
                 &program,
                 &Bounds {
+                    tail_entry: None,
                     sections: &sections,
                     is_function: &is_function,
                     pe_ranges: &[],
@@ -2398,6 +2479,7 @@ pub(crate) mod tests {
         walk.run(
             &program,
             &Bounds {
+                tail_entry: None,
                 sections: &sections,
                 is_function: &|_| false,
                 pe_ranges: &[],
@@ -2426,6 +2508,7 @@ pub(crate) mod tests {
         walk.run(
             &program,
             &Bounds {
+                tail_entry: None,
                 sections: &sections,
                 is_function: &|_| false,
                 pe_ranges: &[],
@@ -2481,6 +2564,7 @@ pub(crate) mod tests {
         walk.run(
             &program,
             &Bounds {
+                tail_entry: None,
                 sections: &sections,
                 is_function: &|_| false,
                 pe_ranges: &[],

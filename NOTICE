@@ -31,6 +31,23 @@ The Rust adaptation admits only funcstart actions, requires each candidate's
 code to decode completely outside established code, and uses bounded,
 resumable scanning instead of the Java Program database.
 
+Ghidra-derived address-table recovery
+
+src/code_pointers.rs, src/analysis/pointers.rs and
+src/analysis/function_candidates.rs adapt aligned pointer-run search,
+relocation guidance, executable-target and offcut/collision checks from:
+https://github.com/NationalSecurityAgency/ghidra/blob/8ca9077040cc43cd790babcfccf19475622a3e9a/Ghidra/Features/Base/src/main/java/ghidra/app/plugin/core/disassembler/AddressTableAnalyzer.java
+https://github.com/NationalSecurityAgency/ghidra/blob/8ca9077040cc43cd790babcfccf19475622a3e9a/Ghidra/Features/Base/src/main/java/ghidra/app/plugin/core/disassembler/AddressTable.java
+https://github.com/NationalSecurityAgency/ghidra/blob/8ca9077040cc43cd790babcfccf19475622a3e9a/Ghidra/Features/BytePatterns/src/main/java/ghidra/app/analyzers/FunctionStartAnalyzer.java
+
+Upstream revision: 8ca9077040cc43cd790babcfccf19475622a3e9a (Ghidra 12.2).
+License: Apache License, Version 2.0 (see LICENSE).
+Ghidra's AddressTableAnalyzer leaves function creation disabled. This adaptation
+adds independent ELF FDE/pattern corroboration, bounded complete CFG validation,
+resumable parent-owned work and in-memory admission witnesses. The small ELF
+init/fini and FDE-range reader is an independent implementation, not an unwinder.
+Existing vendored pattern data retains its separate revision above.
+
 Ghidra named no-return functions
 
 The three data/no-return/*FunctionsThatDoNotReturn files are copied unchanged
