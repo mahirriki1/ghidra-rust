@@ -6,10 +6,14 @@
 use crate::model::FileIdentity;
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::windows::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawHandle};
+use std::os::windows::{
+    ffi::OsStrExt,
+    fs::OpenOptionsExt,
+    io::{AsRawHandle, FromRawHandle, OwnedHandle},
+};
 use std::path::Path;
 use std::process::Child;
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::*;
 use windows_sys::Win32::System::Diagnostics::ToolHelp::*;
 use windows_sys::Win32::System::JobObjects::*;
@@ -200,26 +204,27 @@ fn move_file(temporary: &Path, destination: &Path, flags: u32) -> io::Result<()>
     Ok(())
 }
 
-struct Handle(HANDLE);
+struct Handle(OwnedHandle);
 
 impl Handle {
     fn new(handle: HANDLE) -> io::Result<Self> {
         if handle.is_null() || handle == INVALID_HANDLE_VALUE {
             Err(io::Error::last_os_error())
         } else {
-            Ok(Self(handle))
+            // SAFETY: callers pass uniquely owned kernel handles returned by
+            // successful CreateJobObjectW, CreateToolhelp32Snapshot, or OpenThread
+            // calls. Null and INVALID_HANDLE_VALUE were rejected above. OwnedHandle
+            // closes exactly once and safely transfers ownership between threads.
+            Ok(Self(unsafe { OwnedHandle::from_raw_handle(handle) }))
         }
     }
-}
 
-impl Drop for Handle {
-    fn drop(&mut self) {
-        // SAFETY: Handle is constructed only from an owned, successful API result.
-        unsafe { CloseHandle(self.0) };
+    fn as_raw_handle(&self) -> HANDLE {
+        self.0.as_raw_handle()
     }
 }
 
-/// Retained by the GUI. Closing the last non-inherited job handle terminates
+/// Retained until worker shutdown. Closing the last non-inherited job handle terminates
 /// its worker even if the GUI exits without running Rust destructors.
 pub struct WorkerJob {
     _handle: Handle,
@@ -241,7 +246,7 @@ impl WorkerJob {
         // SAFETY: initialized limits structure and a live, owned job handle.
         if unsafe {
             SetInformationJobObject(
-                job.0,
+                job.as_raw_handle(),
                 JobObjectExtendedLimitInformation,
                 (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
                 std::mem::size_of_val(&limits) as u32,
@@ -251,7 +256,7 @@ impl WorkerJob {
             return Err(io::Error::last_os_error());
         }
         // SAFETY: job and child handles remain live throughout assignment.
-        if unsafe { AssignProcessToJobObject(job.0, child.as_raw_handle()) } == 0 {
+        if unsafe { AssignProcessToJobObject(job.as_raw_handle(), child.as_raw_handle()) } == 0 {
             return Err(io::Error::last_os_error());
         }
         resume_initial_thread(child.id())?;
@@ -270,7 +275,7 @@ fn resume_initial_thread(process_id: u32) -> io::Result<()> {
         ..Default::default()
     };
     // SAFETY: entry has the documented size and remains writable for enumeration.
-    let mut exists = unsafe { Thread32First(snapshot.0, &mut entry) } != 0;
+    let mut exists = unsafe { Thread32First(snapshot.as_raw_handle(), &mut entry) } != 0;
     let mut initial_thread = None;
     while exists {
         if entry.th32OwnerProcessID == process_id
@@ -282,7 +287,7 @@ fn resume_initial_thread(process_id: u32) -> io::Result<()> {
         }
         entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
         // SAFETY: same initialized writable entry and live snapshot as above.
-        exists = unsafe { Thread32Next(snapshot.0, &mut entry) } != 0;
+        exists = unsafe { Thread32Next(snapshot.as_raw_handle(), &mut entry) } != 0;
     }
     // SAFETY: read immediately after the failed enumeration call. Any failure
     // other than end-of-list could hide another thread, so fail closed.
@@ -296,7 +301,7 @@ fn resume_initial_thread(process_id: u32) -> io::Result<()> {
     // only permission to resume the one thread found for that process.
     let thread = Handle::new(unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, thread_id) })?;
     // SAFETY: thread is a live handle with THREAD_SUSPEND_RESUME access.
-    let suspended = unsafe { ResumeThread(thread.0) };
+    let suspended = unsafe { ResumeThread(thread.as_raw_handle()) };
     if suspended != 1 {
         return Err(if suspended == u32::MAX {
             io::Error::last_os_error()
@@ -405,7 +410,7 @@ mod tests {
         assert_ne!(
             unsafe {
                 QueryInformationJobObject(
-                    job._handle.0,
+                    job._handle.as_raw_handle(),
                     JobObjectExtendedLimitInformation,
                     (&mut limits as *mut JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
                     std::mem::size_of_val(&limits) as u32,
@@ -417,7 +422,9 @@ mod tests {
         assert_eq!(limits.ProcessMemoryLimit, 2 * 1024 * 1024 * 1024);
         assert_eq!(limits.BasicLimitInformation.ActiveProcessLimit, 1);
         assert!(child.try_wait().unwrap().is_none());
-        drop(job);
+        // The updater transfers worker ownership to a background job. Closing
+        // the owned job handle there must retain kill-on-close behavior.
+        std::thread::spawn(move || drop(job)).join().unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             if child.try_wait().unwrap().is_some() {
