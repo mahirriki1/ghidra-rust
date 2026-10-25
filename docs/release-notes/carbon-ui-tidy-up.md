@@ -6,3 +6,6 @@
   both tree views when full tab names do not fit.
 - Move feature explanations into concise tooltips and warning menus while keeping
   partial coverage, unsupported results, and decoding uncertainty visible.
+- Stabilize Functions and Strings scrolling at fractional Linux display scales:
+  use vertical-only lists where appropriate and pixel-snapped widths for tables
+  that need horizontal scrolling, ignoring sub-pixel overflow.

@@ -561,7 +561,10 @@ pub fn rows<R>(
     let mut result = None;
     let salt = egui::IdSalt::new(id_salt);
     let id = ui.make_persistent_id(egui::IdSalt::new(salt));
-    let mut area = egui::ScrollArea::both()
+    let horizontal = content_width > 0.0;
+    let pixels_per_point = ui.pixels_per_point();
+    let pixel = 1.0 / pixels_per_point;
+    let mut area = egui::ScrollArea::new([horizontal, true])
         .id_salt(salt)
         .auto_shrink([false, false]);
     // Apply the reveal before showing so the row is in view on this frame.
@@ -569,7 +572,19 @@ pub fn rows<R>(
         let offset = egui::scroll_area::State::load(ui.ctx(), id)
             .map_or(0.0, |state| state.clamped_offset().y);
         // A horizontal scroll bar's gutter hides the bottom of the view.
-        let height = ui.available_height() - ui.spacing().scroll.allocated_width();
+        let gutter = ui.spacing().scroll.allocated_width();
+        let viewport_width = ui.available_width()
+            - if row_height * count as f32 > ui.available_height() {
+                gutter
+            } else {
+                0.0
+            };
+        let height = ui.available_height()
+            - if horizontal && content_width > viewport_width + pixel {
+                gutter
+            } else {
+                0.0
+            };
         if !row_visible(egui::Rangef::new(offset, offset + height), row_height, row) {
             let content = row_height * count as f32;
             let centered = (row as f32 + 0.5) * row_height - height / 2.0;
@@ -577,7 +592,17 @@ pub fn rows<R>(
         }
     }
     let output = area.show_viewport(ui, |ui, viewport| {
-        let width = content_width.max(ui.available_width());
+        // egui pixel-rounds the child rect independently of the viewport.
+        // Filling that rounded child can exceed the viewport by a fraction of
+        // a pixel and enable a needless bar. Fit against the actual viewport,
+        // snap real horizontal content, and ignore sub-pixel overflow.
+        let fit_width = (viewport.width() * pixels_per_point).floor() / pixels_per_point;
+        let requested_width = (content_width * pixels_per_point).round() / pixels_per_point;
+        let width = if horizontal && requested_width > viewport.width() + pixel {
+            requested_width
+        } else {
+            fit_width
+        };
         let origin = ui.max_rect().min;
         ui.allocate_rect(
             egui::Rect::from_min_size(origin, egui::vec2(width, row_height * count as f32)),
@@ -697,6 +722,78 @@ pub fn scaled_radius(zoom: f32) -> u8 {
 #[cfg(test)]
 mod tests {
     use eframe::egui;
+
+    #[test]
+    fn fractional_scale_rows_keep_scrollbars_geometry_and_offsets_stable() {
+        for scale in [1.25, 1.5] {
+            for requested in [0.0, 250.1, 450.3] {
+                let context = egui::Context::default();
+                super::install(&context);
+                context.set_pixels_per_point(scale);
+                context.style_mut_of(egui::Theme::Dark, |style| style.animation_time = 0.0);
+                let mut stable = None;
+                for frame in 0..24 {
+                    let mut output = context.run_ui(
+                        egui::RawInput {
+                            time: Some(frame as f64 * 0.1),
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(260.0, 400.0),
+                            )),
+                            ..Default::default()
+                        },
+                        |ui| {
+                            let (_, out) = super::rows::<()>(
+                                ui,
+                                "fractional-rows",
+                                1000,
+                                20.0,
+                                requested,
+                                None,
+                                |ui, row, rect| {
+                                    let _ = super::row_response(
+                                        ui,
+                                        ui.scope_id().with(row),
+                                        rect,
+                                        false,
+                                        false,
+                                    );
+                                    super::cell_text(ui, rect, "A function or string", super::TEXT);
+                                    None
+                                },
+                            );
+                            // After the vertical gutter settles, a 0.1-point excess is
+                            // below one physical pixel and must not enable horizontal scrolling.
+                            if frame >= 3 {
+                                let horizontal = out.content_size.x > out.inner_rect.width().ceil();
+                                assert_eq!(
+                                    horizontal,
+                                    requested > 400.0,
+                                    "scale={scale}, width={requested}: content={:?} inner={:?}",
+                                    out.content_size,
+                                    out.inner_rect
+                                );
+                                let geometry = (
+                                    horizontal,
+                                    out.content_size.y > out.inner_rect.height(),
+                                    out.inner_rect,
+                                    out.state.clamped_offset(),
+                                );
+                                if let Some(previous) = stable {
+                                    assert_eq!(
+                                        geometry, previous,
+                                        "scale={scale}, width={requested}, frame={frame}"
+                                    );
+                                }
+                                stable = Some(geometry);
+                            }
+                        },
+                    );
+                    output.textures_delta.clear();
+                }
+            }
+        }
+    }
 
     #[test]
     fn narrow_dock_headers_keep_painted_saved_text_and_both_views_reachable() {
