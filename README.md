@@ -103,7 +103,8 @@ fixed gutters at view edges, controls are soft and borderless, and the dragon's
 orange marks selection and focus. Instructions related to a selection are tinted
 more softly than the selection itself. Explanations of coverage limits and
 interactions live in tooltips; status lines, errors, and provenance or
-partial-coverage warnings stay visible.
+partial-coverage warnings stay visible. The bottom status bar stays on one line;
+hover elided status text or the activity bar for details.
 Listing columns and graph blocks are colored, with slightly rounded blocks.
 Decompiled code uses a One Dark-style palette for keywords, types, function
 names, comments, constants/strings, and identifiers. Highlighting is lexical; semantic
@@ -224,10 +225,10 @@ editor, not general type or variable-storage editing.
   point. PE exports and supported x64/ARM64 exception-table function entries load
   on open, including stripped images. In stripped dynamically linked x86-64 ELF
   executables, `main` is recovered from glibc's startup call to
-  `__libc_start_main` and labeled as analysis-derived in **Analysis notes**
+  `__libc_start_main` and labeled as analysis-derived in the status warning popup
   ([details](docs/analysis.md#stripped-elf-startup)). The list is capped at 262,144 entries and
-  8 MiB of names; large PEs prioritize the entry point, exports, and runtime
-  functions near entry, with a visible partial-list notice. Projects containing
+  8 MiB of names, with 256 bytes per name; large PEs prioritize the entry point,
+  exports, and runtime functions near entry, with a visible partial-list notice. Projects containing
   more than 10,000 functions cannot be opened by releases before this limit.
   **Discover functions** follows confirmed decoded direct calls from known entries
   on every supported architecture in resumable bounded batches. Discover starts or
@@ -280,7 +281,8 @@ editor, not general type or variable-storage editing.
   that no references exist.
 - Scan mapped bytes for ASCII and a printable ASCII subset of UTF-16LE strings.
   The tree shows **not scanned** until a scan runs. This is not complete Unicode
-  or Rust string-slice recovery. **Analysis notes** shows loading and coverage limits.
+  or Rust string-slice recovery. The status warning indicator shows a count only
+  when loading or coverage notes exist; click it to read them.
   The Strings tab defaults to six characters and accepts a minimum from 4 to 64.
   This minimum applies before the 10,000-result cap; the text filter searches only
   loaded results. Increase the minimum and rescan when short-string noise fills the
@@ -379,9 +381,19 @@ canceling, a transport failure, or a 30-second wall-time limit stops that worker
 The next action can reopen it. UI results are bound to the current request,
 selection, and annotation state. Dialogs, session I/O, and decoding jobs run in
 background threads. Lists draw visible rows and graph geometry is cached.
-Analysis jobs lasting over 200 ms show a compact animated bar at the bottom right,
-with the active task and elapsed time. It indicates activity without estimating
-a completion percentage. **Analysis → Cancel analysis** stops the worker.
+Analysis runs lasting over 200 ms show a compact bar at the bottom right. It stays
+visible between discovery batches, during adoption and worker setup, and while
+foreground navigation takes priority. Elapsed time includes those waits and
+continues across automatic-analysis steps and worker recovery. A selected-step
+ordinal identifies the current analysis, not an equal portion of runtime.
+Known-function walks show processed/admitted counts with a solid fill: in-flight
+functions remain unfinished, while failed and limited attempts count as processed.
+The admitted total can grow and the fill can decrease as new functions are found;
+this is not whole-program coverage or an ETA. Strings, constants, setup, adoption,
+waits, and function-start patterns use animated activity instead. Hover for counts,
+phase details, and foreground work. **Analysis → Cancel analysis** clears the bar
+immediately and stops the worker; resuming Discover starts a new elapsed clock
+while retaining committed counts. Saved projects do not start a live progress bar.
 Function discovery reports cumulative examined/remaining function counts, committed
 batches, and partial or complete seed coverage. Each batch also reports Seeds,
 Calls, and Publish stages with decode-attempt counts. Its total can grow as calls
