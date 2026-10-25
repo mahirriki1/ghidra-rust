@@ -292,20 +292,50 @@ pub fn history_button(ui: &mut Ui, forward: bool, enabled: bool) -> egui::Respon
 
 /// An editor-style tab on a recessed strip, with trailing actions. `active`
 /// marks the focused provider with an accent rule.
-pub fn dock_header(ui: &mut Ui, title: &str, active: bool, actions: impl FnOnce(&mut Ui)) {
+pub fn dock_header(
+    ui: &mut Ui,
+    title: &str,
+    active: bool,
+    saved: Option<(&str, &str)>,
+    actions: impl FnOnce(&mut Ui),
+) {
     let mut current = active;
-    dock_tabs(ui, &mut current, &[(active, title)], actions);
+    dock_tabs(ui, &mut current, &[(active, title)], saved, actions);
+}
+
+/// The narrowest title `dock_tabs` reserves: an ellipsis and tight padding.
+fn minimum_dock_title(ui: &Ui) -> f32 {
+    ui.painter()
+        .layout_no_wrap("…".into(), FontId::proportional(13.0), TEXT)
+        .size()
+        .x
+        + 8.0f32.max(ui.spacing().button_padding.x * 2.0)
+}
+
+/// Extra width a lone `dock_header` title needs to show in full, so headers can
+/// drop optional actions before the title ellipsizes.
+pub fn dock_title_room(ui: &Ui, title: &str) -> f32 {
+    let full = ui
+        .painter()
+        .layout_no_wrap(title.to_owned(), FontId::proportional(13.0), TEXT)
+        .size()
+        .x
+        + 23.0;
+    (full - minimum_dock_title(ui)).max(0.0)
 }
 
 /// A dock title strip whose entries are editor-style tabs; the selected tab
-/// joins the pane below it. Returns whether the selection changed.
+/// joins the pane below it. `saved` supplies the preferred provenance label and
+/// tooltip; narrow strips shorten it to "Saved". Returns whether selection changed.
 pub fn dock_tabs<T: PartialEq + Copy>(
     ui: &mut Ui,
     current: &mut T,
     tabs: &[(T, &str)],
+    saved: Option<(&str, &str)>,
     actions: impl FnOnce(&mut Ui),
 ) -> bool {
     const HEIGHT: f32 = 26.0;
+    const GAP: f32 = 4.0;
     let mut changed = false;
     let (strip, _) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), HEIGHT),
@@ -318,28 +348,6 @@ pub fn dock_tabs<T: PartialEq + Copy>(
         strip.bottom() - 0.5,
         Stroke::new(1.0, BORDER),
     );
-    // Lay out the actual trailing widgets first, using their own text styles.
-    // Their measured bounds reserve space before any tab paint or hit regions.
-    let actions_rect = strip.shrink2(egui::vec2(4.0, 0.0));
-    let mut actions_ui = ui.new_child(
-        egui::UiBuilder::new()
-            .id_salt("dock-actions")
-            .max_rect(actions_rect)
-            .layout(egui::Layout::right_to_left(egui::Align::Center)),
-    );
-    actions_ui.set_clip_rect(actions_rect.intersect(ui.clip_rect()));
-    actions(&mut actions_ui);
-    let actions_width = actions_ui.min_rect().width();
-    let tabs_right = if actions_width > 0.0 {
-        actions_rect.right() - actions_width - 8.0
-    } else {
-        strip.right()
-    };
-    let tabs_rect = egui::Rect::from_min_max(
-        strip.min,
-        egui::pos2(tabs_right.max(strip.left()), strip.bottom()),
-    );
-    let painter = painter.with_clip_rect(tabs_rect.intersect(ui.clip_rect()));
     let font = FontId::proportional(13.0);
     let tab_width: f32 = tabs
         .iter()
@@ -351,24 +359,125 @@ pub fn dock_tabs<T: PartialEq + Copy>(
                 + 23.0
         })
         .sum();
-    if tab_width > tabs_rect.width() {
-        let selected = tabs
-            .iter()
-            .find(|(value, _)| value == current)
-            .unwrap_or(&tabs[0]);
-        let label = match selected.1 {
-            "Symbol Tree" => "Symbols",
-            "Program Trees" => "Program",
-            name => name,
+    let selected = tabs
+        .iter()
+        .find(|(value, _)| value == current)
+        .unwrap_or(&tabs[0]);
+    let face = match selected.1 {
+        "Symbol Tree" => "Symbols",
+        "Program Trees" => "Program",
+        name => name,
+    };
+    let face_width = egui::WidgetText::from(face)
+        .into_galley(
+            ui,
+            Some(egui::TextWrapMode::Extend),
+            f32::INFINITY,
+            TextStyle::Button,
+        )
+        .size()
+        .x
+        + ui.spacing().button_padding.x * 2.0;
+    let provenance_width = |label: &str| {
+        egui::WidgetText::from(RichText::new(label).weak())
+            .into_galley(
+                ui,
+                Some(egui::TextWrapMode::Extend),
+                f32::INFINITY,
+                TextStyle::Body,
+            )
+            .size()
+            .x
+    };
+    let compact_saved = saved.map_or(0.0, |_| provenance_width("Saved"));
+    let full_saved = saved.map_or(0.0, |(preferred, _)| provenance_width(preferred));
+    let minimum_title = minimum_dock_title(ui);
+    let saved_gap = if saved.is_some() { GAP } else { 0.0 };
+    // Protect a compact provenance label and an ellipsis before registering
+    // trailing controls. Counts stay at the right; neither can consume the title.
+    let actions_rect = egui::Rect::from_min_max(
+        egui::pos2(
+            (strip.left() + minimum_title + GAP + compact_saved + saved_gap)
+                .min(strip.right() - 4.0),
+            strip.top(),
+        ),
+        egui::pos2(strip.right() - 4.0, strip.bottom()),
+    );
+    let mut actions_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .id_salt("dock-actions")
+            .max_rect(actions_rect)
+            .layout(egui::Layout::right_to_left(egui::Align::Center)),
+    );
+    // Text origins are pixel-rounded independently of galley widths. Leave
+    // one physical pixel of paint room inside the nonoverlapping strip gaps.
+    let paint_slack = egui::vec2(1.0 / ui.pixels_per_point(), 0.0);
+    actions_ui.set_clip_rect(
+        actions_rect
+            .expand2(paint_slack)
+            .intersect(strip)
+            .intersect(ui.clip_rect()),
+    );
+    actions(&mut actions_ui);
+    let actions_left = if actions_ui.min_rect().width() > 0.0 {
+        actions_ui.min_rect().left().max(actions_rect.left()) - GAP
+    } else {
+        strip.right() - 4.0
+    };
+    let mut tabs_right = actions_left;
+    if let Some((preferred, tooltip)) = saved {
+        let full_width = full_saved;
+        let available = actions_left - strip.left() - saved_gap;
+        let all_tabs_fit_compact = tab_width + compact_saved <= available;
+        let keep_full = tab_width + full_width <= available
+            || (tabs.len() > 1 && !all_tabs_fit_compact && face_width + full_width <= available);
+        let (label, width) = if keep_full {
+            (preferred, full_width)
+        } else {
+            ("Saved", compact_saved)
         };
+        let saved_rect = egui::Rect::from_min_max(
+            egui::pos2(actions_left - width, strip.top()),
+            egui::pos2(actions_left, strip.bottom()),
+        );
+        let mut saved_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt("dock-saved")
+                .max_rect(saved_rect)
+                .layout(egui::Layout::right_to_left(egui::Align::Center)),
+        );
+        saved_ui.set_clip_rect(
+            saved_rect
+                .expand2(paint_slack)
+                .intersect(strip)
+                .intersect(ui.clip_rect()),
+        );
+        saved_ui.weak(label).on_hover_text(tooltip);
+        tabs_right = saved_rect.left() - saved_gap;
+    }
+    let tabs_rect = egui::Rect::from_min_max(
+        strip.min,
+        egui::pos2(tabs_right.max(strip.left()), strip.bottom()),
+    );
+    let painter = painter.with_clip_rect(tabs_rect.intersect(ui.clip_rect()));
+    // A lone title ellipsizes in place; tab pairs collapse to a view menu.
+    if tabs.len() > 1 && tab_width > tabs_rect.width() {
         let mut tabs_ui = ui.new_child(
             egui::UiBuilder::new()
                 .id_salt("dock-overflow")
                 .max_rect(tabs_rect)
                 .layout(egui::Layout::left_to_right(egui::Align::Center)),
         );
-        tabs_ui.set_clip_rect(tabs_rect.intersect(ui.clip_rect()));
-        tabs_ui.menu_button(RichText::new(label).color(TEXT), |ui| {
+        tabs_ui.set_clip_rect(
+            tabs_rect
+                .expand2(paint_slack)
+                .intersect(strip)
+                .intersect(ui.clip_rect()),
+        );
+        egui::containers::menu::MenuButton::from_button(
+            egui::Button::new(RichText::new(face).color(TEXT)).truncate(),
+        )
+        .ui(&mut tabs_ui, |ui| {
             for (value, label) in tabs {
                 if ui.selectable_label(*current == *value, *label).clicked() {
                     changed = *current != *value;
@@ -376,16 +485,28 @@ pub fn dock_tabs<T: PartialEq + Copy>(
                     ui.close();
                 }
             }
-        });
+        })
+        .0
+        .on_hover_text(selected.1);
         ui.add_space(2.0);
         return changed;
     }
+    // An elided lone title tightens its padding so counts keep their room.
+    let pad = if tab_width > tabs_rect.width() {
+        4.0
+    } else {
+        11.0
+    };
     let mut x = strip.left();
     for (index, (value, label)) in tabs.iter().enumerate() {
-        let galley = painter.layout_no_wrap((*label).to_owned(), font.clone(), TEXT);
+        let mut job =
+            egui::text::LayoutJob::simple_singleline((*label).to_owned(), font.clone(), TEXT);
+        job.wrap = egui::text::TextWrapping::truncate_at_width(tabs_rect.width() - pad * 2.0);
+        let galley = painter.layout_job(job);
+        let elided = galley.elided;
         let tab = egui::Rect::from_min_size(
             egui::pos2(x, strip.top() + 3.0),
-            egui::vec2(galley.size().x + 22.0, HEIGHT - 3.0),
+            egui::vec2(galley.size().x + pad * 2.0, HEIGHT - 3.0),
         );
         x = tab.right() + 1.0;
         let response = ui
@@ -395,6 +516,11 @@ pub fn dock_tabs<T: PartialEq + Copy>(
                 egui::Sense::click(),
             )
             .on_hover_cursor(egui::CursorIcon::Default);
+        let response = if elided {
+            response.on_hover_text(*label)
+        } else {
+            response
+        };
         let selected = *current == *value;
         response
             .widget_info(|| egui::WidgetInfo::selected(egui::Role::Tab, true, selected, *label));
@@ -423,7 +549,7 @@ pub fn dock_tabs<T: PartialEq + Copy>(
             );
         }
         painter.galley(
-            egui::pos2(tab.left() + 11.0, tab.center().y - galley.size().y / 2.0),
+            egui::pos2(tab.left() + pad, tab.center().y - galley.size().y / 2.0),
             galley,
             if selected { TEXT } else { MUTED },
         );
@@ -801,7 +927,6 @@ mod tests {
             let context = egui::Context::default();
             super::install(&context);
             let mut current = false;
-            let mut action = egui::Rect::NOTHING;
             let mut frame = |events: Vec<egui::Event>| {
                 let mut output = context.run_ui(
                     egui::RawInput {
@@ -817,9 +942,11 @@ mod tests {
                             ui,
                             &mut current,
                             &[(false, "Symbol Tree"), (true, "Program Trees")],
-                            |ui| {
-                                action = ui.weak("Saved").rect;
-                            },
+                            Some((
+                                "Saved",
+                                "Saved tree results; recompute each analysis to verify.",
+                            )),
+                            |_| {},
                         );
                     },
                 );
@@ -891,7 +1018,122 @@ mod tests {
                 assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == "Saved")));
                 assert!(current);
             }
-            assert!(action.left() >= saved.left() - 1.0);
+        }
+    }
+
+    #[test]
+    fn saved_dock_titles_truncate_without_clipping_provenance_or_counts() {
+        for scale in [1.0, 1.25] {
+            for width in [360.0, 260.0, 180.0, 120.0] {
+                for (title, count, partial) in [
+                    ("Functions", Some("15"), false),
+                    ("Functions", Some("262144"), false),
+                    ("Functions", Some("15"), width >= 180.0),
+                    ("Decompiler", None, false),
+                    ("Function Graph", None, false),
+                    ("Hex / Memory Map", None, false),
+                ] {
+                    let context = egui::Context::default();
+                    super::install(&context);
+                    context.set_pixels_per_point(scale);
+                    let mut title_rect = egui::Rect::NOTHING;
+                    let frame = || {
+                        let mut output = context.run_ui(
+                            egui::RawInput {
+                                screen_rect: Some(egui::Rect::from_min_size(
+                                    egui::Pos2::ZERO,
+                                    egui::vec2(width, 150.0),
+                                )),
+                                ..Default::default()
+                            },
+                            |ui| {
+                                super::dock_header(
+                                    ui,
+                                    title,
+                                    false,
+                                    Some(("Saved analysis", "Saved results")),
+                                    |ui| {
+                                        if title == "Decompiler" {
+                                            for label in ["Copy", "Refresh", "Signature…", "Auto"]
+                                            {
+                                                let _ = ui.small_button(label);
+                                            }
+                                        }
+                                        if let Some(count) = count {
+                                            ui.weak(count);
+                                        }
+                                        if partial {
+                                            ui.colored_label(super::WARNING, "Partial");
+                                        }
+                                    },
+                                );
+                            },
+                        );
+                        output.textures_delta.clear();
+                        output
+                    };
+                    frame();
+                    let output = frame();
+                    let mut saved_rect = egui::Rect::NOTHING;
+                    let mut count_rect = None;
+                    let mut found_title = false;
+                    for shape in &output.shapes {
+                        if let egui::Shape::Text(text) = &shape.shape {
+                            let label = text.galley.text();
+                            let bounds = text.galley.rect.translate(text.pos.to_vec2());
+                            if label == title
+                                || label == "Saved"
+                                || label == "Saved analysis"
+                                || Some(label) == count
+                                || label == "Partial"
+                            {
+                                assert!(
+                                    shape.clip_rect.contains_rect(bounds),
+                                    "{title}, width={width}, scale={scale}, label={label}: {bounds:?}, clip={:?}",
+                                    shape.clip_rect
+                                );
+                            }
+                            if label == title {
+                                found_title = true;
+                                title_rect = bounds;
+                                if title == "Functions" {
+                                    assert_eq!(text.galley.elided, width <= 120.0);
+                                }
+                                if text.galley.elided {
+                                    assert_eq!(
+                                        text.galley.rows.last().unwrap().glyphs.last().unwrap().chr,
+                                        '…'
+                                    );
+                                }
+                            } else if label == "Saved" || label == "Saved analysis" {
+                                assert!(
+                                    text.galley
+                                        .job
+                                        .sections
+                                        .iter()
+                                        .all(|section| section.format.color == super::MUTED)
+                                );
+                                saved_rect = bounds;
+                                if title == "Functions" {
+                                    let compact = width <= 180.0;
+                                    assert_eq!(
+                                        label,
+                                        if compact { "Saved" } else { "Saved analysis" }
+                                    );
+                                }
+                            } else if Some(label) == count {
+                                count_rect = Some(bounds);
+                            }
+                        }
+                    }
+                    assert!(found_title && saved_rect.is_positive());
+                    assert!(title_rect.right() <= saved_rect.left());
+                    assert_eq!(count_rect.is_some(), count.is_some());
+                    if let Some(count_rect) = count_rect {
+                        assert!(saved_rect.right() <= count_rect.left());
+                    }
+                }
+            }
         }
     }
 
