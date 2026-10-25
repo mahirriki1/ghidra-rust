@@ -59,6 +59,13 @@ pub struct HighlightedCode {
 }
 
 impl HighlightedCode {
+    /// Allocation capacity of the span cache, excluding the source text.
+    pub fn retained_bytes(&self) -> Option<usize> {
+        crate::result_store::Bytes::of::<Self>()
+            .slots::<Span>(self.spans.capacity())
+            .total()
+    }
+
     pub fn new(text: &str) -> Self {
         let mut code = Self {
             spans: Vec::new(),
