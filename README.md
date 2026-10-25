@@ -381,9 +381,19 @@ canceling, a transport failure, or a 30-second wall-time limit stops that worker
 The next action can reopen it. UI results are bound to the current request,
 selection, and annotation state. Dialogs, session I/O, and decoding jobs run in
 background threads. Lists draw visible rows and graph geometry is cached.
-Analysis jobs lasting over 200 ms show a compact animated bar at the bottom right,
-with the active task and elapsed time. It indicates activity without estimating
-a completion percentage. **Analysis → Cancel analysis** stops the worker.
+Analysis runs lasting over 200 ms show a compact bar at the bottom right. It stays
+visible between discovery batches, during adoption and worker setup, and while
+foreground navigation takes priority. Elapsed time includes those waits and
+continues across automatic-analysis steps and worker recovery. A selected-step
+ordinal identifies the current analysis, not an equal portion of runtime.
+Known-function walks show processed/admitted counts with a solid fill: in-flight
+functions remain unfinished, while failed and limited attempts count as processed.
+The admitted total can grow and the fill can decrease as new functions are found;
+this is not whole-program coverage or an ETA. Strings, constants, setup, adoption,
+waits, and function-start patterns use animated activity instead. Hover for counts,
+phase details, and foreground work. **Analysis → Cancel analysis** clears the bar
+immediately and stops the worker; resuming Discover starts a new elapsed clock
+while retaining committed counts. Saved projects do not start a live progress bar.
 Function discovery reports cumulative examined/remaining function counts, committed
 batches, and partial or complete seed coverage. Each batch also reports Seeds,
 Calls, and Publish stages with decode-attempt counts. Its total can grow as calls
