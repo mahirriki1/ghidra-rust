@@ -638,10 +638,6 @@ impl Walk {
             data.propagate(entry, blocks.iter());
         }
         let partial = !warnings.is_empty();
-        warning(
-            warnings,
-            "CFG uses bounded static instruction flow with engine switch-table recovery; exceptions, no-return calls, and other indirect jumps may be incomplete.",
-        );
         Ok(GraphRecovery {
             view: FunctionView {
                 address: entry,

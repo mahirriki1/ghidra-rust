@@ -74,7 +74,7 @@ impl HexPanel {
     ) -> Option<HexAction> {
         let mut action = self.initialize(sections);
         if sections.is_empty() {
-            ui.weak("No mapped sections available.");
+            ui.weak("No mapped sections");
         } else if let Some(index) = self.section_table(ui, sections, action.is_none()) {
             action = self.open_section(index, sections);
         }
@@ -156,7 +156,7 @@ impl HexPanel {
         } else if self.loaded.is_some() {
             self.byte_page(ui, sections);
         } else if self.error.is_none() {
-            ui.weak("Choose a section or enter a mapped address");
+            ui.weak("Select a section or address.");
         }
         action
     }
@@ -539,9 +539,7 @@ impl HexPanel {
             ))
             .monospace(),
         )
-        .on_hover_text(
-            "Click a byte; Shift-click extends the selection within this page. Muted bytes are zero-fill.",
-        );
+        .on_hover_text("Click to select · Shift-click to extend · muted bytes are zero-fill.");
         let font = egui::FontId::monospace(13.0);
         let glyph = ui
             .painter()
