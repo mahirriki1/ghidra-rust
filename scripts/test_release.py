@@ -244,7 +244,7 @@ class ReleaseNotesTests(unittest.TestCase):
         self.assertNotIn("Instructions, not release notes", notes)
         self.assertIn("Hosted CI does not run tests", notes)
 
-    def run_publisher(self, state):
+    def run_publisher(self, state, version="0.0.5"):
         self.entry("new.md", "- Complete feature details.\n- A separate fix.\n")
         source = self.commit("Feature update")
         scripts = self.repo / "scripts"
@@ -286,7 +286,7 @@ elif args[:2] not in (["release", "create"], ["release", "edit"], ["release", "u
         with tempfile.TemporaryDirectory() as directory:
             log = Path(directory) / "calls.jsonl"
             env = dict(os.environ, PATH=str(binary) + os.pathsep + os.environ["PATH"],
-                       RELEASE_TAG="v0.0.5", RELEASE_VERSION="0.0.5", RELEASE_SHA=source,
+                       RELEASE_TAG=f"v{version}", RELEASE_VERSION=version, RELEASE_SHA=source,
                        SOURCE_SHA=source, GH_REPO="example/project", GITHUB_RUN_ID="123",
                        GITHUB_SERVER_URL="https://github.com", RUNNER_TEMP=directory,
                        GITHUB_STEP_SUMMARY=str(Path(directory) / "summary"),
@@ -321,6 +321,33 @@ elif args[:2] not in (["release", "create"], ["release", "edit"], ["release", "u
         calls, notes = self.run_publisher("published")
         self.assertEqual(len(calls), 1)
         self.assertIsNone(notes)
+
+    @staticmethod
+    def publication(calls):
+        return next(call for call in calls if "--draft=false" in call)
+
+    def assert_unstable_prerelease(self, state):
+        calls, _ = self.run_publisher(state, "0.0.5")
+        staged = next(call for call in calls
+                      if call[:2] == ["release", "create"] or "--notes-file" in call)
+        self.assertIn("--prerelease=true", staged)
+        publish = self.publication(calls)
+        self.assertIn("--prerelease=true", publish)
+        self.assertIn("--latest=false", publish)
+
+    def test_new_unstable_version_publishes_as_prerelease_never_marked_latest(self):
+        self.assert_unstable_prerelease("absent")
+
+    def test_resumed_unstable_draft_becomes_a_prerelease(self):
+        self.assert_unstable_prerelease("draft")
+
+    def test_first_stable_version_publishes_as_latest_release(self):
+        calls, _ = self.run_publisher("absent", "1.0.0")
+        create = next(call for call in calls if call[:2] == ["release", "create"])
+        self.assertIn("--prerelease=false", create)
+        publish = self.publication(calls)
+        self.assertIn("--prerelease=false", publish)
+        self.assertIn("--latest=true", publish)
 
 
 class PackageVerificationTests(unittest.TestCase):
