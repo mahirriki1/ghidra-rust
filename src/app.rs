@@ -66,6 +66,7 @@ struct BrowserDialog {
 
 #[derive(Clone, Copy)]
 enum Shortcut {
+    Help,
     Rename,
     GoTo,
     Comment,
@@ -95,6 +96,7 @@ fn shortcut(event: &egui::Event) -> Option<Shortcut> {
         && !modifiers.command;
     if plain {
         return match key {
+            egui::Key::F1 => Some(Shortcut::Help),
             egui::Key::L => Some(Shortcut::Rename),
             egui::Key::G => Some(Shortcut::GoTo),
             egui::Key::Semicolon => Some(Shortcut::Comment),
@@ -558,6 +560,7 @@ pub struct DesktopApp {
     annotations_open: bool,
     program_tree: bool,
     browser_dialog: Option<BrowserDialog>,
+    help_dialog: Option<crate::help::HelpDialog>,
     focus_comment: bool,
     signature_editor: Option<SignatureEditor>,
     signature_replay: Option<SignatureReplay>,
@@ -687,6 +690,7 @@ impl DesktopApp {
             annotations_open: false,
             program_tree: false,
             browser_dialog: None,
+            help_dialog: None,
             focus_comment: false,
             signature_editor: None,
             signature_replay: None,
@@ -3843,11 +3847,12 @@ impl DesktopApp {
     }
 
     fn handle_shortcuts(&mut self, context: &egui::Context) {
-        if self.info.is_none()
-            || self.opening.is_some()
+        if self.opening.is_some()
             || self.file_job.is_some()
             || self.intent.is_some()
             || self.browser_dialog.is_some()
+            || self.help_dialog.is_some()
+            || self.analyze_prompt.is_some()
             || self.signature_editor.is_some()
             || self.signature_change.is_some()
             || context.egui_wants_keyboard_input()
@@ -3857,15 +3862,15 @@ impl DesktopApp {
             return;
         }
         let action = context.input_mut(|input| {
-            let (index, action) = input
-                .events
-                .iter()
-                .enumerate()
-                .find_map(|(index, event)| shortcut(event).map(|action| (index, action)))?;
+            let (index, action) = input.events.iter().enumerate().find_map(|(index, event)| {
+                let action = shortcut(event)?;
+                (self.info.is_some() || matches!(action, Shortcut::Help)).then_some((index, action))
+            })?;
             input.events.remove(index);
             Some(action)
         });
         match action {
+            Some(Shortcut::Help) => self.help_dialog = Some(crate::help::HelpDialog::Shortcuts),
             Some(Shortcut::Rename) => self.begin_rename(),
             Some(Shortcut::GoTo) => self.begin_go_to(),
             Some(Shortcut::Comment) if self.selected.is_some() => {
@@ -4116,26 +4121,14 @@ impl DesktopApp {
                 }
             });
             ui.menu_button("Help", |ui| {
-                ui.label("Ghidra / Rust — native prototype");
-                ui.weak("x86 / x86-64 / AArch64 · limited analysis coverage");
-                ui.separator();
-                egui::Grid::new("shortcuts").num_columns(2).spacing([16.0, 2.0]).show(ui, |ui| {
-                    for (keys, action) in [
-                        ("L", "Rename function / label / local"),
-                        ("G", "Go to address or name"),
-                        (";", "Edit comment"),
-                        ("X", "Xrefs to selection"),
-                        ("Space", "Toggle Listing / Graph"),
-                        ("Alt+Left / Right", "Back / forward"),
-                        ("Ctrl+S", "Save project"),
-                        ("Ctrl+Z", "Undo annotation"),
-                    ] {
-                        ui.label(RichText::new(keys).monospace().color(theme::ACCENT));
-                        ui.label(action);
-                        ui.end_row();
-                    }
-                });
-                ui.weak("Shortcuts pause while typing or in dialogs.");
+                if ui.add(egui::Button::new("Keyboard shortcuts").shortcut_text("F1")).clicked() {
+                    self.help_dialog = Some(crate::help::HelpDialog::Shortcuts);
+                    ui.close();
+                }
+                if ui.button("About Ghidra Rust").clicked() {
+                    self.help_dialog = Some(crate::help::HelpDialog::About);
+                    ui.close();
+                }
             });
             crate::window_chrome::menu_bar_controls(ui);
         });
@@ -6650,6 +6643,11 @@ impl DesktopApp {
                 }
             });
         self.annotations_open = annotations_open;
+        if let Some(dialog) = self.help_dialog
+            && !dialog.show(&context)
+        {
+            self.help_dialog = None;
+        }
         self.unsaved_window(&context);
         self.analyze_window(&context);
         self.file_dialogs.show(&context);
@@ -7786,6 +7784,162 @@ mod tests {
         for ((narrow, wide), restored) in widths[0].iter().zip(&widths[1]).zip(&widths[2]) {
             assert!(wide - narrow > 150.0);
             assert!((restored - narrow).abs() < 2.0);
+        }
+    }
+
+    #[test]
+    fn help_shortcut_respects_focus_dialogs_repeats_and_file_jobs() {
+        let f1 = || {
+            let press = key_event(egui::Key::F1, egui::Modifiers::NONE);
+            let mut release = press.clone();
+            if let egui::Event::Key { pressed, .. } = &mut release {
+                *pressed = false;
+            }
+            vec![press, release]
+        };
+        // Exercise the first frame of a non-editing modal independently of
+        // any previous dialog's keyboard focus or modal layer.
+        {
+            let context = egui::Context::default();
+            let mut app = keyboard_app();
+            app.analyze_prompt = Some(AnalyzePrompt {
+                generation: app.generation,
+                first_open: true,
+            });
+            keyboard_frame(&context, &mut app, f1());
+            assert!(app.help_dialog.is_none());
+        }
+        let context = egui::Context::default();
+        let mut app = keyboard_app();
+        keyboard_frame(&context, &mut app, vec![]);
+        let filter = egui::Id::unique("function-filter");
+        context.memory_mut(|memory| memory.request_focus(filter));
+        keyboard_frame(&context, &mut app, vec![]);
+        keyboard_frame(&context, &mut app, f1());
+        assert!(app.help_dialog.is_none());
+        context.memory_mut(|memory| memory.surrender_focus(filter));
+
+        let (_sender, receiver) = mpsc::sync_channel(1);
+        app.file_job = Some(receiver);
+        keyboard_frame(&context, &mut app, f1());
+        assert!(app.help_dialog.is_none());
+        app.file_job = None;
+
+        app.begin_go_to();
+        keyboard_frame(&context, &mut app, f1());
+        assert!(app.help_dialog.is_none());
+        app.browser_dialog = None;
+
+        // A modal without a text editor must block Help too.
+        app.analyze_prompt = Some(AnalyzePrompt {
+            generation: app.generation,
+            first_open: true,
+        });
+        keyboard_frame(&context, &mut app, f1());
+        assert!(app.help_dialog.is_none());
+        app.analyze_prompt = None;
+        keyboard_frame(&context, &mut app, vec![]);
+        keyboard_frame(&context, &mut app, vec![]);
+
+        // Hold F1 across the end of a file job. egui derives repeat from
+        // whether the key was already down, rather than trusting the flag.
+        let (_sender, receiver) = mpsc::sync_channel(1);
+        app.file_job = Some(receiver);
+        keyboard_frame(
+            &context,
+            &mut app,
+            vec![key_event(egui::Key::F1, egui::Modifiers::NONE)],
+        );
+        app.file_job = None;
+        let mut repeat = key_event(egui::Key::F1, egui::Modifiers::NONE);
+        if let egui::Event::Key { repeat, .. } = &mut repeat {
+            *repeat = true;
+        }
+        keyboard_frame(&context, &mut app, vec![repeat]);
+        assert!(app.help_dialog.is_none());
+        let mut release = key_event(egui::Key::F1, egui::Modifiers::NONE);
+        if let egui::Event::Key { pressed, .. } = &mut release {
+            *pressed = false;
+        }
+        keyboard_frame(&context, &mut app, vec![release.clone()]);
+        keyboard_frame(
+            &context,
+            &mut app,
+            vec![key_event(egui::Key::F1, egui::Modifiers::SHIFT)],
+        );
+        assert!(app.help_dialog.is_none());
+        keyboard_frame(&context, &mut app, vec![release]);
+        keyboard_frame(&context, &mut app, f1());
+        assert_eq!(app.help_dialog, Some(crate::help::HelpDialog::Shortcuts));
+    }
+
+    #[test]
+    fn help_menu_dialogs_close_and_f1_works_without_a_binary() {
+        let context = egui::Context::default();
+        theme::install(&context);
+        let mut app = DesktopApp::empty(None);
+        let frame = |app: &mut DesktopApp, events| {
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1200.0, 800.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| app.draw(ui),
+            );
+            output.textures_delta.clear();
+            output
+        };
+        let click = |output: &egui::FullOutput, label: &str| {
+            let position = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Text(text) if text.galley.text() == label => {
+                        Some(text.pos + text.galley.rect.center().to_vec2())
+                    }
+                    _ => None,
+                })
+                .expect("visible Help control");
+            pointer_events(position)
+        };
+        frame(
+            &mut app,
+            vec![key_event(egui::Key::F1, egui::Modifiers::NONE)],
+        );
+        assert_eq!(app.help_dialog, Some(crate::help::HelpDialog::Shortcuts));
+        frame(&mut app, vec![]);
+        frame(&mut app, vec![]);
+        frame(
+            &mut app,
+            vec![key_event(egui::Key::Escape, egui::Modifiers::NONE)],
+        );
+        assert!(app.help_dialog.is_none());
+        app = keyboard_app();
+        for (label, expected) in [
+            ("Keyboard shortcuts", crate::help::HelpDialog::Shortcuts),
+            ("About Ghidra Rust", crate::help::HelpDialog::About),
+        ] {
+            let output = frame(&mut app, vec![]);
+            frame(&mut app, click(&output, "Help"));
+            frame(&mut app, vec![]);
+            let output = frame(&mut app, vec![]);
+            frame(&mut app, click(&output, label));
+            assert_eq!(app.help_dialog, Some(expected));
+            assert!(!egui::Popup::is_any_open(&context));
+            frame(&mut app, vec![]);
+            let output = frame(&mut app, vec![]);
+            // Help owns keyboard focus; background navigation cannot run.
+            frame(
+                &mut app,
+                vec![key_event(egui::Key::Space, egui::Modifiers::NONE)],
+            );
+            assert!(app.tab == Tab::Listing);
+            frame(&mut app, click(&output, "×"));
+            assert!(app.help_dialog.is_none());
         }
     }
 
