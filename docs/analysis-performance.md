@@ -119,7 +119,7 @@ outside this repository (the benchmark was developed against 12.1.4 with
 OpenJDK 27), then run:
 
 ```sh
-GHIDRA_RUST_BENCH_GHIDRA_HOME="$HOME/tools/ghidra_12.1.4_PUBLIC" \
+GHIDRA_RUST_BENCH_GHIDRA_HOME="$HOME/tools/ghidra_12.2_PUBLIC" \
 GHIDRA_RUST_BENCH_REPEATS=3 \
   cargo +1.98.1 test --release --locked --test ghidra_differential \
   benchmark_against_ghidra -- --exact --ignored --nocapture --test-threads=1
@@ -137,7 +137,11 @@ Optional variables:
 - `GHIDRA_RUST_BENCH_ADDRESSES`: up to 32 comma-separated `0x` virtual
   addresses to decompile in the external input (default: its entry point).
 
-Each run writes a new `target/ghidra-differential/run-*` directory containing
+Each suite writes a new `target/ghidra-differential/run-*` directory (under
+`CARGO_TARGET_DIR` when set, avoiding Ghidra's rejection of hidden project-path
+components). A private worker copy binds every Rust repetition to one executable
+hash even when another worktree rebuilds the shared target; it is removed after
+the runs. The directory contains
 generated inputs, `truth-*.json`, one directory per tool run (request, export,
 process log, and Ghidra's headless and script logs), `suite.json`, and the
 comparator's `report.json` and `report.txt`. Ghidra's per-run project, settings,
@@ -174,6 +178,10 @@ queue exhaustion (300-second ceiling). Truth symbols and requested addresses are
 not seeds. Inventories and call evidence are frozen before decompilation, because
 decompilation can name or create functions. A requested address absent from the
 frozen inventory is `not_discovered`; no function is forced into existence.
+The ELF metadata/table/tail and function-start phases use the same production
+continuation as the desktop. Exports include parent-accepted metadata records,
+slots, candidates, decode attempts, cursor replies, inventory-validation rows
+and in-memory admission witnesses for precision auditing.
 Requests keep the production 30-second deadline. A timed-out or failed worker is
 not reused, so later targets are `not_attempted_after_failure`.
 
@@ -183,7 +191,7 @@ option variables, and passes `-loader ElfLoader -loader-loadLibraries false
 -max-cpu 1 -analysisTimeoutPerFile 300` with a 2 GiB heap. Ghidra's **default
 analyzer selection** is used and every analyzer option is recorded. This profile
 (`ghidra-default-analyzers-cpu1`) is not a matched scope: Ghidra runs many more
-analyses than ghidra-rust's direct-call discovery and function-start patterns.
+analyses than ghidra-rust's direct-call, ELF pointer and function-start pattern discovery.
 `scripts/ghidra/DifferentialExport.java`
 is original benchmark tooling executed by that installation as a pre- and
 post-analysis script; the desktop never loads it, and it adds no Java dependency
@@ -198,6 +206,24 @@ fails if that original base differs from the independently parsed `PT_LOAD`
 minimum. Exports keep raw addresses, which the comparator checks against each
 RVA. Reported executable blocks are compared with the ELF's section addresses
 and file offsets.
+
+### Pointer recovery measurement scope
+
+The x86-64 ELF pointer phase is included in production discovery, with admission
+witnesses exported for auditing. The original optimized stripped corpus is scored
+against 323 primary entries, including two cold fragments. A three-repeat Linux
+run on 2026-10-25 recovered 321/323 in both optimized stripped cases, including
+all 300 table entries, with 100% measured primary precision and unchanged
+confirmed-call precision/recall. The two cold fragments remain missing.
+Pointer tables need exact
+FDE or existing pattern corroboration, so unwind-free inputs need not have equal
+recall. Audit every new entry outside authored extents separately.
+
+Shared-target builds can overlap this harness. Such timings are contended host
+observations, not idle-host measurements or a fair cross-tool speed comparison.
+Process-tree peaks include workers but do not isolate extra retained recovery
+state. Verify the <8 MiB retained-state and <1 s added-discovery targets with an
+isolated matched before/after run before claiming either improvement.
 
 ### Quality metrics
 

@@ -76,6 +76,13 @@ pub const MAX_DATA_OPERATIONS: usize = 131_072;
 pub const MAX_DATA_OPERATIONS_PER_INSTRUCTION: usize = 256;
 pub const MAX_DATA_OPERATION_INPUTS: usize = 16;
 pub const MAX_DATA_ACCESS_BYTES: u32 = 64;
+/// Cumulative ELF metadata records, pointer slots and candidate attempts per discovery.
+pub const MAX_METADATA_RECORDS: usize = MAX_DATA_OPERATIONS;
+pub const MAX_POINTER_SLOTS: usize = 8 * MAX_DATA_OPERATIONS;
+pub const MAX_FUNCTION_ADMISSIONS: usize = MAX_DATA_REFERENCES;
+/// Independent cursor/rebuild limits, shared by all pointer recovery phases.
+pub const MAX_POINTER_STEPS: usize = MAX_PATTERN_CURSOR_STEPS;
+
 /// Compact p-code operations retained per function for block-local propagation.
 pub const MAX_DATA_RETAINED_OPERATIONS: usize = 16_384;
 /// Register/unique byte ranges with known constant values at any point.
@@ -311,6 +318,17 @@ pub struct DiscoveryBatch {
     /// Present exactly for a pattern-scan request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub patterns: Option<PatternScan>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pointers: Option<Box<PointerScan>>,
+    /// Metadata work rebuilt by a seed batch after worker replacement.
+    #[serde(default)]
+    pub recovery_records: usize,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "crate::bounded::vec::<_, _, { MAX_PATTERN_ADMISSIONS }>"
+    )]
+    pub admissions: Vec<FunctionAdmission>,
 }
 
 /// Function starts admitted by one pattern-scan request.
@@ -335,6 +353,122 @@ pub struct PatternScan {
     pub covered: Vec<u64>,
     /// Limits or failures left part of the scan unexamined.
     pub partial: bool,
+}
+
+/// Typed source cursor; seed work stays separate from source scanning.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DiscoveryCursor {
+    Pointers(PointerCursor),
+    Patterns(u64),
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PointerCursor {
+    pub phase: PointerPhase,
+    pub position: u64,
+    pub run_start: Option<u64>,
+    pub first_target: Option<u64>,
+    pub confirmed: bool,
+    pub pending: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum PointerPhase {
+    #[default]
+    Metadata,
+    Tables,
+    Tails,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AdmissionReason {
+    PointerTable,
+    InitMetadata,
+    CorroboratedTail,
+    CrtForwarder,
+    Pattern,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PointerEncoding {
+    Absolute,
+    Relative,
+    LocalSymbol,
+    Direct,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BoundaryEvidence {
+    Fde,
+    Pattern,
+    Format,
+    Forwarder,
+}
+
+/// Sparse, fixed-size admission witness, separate from names and references.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FunctionAdmission {
+    pub entry: u64,
+    pub reason: AdmissionReason,
+    pub source: u64,
+    pub owner: Option<u64>,
+    pub encoding: PointerEncoding,
+    pub boundary: BoundaryEvidence,
+    pub table: Option<u64>,
+}
+
+impl FunctionAdmission {
+    pub fn hover_text(&self) -> String {
+        let reason = match self.reason {
+            AdmissionReason::PointerTable => "Pointer table",
+            AdmissionReason::InitMetadata => "ELF init/fini metadata",
+            AdmissionReason::CorroboratedTail => "Corroborated tail jump",
+            AdmissionReason::CrtForwarder => "Init/fini forwarder",
+            AdmissionReason::Pattern => "Function-start pattern",
+        };
+        let boundary = match self.boundary {
+            BoundaryEvidence::Fde => "FDE boundary",
+            BoundaryEvidence::Pattern => "Pattern boundary",
+            BoundaryEvidence::Format => "Format entry",
+            BoundaryEvidence::Forwarder => "Verified forwarder",
+        };
+        let encoding = match self.encoding {
+            PointerEncoding::Absolute => "Absolute pointer",
+            PointerEncoding::Relative => "ELF RELATIVE",
+            PointerEncoding::LocalSymbol => "Local symbol relocation",
+            PointerEncoding::Direct => "Direct address",
+        };
+        let mut text = format!("{reason} · {boundary}\n{encoding} · {:#x}", self.source);
+        if let Some(owner) = self.owner {
+            text.push_str(&format!("\nOwner {owner:#x}"));
+        }
+        if let Some(table) = self.table {
+            text.push_str(&format!("\nTable {table:#x}"));
+        }
+        text
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PointerScan {
+    pub next: Option<PointerCursor>,
+    pub records: usize,
+    #[serde(deserialize_with = "crate::bounded::vec::<_, _, { MAX_PATTERN_COVERAGE }>")]
+    pub covered: Vec<u64>,
+    pub slots: usize,
+    pub candidates: usize,
+    pub decode_attempts: usize,
+    pub partial: bool,
+}
+
+/// Cumulative parent-accepted recovery costs, exported by the differential harness.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RecoveryAccounting {
+    pub metadata_records: usize,
+    pub pointer_slots: usize,
+    pub candidates: usize,
+    pub decode_attempts: usize,
+    pub cursor_steps: usize,
+    pub inventory_rows: usize,
+    pub witnesses: usize,
 }
 
 /// UTF-8 byte span in rendered C and its originating machine instructions.
@@ -645,7 +779,7 @@ pub enum Request {
         /// With no seeds: continue the function-start pattern scan from this
         /// address instead of walking functions.
         #[serde(default)]
-        patterns: Option<u64>,
+        patterns: Option<DiscoveryCursor>,
     },
     SyncFunctions {
         #[serde(

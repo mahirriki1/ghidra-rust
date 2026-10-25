@@ -244,8 +244,10 @@ editor, not general type or variable-storage editing.
   **Discover functions** follows confirmed decoded direct calls from known entries
   on every supported architecture in resumable bounded batches. Discover starts or
   continues a parent-owned session queue containing the entry point and all
-  admitted known functions, then newly confirmed callees. Complete function
-  recovery is not guaranteed; see [analysis coverage](docs/analysis.md).
+  admitted known functions, then newly confirmed callees. On x86-64 ELF,
+  validated init/fini metadata, pointer tables and corroborated tail boundaries
+  also recover functions. Complete recovery is not guaranteed; see
+  [analysis coverage](docs/analysis.md).
 - Opening a binary offers to analyze it, like Ghidra: an **Analyze binary?**
   dialog runs the checked analyses (function discovery, defined strings,
   FindCrypt) in the background while you browse. **Analysis → Auto analyze…**

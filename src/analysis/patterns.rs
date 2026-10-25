@@ -44,6 +44,7 @@ impl LoadedProgram {
             let recovered = recover_walk_switched(
                 &mut self.program,
                 &Bounds {
+                    tail_entry: None,
                     sections: &self.info.sections,
                     is_function: &is_function,
                     pe_ranges: &self.pe_ranges,
@@ -79,7 +80,6 @@ impl LoadedProgram {
             .filter(|section| section.executable && section.file_size > 0)
             .collect();
         sections.sort_by_key(|section| section.address);
-        let alignment = self.target.instruction_alignment;
         let mut matches = Vec::new();
         scan.next = 'scan: {
             for section in sections {
@@ -129,13 +129,8 @@ impl LoadedProgram {
                                 || function_at(&self.info.functions, address).is_some()
                         };
                         if known(start)
-                            || !start.is_multiple_of(alignment)
+                            || !function_candidates::candidate_entry(self, start)
                             || start >= end
-                            || self.coverage.contains(start)
-                            || self
-                                .pe_ranges
-                                .iter()
-                                .any(|&(low, high)| low < start && start < high)
                             || pattern.start.after_defined
                                 && start != section.address
                                 && !self.coverage.ends_at(start)
@@ -161,6 +156,7 @@ impl LoadedProgram {
                         walk.run(
                             &self.program,
                             &Bounds {
+                                tail_entry: None,
                                 sections: &self.info.sections,
                                 is_function: &|address| address != start && known(address),
                                 pe_ranges: &self.pe_ranges,
@@ -251,6 +247,7 @@ mod tests {
             },
             inventory: Default::default(),
             coverage: Coverage::default(),
+            pointers: None,
             no_return: Arc::default(),
             signatures: Vec::new(),
             applied_signatures: BTreeSet::new(),
@@ -281,7 +278,7 @@ mod tests {
                     },
                     inventory_base: None,
                     seeds: Vec::new(),
-                    patterns: Some(0),
+                    patterns: Some(crate::model::DiscoveryCursor::Patterns(0)),
                 },
                 &mut |event| {
                     event.validate_event(events.len() + 1, events.last())?;
