@@ -36,21 +36,27 @@ impl SignatureEditor {
                 ui.label(
                     RichText::new(format!("{} · {:#x}", self.name, self.function)).monospace(),
                 );
-                ui.label(format!(
-                    "ABI: {} (current image default)",
-                    abi_label(&self.abi)
-                ));
-                ui.weak("Integer and pointer types only. Parameter order determines ABI storage.");
-                if !self.notes.is_empty() {
-                    ScrollArea::vertical()
-                        .id_salt("signature-notes")
-                        .max_height(100.0)
-                        .show(ui, |ui| {
-                            for note in &self.notes {
-                                ui.colored_label(crate::theme::WARNING, note);
-                            }
-                        });
-                }
+                ui.horizontal(|ui| {
+                    ui.label(format!("ABI: {}", abi_label(&self.abi)))
+                        .on_hover_text("Current image ABI.");
+                    if !self.notes.is_empty() {
+                        crate::theme::warning_menu(ui, self.notes.len(), |ui| {
+                            ui.set_max_width(420.0);
+                            ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
+                                for note in &self.notes {
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(note).color(crate::theme::WARNING),
+                                        )
+                                        .wrap(),
+                                    );
+                                }
+                            });
+                        })
+                        .response
+                        .on_hover_text("Signature warnings");
+                    }
+                });
                 ui.horizontal(|ui| {
                     ui.label("Return");
                     type_selector(ui, "signature-return", &mut self.return_type);
@@ -73,11 +79,22 @@ impl SignatureEditor {
                                         .char_limit(64),
                                 );
                                 type_selector(ui, "parameter-type", &mut parameter.ty);
-                                if ui.add_enabled(index > 0, egui::Button::new("↑")).clicked() {
+                                if ui
+                                    .add_enabled(index > 0, egui::Button::new("↑"))
+                                    .on_hover_text("Parameter order determines ABI storage.")
+                                    .on_disabled_hover_text(
+                                        "Parameter order determines ABI storage.",
+                                    )
+                                    .clicked()
+                                {
                                     swap = Some((index, index - 1));
                                 }
                                 if ui
                                     .add_enabled(index + 1 < count, egui::Button::new("↓"))
+                                    .on_hover_text("Parameter order determines ABI storage.")
+                                    .on_disabled_hover_text(
+                                        "Parameter order determines ABI storage.",
+                                    )
                                     .clicked()
                                 {
                                     swap = Some((index, index + 1));
@@ -183,7 +200,9 @@ fn type_selector(ui: &mut egui::Ui, id: &str, ty: &mut Option<SignatureType>) {
             ] {
                 ui.selectable_value(&mut base, Some(value), base_label(&value));
             }
-        });
+        })
+        .response
+        .on_hover_text("Void, integers and pointers.");
     let mut depth = ty.as_ref().map_or(0, |t| t.pointer_depth);
     ComboBox::from_id_salt((id, "pointer"))
         .selected_text(if depth == 0 {
@@ -204,7 +223,9 @@ fn type_selector(ui: &mut egui::Ui, id: &str, ty: &mut Option<SignatureType>) {
                     },
                 );
             }
-        });
+        })
+        .response
+        .on_hover_text("Void, integers and pointers.");
     *ty = base.map(|base| SignatureType {
         base,
         pointer_depth: depth,

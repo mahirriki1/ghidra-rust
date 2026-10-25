@@ -214,9 +214,7 @@ impl Picker {
         let title = match self.kind {
             FileDialogKind::OpenBinary => "Open binary",
             FileDialogKind::OpenProject => "Open project (.grproj)",
-            FileDialogKind::LocateProjectBinary => {
-                "Locate the project's original binary (SHA-256 must match)"
-            }
+            FileDialogKind::LocateProjectBinary => "Locate project binary",
             FileDialogKind::SaveProject => "Save project (.grproj)",
             FileDialogKind::OpenAnnotations => "Open annotations",
             FileDialogKind::SaveAnnotations => "Save annotations",
@@ -227,7 +225,10 @@ impl Picker {
                     .min(context.content_rect().width() - 64.0)
                     .max(320.0),
             );
-            ui.heading(title);
+            let heading = ui.heading(title);
+            if self.kind == FileDialogKind::LocateProjectBinary {
+                heading.on_hover_text("SHA-256 must match the project.");
+            }
             if let Some(path) = self.replace.clone() {
                 ui.label(format!("Replace the existing file {}?", path.display()));
                 ui.horizontal(|ui| {
@@ -323,7 +324,8 @@ impl Picker {
                 self.change_directory(directory);
             }
             if self.listing.truncated {
-                ui.weak("Showing at most 4,096 entries. Enter a path to navigate directly.");
+                ui.colored_label(crate::theme::WARNING, "Partial listing")
+                    .on_hover_text("4,096-entry limit; enter a path directly.");
             }
             ui.horizontal(|ui| {
                 ui.label("File name");

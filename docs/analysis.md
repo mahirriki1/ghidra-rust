@@ -168,6 +168,11 @@ jump; destinations must be aligned file-backed executable addresses. Duplicates
 merge, and walking resumes under the function budget, exposing calls in cases.
 Graph edges are labeled `S`.
 
+The graph uses bounded static flow recovery; exceptions, no-return calls, and
+indirect flow may be incomplete. Function-specific diagnostics appear in the
+conditional graph-toolbar warning menu, and **Legend** explains edge letters.
+No graph warnings does not establish complete runtime flow.
+
 Table size, recovery count, and recovery time are bounded; exhausted or incomplete
 recovery remains partial with an unresolved successor and warning. Unknown
 register/pointer jumps remain unresolved. Destinations never become functions
@@ -184,7 +189,9 @@ instruction PC, target, width, and kind.
 x86 evidence is instruction-local. AArch64 additionally propagates concrete
 register constants within each basic block, for example `ADRP; ADD; LDR` and
 `MOVZ`/`MOVK` with supported arithmetic, shifts, and extensions. These accesses
-are labeled **propagated**, versus **instruction-local**. Block boundaries, calls,
+show `Read*` / `Write*` in **Data accesses**; hover the Access cell for
+“* Address from register constants in this block.” Unmarked accesses use
+instruction-local evidence. Block boundaries, calls,
 unsupported/omitted instructions, and overlapping register writes clear knowledge.
 Loaded pointers are never chased: `ADRP; LDR` identifies the slot, not its value.
 Address formation alone and call arguments create no references. Cross-branch
@@ -218,7 +225,10 @@ references stay visible while subsequent batches run.
 The status bar remains active through setup, adoption, foreground waits, and
 worker recovery. Known-function counts can grow and their fill can decrease as
 calls reveal work; they are not whole-program completion percentages or ETAs.
-Other phases show activity. Hover for phase/count details. Worker **Seeds**,
+Elapsed time includes setup and waits; step counts identify selected analyses,
+not portions of runtime. Processed counts include failed and limited attempts
+and exclude in-flight work. Other phases show activity. Hover for phase/count
+details. Worker **Seeds**,
 **Calls** (shown as **Analyzing references**), and **Publish** stages report batch
 work; progress never resets CPU or wall-time deadlines.
 

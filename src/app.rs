@@ -3796,11 +3796,7 @@ impl DesktopApp {
             } else {
                 "Auto Analysis"
             });
-            ui.label(if first_open {
-                format!("{name} has not been analyzed. Analyze it now?")
-            } else {
-                format!("Choose the analyses to run on {name}.")
-            });
+            ui.label(name);
             ui.add_space(8.0);
             ui.add_enabled(
                 !packed,
@@ -3810,7 +3806,8 @@ impl DesktopApp {
                 "Recovers functions from calls, patterns and ELF pointers; indexes references.",
             );
             if packed {
-                ui.colored_label(theme::WARNING, crate::packing::UPX_ANALYSIS_ERROR);
+                ui.colored_label(theme::WARNING, "Discovery unavailable · UPX")
+                    .on_hover_text("Unpack a separate copy; see status warnings.");
             }
             ui.checkbox(&mut options.strings, "Defined strings");
             ui.add_enabled_ui(options.strings, |ui| {
@@ -3826,12 +3823,12 @@ impl DesktopApp {
             ui.checkbox(&mut options.crypto, "FindCrypt constants")
                 .on_hover_text("Heuristic matches for standardized cryptographic constants.");
             ui.add_space(4.0);
-            ui.weak("Runs in the background; cancel from the Analysis menu.");
             ui.separator();
             ui.horizontal(|ui| {
                 let selected = options.functions && !packed || options.strings || options.crypto;
                 analyze = ui
                     .add_enabled(selected, egui::Button::new("Analyze"))
+                    .on_hover_text("Run in background; cancel from Analysis.")
                     .clicked();
                 dismiss = ui
                     .button(if first_open { "Not now" } else { "Cancel" })
@@ -4111,7 +4108,11 @@ impl DesktopApp {
                 inferred.unsupported.clone(),
             )
         } else {
-            (None, Vec::new(), vec!["No structured inferred prototype is available. Choose the return type and every parameter explicitly, or Cancel and refresh decompilation.".into()])
+            (
+                None,
+                Vec::new(),
+                vec!["No inferred prototype. Choose types or refresh decompilation.".into()],
+            )
         };
         if let Some(status) = self
             .signature_unapplied
@@ -4140,8 +4141,9 @@ impl DesktopApp {
             let modal =
                 egui::Modal::new(egui::Id::unique("signature-applying")).show(context, |ui| {
                     ui.heading("Applying function signature");
-                    ui.label("Verifying the binary and replaying signatures before analysis…");
-                    ui.spinner();
+                    ui.label("Verifying signatures…");
+                    ui.spinner()
+                        .on_hover_text("Verifying binary and replaying signatures.");
                     ui.button("Cancel").clicked()
                 });
             if modal.inner || modal.should_close() {
@@ -4436,7 +4438,7 @@ impl DesktopApp {
                     ui.label(format!("Address {address:#x}"));
                 }
                 BrowserDialogKind::GoTo => {
-                    ui.label("Hexadecimal address or function/label name");
+                    ui.label("Address or name");
                 }
                 BrowserDialogKind::RenameLocal { identity } => {
                     ui.label(format!("Local in function {:#x}", identity.function));
@@ -4446,6 +4448,10 @@ impl DesktopApp {
                 .char_limit(512)
                 .desired_width(f32::INFINITY)
                 .show(ui);
+            if matches!(dialog.kind, BrowserDialogKind::GoTo) {
+                egui::Response::clone(&output.response)
+                    .on_hover_text("Hex address or exact function/label name.");
+            }
             if dialog.focus {
                 output.response.request_focus();
                 output
@@ -4502,7 +4508,10 @@ impl DesktopApp {
                     ui.close();
                 }
                 ui.add_enabled_ui(loaded && self.file_job.is_none(), |ui| {
-                    if ui.add(egui::Button::new("Save project…").shortcut_text("Ctrl+S")).clicked() {
+                    if ui
+                        .add(egui::Button::new("Save project…").shortcut_text("Ctrl+S"))
+                        .clicked()
+                    {
                         self.save_project(false, &context);
                         ui.close();
                     }
@@ -4511,7 +4520,9 @@ impl DesktopApp {
                         ui.close();
                     }
                     ui.checkbox(&mut self.embed_binary, "Include binary in project")
-                        .on_hover_text("A portable .grproj includes the analyzed binary. Otherwise you must locate the matching binary when reopening.");
+                        .on_hover_text(
+                            "Embed binary for portability; otherwise locate it on reopen.",
+                        );
                     ui.separator();
                     if ui.button("Export annotations (JSON)…").clicked() {
                         self.save_annotations(&context);
@@ -4532,35 +4543,62 @@ impl DesktopApp {
             });
             ui.menu_button("Edit", |ui| {
                 if ui
-                    .add_enabled(!self.undo.is_empty(), egui::Button::new("Undo annotation").shortcut_text("Ctrl+Z"))
+                    .add_enabled(
+                        !self.undo.is_empty(),
+                        egui::Button::new("Undo annotation").shortcut_text("Ctrl+Z"),
+                    )
                     .clicked()
                 {
                     self.undo(&context);
                     ui.close();
                 }
                 if ui
-                    .add_enabled(self.selected.is_some(), egui::Button::new("Rename function / label…").shortcut_text("L"))
+                    .add_enabled(
+                        self.selected.is_some(),
+                        egui::Button::new("Rename function / label…").shortcut_text("L"),
+                    )
                     .clicked()
                 {
                     self.begin_rename();
                     ui.close();
                 }
-                if ui.add_enabled(self.selected.is_some(), egui::Button::new("Edit comment…").shortcut_text(";")).clicked() {
+                if ui
+                    .add_enabled(
+                        self.selected.is_some(),
+                        egui::Button::new("Edit comment…").shortcut_text(";"),
+                    )
+                    .clicked()
+                {
                     self.annotations_open = true;
                     self.focus_comment = true;
                     ui.close();
                 }
             });
             ui.menu_button("Navigation", |ui| {
-                if ui.add_enabled(loaded, egui::Button::new("Go to…").shortcut_text("G")).clicked() {
+                if ui
+                    .add_enabled(loaded, egui::Button::new("Go to…").shortcut_text("G"))
+                    .clicked()
+                {
                     self.begin_go_to();
                     ui.close();
                 }
-                if ui.add_enabled(self.history_index > 0, egui::Button::new("Back").shortcut_text("Alt+Left")).clicked() {
+                if ui
+                    .add_enabled(
+                        self.history_index > 0,
+                        egui::Button::new("Back").shortcut_text("Alt+Left"),
+                    )
+                    .clicked()
+                {
                     self.history_step(false, &context);
                     ui.close();
                 }
-                if ui.add_enabled(self.history_index + 1 < self.history.len(), egui::Button::new("Forward").shortcut_text("Alt+Right")).clicked() {
+                if ui
+                    .add_enabled(
+                        self.history_index + 1 < self.history.len(),
+                        egui::Button::new("Forward").shortcut_text("Alt+Right"),
+                    )
+                    .clicked()
+                {
                     self.history_step(true, &context);
                     ui.close();
                 }
@@ -4593,7 +4631,10 @@ impl DesktopApp {
                         ui.close();
                     }
                     ui.separator();
-                    if ui.add_enabled(self.graph.is_some(), egui::Button::new("Refresh function")).clicked() {
+                    if ui
+                        .add_enabled(self.graph.is_some(), egui::Button::new("Refresh function"))
+                        .clicked()
+                    {
                         self.refresh_function(&context);
                         ui.close();
                     }
@@ -4612,7 +4653,7 @@ impl DesktopApp {
                             self.discovery.is_some() || self.call_index.is_some(),
                             egui::Button::new("Rediscover from scratch"),
                         )
-                        .on_hover_text("Discard discovery results, including saved ones, and examine every known function again.")
+                        .on_hover_text("Discard discovery results and reanalyze known functions.")
                         .clicked()
                     {
                         self.rediscover(&context);
@@ -4636,7 +4677,10 @@ impl DesktopApp {
                 }
             });
             ui.menu_button("Help", |ui| {
-                if ui.add(egui::Button::new("Keyboard shortcuts").shortcut_text("F1")).clicked() {
+                if ui
+                    .add(egui::Button::new("Keyboard shortcuts").shortcut_text("F1"))
+                    .clicked()
+                {
                     self.help_dialog = Some(crate::help::HelpDialog::Shortcuts);
                     ui.close();
                 }
@@ -4916,17 +4960,17 @@ impl DesktopApp {
                 format!("Filtering… {}", self.filtered_functions.len())
             });
             if self.cached_functions {
-                ui.weak("Saved analysis").on_hover_text(
-                    "Function names and addresses loaded from the project. Discover functions to recompute.",
-                );
+                ui.weak("Saved analysis")
+                    .on_hover_text("Saved functions; run Discover to recompute.");
             }
             if self
                 .info
                 .as_ref()
                 .is_some_and(|info| info.functions_truncated)
             {
-                ui.colored_label(theme::WARNING, "Partial")
-                    .on_hover_text("Loading or discovery reached a budget or encountered incomplete flow. Known entries are retained; see References and status warnings for coverage.");
+                ui.colored_label(theme::WARNING, "Partial").on_hover_text(
+                    "Incomplete function inventory; see References and status warnings.",
+                );
             }
         });
         if ui
@@ -5248,7 +5292,7 @@ impl DesktopApp {
                 .update(self.generation, self.revision, &session.annotations);
         }
         ui.weak(format!(
-            "{} annotations · click an address to go there",
+            "{} annotations",
             self.annotation_browser.filtered.len()
         ));
         let mut jump = None;
@@ -5271,6 +5315,7 @@ impl DesktopApp {
                                     self.selected == Some(entry.address),
                                     RichText::new(format!("{:08x}", entry.address)).monospace(),
                                 )
+                                .on_hover_text("Go to address.")
                                 .clicked()
                             {
                                 jump = Some((entry.address, false));
@@ -5333,19 +5378,32 @@ impl DesktopApp {
             if !warnings.is_empty() {
                 ui.colored_label(
                     theme::WARNING,
-                    format!("{} local name(s) not applied", warnings.len()),
-                )
-                .on_hover_text(warnings.join("\n"));
+                    format!("{} names not applied", warnings.len()),
+                );
+                theme::warning_menu(ui, warnings.len(), |ui| {
+                    ui.set_max_width(420.0);
+                    ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                        for warning in warnings {
+                            ui.add(
+                                egui::Label::new(RichText::new(warning).color(theme::WARNING))
+                                    .wrap(),
+                            );
+                        }
+                    });
+                })
+                .response
+                .on_hover_text(format!("{} names not applied", warnings.len()));
             }
             if self.saved_analysis {
-                ui.weak("Saved analysis").on_hover_text("Cached results from this project. Refresh to recompute with the analysis engine.");
+                ui.weak("Saved analysis")
+                    .on_hover_text("Saved pseudocode; Refresh to recompute.");
             }
         });
         if let Some(error) = &self.signature_error {
             ui.colored_label(theme::WARNING, error);
         }
         if self.signature_replay.is_some() {
-            ui.weak("Signature state pending worker verification…");
+            ui.weak("Verifying signatures…");
         }
         if let Some(view) = graph_view(&self.graph) {
             let entry = view.address;
@@ -5384,10 +5442,8 @@ impl DesktopApp {
                 .iter()
                 .find(|s| s.function == entry)
             {
-                ui.colored_label(
-                    theme::WARNING,
-                    format!("Signature not applied: {}", status.reason),
-                );
+                ui.colored_label(theme::WARNING, "Signature not applied")
+                    .on_hover_text(&status.reason);
             } else if self
                 .session
                 .as_ref()
@@ -5410,12 +5466,13 @@ impl DesktopApp {
                 .as_ref()
                 .is_some_and(crate::packing::has_upx_warning)
             {
-                ui.colored_label(theme::WARNING, crate::packing::UPX_PACKED_WARNING);
+                ui.colored_label(theme::WARNING, "Decompilation unavailable · UPX")
+                    .on_hover_text("Unpack a separate copy; see status warnings.");
             } else {
                 ui.weak(if self.pending.is_some() {
                     "Decompilation pending…"
                 } else {
-                    "Select a function to view its decompiled code."
+                    "Select a function."
                 });
             }
         }
@@ -5587,7 +5644,8 @@ impl DesktopApp {
                                         ui.close();
                                     }
                                 } else {
-                                    ui.label("Renaming unsupported: no verified storage identity");
+                                    ui.add_enabled(false, egui::Label::new("Rename unavailable"))
+                                        .on_disabled_hover_text("No verified storage identity.");
                                 }
                                 ui.separator();
                             }
@@ -5879,7 +5937,7 @@ impl DesktopApp {
             let mut chosen = None;
             let mut dismiss = false;
             ui.horizontal_wrapped(|ui| {
-                ui.label("Several exact targets:");
+                ui.label("Targets");
                 for target in &choices.set.targets {
                     let name = self
                         .reference_name(target.address)
@@ -5923,8 +5981,9 @@ impl DesktopApp {
                 .color(theme::BLUE),
             );
             if target.kind == TargetKind::StringStart {
-                ui.weak("Only accesses beginning exactly at this string's first byte")
-                    .on_hover_text("Accesses to later bytes, address-only uses and loaded pointers are not recorded by this analysis.");
+                ui.weak("Exact start").on_hover_text(
+                    "First-byte accesses only; excludes interior accesses and loaded pointers.",
+                );
             }
             Some((target.address, true))
         } else if let Some(function) = self.view().map(|view| view.address) {
@@ -6001,20 +6060,17 @@ impl DesktopApp {
     fn data_references_panel(&mut self, ui: &mut egui::Ui, scope: Option<(u64, bool)>) {
         let context = ui.ctx().clone();
         let Some(index) = &self.call_index else {
-            theme::empty_state(ui, "Data accesses not analyzed yet. Run discovery.");
+            theme::empty_state(ui, "Data accesses not analyzed");
             return;
         };
         let Some(data) = &index.report.data else {
-            theme::empty_state(
-                ui,
-                "No data-access analysis in this result. Run discovery again.",
-            );
+            theme::empty_state(ui, "Data-access results unavailable");
             return;
         };
         ui.horizontal_wrapped(|ui| {
             if self.saved_references {
                 ui.colored_label(theme::WARNING, "Saved analysis")
-                    .on_hover_text("Loaded from the project. Run discovery again to recompute.");
+                    .on_hover_text("Saved references; run Discover to recompute.");
             }
             ui.weak(format!(
                 "{} direct accesses · {} unresolved · {} omitted · {} unsupported",
@@ -6024,7 +6080,7 @@ impl DesktopApp {
                 data.unsupported_instructions
             ))
             .on_hover_text(format!(
-                "Direct memory reads/writes in examined functions; {} p-code operations charged, {} access candidates. AArch64 register constants are propagated only within a basic block; address-only values and loaded pointers are outside this pass.",
+                "Examined functions · {} p-code operations · {} candidates. Excludes address-only values and loaded pointers.",
                 data.operations_charged, data.accesses_examined
             ));
             if data.partial || index.report.partial {
@@ -6060,9 +6116,8 @@ impl DesktopApp {
                 format!("{} accesses starting at {address:#x}", rows.len())
             } else {
                 format!("{} accesses from this function", rows.len())
-            });
-            ui.weak("·");
-            ui.weak("An empty result does not establish absence of references.");
+            })
+            .on_hover_text("Examined functions only; empty does not mean no references.");
         });
         let mut source = None;
         let mut read = None;
@@ -6097,7 +6152,17 @@ impl DesktopApp {
                     false,
                     false,
                 )
-                .on_hover_text("Click to open the accessing instruction");
+                .on_hover_text(
+                    if reference.provenance == DataProvenance::Propagated
+                        && ui
+                            .input(|input| input.pointer.hover_pos())
+                            .is_some_and(|pos| pos.x < rect.left() + size_x)
+                    {
+                        "* Address from register constants in this block."
+                    } else {
+                        "Click to open the accessing instruction"
+                    },
+                );
                 let cell = |x: f32, width: f32| {
                     egui::Rect::from_x_y_ranges(
                         rect.left() + x..=rect.left() + x + width,
@@ -6152,17 +6217,22 @@ impl DesktopApp {
                         source = Some((reference.function, reference.address));
                         ui.close();
                     }
-                    if ui.button(format!("Decode {} bytes at {:x}", reference.size, reference.target)).clicked() {
+                    if ui
+                        .button(format!(
+                            "Decode {} bytes at {:x}",
+                            reference.size, reference.target
+                        ))
+                        .clicked()
+                    {
                         read = Some((reference.target, reference.size));
                         ui.close();
                     }
-                    if ui.button(format!("Accesses starting at {:x}", reference.target)).clicked() {
+                    if ui
+                        .button(format!("Accesses starting at {:x}", reference.target))
+                        .clicked()
+                    {
                         target = Some(reference.target);
                         ui.close();
-                    }
-                    if reference.provenance == DataProvenance::Propagated {
-                        ui.separator();
-                        ui.weak("* Pointer built from register constants set earlier in the same basic block");
                     }
                 });
                 None
@@ -6189,7 +6259,7 @@ impl DesktopApp {
                     self.info.is_some() && self.file_job.is_none(),
                     egui::Button::new("Discover"),
                 )
-                .on_hover_text("Discover functions, calls and data accesses")
+                .on_hover_text("Run Discover to populate references.")
                 .clicked()
             {
                 self.request(Request::Discover, &context);
@@ -6253,21 +6323,21 @@ impl DesktopApp {
             return;
         }
         let Some(index) = &self.call_index else {
-            theme::empty_state(ui, "Call references not analyzed yet. Run discovery.");
+            theme::empty_state(ui, "Calls not analyzed");
             return;
         };
         let report = &index.report;
         ui.horizontal_wrapped(|ui| {
             if self.saved_references {
                 ui.colored_label(theme::WARNING, "Saved analysis")
-                    .on_hover_text("Loaded from the project. Run discovery again to recompute.");
+                    .on_hover_text("Saved references; run Discover to recompute.");
             }
             ui.weak(format!(
                 "{} functions examined · {} unresolved calls · {} failed walks",
                 report.functions_examined, report.unresolved_calls, report.failed_functions,
             ))
             .on_hover_text(format!(
-                "Confirmed direct calls in examined functions; unknown indirect targets remain unresolved. {} decode attempts; {} fallthrough calls excluded.",
+                "Confirmed direct calls · {} decode attempts · {} fallthrough calls excluded. Indirect targets may remain unresolved.",
                 report.decode_attempts, report.skipped_fallthrough_calls
             ));
             if report.partial {
@@ -6306,9 +6376,8 @@ impl DesktopApp {
         let report = &index.report;
         let rows = rows.calls.as_slice();
         ui.horizontal(|ui| {
-            ui.label(format!("{} matching calls", rows.len()));
-            ui.weak("·");
-            ui.weak("An empty result does not establish absence of references.");
+            ui.label(format!("{} matching calls", rows.len()))
+                .on_hover_text("Examined functions only; empty does not mean no references.");
         });
         let mut source = None;
         let mut target = None;
@@ -6416,6 +6485,11 @@ impl DesktopApp {
         let saved = (matches!(self.tab, Tab::Graph | Tab::Listing) && self.cached_graph)
             || (self.tab == Tab::Strings && self.cached_strings)
             || (self.tab == Tab::Crypto && self.cached_crypto);
+        let saved_tooltip = if matches!(self.tab, Tab::Graph | Tab::Listing) {
+            "Saved graph/listing; Refresh to recompute."
+        } else {
+            "Saved scan results; rescan to recompute."
+        };
         theme::dock_tabs(
             ui,
             &mut self.tab,
@@ -6430,8 +6504,7 @@ impl DesktopApp {
             ],
             |ui| {
                 if saved {
-                    ui.weak("Saved analysis")
-                        .on_hover_text("Persisted project results. Scan again to recompute.");
+                    ui.weak("Saved analysis").on_hover_text(saved_tooltip);
                 }
             },
         );
@@ -6547,11 +6620,8 @@ impl DesktopApp {
             Tab::Listing => {
                 let mut listing_xrefs = None;
                 if let Some(pc) = self.undisplayed_call {
-                    ui.colored_label(
-                        theme::WARNING,
-                        format!("{pc:#x} is outside this function's bounded graph"),
-                    )
-                    .on_hover_text("Use Go to inspect the referenced instruction's address.");
+                    ui.colored_label(theme::WARNING, format!("Outside graph: {pc:#x}"))
+                        .on_hover_text("Use Go to inspect the referenced instruction's address.");
                 }
                 if self.info.is_none() {
                     theme::empty_state(ui, "No binary loaded");
@@ -6769,16 +6839,13 @@ impl DesktopApp {
                                 .map_or(String::new(), |minimum| format!(" · min. {minimum}"))
                         ));
                     }
+                    if self.strings_truncated {
+                        ui.colored_label(theme::WARNING, "Partial scan")
+                        .on_hover_text(
+                            "10,000 previews / 64 MiB limit. Increase minimum length and rescan.",
+                        );
+                    }
                 });
-                if self.strings_truncated {
-                    ui.colored_label(
-                        theme::WARNING,
-                        "Partial scan: 10,000 previews / 64 MiB limit",
-                    )
-                    .on_hover_text(
-                        "Increase the minimum length and scan again to reduce short-string noise.",
-                    );
-                }
                 let mut read = None;
                 let mut xrefs = None;
                 let glyph = theme::glyph_width(ui);
@@ -6870,9 +6937,8 @@ impl DesktopApp {
                     {
                         self.request(Request::Crypto, &context);
                     }
-                    ui.weak(format!("{} matches", self.crypto.len()));
-                    ui.separator();
-                    ui.weak("Matches are clues, not proof of algorithm use");
+                    ui.weak(format!("{} candidates", self.crypto.len()))
+                        .on_hover_text("Constant matches do not prove algorithm use.");
                 });
                 let mut read = None;
                 let glyph = theme::glyph_width(ui);
@@ -7198,10 +7264,11 @@ impl DesktopApp {
                         if let Some(step) = self.analysis_plan.as_ref().and_then(|plan| plan.current.or(plan.steps.front().copied())) {
                             ui.label(step.label());
                         }
-                        ui.label("Analysis is running. Use Analysis → Cancel analysis to stop it.");
-                        ui.label("Elapsed time includes setup and waits. Steps identify selected analyses, not portions of runtime.");
+                        ui.label("Cancel: Analysis → Cancel analysis.");
+                        ui.label("Elapsed includes waits · step count is not time progress.");
                         if let Some(work) = display.known {
-                            ui.label(format!("{} / {} known functions processed. Failed and limited attempts count as processed; in-flight work does not. The total can grow as more functions are admitted; this is not whole-program coverage.", work.processed, work.total));
+                            ui.label(format!("{}/{} known functions processed", work.processed, work.total));
+                            ui.label("Includes failed/limited attempts; excludes in-flight work. Total may grow; not whole-program coverage.");
                         }
                         if let Some(task) = display.foreground {
                             ui.label(task);
@@ -7314,7 +7381,7 @@ impl DesktopApp {
                 self.annotation_browser(ui);
                 ui.separator();
                 if self.selected.is_none() {
-                    ui.weak("Select an address to add a name or comment.");
+                    ui.weak("Select an address.");
                 } else {
                     self.annotation_editor(ui);
                 }
@@ -8407,6 +8474,96 @@ mod tests {
                 _ => assert_eq!(app.status, "waiting"),
             }
         }
+    }
+
+    #[test]
+    fn propagated_access_hover_preserves_row_navigation() {
+        let context = egui::Context::default();
+        theme::install(&context);
+        context.style_mut_of(egui::Theme::Dark, |style| {
+            style.interaction.tooltip_delay = 0.0
+        });
+        let mut app = semantic_app();
+        app.info.as_mut().unwrap().architecture = "AArch64".into();
+        app.reference_data = true;
+        let mut report = CallAnalysis::default();
+        report.data = Some(DataAnalysis {
+            references: vec![DataReference {
+                function: 0x1000,
+                address: 0x1004,
+                target: 0x1080,
+                size: 4,
+                access: DataAccess::Read,
+                provenance: DataProvenance::Propagated,
+            }],
+            ..Default::default()
+        });
+        let index = crate::call_analysis::CallIndex::new(report);
+        app.set_call_index(Some(Arc::new(index)));
+        let frame = |app: &mut DesktopApp, events| {
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    time: Some(context.input(|input| input.time) + 0.25),
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800.0, 400.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    app.data_references_panel(ui, Some((0x1000, false)));
+                },
+            );
+            output.textures_delta.clear();
+            output
+        };
+        frame(&mut app, vec![]);
+        let output = frame(&mut app, vec![]);
+        let pos = text_position(&output, "Read*", 0) + egui::vec2(6.0, 5.0);
+        frame(&mut app, vec![egui::Event::PointerMoved(pos)]);
+        let output = frame(&mut app, vec![]);
+        assert!(
+            rendered_text(&output)
+                .iter()
+                .any(|text| text.contains("* Address from register constants in this block."))
+        );
+        frame(&mut app, pointer_events(pos));
+        assert_eq!(app.selected, Some(0x1004));
+        assert!(app.tab == Tab::Listing);
+    }
+
+    #[test]
+    fn missing_inferred_signature_is_discoverable_in_warning_menu() {
+        let context = egui::Context::default();
+        theme::install(&context);
+        let mut app = semantic_app();
+        edit_semantics(&mut app, |semantics| semantics.prototype = None);
+        app.begin_signature_editor();
+        let frame = |app: &mut DesktopApp, events| {
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 600.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |_| app.signature_window(&context),
+            );
+            output.textures_delta.clear();
+            output
+        };
+        frame(&mut app, vec![]);
+        let output = frame(&mut app, vec![]);
+        let pos = text_position(&output, "    1", 0) + egui::vec2(8.0, 5.0);
+        frame(&mut app, pointer_events(pos));
+        let output = frame(&mut app, vec![]);
+        assert!(rendered_text(&output).iter().any(|text| {
+            text.contains("No inferred prototype. Choose types or refresh decompilation.")
+        }));
+        assert!(app.signature_editor.as_ref().unwrap().return_type.is_none());
     }
 
     #[test]
@@ -10003,7 +10160,8 @@ mod tests {
         // Two calls to it (one recursive) and its own outgoing call.
         assert!(text.iter().any(|t| t == "3 matching calls"));
         assert!(
-            text.iter()
+            !text
+                .iter()
                 .any(|t| t.contains("does not establish absence"))
         );
         app.reference_direction = CallDirection::Outgoing;
@@ -10034,10 +10192,7 @@ mod tests {
         });
         assert!(app.reference_data);
         let text = frame(&mut app);
-        assert!(
-            text.iter()
-                .any(|t| t.contains("exactly at this string's first byte"))
-        );
+        assert!(text.iter().any(|t| t == "Exact start"));
         assert!(text.iter().any(|t| t == "1 accesses starting at 0x2010"));
         app.reference_access = AccessFilter::Read;
         assert!(
@@ -11378,8 +11533,8 @@ mod tests {
             assert!(
                 rendered_text(&output)
                     .iter()
-                    .any(|text| text.contains("in-flight work does not")
-                        && text.contains("total can grow"))
+                    .any(|text| text.contains("excludes in-flight work")
+                        && text.contains("Total may grow"))
             );
         }
     }
