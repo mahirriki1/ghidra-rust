@@ -34,9 +34,8 @@ big-endian word representation. Sigma/tau are scanned both as their ASCII bytes
 (equivalent to little-endian storage of the usual numeric words) and as those
 numeric words stored big-endian. There are 13 byte signatures; the longest is
 64 bytes. Matches are checked at every byte alignment, including overlapping
-signatures. The scanner returns at most the caller's limit or 4,096 hits,
-whichever is smaller. Streaming callers must overlap chunks by 63 bytes and
-suppress duplicate hits themselves; isolated region boundaries are not bridged.
+signatures. The scanner returns bounded results; streaming callers must overlap
+chunks by 63 bytes and suppress duplicates. Isolated region boundaries are not bridged.
 
 These are **constant matches**, not confirmation that an algorithm executes,
 that a key is present, or that data can be decrypted. Documentation, unused code,
@@ -57,14 +56,13 @@ and preserves its bytes. Other transformations produce arbitrary bytes, so an
 invalid UTF-8 result must be shown as bytes rather than repaired text.
 
 XOR key entry requires `hex:` or `text:` to avoid ambiguity: `hex:4142` is two
-bytes, while `text:4142` is four UTF-8 bytes. Keys and selected input are bounded
-to 64 KiB; transformed output is bounded to 256 KiB. Input over the limit is
-rejected rather than silently truncated. A wrong XOR key can produce valid text;
-no unauthenticated XOR operation can establish that a key is correct.
+bytes, while `text:4142` is four UTF-8 bytes. [Input, key, and output limits](analysis.md#resource-limits-and-trust-boundaries)
+reject oversized data rather than silently truncating it. A wrong XOR key can
+produce valid text; no unauthenticated XOR operation can establish correctness.
 
 Suggestions include valid hex/Base64 transformations, evidence-based UTF-16
-interpretations, and at most five ranked nonzero single-byte XOR guesses. The
-ranking is a simple readability heuristic, with a bias toward ordinary Latin
+interpretations, and ranked nonzero single-byte XOR guesses. The ranking is a
+simple readability heuristic, with a bias toward ordinary Latin
 text; it is not confidence, automatic decryption, or a general language detector.
 Only suggested previews are generated. Applying an annotation is a separate user
 action, and decoded output does not modify the source binary.

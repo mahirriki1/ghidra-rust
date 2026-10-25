@@ -4,7 +4,8 @@ The Linux desktop is a native Rust executable. It does not need a Rust, Java,
 or Python runtime. It requires a conventional glibc-based x86-64 Linux system,
 an OpenGL-capable X11 or Wayland desktop, and compatible system shared libraries.
 Analysis workers require **bubblewrap** (`bwrap`), working unprivileged user
-namespaces, and the conventional `/usr`-based filesystem described in the README.
+namespaces, and the conventional `/usr`-based filesystem described under
+[Worker isolation](#worker-isolation).
 The app reports sandbox startup failures rather than starting an unrestricted
 worker. Nix-style layouts and other architectures are not covered by this package.
 
@@ -39,11 +40,9 @@ shared-library dependencies. X11/Wayland and OpenGL components loaded at runtime
 are additional requirements. Use `ldd ./ghidra-rust` on a trusted downloaded build
 to diagnose missing direct libraries.
 
-A package made locally inherits that build machine's library requirements.
-The current local Arch/WSL build requires `GLIBC_2.43`; it is not a substitute for
-a package actually built and tested on the Ubuntu 24.04 release runner. Build on
-your oldest supported distribution and test on each intended target. An AppImage
-or distro-specific installer is not produced by these scripts.
+Locally built packages inherit the build host's library requirements. Inspect
+`BUILD-INFO.json` and test on each intended distribution. The scripts do not
+produce an AppImage or distro-specific installer.
 
 Ubuntu 24.04 and some other distributions can additionally restrict unprivileged
 user namespaces through local security policy. Bubblewrap must be allowed by that
@@ -74,10 +73,32 @@ Follow [building and shipping each version](releases.md) for prerequisites and
 `scripts/build-linux.sh`. Python 3.11+ is a packaging tool on the build machine
 only; it is not distributed with or used by the desktop.
 
-Open the original C fixture built by the worker tests or compile it manually as
-shown in [the fixture guide](../tests/fixtures/README.md). Check listing/CFG and
-decompiler results, mapped instruction selection, navigation/renaming, strings
-and decoding, FindCrypt, and saving/reopening an embedded `.grproj`. Verify the
-input bytes remain unchanged and workers exit when the app closes. Projects
-still require trusted sources because SQLite parses them in a GUI background
-thread.
+Build the [original C fixture](../tests/fixtures/README.md) and check Listing/CFG,
+mapped pseudocode selection, call navigation/history, rename/undo, strings,
+decoding, FindCrypt, Hex, and embedded/external project save/reopen with saved
+provenance. Verify unchanged input bytes and worker shutdown. See
+[project trust boundaries](analysis.md#resource-limits-and-trust-boundaries).
+
+## Worker isolation
+
+Workers use bubblewrap private namespaces, no network, restricted read-only
+system-library mounts, a read-only executable, and only the selected input from
+user data. The analysis image is immutable for the session. Conventional
+`/usr`-based systems are supported, with `/lib` and `/lib64` either mounted
+read-only or resolved under `/usr`.
+
+Workers have a 2 GiB address-space limit, an approximately 20-second per-request
+CPU budget, no core dumps, and no privilege escalation. Missing containment or
+identity setup fails closed. These controls reduce exposure; they do not prove
+the app or upstream engine is free of vulnerabilities.
+
+## Troubleshooting
+
+If Wayland/Mesa cannot initialize OpenGL, try the documented X11 software-rendering
+fallback:
+
+```sh
+env -u WAYLAND_DISPLAY LIBGL_ALWAYS_SOFTWARE=1 cargo run --release --locked
+```
+
+Software rendering is a compatibility workaround, not a speed improvement.
