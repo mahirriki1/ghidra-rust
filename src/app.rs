@@ -10930,6 +10930,9 @@ mod tests {
                 decode_attempts: count,
                 ..Default::default()
             },
+            pointers: None,
+            admissions: Vec::new(),
+            recovery_records: 0,
         };
         crate::discovery::commit_replacement(state, app.info.as_ref().unwrap(), &batch).unwrap();
     }
