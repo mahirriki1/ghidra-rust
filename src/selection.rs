@@ -4,6 +4,7 @@ use crate::model::{
 };
 use std::collections::BTreeSet;
 use std::ops::Range;
+use std::sync::Arc;
 
 /// Checked, merged executable intervals. Repeated PC lookups are logarithmic in
 /// the section count instead of multiplying both public collection budgets.
@@ -142,9 +143,10 @@ pub fn validate_mappings(
     Ok(())
 }
 
+/// Mutable selection over mappings shared with the displayed decompilation.
 #[derive(Default)]
 pub struct SemanticSelection {
-    pub mappings: Vec<CodeMapping>,
+    pub mappings: Arc<[CodeMapping]>,
     pub addresses: BTreeSet<u64>,
     pub ranges: Vec<Range<usize>>,
 }
@@ -275,7 +277,8 @@ mod tests {
                     end: 8,
                     addresses: vec![0x1000],
                 },
-            ],
+            ]
+            .into(),
             ..Default::default()
         };
         selection.select_instruction(0x1000);

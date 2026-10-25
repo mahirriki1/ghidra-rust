@@ -416,9 +416,10 @@ the same initial or replay context rather than equating these two workloads.
 A→B→A can change C and mapping offsets even with an unchanged inventory: the
 original AArch64 data fixture acquires shared global-type knowledge when its
 callee is analyzed. The harness validates each result and records every digest
-difference rather than assuming immutable engine context. Any future result
-cache must account for global types as well as function names, imports and CFG
-boundaries. Before/after comparisons must use corresponding request sequences.
+difference rather than assuming immutable engine context. The session result
+store intentionally keeps the first validated result until Refresh; misses use
+the warm worker. Refresh can therefore differ after shared global-type learning.
+Function names and CFG inventory remain explicit cache dependencies. Before/after comparisons must use corresponding request sequences.
 
 ### Observer and allocator effects
 
@@ -477,3 +478,42 @@ selection and Graph, plus fixture local rename/undo, comment retention, semantic
 call navigation/history, refresh and embedded-project save/reopen. GUI frame
 submission proxies are not display-presentation measurements. Filesystem cache
 state was uncontrolled, and this is not a comparison against Ghidra.
+
+## Per-function store measurements
+
+`tests/analysis_baseline.rs` retains its original first-visit timing and memory
+endpoints, then adds a separate two-function store workload. It measures 300
+A/B/A compatible visits through the production coordinator, base graph camera and
+semantic-selection adoption. `cached_visits` reports p50/p95/max, zero-request
+verification and retained/pinned/uncached bytes. `B_graph_miss_ms` and
+`B_decompile_miss_ms` retain the second function's actual warm-worker miss costs;
+`cache_retained_memory` samples the client and worker tree with both functions
+retained. The sampler still uses contemporaneous RSS/PSS and a 10 ms interval;
+it can miss short peaks. Native rendering is outside these coordinator timings.
+The Windows baseline writes the same store workload as `cached_function_visits`
+after its independent warm-engine A/B/A correctness comparison. Run it natively
+on Windows; compiling this code on Linux does not validate Windows behavior.
+
+With `--features performance`, `function_result_lookup_adoption` measures the
+native desktop's synchronous lookup/adoption separately from the existing
+navigation frame-submission clock. Graph/code component misses, invalidation
+reasons, admission, context preparation, retained/pinned/uncached/preparation bytes
+and cumulative evicted bytes are trace events. The trace summarizer includes
+these events only from its existing certified request prefixes or a complete
+process trace; zero-duration lookup records remain counted as events.
+
+For an original fixture, build with `--features capture,performance` and set
+`GHIDRA_RUST_CAPTURE_CACHE_CHECK=A,B` (hexadecimal function entries),
+`GHIDRA_RUST_CAPTURE_TO=<new.ppm>`, and optionally
+`GHIDRA_RUST_CAPTURE_PROJECT=<new.grproj>`. This developer-only native scenario
+checks A/B/A sharing, exact instruction Back/Forward, instruction/code selection,
+graph rendering, Refresh recomputation and v4 save/reopen, then captures the final
+frame. Results and metrics stay outside normal desktop UI. Use fresh artifact
+paths and retain the raw trace; the scenario asserts its expected outcomes.
+
+The budget is retained allocation accounting, not process RSS. Mutable discovery
+continuation, temporary projections/presentation, uncached current results and
+image/worker allocations remain outside it. B-tree/key overhead is charged
+conservatively; payloads charge string/vector capacities with checked arithmetic.
+These measurements make no comparison with Ghidra and do not establish cold-cache
+or end-to-end display latency.
