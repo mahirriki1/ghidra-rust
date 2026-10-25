@@ -23,7 +23,7 @@ const SAVE_KEYS: &str = "Ctrl+S";
 const UNDO_KEYS: &str = "Cmd+Z";
 #[cfg(not(target_os = "macos"))]
 const UNDO_KEYS: &str = "Ctrl+Z";
-const ABOUT_SCOPE: &str = "Experimental x86 / x86-64 / AArch64 reverse engineering.";
+const ABOUT_SCOPE: &str = "Experimental · x86 / x86-64 / AArch64";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HelpDialog {
@@ -58,7 +58,6 @@ impl HelpDialog {
             match self {
                 Self::Shortcuts => {
                     shortcut_table(ui, key_width);
-                    ui.weak("Shortcuts pause while typing or in dialogs.");
                 }
                 Self::About => {
                     ui.label(concat!("Version ", env!("CARGO_PKG_VERSION")));
@@ -112,7 +111,12 @@ fn shortcut_dimensions(ui: &egui::Ui) -> (f32, f32) {
 }
 
 fn shortcut_table(ui: &mut egui::Ui, key_width: f32) {
-    theme::column_header(ui, &[("Shortcut", 0.0), ("Action", key_width)], 0.0);
+    let header = ui.scope(|ui| {
+        theme::column_header(ui, &[("Shortcut", 0.0), ("Action", key_width)], 0.0);
+    });
+    header
+        .response
+        .on_hover_text("Inactive while typing, in dialogs, or during file operations.");
     let (body, _) = ui.allocate_exact_size(
         egui::vec2(
             ui.available_width(),
