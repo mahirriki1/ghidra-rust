@@ -31,6 +31,12 @@ pub const NODE_SELECTED: Color32 = Color32::from_rgb(92, 58, 30);
 pub const NODE_ENTRY: Color32 = Color32::from_rgb(34, 68, 46);
 pub const NODE_RETURN: Color32 = Color32::from_rgb(90, 36, 40);
 pub const NODE_RADIUS: u8 = 3;
+/// Instructions or tokens linked to the selection, below the selection itself.
+pub const RELATED: Color32 = Color32::from_rgb(52, 42, 34);
+/// Height of one dense listing or table row; virtualized lists rely on it.
+pub const ROW_HEIGHT: f32 = 20.0;
+/// Bytes shown in the Listing's byte column before eliding the remainder.
+pub const LISTING_BYTES: usize = 8;
 const ADDRESS: Color32 = MUTED;
 const BYTES: Color32 = Color32::from_rgb(92, 99, 112);
 const MNEMONIC: Color32 = SYNTAX_KEYWORD;
@@ -104,7 +110,15 @@ pub fn install(context: &egui::Context) {
     visuals.widgets.active.bg_stroke = Stroke::new(1.5, ACCENT);
     visuals.widgets.open.weak_bg_fill = HOVER;
     visuals.widgets.open.bg_stroke = Stroke::NONE;
-    // Virtualized listing and function rows assume this row height.
+    // Desktop-style scroll bars stay visible in a fixed gutter at the edge of
+    // each view instead of floating over, and tracking, the visible rows.
+    style.spacing.scroll = egui::style::ScrollStyle {
+        bar_width: 8.0,
+        bar_inner_margin: 2.0,
+        dormant_background_opacity: 0.5,
+        dormant_handle_opacity: 0.7,
+        ..egui::style::ScrollStyle::solid()
+    };
     style.spacing.item_spacing = egui::vec2(5.0, 3.0);
     style.spacing.button_padding = egui::vec2(6.0, 2.0);
     style.spacing.interact_size.y = 20.0;
@@ -214,43 +228,99 @@ pub fn history_button(ui: &mut Ui, forward: bool, enabled: bool) -> egui::Respon
 /// An editor-style tab on a recessed strip, with trailing actions. `active`
 /// marks the focused provider with an accent rule.
 pub fn dock_header(ui: &mut Ui, title: &str, active: bool, actions: impl FnOnce(&mut Ui)) {
-    let background = ui.painter().add(egui::Shape::Noop);
-    let row = ui.horizontal(|ui| {
-        ui.set_min_height(26.0);
-        ui.add_space(4.0);
-        let title = ui.label(RichText::new(title).color(if active { TEXT } else { MUTED }));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.add_space(4.0);
-            actions(ui);
-        });
-        title.rect
-    });
-    let strip = row.response.rect.expand2(egui::vec2(2.0, 1.0));
-    let tab = egui::Rect::from_x_y_ranges(
-        row.inner.x_range().expand(10.0),
-        (strip.top() + 3.0)..=strip.bottom(),
+    let mut current = active;
+    dock_tabs(ui, &mut current, &[(active, title)], actions);
+}
+
+/// A dock title strip whose entries are editor-style tabs; the selected tab
+/// joins the pane below it. Returns whether the selection changed.
+pub fn dock_tabs<T: PartialEq + Copy>(
+    ui: &mut Ui,
+    current: &mut T,
+    tabs: &[(T, &str)],
+    actions: impl FnOnce(&mut Ui),
+) -> bool {
+    const HEIGHT: f32 = 26.0;
+    let mut changed = false;
+    let (strip, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), HEIGHT),
+        egui::Sense::hover(),
     );
-    let painter = ui.painter();
-    painter.set(
-        background,
-        egui::Shape::Vec(vec![
-            egui::Shape::rect_filled(strip, 3, CHROME),
-            egui::Shape::rect_filled(
+    let painter = ui.painter().with_clip_rect(strip.intersect(ui.clip_rect()));
+    painter.rect_filled(strip, 0, CHROME);
+    painter.hline(
+        strip.x_range(),
+        strip.bottom() - 0.5,
+        Stroke::new(1.0, BORDER),
+    );
+    let font = FontId::proportional(13.0);
+    let mut x = strip.left();
+    for (index, (value, label)) in tabs.iter().enumerate() {
+        let galley = painter.layout_no_wrap((*label).to_owned(), font.clone(), TEXT);
+        let tab = egui::Rect::from_min_size(
+            egui::pos2(x, strip.top() + 3.0),
+            egui::vec2(galley.size().x + 22.0, HEIGHT - 3.0),
+        );
+        x = tab.right() + 1.0;
+        let response = ui
+            .interact(
                 tab,
-                CornerRadius {
-                    nw: 4,
-                    ne: 4,
-                    sw: 0,
-                    se: 0,
-                },
-                if active { VIEW } else { HEADER },
-            ),
-        ]),
-    );
-    if active {
-        painter.hline(tab.x_range(), tab.top() + 1.0, Stroke::new(2.0, ACCENT));
+                ui.scope_id().with(("dock-tab", index)),
+                egui::Sense::click(),
+            )
+            .on_hover_cursor(egui::CursorIcon::Default);
+        let selected = *current == *value;
+        response
+            .widget_info(|| egui::WidgetInfo::selected(egui::Role::Tab, true, selected, *label));
+        let fill = if selected {
+            VIEW
+        } else if response.hovered() {
+            HOVER
+        } else {
+            HEADER
+        };
+        painter.rect_filled(
+            tab,
+            CornerRadius {
+                nw: 4,
+                ne: 4,
+                sw: 0,
+                se: 0,
+            },
+            fill,
+        );
+        if selected {
+            painter.hline(
+                tab.x_range().shrink(1.0),
+                tab.top() + 1.0,
+                Stroke::new(2.0, ACCENT),
+            );
+        }
+        painter.galley(
+            egui::pos2(tab.left() + 11.0, tab.center().y - galley.size().y / 2.0),
+            galley,
+            if selected { TEXT } else { MUTED },
+        );
+        if response.clicked() && !selected {
+            *current = *value;
+            changed = true;
+        }
     }
-    ui.add_space(4.0);
+    let actions_rect = egui::Rect::from_min_max(
+        egui::pos2(x + 8.0, strip.top()),
+        egui::pos2(strip.right() - 4.0, strip.bottom()),
+    );
+    if actions_rect.width() > 0.0 {
+        let mut actions_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(actions_rect)
+                .layout(egui::Layout::right_to_left(egui::Align::Center)),
+        );
+        actions_ui.set_clip_rect(actions_rect.intersect(ui.clip_rect()));
+        actions(&mut actions_ui);
+    }
+    ui.add_space(2.0);
+    changed
 }
 
 /// One entry of a view switcher, underlined when selected. Behaves like
@@ -277,30 +347,233 @@ pub fn tab<T: PartialEq>(ui: &mut Ui, current: &mut T, value: T, label: &str) ->
     response
 }
 
+/// Hex digits used for addresses in a listing ending at `last`.
+pub fn address_digits(last: u64) -> usize {
+    (64 - last.leading_zeros() as usize).div_ceil(4).max(8)
+}
+
+/// Instruction bytes for the fixed-width byte column; long encodings are
+/// elided so the mnemonic column stays aligned.
+pub fn listing_bytes(bytes: &[u8]) -> String {
+    let shown = if bytes.len() > LISTING_BYTES {
+        LISTING_BYTES - 1
+    } else {
+        bytes.len()
+    };
+    let mut text = String::with_capacity(LISTING_BYTES * 3);
+    for (index, byte) in bytes[..shown].iter().enumerate() {
+        if index > 0 {
+            text.push(' ');
+        }
+        text.push_str(&format!("{byte:02x}"));
+    }
+    if shown < bytes.len() {
+        text.push('…');
+    }
+    text
+}
+
+/// Character offsets of the Listing's Address, Bytes, Mnemonic and Operands
+/// columns.
+pub fn listing_columns(address_digits: usize) -> [usize; 4] {
+    let bytes = address_digits + 2;
+    let mnemonic = bytes + LISTING_BYTES * 3 + 1;
+    [0, bytes, mnemonic, mnemonic + 11]
+}
+
 pub fn listing_row(
     address: u64,
-    bytes: &str,
+    address_digits: usize,
+    bytes: &[u8],
     mnemonic: &str,
     operands: &str,
 ) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::default();
+    let bytes_width = LISTING_BYTES * 3 - 1;
     for (text, color) in [
-        (format!("{address:08x}  "), ADDRESS),
-        (format!("{bytes:<25} "), BYTES),
+        (format!("{address:0address_digits$x}  "), ADDRESS),
+        (format!("{:<bytes_width$}  ", listing_bytes(bytes)), BYTES),
         (format!("{mnemonic:<10} "), MNEMONIC),
         (operands.to_owned(), TEXT),
     ] {
-        job.append(
-            &text,
-            0.0,
-            egui::TextFormat {
-                font_id: FontId::monospace(13.0),
-                color,
-                ..Default::default()
-            },
-        );
+        job.append(&text, 0.0, mono_format(color));
     }
     job
+}
+
+pub fn mono_format(color: Color32) -> egui::TextFormat {
+    egui::TextFormat {
+        font_id: FontId::monospace(13.0),
+        color,
+        ..Default::default()
+    }
+}
+
+/// Width of one monospace character in the shared code font.
+pub fn glyph_width(ui: &Ui) -> f32 {
+    ui.fonts_mut(|fonts| fonts.glyph_width(&FontId::monospace(13.0), '0'))
+}
+
+/// Rows of `pitch` overlapping the content-space range `viewport`.
+pub fn visible_rows(viewport: egui::Rangef, pitch: f32, count: usize) -> std::ops::Range<usize> {
+    if count == 0 || pitch <= 0.0 || viewport.max <= 0.0 {
+        return 0..0;
+    }
+    let first = ((viewport.min.max(0.0) / pitch).floor() as usize).min(count);
+    let last = ((viewport.max / pitch).ceil() as usize).clamp(first, count);
+    first..last
+}
+
+/// Whether `row` lies entirely inside the content-space range `viewport`.
+pub fn row_visible(viewport: egui::Rangef, pitch: f32, row: usize) -> bool {
+    let top = row as f32 * pitch;
+    top >= viewport.min && top + pitch <= viewport.max
+}
+
+/// A virtualized list of `row_height` rows filling the available space.
+///
+/// Every row spans the full content width, so the scroll range and bars do not
+/// depend on which rows happen to be visible. `reveal` brings a row into view,
+/// centered, only when it is not already fully visible. `add_row` receives the
+/// row index and its screen rectangle.
+pub fn rows<R>(
+    ui: &mut Ui,
+    id_salt: impl std::hash::Hash + std::fmt::Debug,
+    count: usize,
+    row_height: f32,
+    content_width: f32,
+    reveal: Option<usize>,
+    mut add_row: impl FnMut(&mut Ui, usize, egui::Rect) -> Option<R>,
+) -> (Option<R>, egui::scroll_area::ScrollAreaOutput<()>) {
+    let mut result = None;
+    let salt = egui::IdSalt::new(id_salt);
+    let id = ui.make_persistent_id(egui::IdSalt::new(salt));
+    let mut area = egui::ScrollArea::both()
+        .id_salt(salt)
+        .auto_shrink([false, false]);
+    // Apply the reveal before showing so the row is in view on this frame.
+    if let Some(row) = reveal.filter(|row| *row < count) {
+        let offset = egui::scroll_area::State::load(ui.ctx(), id)
+            .map_or(0.0, |state| state.clamped_offset().y);
+        // A horizontal scroll bar's gutter hides the bottom of the view.
+        let height = ui.available_height() - ui.spacing().scroll.allocated_width();
+        if !row_visible(egui::Rangef::new(offset, offset + height), row_height, row) {
+            let content = row_height * count as f32;
+            let centered = (row as f32 + 0.5) * row_height - height / 2.0;
+            area = area.vertical_scroll_offset(centered.clamp(0.0, (content - height).max(0.0)));
+        }
+    }
+    let output = area.show_viewport(ui, |ui, viewport| {
+        let width = content_width.max(ui.available_width());
+        let origin = ui.max_rect().min;
+        ui.allocate_rect(
+            egui::Rect::from_min_size(origin, egui::vec2(width, row_height * count as f32)),
+            egui::Sense::hover(),
+        );
+        for row in visible_rows(viewport.y_range(), row_height, count) {
+            let rect = egui::Rect::from_min_size(
+                origin + egui::vec2(0.0, row as f32 * row_height),
+                egui::vec2(width, row_height),
+            );
+            if let Some(value) = add_row(ui, row, rect) {
+                result = Some(value);
+            }
+        }
+    });
+    debug_assert_eq!(output.id, id, "reveal reads this scroll area's state");
+    (result, output)
+}
+
+/// A clickable full-width row with hover, related and selected fills.
+pub fn row_response(
+    ui: &mut Ui,
+    id: egui::Id,
+    rect: egui::Rect,
+    selected: bool,
+    related: bool,
+) -> egui::Response {
+    let response = ui.interact(rect, id, egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let fill = if selected {
+            Some(SELECTION)
+        } else if related {
+            Some(RELATED)
+        } else if response.hovered() {
+            Some(HOVER)
+        } else {
+            None
+        };
+        if let Some(fill) = fill {
+            ui.painter().rect_filled(rect, 0, fill);
+        }
+        if selected {
+            ui.painter().rect_filled(
+                egui::Rect::from_min_size(rect.min, egui::vec2(2.0, rect.height())),
+                0,
+                ACCENT,
+            );
+        }
+    }
+    response
+}
+
+/// Paint one line of text in a row cell, vertically centered and clipped to
+/// `cell` with an ellipsis rather than overlapping the next column.
+pub fn cell_text(ui: &Ui, cell: egui::Rect, text: impl Into<egui::WidgetText>, color: Color32) {
+    if !ui.is_rect_visible(cell) {
+        return;
+    }
+    let galley = text.into().into_galley(
+        ui,
+        Some(egui::TextWrapMode::Truncate),
+        (cell.width() - 6.0).max(0.0),
+        TextStyle::Monospace,
+    );
+    let position = egui::pos2(cell.left() + 6.0, cell.center().y - galley.size().y / 2.0);
+    ui.painter()
+        .with_clip_rect(cell.intersect(ui.clip_rect()))
+        .galley(position, galley, color);
+}
+
+/// A column-heading strip in the shared header style. `columns` holds each
+/// title and its x offset from the strip's left edge; `scroll_x` follows a
+/// horizontally scrolled body.
+pub fn column_header(ui: &mut Ui, columns: &[(&str, f32)], scroll_x: f32) -> egui::Rect {
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), ROW_HEIGHT),
+        egui::Sense::hover(),
+    );
+    paint_column_header(ui, rect, columns, scroll_x);
+    rect
+}
+
+/// Paint a header strip into an already allocated rectangle.
+pub fn paint_column_header(ui: &Ui, rect: egui::Rect, columns: &[(&str, f32)], scroll_x: f32) {
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+    painter.rect_filled(rect, 0, HEADER);
+    painter.hline(
+        rect.x_range(),
+        rect.bottom() - 0.5,
+        Stroke::new(1.0, BORDER),
+    );
+    for (title, x) in columns {
+        painter.text(
+            egui::pos2(rect.left() + 6.0 + x - scroll_x, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            *title,
+            FontId::proportional(12.0),
+            MUTED,
+        );
+    }
+}
+
+/// A muted placeholder centered in an empty view.
+pub fn empty_state(ui: &mut Ui, text: &str) {
+    ui.add_space(24.0);
+    ui.vertical_centered(|ui| ui.weak(text));
 }
 
 /// Graph block corner radius at the current zoom.
@@ -330,5 +603,77 @@ mod tests {
                 "{font:?}"
             );
         }
+    }
+
+    #[test]
+    fn visible_rows_cover_partial_rows_at_both_edges_and_stay_in_bounds() {
+        let range = |min, max| egui::Rangef::new(min, max);
+        assert_eq!(super::visible_rows(range(0.0, 100.0), 20.0, 1000), 0..5);
+        assert_eq!(super::visible_rows(range(10.0, 101.0), 20.0, 1000), 0..6);
+        assert_eq!(
+            super::visible_rows(range(19_990.0, 20_100.0), 20.0, 1000),
+            999..1000
+        );
+        assert_eq!(super::visible_rows(range(0.0, 100.0), 20.0, 0), 0..0);
+        assert!(super::row_visible(range(40.0, 100.0), 20.0, 2));
+        assert!(!super::row_visible(range(41.0, 100.0), 20.0, 2));
+        assert!(!super::row_visible(range(0.0, 100.0), 20.0, 5));
+    }
+
+    #[test]
+    fn revealing_rows_scrolls_only_when_needed_and_centers_the_target() {
+        let context = egui::Context::default();
+        super::install(&context);
+        let frame = |reveal: Option<usize>| {
+            let mut offset = 0.0;
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(400.0, 300.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    let (_, rows) =
+                        super::rows::<()>(ui, "rows", 1000, 20.0, 900.0, reveal, |_, _, _| None);
+                    offset = rows.state.clamped_offset().y;
+                    assert_eq!(rows.content_size.x, 900.0, "width is independent of rows");
+                },
+            );
+            output.textures_delta.clear();
+            offset
+        };
+        frame(None);
+        assert_eq!(frame(Some(5)), 0.0, "a visible row does not move the view");
+        let offset = frame(Some(500));
+        let center = 500.0 * 20.0 + 10.0;
+        assert!(
+            (offset..offset + 300.0).contains(&(center - 20.0)),
+            "row 500 is in view at offset {offset}"
+        );
+        assert!(
+            (offset + 150.0 - center).abs() < 25.0,
+            "and roughly centered"
+        );
+        assert_eq!(
+            frame(Some(500)),
+            offset,
+            "revealing it again keeps the view"
+        );
+    }
+
+    #[test]
+    fn long_encodings_keep_listing_columns_aligned() {
+        let short = super::listing_row(0x1000, 8, &[0x90], "NOP", "");
+        let long = super::listing_row(0x1001, 8, &[0x66; 15], "NOP", "word ptr [rax]");
+        let mnemonic = super::listing_columns(8)[2];
+        for job in [short, long] {
+            let at = job.text.find("NOP").unwrap();
+            assert_eq!(job.text[..at].chars().count(), mnemonic, "{}", job.text);
+        }
+        assert_eq!(super::listing_bytes(&[0x66; 15]), "66 66 66 66 66 66 66…");
+        assert_eq!(super::address_digits(0x1000), 8);
+        assert_eq!(super::address_digits(0x1_4000_1000), 9);
     }
 }

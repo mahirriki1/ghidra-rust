@@ -38,8 +38,12 @@ pub const MAX_STRING_MINIMUM: usize = 64;
 pub const MAX_ANALYSIS_FUNCTIONS: usize = 128;
 /// Interrupted batches retry each affected seed individually at most once.
 pub const MAX_DISCOVERY_INTERRUPTION_ATTEMPTS: usize = 2;
-/// Sixteen worst-case JSON-escaped 256-byte names fit below 60 KiB requests.
-pub const MAX_DISCOVERY_SYNC_FUNCTIONS: usize = 16;
+/// Entries in one function-name synchronization. Requests are also packed by
+/// encoded size with [`sync_chunks`] or [`sync_entry_bytes`].
+pub const MAX_DISCOVERY_SYNC_FUNCTIONS: usize = 1024;
+/// Encoded entry bytes per synchronization, leaving room for the request
+/// envelope below the 60 KiB request limit.
+pub const MAX_SYNC_FUNCTION_BYTES: usize = 48 * 1024;
 pub const MAX_ANALYSIS_INSTRUCTIONS: usize = 16_384;
 /// Executable bytes inspected by one function-start pattern request.
 pub const MAX_PATTERN_SCAN_BYTES: u64 = 1024 * 1024;
@@ -349,6 +353,37 @@ pub struct FunctionInfo {
 }
 
 /// Bytes `serde_json` emits for `text` inside a string literal, excluding quotes.
+/// Upper bound on one synchronization entry's encoding: braces, keys, quotes,
+/// a 20-digit address and a separator around the escaped name.
+pub fn sync_entry_bytes(name: &str) -> usize {
+    json_escaped_len(name) + 48
+}
+
+/// Consecutive name synchronizations, each within both the entry count and
+/// the encoded byte budget. A single entry always fits, since names are
+/// bounded by [`MAX_FUNCTION_NAME_BYTES`].
+pub fn sync_chunks(functions: &[FunctionInfo]) -> impl Iterator<Item = &[FunctionInfo]> {
+    let mut rest = functions;
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        let mut bytes = 0;
+        let length = rest
+            .iter()
+            .take(MAX_DISCOVERY_SYNC_FUNCTIONS)
+            .take_while(|function| {
+                bytes += sync_entry_bytes(&function.name);
+                bytes <= MAX_SYNC_FUNCTION_BYTES
+            })
+            .count()
+            .max(1);
+        let (chunk, tail) = rest.split_at(length);
+        rest = tail;
+        Some(chunk)
+    })
+}
+
 pub fn json_escaped_len(text: &str) -> usize {
     text.chars()
         .map(|c| match c {
@@ -778,5 +813,38 @@ mod tests {
         };
         let encoded = serde_json::to_value(scan).unwrap();
         assert!(serde_json::from_value::<PatternScan>(encoded).is_err());
+    }
+
+    #[test]
+    fn name_synchronizations_pack_short_names_and_stay_below_the_request_limit() {
+        let function = |address, name: &str| FunctionInfo {
+            address,
+            name: name.to_owned(),
+        };
+        let encoded = |chunk: &[FunctionInfo]| {
+            serde_json::to_vec(&Request::SyncFunctions {
+                functions: chunk.to_vec(),
+            })
+            .unwrap()
+            .len()
+        };
+        let short: Vec<_> = (0..3000u64)
+            .map(|a| function(u64::MAX - a, &format!("sub_{a:x}")))
+            .collect();
+        let chunks: Vec<_> = sync_chunks(&short).collect();
+        assert!(
+            chunks[0].len() > 512,
+            "{} short names per request",
+            chunks[0].len()
+        );
+        assert_eq!(chunks.concat(), short);
+        let worst: Vec<_> = (0..200u64)
+            .map(|a| function(u64::MAX - a, &"\u{1}".repeat(MAX_FUNCTION_NAME_BYTES)))
+            .collect();
+        let worst_chunks: Vec<_> = sync_chunks(&worst).collect();
+        assert_eq!(worst_chunks.concat(), worst);
+        for chunk in chunks.iter().chain(&worst_chunks) {
+            assert!(encoded(chunk) < 60 * 1024, "{} entries", chunk.len());
+        }
     }
 }

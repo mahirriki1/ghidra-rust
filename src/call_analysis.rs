@@ -19,6 +19,33 @@ impl AnalysisProgress {
         }
         Ok(())
     }
+
+    /// The desktop's acceptance rule for the `count`th (1-based) progress
+    /// event of one discovery request: it starts at `Seeds`, stays within the
+    /// per-request event budget, and never regresses.
+    pub fn validate_event(&self, count: usize, previous: Option<&Self>) -> Result<(), String> {
+        if (count == 1 && self.stage != AnalysisStage::Seeds) || count > MAX_ANALYSIS_FUNCTIONS + 3
+        {
+            return Err("Invalid analysis progress sequence".into());
+        }
+        self.validate_after(previous)
+    }
+}
+
+impl CallAnalysis {
+    /// A discovery reply's totals must equal its final `Publish` progress.
+    pub fn validate_final(&self, last: Option<&AnalysisProgress>) -> Result<(), String> {
+        match last {
+            Some(last)
+                if last.stage == AnalysisStage::Publish
+                    && last.functions_examined == self.functions_examined
+                    && last.decode_attempts == self.decode_attempts =>
+            {
+                Ok(())
+            }
+            _ => Err("Call analysis did not match its final progress".into()),
+        }
+    }
 }
 
 /// An aligned instruction start inside a file-backed executable section, using

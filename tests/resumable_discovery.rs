@@ -108,7 +108,7 @@ fn all_known_seeds_survive_cancel_restart_and_interactive_requests() {
     let mut worker = self::worker(&path);
     let reopened = open(&mut worker, &path);
     assert_eq!(info.sha256, reopened.sha256);
-    for functions in first_functions.chunks(MAX_DISCOVERY_SYNC_FUNCTIONS) {
+    for functions in ghidra_rust::model::sync_chunks(&first_functions) {
         assert!(matches!(
             request(
                 &mut worker,

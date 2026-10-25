@@ -10,7 +10,6 @@ impl LoadedProgram {
     pub(super) fn scan_patterns(
         &mut self,
         cursor: u64,
-        progress: &mut dyn FnMut(AnalysisProgress) -> Result<(), String>,
     ) -> Result<(PatternScan, Discovered), String> {
         let _span = crate::performance::span("discovery_function_patterns");
         let mut scan = PatternScan {
@@ -65,11 +64,6 @@ impl LoadedProgram {
             scan.next = None;
             return Ok((scan, discovered));
         }
-        progress(AnalysisProgress {
-            stage: AnalysisStage::Calls,
-            functions_examined: 0,
-            decode_attempts: MAX_ANALYSIS_INSTRUCTIONS - remaining,
-        })?;
         let mut name_bytes = self
             .info
             .functions
@@ -266,7 +260,41 @@ mod tests {
     }
 
     fn run_scan(loaded: &mut LoadedProgram) -> (PatternScan, Discovered) {
-        loaded.scan_patterns(0, &mut |_| Ok(())).unwrap()
+        loaded.scan_patterns(0).unwrap()
+    }
+
+    #[test]
+    fn pattern_batches_follow_the_desktop_progress_protocol() {
+        // The desktop stops a worker whose discovery progress does not start
+        // at Seeds or whose reply does not match a final Publish event, so a
+        // pattern step must satisfy both or discovery can never finish.
+        let mut loaded = x86_section(".text", vec![0x55, 0x48, 0x89, 0xe5, 0x5d, 0xc3]);
+        let mut events: Vec<AnalysisProgress> = Vec::new();
+        let reply = loaded
+            .handle_with_progress(
+                Request::DiscoverBatch {
+                    binding: DiscoveryBinding {
+                        generation: 1,
+                        epoch: 1,
+                        revision: 0,
+                        batch: 1,
+                    },
+                    inventory_base: None,
+                    seeds: Vec::new(),
+                    patterns: Some(0),
+                },
+                &mut |event| {
+                    event.validate_event(events.len() + 1, events.last())?;
+                    events.push(event);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let Response::DiscoveryBatch { batch } = reply else {
+            panic!("Expected a discovery batch");
+        };
+        assert_eq!(batch.patterns.unwrap().admitted, [0x1000]);
+        batch.analysis.validate_final(events.last()).unwrap();
     }
 
     #[test]
