@@ -6528,6 +6528,10 @@ impl DesktopApp {
     }
 
     fn status_bar(&self, ui: &mut egui::Ui) {
+        self.status_bar_at(ui, Instant::now());
+    }
+
+    fn status_bar_at(&self, ui: &mut egui::Ui, now: Instant) {
         let (row, _) = ui.allocate_exact_size(
             egui::vec2(ui.available_width(), theme::ROW_HEIGHT),
             egui::Sense::hover(),
@@ -6540,7 +6544,7 @@ impl DesktopApp {
                 ui.set_clip_rect(row.intersect(ui.clip_rect()));
                 ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
                 if let Some(pending) = &self.pending {
-                    let elapsed = pending.started.elapsed();
+                    let elapsed = now.saturating_duration_since(pending.started);
                     // Avoid flashing the bar for jobs which finish immediately.
                     if elapsed >= Duration::from_millis(200) {
                         let task = match pending.request {
@@ -9990,6 +9994,7 @@ mod tests {
     fn status_frame(
         context: &egui::Context,
         app: &DesktopApp,
+        now: Instant,
         width: f32,
         events: Vec<egui::Event>,
     ) -> (egui::FullOutput, egui::Rect) {
@@ -10006,7 +10011,7 @@ mod tests {
             |ui| {
                 rect = egui::Panel::bottom("status")
                     .frame(theme::status_frame(ui.style()))
-                    .show(ui, |ui| app.status_bar(ui))
+                    .show(ui, |ui| app.status_bar_at(ui, now))
                     .response
                     .rect;
             },
@@ -10019,14 +10024,15 @@ mod tests {
     fn status_notes_filter_only_exact_legacy_text_without_changing_project_data() {
         let context = egui::Context::default();
         theme::install(&context);
+        let now = Instant::now();
         let mut app = keyboard_app();
         let legacy = vec![
             "Prototype analysis: symbols and supported PE function metadata load immediately; deeper function discovery is explicit. Optimized C++/Rust types and source reconstruction are incomplete.".into(),
             "Function lists are capped at 262144 entries, 8 MiB of names, and 256 bytes per name in this prototype.".into(),
         ];
         app.info.as_mut().unwrap().warnings = legacy.clone();
-        status_frame(&context, &app, 1000.0, vec![]);
-        let (output, _) = status_frame(&context, &app, 1000.0, vec![]);
+        status_frame(&context, &app, now, 1000.0, vec![]);
+        let (output, _) = status_frame(&context, &app, now, 1000.0, vec![]);
         assert!(
             !rendered_text(&output)
                 .iter()
@@ -10044,10 +10050,10 @@ mod tests {
             app.status_notes().collect::<Vec<_>>(),
             [crate::packing::UPX_PACKED_WARNING, &near_legacy]
         );
-        let (output, _) = status_frame(&context, &app, 1000.0, vec![]);
+        let (output, _) = status_frame(&context, &app, now, 1000.0, vec![]);
         let position = text_position(&output, "    2", 0) + egui::vec2(8.0, 5.0);
-        status_frame(&context, &app, 1000.0, pointer_events(position));
-        let (output, _) = status_frame(&context, &app, 1000.0, vec![]);
+        status_frame(&context, &app, now, 1000.0, pointer_events(position));
+        let (output, _) = status_frame(&context, &app, now, 1000.0, vec![]);
         let texts = rendered_text(&output);
         assert!(
             texts
@@ -10065,6 +10071,7 @@ mod tests {
         for width in [1440.0, 1000.0, 520.0, 260.0] {
             let context = egui::Context::default();
             theme::install(&context);
+            let now = Instant::now();
             let mut app = keyboard_app();
             app.status = format!("{}\nmore details", "Discovery batch committed ".repeat(100));
             app.discovery = Some(crate::discovery::Discovery::new(
@@ -10087,21 +10094,37 @@ mod tests {
                     binary_sha256: String::new(),
                     context: String::new(),
                 },
-                started: Instant::now(),
+                started: now,
                 selection: 0,
                 revision: 0,
                 byte_origin: (None, Tab::Listing),
                 bytes: None,
             });
-            status_frame(&context, &app, width, vec![]);
-            let (output, idle_rect) = status_frame(&context, &app, width, vec![]);
+            status_frame(&context, &app, now, width, vec![]);
+            let (output, idle_rect) = status_frame(
+                &context,
+                &app,
+                now + Duration::from_millis(199),
+                width,
+                vec![],
+            );
             assert!(
                 !rendered_text(&output)
                     .iter()
                     .any(|text| text.contains("Applying function signatures"))
             );
-            app.pending.as_mut().unwrap().started -= Duration::from_secs(2);
-            let (output, busy_rect) = status_frame(&context, &app, width, vec![]);
+            let (output, busy_rect) = status_frame(
+                &context,
+                &app,
+                now + Duration::from_millis(200),
+                width,
+                vec![],
+            );
+            assert!(
+                rendered_text(&output)
+                    .iter()
+                    .any(|text| text.contains("Applying function signatures"))
+            );
             assert_eq!(idle_rect, busy_rect);
             assert!(
                 busy_rect.height() <= theme::ROW_HEIGHT + 8.0,
