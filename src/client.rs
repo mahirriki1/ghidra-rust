@@ -295,6 +295,31 @@ impl WorkerClient {
     pub fn poll(&self) -> Option<WorkerEvent> {
         self.events.try_recv().ok()
     }
+
+    /// Update jobs call this off the GUI thread before replacing the executable.
+    /// Keep the extracted-image lease until the child has actually been reaped.
+    pub fn stop_and_wait(mut self) -> Result<(), String> {
+        if let Some(mut child) = self.child.take() {
+            let killed = child.kill();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) if killed.is_ok() && std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    result => {
+                        self.child = Some(child);
+                        return Err(format!(
+                            "Cannot stop and reap the analysis worker for update: {result:?}"
+                        ));
+                    }
+                }
+            }
+        }
+        self.source_lease = None;
+        Ok(())
+    }
 }
 
 #[cfg(target_os = "linux")]

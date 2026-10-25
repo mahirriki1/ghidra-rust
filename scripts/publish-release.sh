@@ -38,6 +38,11 @@ else
     gh release edit "$RELEASE_TAG" --notes-file "$notes" --prerelease="$prerelease"
 fi
 # Keep failed uploads in a draft. A rerun can safely replace a partial upload.
+if [[ -n "${UPDATE_SIGNING_KEY:-}" ]]; then
+    python3 scripts/sign-updates.py --sign target/release-assets
+else
+    echo "::warning::UPDATE_SIGNING_KEY is not configured; this release cannot be installed by the in-app updater."
+fi
 gh release upload "$RELEASE_TAG" target/release-assets/* --clobber
 gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' > "$RUNNER_TEMP/release-assets.txt"
 python3 - "$RUNNER_TEMP/release-assets.txt" <<'PY'

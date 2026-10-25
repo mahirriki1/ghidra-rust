@@ -452,6 +452,7 @@ enum Intent {
     OpenPath(PathBuf),
     Close,
     Quit,
+    InstallUpdate,
     LoadAnnotations,
 }
 
@@ -655,6 +656,8 @@ pub struct DesktopApp {
     program_tree: bool,
     browser_dialog: Option<BrowserDialog>,
     help_dialog: Option<crate::help::HelpDialog>,
+    updater: crate::update_ui::UpdatePanel,
+    restart: crate::updater::RestartSlot,
     focus_comment: bool,
     signature_editor: Option<SignatureEditor>,
     signature_replay: Option<SignatureReplay>,
@@ -789,6 +792,8 @@ impl DesktopApp {
             program_tree: false,
             browser_dialog: None,
             help_dialog: None,
+            updater: crate::update_ui::UpdatePanel::default(),
+            restart: crate::updater::RestartSlot::default(),
             focus_comment: false,
             signature_editor: None,
             signature_replay: None,
@@ -803,6 +808,11 @@ impl DesktopApp {
     fn dirty(&self) -> bool {
         self.revision != self.saved_revision
             || (self.project_path.is_some() && self.result_revision != self.saved_result_revision)
+    }
+
+    pub fn with_restart(mut self, restart: crate::updater::RestartSlot) -> Self {
+        self.restart = restart;
+        self
     }
 
     fn request_intent(&mut self, intent: Intent, context: &egui::Context) {
@@ -853,8 +863,35 @@ impl DesktopApp {
                 self.quit_confirmed = true;
                 context.send_viewport_cmd(egui::ViewportCommand::Close);
             }
+            Intent::InstallUpdate => self.install_update(context),
             Intent::LoadAnnotations => self.load_annotations(context),
         }
+    }
+
+    fn install_update(&mut self, context: &egui::Context) {
+        let Some(prepared) = self.updater.ready() else {
+            return;
+        };
+        if self.file_job.is_some()
+            || self.opening.is_some()
+            || self.signature_change.is_some()
+            || self.signature_replay.is_some()
+        {
+            self.status =
+                "Wait for the current file or signature operation before installing the update"
+                    .into();
+            self.updater.open = true;
+            return;
+        }
+        let protections = self.binary_protection.iter().cloned().collect();
+        let worker = self.client.take();
+        self.stop_worker();
+        self.updater.install(crate::updater::install_job(
+            context,
+            prepared,
+            protections,
+            worker,
+        ));
     }
 
     fn clear_binary(&mut self) {
@@ -4371,6 +4408,7 @@ impl DesktopApp {
             || self.intent.is_some()
             || self.browser_dialog.is_some()
             || self.help_dialog.is_some()
+            || self.updater.open
             || self.analyze_prompt.is_some()
             || self.signature_editor.is_some()
             || self.signature_change.is_some()
@@ -4677,6 +4715,11 @@ impl DesktopApp {
                 }
             });
             ui.menu_button("Help", |ui| {
+                if ui.button("Check for updates…").clicked() {
+                    self.help_dialog = None;
+                    self.updater.open = true;
+                    ui.close();
+                }
                 if ui
                     .add(egui::Button::new("Keyboard shortcuts").shortcut_text("F1"))
                     .clicked()
@@ -7365,18 +7408,40 @@ impl DesktopApp {
         if let Some(path) = self.initial_path.take() {
             self.request_intent(Intent::OpenPath(path), &context);
         }
-        if let Some(path) = context.input(|input| {
-            input
-                .raw
-                .dropped_files
-                .first()
-                .map(|file| file.path().to_owned())
-        }) {
+        if let Some(path) = context
+            .input(|input| {
+                input
+                    .raw
+                    .dropped_files
+                    .first()
+                    .map(|file| file.path().to_owned())
+            })
+            .filter(|_| !self.updater.installing())
+        {
             self.request_intent(Intent::OpenPath(path), &context);
         }
         self.poll_files(&context);
-        self.poll_worker(&context);
+        if !self.updater.installing() {
+            self.poll_worker(&context);
+        }
+        if let Some(installed) = self.updater.poll(&context) {
+            self.status = format!(
+                "Updated. Previous executable: {}; notices: {}",
+                installed.backup.display(),
+                installed.notices.display()
+            );
+            self.restart.set(crate::updater::Restart {
+                executable: installed.executable,
+                project: self.project_path.clone(),
+            });
+            self.quit_confirmed = true;
+            context.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        if self.updater.installing() && context.input(|input| input.viewport().close_requested()) {
+            context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
         if context.input(|input| input.viewport().close_requested())
+            && !self.updater.installing()
             && self.dirty()
             && !self.quit_confirmed
         {
@@ -7433,6 +7498,13 @@ impl DesktopApp {
         self.file_dialogs.show(&context);
         self.browser_dialog(&context);
         self.signature_window(&context);
+        if self.intent.is_none()
+            && self.after_save.is_none()
+            && self.file_job.is_none()
+            && self.updater.show(&context)
+        {
+            self.request_intent(Intent::InstallUpdate, &context);
+        }
         self.handle_shortcuts(&context);
         crate::window_chrome::resize_borders(ui);
     }
@@ -7644,6 +7716,11 @@ impl DesktopApp {
             if let Some(canvas) = &mut self.canvas {
                 canvas.reveal_instruction(address);
             }
+            return;
+        }
+        if !busy && std::mem::take(&mut capture.updates) {
+            self.updater.open = true;
+            context.request_repaint();
             return;
         }
         capture.tick(context, !busy);
@@ -8979,6 +9056,104 @@ mod tests {
             frame(&mut app, click(&output, "×"));
             assert!(app.help_dialog.is_none());
         }
+        let output = frame(&mut app, vec![]);
+        frame(&mut app, click(&output, "Help"));
+        frame(&mut app, vec![]);
+        let output = frame(&mut app, vec![]);
+        frame(&mut app, click(&output, "Check for updates…"));
+        assert!(app.updater.open);
+        frame(&mut app, vec![]);
+        frame(
+            &mut app,
+            vec![key_event(egui::Key::Space, egui::Modifiers::NONE)],
+        );
+        assert!(app.tab == Tab::Listing);
+        frame(
+            &mut app,
+            vec![key_event(egui::Key::F1, egui::Modifiers::NONE)],
+        );
+        assert!(app.help_dialog.is_none());
+        frame(&mut app, vec![]);
+        frame(
+            &mut app,
+            vec![key_event(egui::Key::Escape, egui::Modifiers::NONE)],
+        );
+        assert!(!app.updater.open);
+    }
+
+    #[test]
+    fn update_restart_intent_uses_save_prompt_and_cancel_keeps_the_session() {
+        let context = egui::Context::default();
+        theme::install(&context);
+        let mut app = keyboard_app();
+        app.revision = app.saved_revision + 1;
+        let selection = app.selected;
+        app.request_intent(Intent::InstallUpdate, &context);
+        assert!(matches!(app.intent, Some(Intent::InstallUpdate)));
+        assert!(app.dirty());
+        assert!(!app.quit_confirmed);
+        assert!(app.restart.take().is_none());
+        // Cancelling the save prompt neither installs nor discards anything.
+        let draw = |app: &mut DesktopApp, events| {
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1200.0, 800.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| app.draw(ui),
+            );
+            output.textures_delta.clear();
+            output
+        };
+        draw(&mut app, vec![]);
+        let output = draw(&mut app, vec![]);
+        let position = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) if text.galley.text() == "Cancel" => {
+                    Some(text.pos + text.galley.rect.center().to_vec2())
+                }
+                _ => None,
+            })
+            .expect("save prompt Cancel control");
+        draw(&mut app, pointer_events(position));
+        assert!(app.intent.is_none());
+        assert_eq!(app.selected, selection);
+        assert!(app.dirty());
+        // A save that still has newer edits must present the prompt again.
+        app.after_save = Some(Intent::InstallUpdate);
+        app.finish_save(&context);
+        assert!(matches!(app.intent, Some(Intent::InstallUpdate)));
+        assert!(!app.quit_confirmed);
+    }
+
+    #[test]
+    fn closing_during_install_cannot_reopen_a_discard_prompt_or_exit_early() {
+        let context = egui::Context::default();
+        theme::install(&context);
+        let mut app = keyboard_app();
+        // Discarding unsaved work before installation leaves the revision dirty.
+        app.revision = app.saved_revision + 1;
+        let (job, _completion) = crate::updater::Job::pending_for_test();
+        app.updater.install(job);
+        let mut input = egui::RawInput::default();
+        input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .events
+            .push(egui::ViewportEvent::Close);
+        let mut output = context.run_ui(input, |ui| app.draw(ui));
+        output.textures_delta.clear();
+        assert!(app.updater.installing());
+        assert!(app.intent.is_none());
+        assert!(!app.quit_confirmed);
+        assert!(app.restart.take().is_none());
     }
 
     #[test]

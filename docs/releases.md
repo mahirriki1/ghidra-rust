@@ -10,13 +10,15 @@ Use Rust 1.98.1 with `rustfmt` and `clippy`. Build each operating system on that
 operating system; a cross-typecheck does not produce a tested native release.
 
 On Linux x64, install a C/C++ toolchain, pkg-config, binutils (`strip`/`readelf`),
-Python 3.11 or newer, the X11/Wayland/OpenGL development libraries, and bubblewrap.
-Python is used only to assemble the release package. On Ubuntu 24.04:
+Python 3.11 or newer, OpenSSL, the X11/Wayland/OpenGL development libraries, and
+bubblewrap. Python and OpenSSL support packaging, update signing, and the Linux
+signer/verifier interoperability test; neither is a desktop runtime dependency.
+On Ubuntu 24.04:
 
 ```sh
 sudo apt-get update
 sudo apt-get install --no-install-recommends -y \
-  build-essential pkg-config binutils python3 bubblewrap \
+  build-essential pkg-config binutils python3 openssl bubblewrap \
   libx11-dev libxi-dev libxrandr-dev libxcursor-dev libxinerama-dev \
   libxkbcommon-dev libwayland-dev libgl1-mesa-dev
 rustup toolchain install 1.98.1 --component rustfmt,clippy
@@ -157,9 +159,100 @@ publishing. Worker tests and headless UI tests do not test every graphics driver
 Follow the [Windows trust limits](windows.md) and
 [project trust boundaries](analysis.md#resource-limits-and-trust-boundaries).
 
-The packages are unsigned. Checksums detect changes when obtained through a
-trusted channel, but do not authenticate the publisher. Automatic publication
-does not sign the packages. A configured
+The executables do not have OS code signatures. Checksums detect changes when
+obtained through a trusted channel, but do not authenticate the publisher.
+When configured, the separate update-manifest signature authenticates in-app
+updates; it does not provide Windows Authenticode signing. A configured
 workflow is not evidence of a successful hosted run; inspect the actual jobs for
 the tagged commit. Hosted jobs do not run tests, so record local test results
 for each platform you validated.
+
+## In-app updates
+
+Linux x64 and Windows x64 portable desktops provide **Help → Check for updates…**.
+Checking and downloading are explicit user actions; there are no startup checks
+or automatic installations. The app examines at most 60 recent published releases
+and chooses the highest newer `vX.Y.Z` version. Alpha (`0.x`) builds include
+pre-releases; stable builds exclude them. Drafts and downgrades are rejected.
+Missing or invalid signatures stop the update and leave a GitHub Releases link.
+
+The app authenticates the exact `update.json` bytes using the Ed25519 public key
+embedded from `data/update-public-key.txt`. The manifest binds the repository,
+version, platform, filenames, lengths, and SHA-256 hashes of both standalone
+executables and a combined dependency-notice file. Only matching HTTPS release
+assets are accepted. Responses, downloads, release counts, and timeouts are
+bounded. Downloads stream to a private staging directory rather than retaining
+the executable in memory. Files are hashed again during installation.
+
+**Download update** stages the executable and notices. **Install and restart**
+uses the normal save/discard/cancel flow, stops and reaps the current analysis
+worker, stages files beside the installed executable, and retains the previous
+version. The executable is replaced only after validation. Linux uses atomic
+replacement; Windows first renames the running executable to its recovery path,
+then publishes the new file without overwriting a file that appeared meanwhile.
+A failed Windows publication attempts to restore the previous path; if that is
+not possible, the error identifies the retained executable for manual recovery.
+An unexpected interruption between those Windows renames can also require manual
+recovery. Input-file identity guards remain in force, including hard links: an
+app analyzing its own executable must close that binary before updating.
+
+The desktop exits before launching the new version. A saved project reopens;
+unsaved binary-only sessions are not automatically restored. The installation
+folder must be writable. The updater does not request elevation or manage system
+packages. Installed documentation is not replaced; updated application and
+dependency notices are collected from both release packages into a new
+`ghidra-rust-VERSION-notices-*.txt` beside the executable. Keep this file when
+redistributing an updated app.
+
+Recovery copies use `ghidra-rust-previous-VERSION-*` (with `.exe` on Windows).
+Keep them until the new release works, then remove obsolete copies manually.
+To recover, close the app and copy the desired previous executable back to the
+normal executable path. Older releases may reject projects saved in a newer
+format; retain project backups before upgrading. Failed downloads and
+verification never replace the installed executable. A failed relaunch leaves
+the verified new executable installed. Windows shows the manual launch path in
+a native error dialog; Linux reports it through stderr, which may not be visible
+when launched from a desktop menu. Linux directory entries are not explicitly
+fsynced, so atomic replacement is not a power-loss durability guarantee.
+
+### Configure release signing once
+
+The repository's public key must match the private PEM supplied in the
+**UPDATE_SIGNING_KEY** GitHub Actions secret. The private key is never committed
+or embedded in the app. The maintainer must retain the corresponding private key
+securely outside the repository/build directory, back it up, and configure the
+repository secret:
+
+```sh
+gh secret set UPDATE_SIGNING_KEY --repo mahirriki1/ghidra-rust < /secure/path/update-signing.pem
+```
+
+To initialize a new fork before distributing its first updater-enabled build,
+remove its inherited public key, change the repository constants in the updater
+and signing script, then run:
+
+```sh
+python3 scripts/sign-updates.py --init-key /secure/path/update-signing.pem
+```
+
+This refuses to overwrite an existing key or trust root. Replacing the public
+key after distribution breaks the existing clients' trust chain; key rotation
+requires a planned transition release authenticated by the old key.
+
+The automatic publisher verifies both complete native packages first, then signs
+the update manifest using OpenSSL and uploads `update.json`, `update.json.sig`,
+and `ghidra-rust-VERSION-update-notices.txt` alongside the usual eight assets.
+Signing fails if the secret does not match the embedded public key. Without the
+secret, publication emits a warning and retains the existing downloadable package
+workflow, but that release cannot be installed in-app. Manual releases can add
+the same files after package verification:
+
+```sh
+python3 scripts/verify-release-assets.py target/release-assets
+python3 scripts/sign-updates.py --sign target/release-assets --key-file /secure/path/update-signing.pem
+python3 -m unittest discover -s scripts -p 'test_updates.py'
+```
+
+The first updater-enabled version requires a manual download. Installation and
+restart still need native Windows validation before being described as tested
+there; Linux checks do not establish Windows runtime support.

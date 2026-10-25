@@ -54,16 +54,30 @@ fn run_desktop(initial_path: Option<PathBuf>) -> eframe::Result<()> {
         centered: placement.is_none(),
         ..Default::default()
     };
+    let restart = ghidra_rust::updater::RestartSlot::default();
+    let app_restart = restart.clone();
     eframe::run_native(
         "Ghidra Rust — Native reverse engineering",
         options,
         Box::new(move |cc| {
-            Ok(Box::new(ghidra_rust::app::DesktopApp::new(
-                cc,
-                initial_path,
-            )))
+            Ok(Box::new(
+                ghidra_rust::app::DesktopApp::new(cc, initial_path).with_restart(app_restart),
+            ))
         }),
-    )
+    )?;
+    if let Some(restart) = restart.take() {
+        let mut command = std::process::Command::new(&restart.executable);
+        if let Some(project) = restart.project {
+            command.arg(project);
+        }
+        command.spawn().map_err(|error| {
+            eframe::Error::AppCreation(Box::new(std::io::Error::other(format!(
+                "The update was installed, but restart failed: {error}. Relaunch {} manually.",
+                restart.executable.display()
+            ))))
+        })?;
+    }
+    Ok(())
 }
 
 fn report_startup_error(error: &str) {
