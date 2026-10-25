@@ -106,6 +106,14 @@ and during file operations.
 **Help → Keyboard shortcuts** opens the same reference as F1.
 **Help → About Ghidra Rust** shows the version and license/notice links.
 
+**Help → Check for updates…** checks GitHub on request, including newer alpha
+releases while running a `0.x` version. Download a verified update, then choose
+**Install and restart**. Unsaved work uses the normal save/discard/cancel prompt;
+a saved project reopens after restart. Linux x64 and Windows x64 portable builds
+require a writable installation folder. Updates retain the previous executable
+and current dependency notices beside the app. Older or unsigned releases cannot
+be installed through the updater. See [update setup and recovery](docs/releases.md#in-app-updates).
+
 ### References and inspection
 
 Use **X** or **Xrefs to…** to inspect confirmed call/data targets. Multiple

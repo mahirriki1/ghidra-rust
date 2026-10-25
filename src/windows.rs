@@ -166,6 +166,19 @@ pub fn file_identity(file: &File) -> io::Result<FileIdentity> {
 /// Same-volume replacement supports existing destinations on Windows, unlike
 /// std::fs::rename. Callers already synced and closed the temporary file.
 pub fn atomic_replace(temporary: &Path, destination: &Path) -> io::Result<()> {
+    move_file(
+        temporary,
+        destination,
+        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+    )
+}
+
+/// Roll back an update without overwriting a file created after publication failed.
+pub fn rename_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
+    move_file(source, destination, MOVEFILE_WRITE_THROUGH)
+}
+
+fn move_file(temporary: &Path, destination: &Path, flags: u32) -> io::Result<()> {
     fn wide(path: &Path) -> io::Result<Vec<u16>> {
         let mut text: Vec<u16> = path.as_os_str().encode_wide().collect();
         if text.contains(&0) {
@@ -181,14 +194,7 @@ pub fn atomic_replace(temporary: &Path, destination: &Path) -> io::Result<()> {
     let destination = wide(destination)?;
     // SAFETY: both buffers are live NUL-terminated UTF-16 strings. COPY_ALLOWED
     // is deliberately absent: replacement must remain a same-volume rename.
-    if unsafe {
-        MoveFileExW(
-            temporary.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    } == 0
-    {
+    if unsafe { MoveFileExW(temporary.as_ptr(), destination.as_ptr(), flags) } == 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
