@@ -11,6 +11,7 @@
 //! its instructions. `GHIDRA_RUST_CAPTURE_ANALYZE=1` runs every automatic
 //! analysis first; otherwise the first-open prompt is dismissed without
 //! analyzing. `GHIDRA_RUST_CAPTURE_SIZE=<width>x<height>` resizes the window.
+//! `GHIDRA_RUST_CAPTURE_UPDATES=1` opens the update dialog after analysis/checks.
 use eframe::egui;
 use std::io::Write;
 use std::time::{Duration, Instant};
@@ -23,6 +24,7 @@ pub struct Capture {
     pub select: Option<u64>,
     pub tab: Option<String>,
     pub analyze: bool,
+    pub updates: bool,
     pub size: Option<egui::Vec2>,
     idle_since: Option<Instant>,
     requested: bool,
@@ -70,6 +72,7 @@ impl Capture {
             select: address("GHIDRA_RUST_CAPTURE_SELECT"),
             tab: std::env::var("GHIDRA_RUST_CAPTURE_TAB").ok(),
             analyze: std::env::var_os("GHIDRA_RUST_CAPTURE_ANALYZE").is_some(),
+            updates: std::env::var_os("GHIDRA_RUST_CAPTURE_UPDATES").is_some(),
             size,
             idle_since: None,
             requested: false,

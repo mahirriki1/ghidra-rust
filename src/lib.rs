@@ -44,6 +44,8 @@ mod signature_ui;
 pub mod signatures;
 mod switch_analysis;
 pub mod theme;
+mod update_ui;
+pub mod updater;
 pub mod window_chrome;
 #[cfg(windows)]
 pub mod windows;

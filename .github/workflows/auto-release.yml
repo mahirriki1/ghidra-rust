@@ -69,4 +69,8 @@ jobs:
           python3 scripts/check-release-version.py --tag "$RELEASE_TAG"
           python3 scripts/verify-release-assets.py target/release-assets
       - name: Generate update notes and publish all assets
+        # Older/manual releases remain downloadable without this secret, but
+        # the desktop deliberately refuses to install unsigned releases.
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
         run: bash scripts/publish-release.sh
