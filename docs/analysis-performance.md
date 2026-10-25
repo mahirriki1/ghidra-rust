@@ -115,8 +115,8 @@ the production contained worker and with a separately installed Ghidra, then
 reports quality and cost side by side. It measures; it does not establish that
 either tool is better. Download and verify an official
 [Ghidra release](https://github.com/NationalSecurityAgency/ghidra/releases)
-outside this repository (the benchmark was developed against 12.1.4 with
-OpenJDK 27), then run:
+outside this repository (the current benchmark baseline is Ghidra 12.2 with
+JDK 25), then run:
 
 ```sh
 GHIDRA_RUST_BENCH_GHIDRA_HOME="$HOME/tools/ghidra_12.2_PUBLIC" \
