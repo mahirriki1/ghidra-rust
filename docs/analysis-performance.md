@@ -416,9 +416,10 @@ the same initial or replay context rather than equating these two workloads.
 A→B→A can change C and mapping offsets even with an unchanged inventory: the
 original AArch64 data fixture acquires shared global-type knowledge when its
 callee is analyzed. The harness validates each result and records every digest
-difference rather than assuming immutable engine context. Any future result
-cache must account for global types as well as function names, imports and CFG
-boundaries. Before/after comparisons must use corresponding request sequences.
+difference rather than assuming immutable engine context. The session result
+store intentionally keeps the first validated result until Refresh; misses use
+the warm worker. Refresh can therefore differ after shared global-type learning.
+Function names and CFG inventory remain explicit cache dependencies. Before/after comparisons must use corresponding request sequences.
 
 ### Observer and allocator effects
 
@@ -477,3 +478,116 @@ selection and Graph, plus fixture local rename/undo, comment retention, semantic
 call navigation/history, refresh and embedded-project save/reopen. GUI frame
 submission proxies are not display-presentation measurements. Filesystem cache
 state was uncontrolled, and this is not a comparison against Ghidra.
+
+## Per-function store measurements
+
+`tests/analysis_baseline.rs` retains its original first-visit timing and memory
+endpoints, then adds a separate two-function store workload. It measures 300
+A/B/A compatible visits through the production coordinator, base graph camera and
+semantic-selection adoption, retaining the exact discovered inventory and one
+shared discovery publication/index. `cached_visits` reports p50/p95/max, zero-request
+verification and retained/pinned/uncached bytes. `B_graph_miss_ms` and
+`B_decompile_miss_ms` retain the second function's actual warm-worker miss costs;
+`cache_retained_memory` samples the client and worker tree with both functions
+retained. The sampler still uses contemporaneous RSS/PSS and a 10 ms interval;
+it can miss short peaks. Native rendering is outside these coordinator timings.
+The Windows baseline writes the same store workload as `cached_function_visits`
+after its independent warm-engine A/B/A correctness comparison. Run it natively
+on Windows; compiling this code on Linux does not validate Windows behavior.
+
+With `--features performance`, `function_result_lookup_adoption` measures the
+native desktop's synchronous lookup/adoption separately from the existing
+navigation frame-submission clock. Graph/code component misses, invalidation
+reasons, admission, context preparation, retained/pinned/uncached/preparation bytes
+and cumulative evicted bytes are trace events. Context preparation reports a
+conservative bound for active/queued projections and grouping; deferred discovery
+publication reports its snapshot/index capacity separately as
+`result_store_discovery_preparation_bytes`. The trace summarizer includes
+these events only from its existing certified request prefixes or a complete
+process trace; zero-duration lookup records remain counted as events.
+
+For an original fixture, build with `--features capture,performance` and set
+`GHIDRA_RUST_CAPTURE_CACHE_CHECK=A,B` (hexadecimal function entries),
+`GHIDRA_RUST_CAPTURE_TO=<new.ppm>`, and optionally
+`GHIDRA_RUST_CAPTURE_PROJECT=<new.grproj>`. This developer-only native scenario
+checks A/B/A sharing, exact instruction Back/Forward, instruction/code selection,
+graph rendering, Refresh recomputation, v4 save/reopen and navigation during a
+worker restart. It checks saved provenance and an unchanged project staying clean,
+then captures the final frame. Results and metrics stay outside normal desktop UI. Use fresh artifact
+paths and retain the raw trace; the scenario asserts its expected outcomes.
+
+The budget is retained allocation accounting, not process RSS. Mutable discovery
+continuation, temporary projections/presentation, uncached current results and
+image/worker allocations remain outside it. B-tree/key overhead is charged
+conservatively; payloads charge string/vector capacities with checked arithmetic.
+These measurements make no comparison with Ghidra and do not establish cold-cache
+or end-to-end display latency.
+
+### Recorded Linux fixture run (2026-10-25)
+
+Rust 1.98.1, GCC 16.2.1, x86-64 Linux 6.18.57-2-lts; three repetitions of
+seven original fixtures. The clean before record is `baseline-Z3B5Aq.json` at
+`a1ac9fe`; the after record is `baseline-pB7RDA.json`. The after record honestly
+identifies `c1633fe` with a dirty worktree; that measured implementation was
+subsequently committed as `5b89555`. The raw records retain executable hashes,
+input hashes and observer limitations. Six fixture input hashes match before/
+after. The generated 300-seed ELF hashes differ; its source is emitted at a fresh
+temporary path in each run. Its after-only store figures below are not a paired
+before/after comparison.
+
+There were 6,300 measured compatible visits and zero worker requests on hits.
+Each table cell lists the three independent per-run p95 lookup/adoption values
+in milliseconds. These steady coordinator timings exclude native rendering.
+Retained bytes include both prepared functions, context bookkeeping and the
+shared discovery publication/index; these small workloads caused no eviction
+or uncached-current retention.
+
+| Fixture | Per-run p95 (ms) | Retained charge (bytes) |
+| --- | --- | ---: |
+| ARM64-ELF | 0.000247, 0.000266, 0.000266 | 31,412 |
+| ARM64-MachO | 0.000278, 0.000689, 0.000248 | 31,457 |
+| ARM64-PE | 0.000247, 0.000249, 0.000241 | 31,436 |
+| ARM64-PE-metadata | 0.000254, 0.000240, 0.000344 | 30,106 |
+| ARM64-PE-metadata-8MiB | 0.000289, 0.000246, 0.000238 | 30,106 |
+| x86-64-ELF | 0.000344, 0.000369, 0.000302 | 49,659 |
+| x86-64-ELF-300-seeds | 0.000452, 0.000623, 0.000422 | 38,849 |
+
+For the SHA-matched `sample.c` x86-64 ELF, A was `branch_loop` at `0x401164`;
+B in the headless store workload was `_init` at `0x401000`. Before/after median
+first A graph request times were 1.073236/1.079447 ms, and
+first A decompilation request times were 4.266815/3.279764 ms.
+The three second-function graph misses were 1.058264, 1.087747, 1.058678 ms;
+its decompilation misses were 1.061742, 1.058648, 1.062557 ms.
+At the original one-function endpoint, median process-tree PSS was
+58271/58675 KiB before/after. With both functions and the shared publication
+retained, after-run PSS samples were 58739, 58842, 58751 KiB and RSS samples were
+66968, 67016, 67008 KiB. These observations are not evidence of a speed or
+memory improvement: the host is shared, polling/sampling perturb timing, and the
+extended retained endpoint contains additional results.
+
+A production-payload pressure regression separately ran 384 visits with a scaled
+49,152-byte budget. Peak charged retention was 38,216 bytes; cumulative eviction
+was 9,085,112 bytes. A pinned result forced 128 uncached admissions without
+exceeding the retained budget. Its charge survived invalidation until the final
+snapshot owner dropped. This exercises capacity accounting; it is not a GUI RSS
+or large-program churn benchmark.
+
+The native release desktop ran on the same safe C fixture with X11 software
+rendering (`env -u WAYLAND_DISPLAY LIBGL_ALWAYS_SOFTWARE=1`). Its B was
+`read_write_word` at `0x401146`. A/B/A, exact instruction Back/Forward, genuine
+selection links, graph display, Refresh, v4 save/reopen and a worker restart with
+superseded navigation all passed assertions. Saved graph/code/inventory markers
+survived restart and reusing the same result left the project clean. The four
+full native hit lookup/adoption spans were 9, 8, 8, 7 microseconds (p95
+9 microseconds); this tiny sample measures synchronous adoption separately from
+frame submission and does not establish end-to-end latency. The parent trace
+ended with `trace_health` and no dropped records.
+
+Native Windows was validated separately on a Windows 11 Pro x64 virtual machine.
+`scripts/build-windows.ps1` passed formatting, the debug tests (359 library
+tests plus integration suites, including the PE fixture), strict Clippy, the
+release build, the release PE/AArch64 worker tests and packaging. The release
+desktop then repeated the same A/B/A, exact history, selection, Refresh, v4
+save/reopen and worker-restart assertions on the fixture, and they passed. The
+virtual machine renders OpenGL in software through Microsoft's D3D12-based
+compatibility layer, so that run provides no rendering-latency evidence.

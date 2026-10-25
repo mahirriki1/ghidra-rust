@@ -35,6 +35,19 @@ pub struct DiscoverySnapshot {
 }
 
 impl DiscoverySnapshot {
+    /// None means not analyzed/absent from this publication, distinct from a
+    /// completed function with no outgoing evidence.
+    pub fn status(&self, address: u64) -> Option<Status> {
+        [
+            (&self.pending, Status::Pending),
+            (&self.done, Status::Done),
+            (&self.limited, Status::PartialByOwnLimit),
+            (&self.failed, Status::Failed),
+        ]
+        .into_iter()
+        .find_map(|(list, status)| list.binary_search(&address).ok().map(|_| status))
+    }
+
     /// Treats every field as untrusted. Structural consistency only: this does
     /// not establish that the evidence matches the binary's instructions.
     pub fn validate(&self, info: &BinaryInfo) -> Result<(), String> {
@@ -909,6 +922,23 @@ fn pattern_scan_offset(info: &BinaryInfo, address: u64) -> Result<(u64, u64), St
 }
 
 /// Test helper: adopts a batch carrying a complete inventory and commits it.
+impl crate::result_store::Retained for DiscoverySnapshot {
+    fn retained_bytes(&self) -> Option<usize> {
+        use crate::result_store::Bytes;
+        let mut bytes = Bytes::of::<Self>()
+            .plus(self.fingerprint.capacity())
+            .slots::<u64>(self.pending.capacity())
+            .slots::<u64>(self.done.capacity())
+            .slots::<u64>(self.limited.capacity())
+            .slots::<u64>(self.failed.capacity())
+            .slots::<CallReference>(self.report.references.capacity());
+        if let Some(data) = &self.report.data {
+            bytes = bytes.slots::<DataReference>(data.references.capacity());
+        }
+        bytes.total()
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn commit_replacement(
     state: &mut Discovery,
