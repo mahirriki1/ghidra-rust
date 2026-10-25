@@ -175,22 +175,23 @@ impl GraphCanvas {
             }
             ui.label(format!("{:.0}%", self.zoom * 100.0))
                 .on_hover_text("Drag to pan · Ctrl+wheel to zoom · double-click a call to follow");
-            ui.scope(|ui| {
-                ui.visuals_mut().widgets.inactive.bg_fill = egui::Color32::TRANSPARENT;
-                ui.menu_button(egui::RichText::new("Legend").color(theme::MUTED), |ui| {
-                    for (kind, label) in [
-                        (EdgeKind::True, "T: true"),
-                        (EdgeKind::False, "F: false"),
-                        (EdgeKind::Branch, "B: branch"),
-                        (EdgeKind::Branch, "S: recovered switch"),
-                        (EdgeKind::Unknown, "?: unresolved"),
-                    ] {
-                        ui.colored_label(edge_color(kind), label);
-                    }
-                })
-                .response
-                .on_hover_text("T true · F false · B branch\nS recovered switch · ? unresolved");
-            });
+            egui::containers::menu::MenuButton::from_button(
+                egui::Button::new(egui::RichText::new("Legend").color(theme::MUTED))
+                    .frame_when_inactive(false),
+            )
+            .ui(ui, |ui| {
+                for (kind, label) in [
+                    (EdgeKind::True, "T: true"),
+                    (EdgeKind::False, "F: false"),
+                    (EdgeKind::Branch, "B: branch"),
+                    (EdgeKind::Branch, "S: recovered switch"),
+                    (EdgeKind::Unknown, "?: unresolved"),
+                ] {
+                    ui.colored_label(edge_color(kind), label);
+                }
+            })
+            .0
+            .on_hover_text("T true · F false · B branch\nS recovered switch · ? unresolved");
             let warnings = graph_notes(view).collect::<Vec<_>>();
             if !warnings.is_empty() {
                 theme::warning_menu(ui, warnings.len(), |ui| {

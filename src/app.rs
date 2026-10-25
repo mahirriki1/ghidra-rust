@@ -8486,18 +8486,20 @@ mod tests {
         let mut app = semantic_app();
         app.info.as_mut().unwrap().architecture = "AArch64".into();
         app.reference_data = true;
-        let mut report = CallAnalysis::default();
-        report.data = Some(DataAnalysis {
-            references: vec![DataReference {
-                function: 0x1000,
-                address: 0x1004,
-                target: 0x1080,
-                size: 4,
-                access: DataAccess::Read,
-                provenance: DataProvenance::Propagated,
-            }],
+        let report = CallAnalysis {
+            data: Some(DataAnalysis {
+                references: vec![DataReference {
+                    function: 0x1000,
+                    address: 0x1004,
+                    target: 0x1080,
+                    size: 4,
+                    access: DataAccess::Read,
+                    provenance: DataProvenance::Propagated,
+                }],
+                ..Default::default()
+            }),
             ..Default::default()
-        });
+        };
         let index = crate::call_analysis::CallIndex::new(report);
         app.set_call_index(Some(Arc::new(index)));
         let frame = |app: &mut DesktopApp, events| {
