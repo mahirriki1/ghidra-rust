@@ -160,7 +160,7 @@ impl GraphCanvas {
             *self = Self::new(view);
         }
         let mut zoom_change = 1.0;
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui.button("Fit").clicked() {
                 self.needs_fit = true;
             }
@@ -175,19 +175,41 @@ impl GraphCanvas {
             }
             ui.label(format!("{:.0}%", self.zoom * 100.0))
                 .on_hover_text("Drag to pan · Ctrl+wheel to zoom · double-click a call to follow");
-        });
-        ui.horizontal_wrapped(|ui| {
-            for (kind, label) in [
-                (EdgeKind::True, "T: true"),
-                (EdgeKind::False, "F: false"),
-                (EdgeKind::Branch, "B: branch"),
-                (EdgeKind::Branch, "S: recovered switch target"),
-                (EdgeKind::Unknown, "?: unresolved"),
-            ] {
-                ui.colored_label(edge_color(kind), label);
-            }
-            if view.blocks.len() > MAX_BLOCKS {
-                ui.label("Graph preview limited to 128 blocks");
+            ui.scope(|ui| {
+                ui.visuals_mut().widgets.inactive.bg_fill = egui::Color32::TRANSPARENT;
+                ui.menu_button(egui::RichText::new("Legend").color(theme::MUTED), |ui| {
+                    for (kind, label) in [
+                        (EdgeKind::True, "T: true"),
+                        (EdgeKind::False, "F: false"),
+                        (EdgeKind::Branch, "B: branch"),
+                        (EdgeKind::Branch, "S: recovered switch"),
+                        (EdgeKind::Unknown, "?: unresolved"),
+                    ] {
+                        ui.colored_label(edge_color(kind), label);
+                    }
+                })
+                .response
+                .on_hover_text("T true · F false · B branch\nS recovered switch · ? unresolved");
+            });
+            let warnings = graph_notes(view).collect::<Vec<_>>();
+            if !warnings.is_empty() {
+                theme::warning_menu(ui, warnings.len(), |ui| {
+                    ui.set_max_width(420.0);
+                    egui::ScrollArea::vertical()
+                        .max_height(260.0)
+                        .show(ui, |ui| {
+                            for warning in warnings {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(warning).color(theme::WARNING),
+                                    )
+                                    .wrap(),
+                                );
+                            }
+                        });
+                })
+                .response
+                .on_hover_text("Graph warnings");
             }
         });
         let size = ui.available_size().max(vec2(1.0, 1.0));
@@ -839,6 +861,17 @@ fn clip_segment(start: Pos2, end: Pos2, clip: Rect) -> Option<(Pos2, Pos2)> {
     Some((start + delta * min, start + delta * max))
 }
 
+// Display-only compatibility for saved graphs; never alter stored diagnostics.
+const LEGACY_CFG_NOTE: &str = "CFG uses bounded static instruction flow with engine switch-table recovery; exceptions, no-return calls, and other indirect jumps may be incomplete.";
+
+fn graph_notes(view: &FunctionView) -> impl Iterator<Item = &str> {
+    view.warnings
+        .iter()
+        .map(String::as_str)
+        .filter(|note| *note != LEGACY_CFG_NOTE)
+        .chain((view.blocks.len() > MAX_BLOCKS).then_some("Graph preview limited to 128 blocks"))
+}
+
 fn edge_color(kind: EdgeKind) -> Color32 {
     match kind {
         EdgeKind::True => theme::EDGE_TRUE,
@@ -871,6 +904,102 @@ fn dashed_line(painter: &egui::Painter, start: Pos2, end: Pos2, stroke: Stroke) 
 mod tests {
     use super::*;
     use crate::model::{BasicBlock, CallSite, Edge, Instruction};
+
+    #[test]
+    fn toolbar_preserves_saved_diagnostics_and_exposes_legend() {
+        let context = egui::Context::default();
+        theme::install(&context);
+        let mut view = fixture();
+        let near = format!("{LEGACY_CFG_NOTE} Custom detail.");
+        view.warnings = vec![
+            LEGACY_CFG_NOTE.into(),
+            "Decode failed".into(),
+            "Instruction budget reached".into(),
+            "Unresolved indirect jump".into(),
+            "Partial switch table".into(),
+            near.clone(),
+        ];
+        let stored = view.warnings.clone();
+        let mut canvas = GraphCanvas::new(&view);
+        let frame = |canvas: &mut GraphCanvas, events| {
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(500.0, 500.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    canvas.show(ui, &view, None);
+                },
+            );
+            output.textures_delta.clear();
+            output
+        };
+        let text = |out: &egui::FullOutput| {
+            out.shapes
+                .iter()
+                .filter_map(|s| {
+                    if let egui::Shape::Text(t) = &s.shape {
+                        Some(t.galley.text().to_owned())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let click = |out: &egui::FullOutput, label: &str| {
+            let pos = out
+                .shapes
+                .iter()
+                .find_map(|s| {
+                    if let egui::Shape::Text(t) = &s.shape {
+                        (t.galley.text() == label).then_some(t.pos + vec2(8.0, 5.0))
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]
+        };
+        frame(&mut canvas, vec![]);
+        let out = frame(&mut canvas, vec![]);
+        frame(&mut canvas, click(&out, "    5"));
+        let out = frame(&mut canvas, vec![]);
+        let texts = text(&out);
+        assert!(texts.contains(&"Partial switch table".into()));
+        assert!(texts.contains(&near));
+        assert!(!texts.contains(&LEGACY_CFG_NOTE.into()));
+        assert_eq!(view.warnings, stored);
+        egui::Popup::close_all(&context);
+        let out = frame(&mut canvas, vec![]);
+        frame(&mut canvas, click(&out, "Legend"));
+        let texts = text(&frame(&mut canvas, vec![]));
+        for label in [
+            "T: true",
+            "F: false",
+            "B: branch",
+            "S: recovered switch",
+            "?: unresolved",
+        ] {
+            assert!(texts.contains(&label.into()), "{label}");
+        }
+        view.warnings = vec![LEGACY_CFG_NOTE.into()];
+        assert_eq!(graph_notes(&view).count(), 0);
+    }
 
     fn fixture() -> FunctionView {
         FunctionView {
