@@ -10,6 +10,8 @@
   the existing save/discard/cancel prompt, stop and reap the analysis worker,
   restart the desktop, and reopen a saved project. Binary-only sessions are not
   restored automatically, and the updater does not request administrator access.
+- Retain Windows worker resource limits while transferring worker ownership to
+  the updater's background shutdown job, using owned operating-system handles.
 - Retain a recovery executable and current application, dependency, and embedded
   font notices beside the app. Preserve analyzed-input protection through renamed
   paths and hard links. Windows publication failures attempt restoration; an
