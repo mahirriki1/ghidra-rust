@@ -7,13 +7,20 @@ the relevant source modules before changing behavior. Follow more specific
 ## Purpose and scope
 
 - Build a responsive, memory-conscious native Rust reverse-engineering desktop
-  with a familiar Ghidra layout and function-graph navigation.
+  with a familiar Ghidra layout and function-graph navigation. The long-term
+  goal is a faster, more modern replacement for Ghidra's day-to-day analysis
+  workflow.
 - The current implementation supports linked x86/x86-64 and little-endian
-  AArch64 (64-bit ABI) ELF, PE, and baseline arm64 Mach-O images. It is an
-  experimental subset, not a complete Ghidra or IDA replacement.
-- Keep the core desktop independent of Java and Python runtimes. Plugins,
-  scripting, debugger integration, type/variable editing, and a user-facing CLI
-  are future work unless explicitly requested.
+  AArch64 (64-bit ABI) ELF, PE, and baseline arm64 Mach-O images. It is still an
+  experimental subset; do not describe it as a complete Ghidra or IDA
+  replacement until the documented coverage supports that claim.
+- Prioritize the whole-program foundation that Ghidra workflows depend on:
+  persistent per-function results, a program-wide listing, code/data
+  definition, data types, and program-wide references and search. Type/variable
+  editing, a headless analyzer, and a plugin/scripting API are in scope when
+  scheduled; the debugger remains future work unless explicitly requested.
+- Keep the core desktop independent of Java and Python runtimes. Plugin and
+  scripting interfaces must not add either runtime to the core.
 - Measure performance and memory before claiming improvements over Ghidra.
   Account for worker memory and duplicated image bytes, not just the GUI process.
 
