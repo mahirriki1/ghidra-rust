@@ -191,8 +191,8 @@ register constants within each basic block, for example `ADRP; ADD; LDR` and
 `MOVZ`/`MOVK` with supported arithmetic, shifts, and extensions. These accesses
 show `Read*` / `Write*` in **Data accesses**; hover the Access cell for
 “* Address from register constants in this block.” Unmarked accesses use
-instruction-local evidence. Block boundaries, calls,
-unsupported/omitted instructions, and overlapping register writes clear knowledge.
+instruction-local evidence. Block boundaries, calls, unsupported/omitted
+instructions, and overlapping register writes clear knowledge.
 Loaded pointers are never chased: `ADRP; LDR` identifies the slot, not its value.
 Address formation alone and call arguments create no references. Cross-branch
 values and switch-recovery table reads are excluded. Internal p-code branches,
@@ -228,9 +228,9 @@ calls reveal work; they are not whole-program completion percentages or ETAs.
 Elapsed time includes setup and waits; step counts identify selected analyses,
 not portions of runtime. Processed counts include failed and limited attempts
 and exclude in-flight work. Other phases show activity. Hover for phase/count
-details. Worker **Seeds**,
-**Calls** (shown as **Analyzing references**), and **Publish** stages report batch
-work; progress never resets CPU or wall-time deadlines.
+details. Worker **Seeds**, **Calls** (shown as **Analyzing references**), and
+**Publish** stages report batch work; progress never resets CPU or wall-time
+deadlines.
 
 Cancel terminates the worker and pauses discovery while retaining committed
 batches and the remaining queue. Discover resumes with a new elapsed clock.

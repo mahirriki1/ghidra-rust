@@ -9,3 +9,5 @@
 - Stabilize Functions and Strings scrolling at fractional Linux display scales:
   use vertical-only lists where appropriate and pixel-snapped widths for tables
   that need horizontal scrolling, ignoring sub-pixel overflow.
+- Refresh the native graph screenshot to show the updated Carbon interface,
+  compact graph toolbar, and genuine linked instruction/pseudocode selection.

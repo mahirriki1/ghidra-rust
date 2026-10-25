@@ -71,7 +71,8 @@ See [architecture coverage](docs/architectures.md).
 
 Browse or filter Functions, then select a function to inspect its listing,
 graph, and pseudocode. Pan and zoom the graph; **Fit** shows an overview and
-**Entry** returns to readable entry code. **Legend** and graph warnings are in the graph toolbar.
+**Entry** returns to readable entry code.
+**Legend** and graph warnings are in the graph toolbar.
 
 Double-click a resolved call instruction or decompiler call-name token to
 open its target. Back / Forward returns to previous instruction selections.
