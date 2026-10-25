@@ -4409,7 +4409,7 @@ impl DesktopApp {
                 .is_some_and(|info| info.functions_truncated)
             {
                 ui.colored_label(theme::WARNING, "Partial")
-                    .on_hover_text("Loading or discovery reached a budget or encountered incomplete flow. Known entries are retained; see References and Analysis notes for coverage.");
+                    .on_hover_text("Loading or discovery reached a budget or encountered incomplete flow. Known entries are retained; see References and status warnings for coverage.");
             }
         });
         if ui
@@ -6511,6 +6511,124 @@ impl DesktopApp {
 }
 
 impl DesktopApp {
+    /// Display-only filtering keeps old project warning data intact.
+    fn status_notes(&self) -> impl Iterator<Item = &str> {
+        self.info
+            .iter()
+            .flat_map(|info| info.warnings.iter().map(String::as_str))
+            .filter(|note| !is_legacy_load_note(note))
+            .chain(self.discovery_summary.as_deref().filter(|_| {
+                self.discovery.as_ref().is_some_and(|state| state.partial())
+                    || self.discovery_saved.as_ref().is_some_and(|saved| {
+                        saved.report.partial
+                            || saved.remaining() != 0
+                            || saved.report.data.as_ref().is_some_and(|data| data.partial)
+                    })
+            }))
+    }
+
+    fn status_bar(&self, ui: &mut egui::Ui) {
+        let (row, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), theme::ROW_HEIGHT),
+            egui::Sense::hover(),
+        );
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(row)
+                .layout(egui::Layout::right_to_left(egui::Align::Center)),
+            |ui| {
+                ui.set_clip_rect(row.intersect(ui.clip_rect()));
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                if let Some(pending) = &self.pending {
+                    let elapsed = pending.started.elapsed();
+                    // Avoid flashing the bar for jobs which finish immediately.
+                    if elapsed >= Duration::from_millis(200) {
+                        let task = match pending.request {
+                            Request::Open { .. } => "Opening binary",
+                            Request::Graph { .. } => "Building graph",
+                            Request::Decompile { .. } | Request::DecompileWithLocals { .. } => "Decompiling",
+                            Request::Discover | Request::DiscoverBatch { .. } => "Discovering functions",
+                            Request::SyncFunctions { .. } => "Restoring function context",
+                            Request::SyncSignatures { .. } => "Applying function signatures",
+                            Request::Rename { .. } => "Renaming function",
+                            Request::Bytes { .. } => "Reading bytes",
+                            Request::Strings | Request::StringsWithOptions { .. } => "Finding strings",
+                            Request::Crypto => "Scanning constants",
+                        };
+                        let stage = self.analysis_progress.as_ref().map(|progress| match progress.stage {
+                            AnalysisStage::Seeds => "Seeding analysis",
+                            AnalysisStage::Calls => "Analyzing references",
+                            AnalysisStage::Publish => "Publishing results",
+                        }).unwrap_or(task);
+                        let activity = ui.allocate_ui_with_layout(
+                            egui::vec2((row.width() * 0.45).min(360.0), row.height()),
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| theme::analysis_activity(ui, stage, elapsed),
+                        );
+                        activity.response.on_hover_ui(|ui| {
+                            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                            ui.label(format!("{stage} · {:.1}s", elapsed.as_secs_f32()));
+                            ui.label("Analysis is running. Use Analysis → Cancel analysis to stop it.");
+                            if let Some(plan) = &self.analysis_plan {
+                                let step = plan.current.or(plan.steps.front().copied());
+                                ui.label(format!(
+                                    "Auto analysis {}/{}{}",
+                                    plan.total - plan.steps.len(), plan.total,
+                                    step.map_or(String::new(), |step| format!(" · {}", step.label())),
+                                ));
+                            }
+                            if let Some(progress) = &self.analysis_progress {
+                                ui.label(format!("{} functions examined · {} decode attempts. Total work is unknown.", progress.functions_examined, progress.decode_attempts));
+                            }
+                            if let Some(summary) = &self.discovery_summary {
+                                ui.label(summary);
+                            }
+                        });
+                    }
+                }
+                let count = self.status_notes().count();
+                if count != 0 {
+                    theme::warning_menu(ui, count, |ui| {
+                        ui.set_max_width(520.0);
+                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                        for note in self.status_notes().take(64) {
+                            ui.label(crop(note, 1024));
+                        }
+                    });
+                }
+                let identity = self.info.as_ref().map(|info| format!(
+                    "{} · {} · {} bytes", info.format, info.architecture, info.file_len,
+                ));
+                if ui.available_width() >= 600.0
+                    && let Some(identity) = &identity
+                {
+                    ui.add(egui::Label::new(RichText::new(identity).weak()).truncate())
+                        .on_hover_text(identity);
+                }
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width().max(0.0), row.height()),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        if self.file_job.is_some() {
+                            ui.spinner();
+                        }
+                        let status = ui.add(egui::Label::new(&self.status).truncate());
+                        status.on_hover_ui(|ui| {
+                            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                            ui.label(&self.status);
+                            if let Some(identity) = &identity {
+                                ui.weak(identity);
+                            }
+                            if let Some(summary) = &self.discovery_summary {
+                                ui.label(summary);
+                            }
+                        });
+                    },
+                );
+            },
+        );
+    }
+
     fn draw(&mut self, ui: &mut egui::Ui) {
         let context = ui.ctx().clone();
         if let Some(path) = self.initial_path.take() {
@@ -6541,76 +6659,7 @@ impl DesktopApp {
             .show(ui, |ui| self.toolbar(ui));
         egui::Panel::bottom("status")
             .frame(theme::status_frame(ui.style()))
-            .show(ui, |ui| {
-            egui::Sides::new().shrink_left().wrap().show(
-                ui,
-                |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        if self.file_job.is_some() {
-                            ui.spinner();
-                        }
-                        ui.label(&self.status);
-                        if let Some(plan) = &self.analysis_plan {
-                            let step = plan.current.or(plan.steps.front().copied());
-                            ui.weak(format!(
-                                "Auto analysis {}/{}{}",
-                                plan.total - plan.steps.len(),
-                                plan.total,
-                                step.map_or(String::new(), |step| format!(" · {}", step.label())),
-                            ));
-                        }
-                        if let Some(summary) = &self.discovery_summary {
-                            ui.weak(summary);
-                        }
-                        if let Some(info) = &self.info {
-                            ui.weak(format!(
-                                "{} · {} · {} bytes",
-                                info.format, info.architecture, info.file_len
-                            ));
-                            if !info.warnings.is_empty() {
-                                ui.menu_button("Analysis notes", |ui| {
-                                    ui.set_max_width(520.0);
-                                    for warning in info.warnings.iter().take(64) {
-                                        ui.label(crop(warning, 1024));
-                                    }
-                                });
-                            }
-                        }
-                    });
-                },
-                |ui| {
-                    if let Some(pending) = &self.pending {
-                        let elapsed = pending.started.elapsed();
-                        // Avoid flashing the bar for jobs which finish immediately.
-                        if elapsed >= Duration::from_millis(200) {
-                            let task = match pending.request {
-                                Request::Open { .. } => "Opening binary",
-                                Request::Graph { .. } => "Building graph",
-                                Request::Decompile { .. } | Request::DecompileWithLocals { .. } => "Decompiling",
-                                Request::Discover | Request::DiscoverBatch { .. } => {
-                                    "Discovering functions"
-                                }
-                                Request::SyncFunctions { .. } => "Restoring function context",
-                                Request::SyncSignatures { .. } => "Applying function signatures",
-                                Request::Rename { .. } => "Renaming function",
-                                Request::Bytes { .. } => "Reading bytes",
-                                Request::Strings | Request::StringsWithOptions { .. } => {
-                                    "Finding strings"
-                                }
-                                Request::Crypto => "Scanning constants",
-                            };
-                            let stage = self.analysis_progress.as_ref().map(|progress| match progress.stage {
-                                AnalysisStage::Seeds => "Seeding analysis", AnalysisStage::Calls => "Analyzing references", AnalysisStage::Publish => "Publishing results",
-                            }).unwrap_or(task);
-                            let activity = ui.scope(|ui| theme::analysis_activity(ui, stage, elapsed));
-                            if let Some(progress) = &self.analysis_progress {
-                                activity.response.on_hover_text(format!("{} functions examined · {} decode attempts. Total work is unknown.", progress.functions_examined, progress.decode_attempts));
-                            }
-                        }
-                    }
-                },
-            );
-        });
+            .show(ui, |ui| self.status_bar(ui));
         // Side docks shrink with the window so the central views keep room.
         let (left, right) = dock_ranges(ui.available_width());
         egui::Panel::left("navigation-dock-v2")
@@ -6729,6 +6778,15 @@ impl DesktopApp {
         }
         capture.tick(context, !busy);
     }
+}
+
+// Freeze the exact historical messages: similarly worded real warnings stay visible.
+fn is_legacy_load_note(note: &str) -> bool {
+    matches!(
+        note,
+        "Prototype analysis: symbols and supported PE function metadata load immediately; deeper function discovery is explicit. Optimized C++/Rust types and source reconstruction are incomplete."
+            | "Function lists are capped at 262144 entries, 8 MiB of names, and 256 bytes per name in this prototype."
+    )
 }
 
 fn discovery_summary(
@@ -9927,6 +9985,143 @@ mod tests {
             &egui::Context::default(),
         );
         assert!(app.decompiled.is_empty());
+    }
+
+    fn status_frame(
+        context: &egui::Context,
+        app: &DesktopApp,
+        width: f32,
+        events: Vec<egui::Event>,
+    ) -> (egui::FullOutput, egui::Rect) {
+        let mut rect = egui::Rect::NOTHING;
+        let mut output = context.run_ui(
+            egui::RawInput {
+                events,
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 160.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                rect = egui::Panel::bottom("status")
+                    .frame(theme::status_frame(ui.style()))
+                    .show(ui, |ui| app.status_bar(ui))
+                    .response
+                    .rect;
+            },
+        );
+        output.textures_delta.clear();
+        (output, rect)
+    }
+
+    #[test]
+    fn status_notes_filter_only_exact_legacy_text_without_changing_project_data() {
+        let context = egui::Context::default();
+        theme::install(&context);
+        let mut app = keyboard_app();
+        let legacy = vec![
+            "Prototype analysis: symbols and supported PE function metadata load immediately; deeper function discovery is explicit. Optimized C++/Rust types and source reconstruction are incomplete.".into(),
+            "Function lists are capped at 262144 entries, 8 MiB of names, and 256 bytes per name in this prototype.".into(),
+        ];
+        app.info.as_mut().unwrap().warnings = legacy.clone();
+        status_frame(&context, &app, 1000.0, vec![]);
+        let (output, _) = status_frame(&context, &app, 1000.0, vec![]);
+        assert!(
+            !rendered_text(&output)
+                .iter()
+                .any(|text| text.starts_with("    "))
+        );
+        assert_eq!(app.info.as_ref().unwrap().warnings, legacy);
+
+        let near_legacy = format!("{} Additional coverage warning.", legacy[1]);
+        app.info.as_mut().unwrap().warnings.extend([
+            crate::packing::UPX_PACKED_WARNING.into(),
+            near_legacy.clone(),
+        ]);
+        let stored = app.info.as_ref().unwrap().warnings.clone();
+        assert_eq!(
+            app.status_notes().collect::<Vec<_>>(),
+            [crate::packing::UPX_PACKED_WARNING, &near_legacy]
+        );
+        let (output, _) = status_frame(&context, &app, 1000.0, vec![]);
+        let position = text_position(&output, "    2", 0) + egui::vec2(8.0, 5.0);
+        status_frame(&context, &app, 1000.0, pointer_events(position));
+        let (output, _) = status_frame(&context, &app, 1000.0, vec![]);
+        let texts = rendered_text(&output);
+        assert!(
+            texts
+                .iter()
+                .any(|text| text == crate::packing::UPX_PACKED_WARNING)
+        );
+        assert!(texts.contains(&near_legacy));
+        assert!(!texts.contains(&legacy[0]));
+        assert!(!texts.contains(&legacy[1]));
+        assert_eq!(app.info.as_ref().unwrap().warnings, stored);
+    }
+
+    #[test]
+    fn status_bar_stays_one_row_with_long_multiline_text_and_partial_discovery() {
+        for width in [1440.0, 1000.0, 520.0, 260.0] {
+            let context = egui::Context::default();
+            theme::install(&context);
+            let mut app = keyboard_app();
+            app.status = format!("{}\nmore details", "Discovery batch committed ".repeat(100));
+            app.discovery = Some(crate::discovery::Discovery::new(
+                Some(0x1000),
+                [0x1000],
+                false,
+            ));
+            app.discovery_running = true;
+            app.update_discovery_summary();
+            app.analysis_plan = Some(AnalysisPlan {
+                generation: app.generation,
+                steps: VecDeque::new(),
+                current: Some(AnalysisStep::Functions),
+                total: 2,
+            });
+            app.pending = Some(Pending {
+                id: 1,
+                request: Request::SyncSignatures {
+                    signatures: Vec::new(),
+                    binary_sha256: String::new(),
+                    context: String::new(),
+                },
+                started: Instant::now(),
+                selection: 0,
+                revision: 0,
+                byte_origin: (None, Tab::Listing),
+                bytes: None,
+            });
+            status_frame(&context, &app, width, vec![]);
+            let (output, idle_rect) = status_frame(&context, &app, width, vec![]);
+            assert!(
+                !rendered_text(&output)
+                    .iter()
+                    .any(|text| text.contains("Applying function signatures"))
+            );
+            app.pending.as_mut().unwrap().started -= Duration::from_secs(2);
+            let (output, busy_rect) = status_frame(&context, &app, width, vec![]);
+            assert_eq!(idle_rect, busy_rect);
+            assert!(
+                busy_rect.height() <= theme::ROW_HEIGHT + 8.0,
+                "{busy_rect:?}"
+            );
+            assert!(rendered_text(&output).iter().any(|text| text == "    1"));
+            for shape in &output.shapes {
+                if let egui::epaint::Shape::Text(text) = &shape.shape {
+                    assert_eq!(text.galley.rows.len(), 1, "{:?}", text.galley.text());
+                    assert!(
+                        text.pos.y >= busy_rect.top()
+                            && text.pos.y + text.galley.size().y <= busy_rect.bottom()
+                    );
+                    assert!(shape.clip_rect.left() >= 0.0 && shape.clip_rect.right() <= width);
+                }
+            }
+            // Saved partial coverage continues to show an indicator after reopen.
+            app.discovery_saved = app.discovery.take().map(|state| Arc::new(state.save()));
+            assert_eq!(app.status_notes().count(), 1);
+        }
     }
 
     #[test]
