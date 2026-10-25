@@ -318,7 +318,68 @@ pub fn dock_tabs<T: PartialEq + Copy>(
         strip.bottom() - 0.5,
         Stroke::new(1.0, BORDER),
     );
+    // Lay out the actual trailing widgets first, using their own text styles.
+    // Their measured bounds reserve space before any tab paint or hit regions.
+    let actions_rect = strip.shrink2(egui::vec2(4.0, 0.0));
+    let mut actions_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .id_salt("dock-actions")
+            .max_rect(actions_rect)
+            .layout(egui::Layout::right_to_left(egui::Align::Center)),
+    );
+    actions_ui.set_clip_rect(actions_rect.intersect(ui.clip_rect()));
+    actions(&mut actions_ui);
+    let actions_width = actions_ui.min_rect().width();
+    let tabs_right = if actions_width > 0.0 {
+        actions_rect.right() - actions_width - 8.0
+    } else {
+        strip.right()
+    };
+    let tabs_rect = egui::Rect::from_min_max(
+        strip.min,
+        egui::pos2(tabs_right.max(strip.left()), strip.bottom()),
+    );
+    let painter = painter.with_clip_rect(tabs_rect.intersect(ui.clip_rect()));
     let font = FontId::proportional(13.0);
+    let tab_width: f32 = tabs
+        .iter()
+        .map(|(_, label)| {
+            painter
+                .layout_no_wrap((*label).to_owned(), font.clone(), TEXT)
+                .size()
+                .x
+                + 23.0
+        })
+        .sum();
+    if tab_width > tabs_rect.width() {
+        let selected = tabs
+            .iter()
+            .find(|(value, _)| value == current)
+            .unwrap_or(&tabs[0]);
+        let label = match selected.1 {
+            "Symbol Tree" => "Symbols",
+            "Program Trees" => "Program",
+            name => name,
+        };
+        let mut tabs_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt("dock-overflow")
+                .max_rect(tabs_rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        tabs_ui.set_clip_rect(tabs_rect.intersect(ui.clip_rect()));
+        tabs_ui.menu_button(RichText::new(label).color(TEXT), |ui| {
+            for (value, label) in tabs {
+                if ui.selectable_label(*current == *value, *label).clicked() {
+                    changed = *current != *value;
+                    *current = *value;
+                    ui.close();
+                }
+            }
+        });
+        ui.add_space(2.0);
+        return changed;
+    }
     let mut x = strip.left();
     for (index, (value, label)) in tabs.iter().enumerate() {
         let galley = painter.layout_no_wrap((*label).to_owned(), font.clone(), TEXT);
@@ -370,19 +431,6 @@ pub fn dock_tabs<T: PartialEq + Copy>(
             *current = *value;
             changed = true;
         }
-    }
-    let actions_rect = egui::Rect::from_min_max(
-        egui::pos2(x + 8.0, strip.top()),
-        egui::pos2(strip.right() - 4.0, strip.bottom()),
-    );
-    if actions_rect.width() > 0.0 {
-        let mut actions_ui = ui.new_child(
-            egui::UiBuilder::new()
-                .max_rect(actions_rect)
-                .layout(egui::Layout::right_to_left(egui::Align::Center)),
-        );
-        actions_ui.set_clip_rect(actions_rect.intersect(ui.clip_rect()));
-        actions(&mut actions_ui);
     }
     ui.add_space(2.0);
     changed
@@ -649,6 +697,106 @@ pub fn scaled_radius(zoom: f32) -> u8 {
 #[cfg(test)]
 mod tests {
     use eframe::egui;
+
+    #[test]
+    fn narrow_dock_headers_keep_painted_saved_text_and_both_views_reachable() {
+        for width in [360.0, 260.0, 180.0, 120.0] {
+            let context = egui::Context::default();
+            super::install(&context);
+            let mut current = false;
+            let mut action = egui::Rect::NOTHING;
+            let mut frame = |events: Vec<egui::Event>| {
+                let mut output = context.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, 200.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        super::dock_tabs(
+                            ui,
+                            &mut current,
+                            &[(false, "Symbol Tree"), (true, "Program Trees")],
+                            |ui| {
+                                action = ui.weak("Saved").rect;
+                            },
+                        );
+                    },
+                );
+                output.textures_delta.clear();
+                output
+            };
+            frame(vec![]);
+            let output = frame(vec![]);
+            let saved = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == "Saved" => {
+                        let bounds = text.galley.rect.translate(text.pos.to_vec2());
+                        assert!(
+                            shape.clip_rect.contains_rect(bounds),
+                            "{width}: {bounds:?} vs {:?}",
+                            shape.clip_rect
+                        );
+                        Some(bounds)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            let tab = output.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == "Symbols" => {
+                    Some(text.pos + egui::vec2(8.0, 5.0))
+                }
+                _ => None,
+            });
+            if let Some(pos) = tab {
+                assert!(pos.x < saved.left());
+                let click = |pos| {
+                    vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed: false,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ]
+                };
+                frame(click(pos));
+                let output = frame(vec![]);
+                let texts = output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) => Some((text.galley.text(), text.pos)),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert!(texts.iter().any(|(text, _)| *text == "Symbol Tree"));
+                let pos = texts
+                    .iter()
+                    .find(|(text, _)| *text == "Program Trees")
+                    .unwrap()
+                    .1
+                    + egui::vec2(8.0, 5.0);
+                frame(click(pos));
+                let output = frame(vec![]);
+                assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == "Saved")));
+                assert!(current);
+            }
+            assert!(action.left() >= saved.left() - 1.0);
+        }
+    }
 
     #[test]
     fn interface_fonts_render_the_arrows_used_in_labels_and_graph_exits() {

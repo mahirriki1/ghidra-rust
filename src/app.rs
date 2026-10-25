@@ -4719,7 +4719,9 @@ impl DesktopApp {
                     &[(false, "Symbol Tree"), (true, "Program Trees")],
                     |ui| {
                         if cached {
-                            ui.weak("Saved").on_hover_text("Some tree results were loaded from the project. Recompute the corresponding analysis to verify them.");
+                            ui.weak("Saved").on_hover_text(
+                                "Saved tree results; recompute each analysis to verify.",
+                            );
                         }
                     },
                 );
