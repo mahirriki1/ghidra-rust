@@ -3368,7 +3368,7 @@ impl DesktopApp {
                 self.schedule_request(Request::Decompile { address });
             }
             self.saved_result_revision = self.result_revision;
-            self.status = "Project opened — showing saved analysis; use Analysis → Refresh function to recompute".into();
+            self.status = "Project opened · saved analysis".into();
         } else if let Some(address) = selected {
             self.navigate(address, true, context);
             self.status = if cache_compatible {
@@ -4761,13 +4761,11 @@ impl DesktopApp {
                     ui,
                     &mut self.program_tree,
                     &[(false, "Symbol Tree"), (true, "Program Trees")],
-                    |ui| {
-                        if cached {
-                            ui.weak("Saved").on_hover_text(
-                                "Saved tree results; recompute each analysis to verify.",
-                            );
-                        }
-                    },
+                    cached.then_some((
+                        "Saved",
+                        "Saved tree results; recompute each analysis to verify.",
+                    )),
+                    |_| {},
                 );
                 self.symbol_tree(ui);
             });
@@ -4953,26 +4951,31 @@ impl DesktopApp {
         if !filtered {
             ui.ctx().request_repaint();
         }
-        theme::dock_header(ui, "Functions", false, |ui| {
-            ui.weak(if filtered {
-                self.filtered_functions.len().to_string()
-            } else {
-                format!("Filtering… {}", self.filtered_functions.len())
-            });
-            if self.cached_functions {
-                ui.weak("Saved analysis")
-                    .on_hover_text("Saved functions; run Discover to recompute.");
-            }
-            if self
-                .info
-                .as_ref()
-                .is_some_and(|info| info.functions_truncated)
-            {
-                ui.colored_label(theme::WARNING, "Partial").on_hover_text(
-                    "Incomplete function inventory; see References and status warnings.",
-                );
-            }
-        });
+        theme::dock_header(
+            ui,
+            "Functions",
+            false,
+            self.cached_functions.then_some((
+                "Saved analysis",
+                "Saved functions; run Discover to recompute.",
+            )),
+            |ui| {
+                ui.weak(if filtered {
+                    self.filtered_functions.len().to_string()
+                } else {
+                    format!("Filtering… {}", self.filtered_functions.len())
+                });
+                if self
+                    .info
+                    .as_ref()
+                    .is_some_and(|info| info.functions_truncated)
+                {
+                    ui.colored_label(theme::WARNING, "Partial").on_hover_text(
+                        "Incomplete function inventory; see References and status warnings.",
+                    );
+                }
+            },
+        );
         if ui
             .add(
                 TextEdit::singleline(&mut self.function_filter)
@@ -5352,53 +5355,89 @@ impl DesktopApp {
     fn side_panel(&mut self, ui: &mut egui::Ui) {
         self.update_comment_rows();
         let context = ui.ctx().clone();
-        theme::dock_header(ui, "Decompiler", false, |ui| {
-            if ui
-                .small_button("Copy")
-                .on_hover_text("Copy full pseudocode")
-                .clicked()
-            {
-                context.copy_text(self.decompiled().to_owned());
-            }
-            if ui.small_button("Refresh").clicked() {
-                self.refresh_decompilation(&context);
-            }
-            if ui
-                .add_enabled(
-                    self.graph.is_some() && self.signature_replay.is_none(),
-                    egui::Button::new("Signature…").small(),
-                )
-                .on_hover_text("Edit return type, ordered parameters and current image ABI")
-                .clicked()
-            {
-                self.begin_signature_editor();
-            }
-            ui.checkbox(&mut self.auto_decompile, "Auto");
-            let warnings = &semantics_of(&self.code).warnings;
-            if !warnings.is_empty() {
-                ui.colored_label(
-                    theme::WARNING,
-                    format!("{} names not applied", warnings.len()),
-                );
-                theme::warning_menu(ui, warnings.len(), |ui| {
-                    ui.set_max_width(420.0);
-                    ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
-                        for warning in warnings {
-                            ui.add(
-                                egui::Label::new(RichText::new(warning).color(theme::WARNING))
-                                    .wrap(),
-                            );
-                        }
-                    });
-                })
-                .response
-                .on_hover_text(format!("{} names not applied", warnings.len()));
-            }
-            if self.saved_analysis {
-                ui.weak("Saved analysis")
-                    .on_hover_text("Saved pseudocode; Refresh to recompute.");
-            }
-        });
+        theme::dock_header(
+            ui,
+            "Decompiler",
+            false,
+            self.saved_analysis
+                .then_some(("Saved analysis", "Saved pseudocode; Refresh to recompute.")),
+            |ui| {
+                if ui
+                    .small_button("Copy")
+                    .on_hover_text("Copy full pseudocode")
+                    .clicked()
+                {
+                    context.copy_text(self.decompiled().to_owned());
+                }
+                if ui.small_button("Refresh").clicked() {
+                    self.refresh_decompilation(&context);
+                }
+                // Narrow docks drop controls that the context and View menus
+                // also offer, keeping the title and warning count visible.
+                let warning_count = semantics_of(&self.code).warnings.len();
+                let not_applied = format!("{warning_count} names not applied");
+                let text = |text: &str| {
+                    egui::WidgetText::from(text)
+                        .into_galley(
+                            ui,
+                            Some(egui::TextWrapMode::Extend),
+                            f32::INFINITY,
+                            egui::TextStyle::Button,
+                        )
+                        .size()
+                        .x
+                };
+                let spacing = ui.spacing();
+                let button = |label: &str| {
+                    text(label) + spacing.button_padding.x * 2.0 + spacing.item_spacing.x
+                };
+                let warning_width = if warning_count == 0 {
+                    0.0
+                } else {
+                    button(&format!("    {warning_count}"))
+                };
+                let tools_width = button("Signature…")
+                    + text("Auto")
+                    + spacing.icon_width
+                    + spacing.icon_spacing
+                    + spacing.item_spacing.x;
+                let label_width = text(&not_applied) + spacing.item_spacing.x;
+                let title_room = theme::dock_title_room(ui, "Decompiler");
+                let show_tools = ui.available_width() >= tools_width + warning_width + title_room;
+                if show_tools {
+                    if ui
+                        .add_enabled(
+                            self.graph.is_some() && self.signature_replay.is_none(),
+                            egui::Button::new("Signature…").small(),
+                        )
+                        .on_hover_text("Edit return type, ordered parameters and current image ABI")
+                        .clicked()
+                    {
+                        self.begin_signature_editor();
+                    }
+                    ui.checkbox(&mut self.auto_decompile, "Auto");
+                }
+                let warnings = &semantics_of(&self.code).warnings;
+                if !warnings.is_empty() {
+                    if ui.available_width() >= label_width + warning_width {
+                        ui.colored_label(theme::WARNING, &not_applied);
+                    }
+                    theme::warning_menu(ui, warnings.len(), |ui| {
+                        ui.set_max_width(420.0);
+                        ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                            for warning in warnings {
+                                ui.add(
+                                    egui::Label::new(RichText::new(warning).color(theme::WARNING))
+                                        .wrap(),
+                                );
+                            }
+                        });
+                    })
+                    .response
+                    .on_hover_text(not_applied);
+                }
+            },
+        );
         if let Some(error) = &self.signature_error {
             ui.colored_label(theme::WARNING, error);
         }
@@ -6502,11 +6541,8 @@ impl DesktopApp {
                 (Tab::Hex, "Hex / Memory Map"),
                 (Tab::References, "References"),
             ],
-            |ui| {
-                if saved {
-                    ui.weak("Saved analysis").on_hover_text(saved_tooltip);
-                }
-            },
+            saved.then_some(("Saved analysis", saved_tooltip)),
+            |_| {},
         );
         let context = ui.ctx().clone();
         match self.tab {
@@ -9316,6 +9352,74 @@ mod tests {
     }
 
     #[test]
+    fn narrow_decompiler_header_keeps_title_provenance_and_actions_unclipped() {
+        for scale in [1.0, 1.25] {
+            for width in [600.0, 340.0, 300.0, 240.0] {
+                let context = egui::Context::default();
+                theme::install(&context);
+                context.set_pixels_per_point(scale);
+                let mut app = semantic_app();
+                app.saved_analysis = true;
+                let mut frame = || {
+                    let mut output = context.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(width, 300.0),
+                            )),
+                            ..Default::default()
+                        },
+                        |ui| app.side_panel(ui),
+                    );
+                    output.textures_delta.clear();
+                    output
+                };
+                frame();
+                let output = frame();
+                let mut header = Vec::new();
+                for shape in &output.shapes {
+                    if let egui::epaint::Shape::Text(text) = &shape.shape {
+                        let bounds = text.galley.rect.translate(text.pos.to_vec2());
+                        if bounds.bottom() <= 26.0 {
+                            assert!(
+                                shape.clip_rect.contains_rect(bounds),
+                                "width={width}, scale={scale}: {} clipped",
+                                text.galley.text()
+                            );
+                            if text.galley.text() == "Decompiler" {
+                                assert!(!text.galley.elided, "width={width}, scale={scale}");
+                            }
+                            header.push(text.galley.text().to_owned());
+                        }
+                    }
+                }
+                for label in ["Decompiler", "Copy", "Refresh"] {
+                    assert!(
+                        header.iter().any(|text| text == label),
+                        "{width}: {header:?}"
+                    );
+                }
+                let saved = if width >= 300.0 {
+                    "Saved analysis"
+                } else {
+                    "Saved"
+                };
+                assert!(
+                    header.iter().any(|text| text == saved),
+                    "{width}: {header:?}"
+                );
+                if width >= 600.0 || width <= 240.0 {
+                    assert_eq!(
+                        header.iter().any(|text| text == "Signature…"),
+                        width >= 600.0,
+                        "{width}: {header:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn comments_render_at_exact_listing_and_code_locations_and_refresh_after_edit_delete_undo() {
         let context = egui::Context::default();
         theme::install(&context);
@@ -10697,6 +10801,7 @@ mod tests {
             &egui::Context::default(),
         );
         assert_eq!(app.project_path, Some(project_path));
+        assert_eq!(app.status, "Project opened · saved analysis");
         assert!(app.saved_analysis);
         assert!(app.code.is_some());
         assert!(app.decompiled().contains("restored_entry"));
