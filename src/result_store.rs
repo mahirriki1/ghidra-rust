@@ -466,6 +466,60 @@ impl<G: Retained, D: Retained> ResultStore<G, D> {
         true
     }
 
+    /// Preflight a publication swap while preserving the old UI publication
+    /// if save pins would still prevent admission after releasing UI owners.
+    pub fn can_replace_publication<T: Retained, U: Retained>(
+        &self,
+        snapshot: &Arc<T>,
+        indexes: &Arc<U>,
+        previous: (&Arc<T>, &Arc<U>),
+        snapshot_owners_released: usize,
+        protect: &[u64],
+    ) -> bool {
+        self.reap_external();
+        let leases = self.external.borrow();
+        let charge = |identity| {
+            leases
+                .iter()
+                .find(|lease| lease.identity == identity)
+                .map_or(0, |lease| lease.bytes)
+        };
+        let new_bytes = |identity, value: Option<usize>| {
+            if charge(identity) != 0 {
+                Some(0)
+            } else {
+                value?.checked_add(COMPONENT_OVERHEAD)
+            }
+        };
+        let Some(needed) = new_bytes(Arc::as_ptr(snapshot) as usize, snapshot.retained_bytes())
+            .and_then(|s| {
+                new_bytes(Arc::as_ptr(indexes) as usize, indexes.retained_bytes())
+                    .and_then(|i| s.checked_add(i))
+            })
+        else {
+            return false;
+        };
+        let mut released = 0usize;
+        if Arc::strong_count(previous.1) == 1 {
+            released = charge(Arc::as_ptr(previous.1) as usize);
+            if Arc::strong_count(previous.0) <= snapshot_owners_released {
+                released = released.saturating_add(charge(Arc::as_ptr(previous.0) as usize));
+            }
+        }
+        for (address, record) in &self.records {
+            if !protect.contains(address) {
+                let (total, pinned) = record.indexed();
+                released = released.saturating_add(total.saturating_sub(pinned));
+            }
+        }
+        self.ledger
+            .charged()
+            .saturating_add(self.metadata)
+            .saturating_sub(released)
+            .checked_add(needed)
+            .is_some_and(|total| total <= self.budget)
+    }
+
     fn reap_external(&self) {
         self.external.borrow_mut().retain(|lease| {
             if (lease.alive)() {
@@ -843,5 +897,22 @@ mod tests {
             &[]
         ));
         assert_eq!(store.usage().charged, 0);
+    }
+    #[test]
+    fn publication_pressure_keeps_old_evidence_until_save_pins_release() {
+        let mut store = Store::new(unit() * 2);
+        let old = Arc::new(Blob(UNIT));
+        let index = Arc::new(Blob(UNIT));
+        assert!(store.retain_publication(&old, &index, &[]));
+        let save = old.clone();
+        let new = Arc::new(Blob(UNIT));
+        let new_index = Arc::new(Blob(UNIT));
+        assert!(!store.can_replace_publication(&new, &new_index, (&old, &index), 1, &[]));
+        assert_eq!(store.usage().charged, store.usage().budget);
+        drop(save);
+        assert!(store.can_replace_publication(&new, &new_index, (&old, &index), 1, &[]));
+        drop((old, index));
+        assert!(store.retain_publication(&new, &new_index, &[]));
+        assert_eq!(store.usage().charged, store.usage().budget);
     }
 }

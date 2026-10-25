@@ -378,3 +378,44 @@ fn contained_x86_fixture_revisits_use_zero_worker_requests() {
     };
     worker_cache_case(&path, address("branch_loop"), address("read_write_word"));
 }
+
+#[test]
+fn production_payload_churn_is_bounded_and_save_pins_cannot_force_admission() {
+    let budget = 48 * 1024;
+    let mut results = FunctionResults::new(budget);
+    results.open(&"a".repeat(64), &[]);
+    results.update_inputs(functions(), vec![]);
+    ready(&mut results);
+    let text = format!("/*{}*/", "x".repeat(28 * 1024));
+    let mut peak = 0;
+    for step in 0..256 {
+        populate(&mut results, 0x1000 + 4 * (step % 32), &text);
+        let usage = results.usage();
+        peak = peak.max(usage.charged);
+        assert!(usage.charged <= budget);
+    }
+    assert!(results.counters().evicted > 0);
+    let pin = results.lookup(0x107c, "").decompiled.unwrap().0;
+    for step in 0..128 {
+        populate(&mut results, 0x1000 + 4 * (step % 16), &text);
+        let usage = results.usage();
+        peak = peak.max(usage.charged);
+        assert!(usage.charged <= budget);
+        assert!(usage.pinned >= pin.bytes());
+    }
+    assert!(results.counters().uncached > 0);
+    assert_eq!(
+        results.usage().uncached,
+        0,
+        "temporary uncached results were released"
+    );
+    results.refresh(0x107c);
+    let held = results.usage().charged;
+    drop(pin);
+    assert!(results.usage().charged < held);
+    println!(
+        "Production payload churn: 384 visits, budget={budget}, peak_charged={peak}, evicted_bytes={}, uncached_admissions={}",
+        results.counters().evicted_bytes,
+        results.counters().uncached
+    );
+}

@@ -92,6 +92,27 @@ struct InputState {
 }
 
 impl Inputs {
+    fn preparation_bytes(&self) -> usize {
+        let mut bytes = crate::result_store::Bytes::of::<Self>()
+            .slots::<FunctionInfo>(self.functions.capacity())
+            .slots::<LocalRename>(self.locals.capacity());
+        for function in &self.functions {
+            bytes = bytes.plus(function.name.capacity());
+        }
+        for local in &self.locals {
+            bytes = bytes
+                .plus(local.name.capacity())
+                .plus(local.identity.engine.capacity())
+                .plus(local.identity.verification.capacity());
+        }
+        // Temporary grouping/serialization and the completed digest map can
+        // coexist with the input iterator backing. Report a conservative bound.
+        bytes
+            .total()
+            .and_then(|bytes| bytes.checked_mul(2))
+            .unwrap_or(usize::MAX)
+    }
+
     fn digest(self) -> InputState {
         let _preparation = crate::performance::span("function_result_context_preparation");
         let mut inventory = Sha256::new();
@@ -211,24 +232,7 @@ impl FunctionResults {
         let Some(inputs) = self.next_inputs.take() else {
             return;
         };
-        // Conservative capacity charge for the temporary projection, including
-        // bounded strings and local records. It is reported outside the store.
-        self.preparation_bytes = inputs.functions.capacity() * size_of::<FunctionInfo>()
-            + inputs
-                .functions
-                .iter()
-                .map(|f| f.name.capacity())
-                .sum::<usize>()
-            + inputs.locals.capacity() * size_of::<LocalRename>()
-            + inputs
-                .locals
-                .iter()
-                .map(|r| {
-                    r.name.capacity()
-                        + r.identity.engine.capacity()
-                        + r.identity.verification.capacity()
-                })
-                .sum::<usize>();
+        self.preparation_bytes = inputs.preparation_bytes();
         crate::performance::event(
             "result_store_preparation_bytes",
             self.preparation_bytes as u64,
@@ -449,8 +453,28 @@ impl FunctionResults {
 
     pub fn usage(&self) -> StoreUsage {
         let mut usage = self.store.usage();
-        usage.preparation = self.preparation_bytes;
+        usage.preparation = self.preparation_bytes.saturating_add(
+            self.next_inputs
+                .as_ref()
+                .map_or(0, Inputs::preparation_bytes),
+        );
         usage
+    }
+
+    pub fn can_replace_discovery(
+        &self,
+        new: &Arc<crate::call_analysis::CallIndex>,
+        old: &Arc<crate::call_analysis::CallIndex>,
+        saved_owner: bool,
+        protect: &[u64],
+    ) -> bool {
+        self.store.can_replace_publication(
+            new.snapshot(),
+            new,
+            (old.snapshot(), old),
+            1 + usize::from(saved_owner),
+            protect,
+        )
     }
 
     pub fn retain_discovery(

@@ -1153,7 +1153,8 @@ fn warm_aba(
     pair: [u64; 2],
 ) -> WarmResults {
     let mut results = BTreeMap::new();
-    let mut cached = result_measurement::CachedResults::new(info);
+    let mut cached = result_measurement::CachedResults::new(info, &discovered.functions);
+    cached.publish(std::sync::Arc::new(discovered.state.save()));
     let mut steps = Vec::new();
     let controlled = !matches!(fixture.expected, Expected::External);
     let context = coverage_context(info, discovered);

@@ -491,6 +491,7 @@ pub struct DesktopApp {
     saved_revision: u64,
     result_revision: u64,
     saved_result_revision: u64,
+    result_scope: Option<u64>,
     undo: VecDeque<Edit>,
     /// Retained per-function results; the displayed ones are shared, not copied.
     results: FunctionResults,
@@ -640,6 +641,7 @@ impl DesktopApp {
             saved_revision: 0,
             result_revision: 0,
             saved_result_revision: 0,
+            result_scope: None,
             undo: VecDeque::new(),
             results: FunctionResults::default(),
             graph: None,
@@ -853,6 +855,7 @@ impl DesktopApp {
         self.browser_dialog = None;
         self.focus_comment = false;
         self.reset_names.clear();
+        self.result_scope = None;
         self.results.close();
         self.graph = None;
         self.canvas = None;
@@ -1379,6 +1382,28 @@ impl DesktopApp {
                 return;
             }
             self.send_direct_at(request, origin);
+        } else if let Request::Graph { address } = request {
+            if origin.selection != self.selection_generation {
+                return;
+            }
+            if self.signature_change.is_none() {
+                let _lookup_adoption = crate::performance::span("function_result_lookup_adoption");
+                let state = self.local_override_state(address);
+                let hit = self.results.lookup(address, &state);
+                let requests =
+                    FunctionResults::miss_requests(&hit, address, self.should_auto_decompile());
+                if let Some((graph, origin)) = hit.graph {
+                    self.adopt_graph(graph, origin);
+                }
+                if let Some((code, origin)) = hit.decompiled {
+                    self.adopt_decompilation(code, origin);
+                }
+                for request in requests {
+                    self.schedule_request(request);
+                }
+            } else {
+                self.schedule_request(Request::Graph { address });
+            }
         } else {
             self.schedule_request(request);
         }
@@ -1404,6 +1429,10 @@ impl DesktopApp {
         record: bool,
         context: &egui::Context,
     ) {
+        if self.result_scope != Some(address) {
+            self.result_revision = self.result_revision.wrapping_add(1);
+        }
+        self.result_scope = Some(address);
         self.reference_focus = None;
         self.selected_call = None;
         self.undisplayed_call = None;
@@ -1457,6 +1486,14 @@ impl DesktopApp {
         self.queue.retain(|request| {
             !matches!(request, Request::Graph { .. } | Request::Decompile { .. })
         });
+        if let Some(opening) = &mut self.opening
+            && matches!(
+                opening.follow,
+                Some(Request::Graph { .. } | Request::Decompile { .. })
+            )
+        {
+            opening.follow = None;
+        }
         for request in requests {
             self.status = format!("Loading function {address:#x}…");
             self.request(request, context);
@@ -1499,6 +1536,7 @@ impl DesktopApp {
     /// Drops the displayed decompilation and every selection derived from it.
     fn clear_decompilation(&mut self) {
         self.code = None;
+        self.saved_analysis = false;
         self.semantic.clear();
         self.comment_rows_key = None;
         self.selected_local = None;
@@ -1515,9 +1553,8 @@ impl DesktopApp {
         let address = graph.address();
         self.canvas = Some(GraphCanvas::with_geometry(graph.view(), graph.geometry()));
         self.cached_graph = origin == ResultOrigin::Saved;
-        self.saved_analysis = origin == ResultOrigin::Saved;
         self.graph = Some(graph);
-        self.result_revision = self.result_revision.wrapping_add(1);
+        self.result_scope = Some(address);
         if let Some((function, pc)) = self.signature_restore_pc.take()
             && function == address
         {
@@ -1573,7 +1610,6 @@ impl DesktopApp {
             .cloned()
             .unwrap_or_else(|| "Ready".into());
         self.code = Some(code);
-        self.result_revision = self.result_revision.wrapping_add(1);
     }
 
     fn view(&self) -> Option<&FunctionView> {
@@ -1692,6 +1728,7 @@ impl DesktopApp {
         // Dropping the receiver discards any background adoption in progress.
         self.discovery = None;
         self.discovery_job = None;
+        self.deferred_discovery = None;
         self.discovery_running = false;
         self.discovery_summary = None;
         self.discovery_saved = None;
@@ -1775,21 +1812,49 @@ impl DesktopApp {
             return;
         }
         if let Ok(Some(publication)) = &update.publication {
-            // Release the old display owners before reserving a new publication.
-            // An in-flight save keeps its snapshot charged via its weak lease.
-            self.call_index = None;
-            self.discovery_saved = None;
+            let preparation = crate::result_store::Retained::retained_bytes(update.saved.as_ref())
+                .and_then(|snapshot| {
+                    crate::result_store::Retained::retained_bytes(publication.index.as_ref())
+                        .and_then(|index| snapshot.checked_add(index))
+                })
+                .unwrap_or(usize::MAX);
+            crate::performance::event(
+                "result_store_discovery_preparation_bytes",
+                preparation as u64,
+            );
             let protect = self
                 .view()
                 .map(|view| view.address)
                 .into_iter()
                 .collect::<Vec<_>>();
+            if let Some(old) = &self.call_index {
+                let saved_owner = self
+                    .discovery_saved
+                    .as_ref()
+                    .is_some_and(|saved| Arc::ptr_eq(saved, old.snapshot()));
+                if !self.results.can_replace_discovery(
+                    &publication.index,
+                    old,
+                    saved_owner,
+                    &protect,
+                ) {
+                    self.deferred_discovery = Some(update);
+                    _context.request_repaint_after(Duration::from_millis(20));
+                    return;
+                }
+            }
+            // The old evidence stays displayed through pressure. After the
+            // swap preflight succeeds, release UI owners before reservation;
+            // an in-flight save continues to pin and charge its old snapshot.
+            self.call_index = None;
+            self.discovery_saved = None;
             if !self.results.retain_discovery(&publication.index, &protect) {
                 self.deferred_discovery = Some(update);
                 _context.request_repaint_after(Duration::from_millis(20));
                 return;
             }
         }
+        crate::performance::event("result_store_discovery_preparation_bytes", 0);
         self.discovery = Some(update.state);
         self.discovery_saved = Some(update.saved);
         match update.publication {
@@ -2277,8 +2342,8 @@ impl DesktopApp {
                 if !opening.preserve {
                     self.binary_protection = Some(protection);
                 }
-                self.cached_functions =
-                    project.as_ref().is_some_and(|p| p.project.cache_compatible);
+                self.cached_functions = (opening.preserve && self.cached_functions)
+                    || project.as_ref().is_some_and(|p| p.project.cache_compatible);
                 // Replayed names and display labels differ from the raw Opened
                 // inventory; the first batch from this worker replaces it.
                 self.worker_inventory = None;
@@ -2332,14 +2397,12 @@ impl DesktopApp {
                     } else {
                         self.schedule_open_follow(request, opening.follow_origin);
                     }
-                } else {
-                    if !opening.preserve {
-                        // Like Ghidra, offer analysis when a binary is first opened.
-                        self.analyze_prompt = Some(AnalyzePrompt {
-                            generation: self.generation,
-                            first_open: true,
-                        });
-                    }
+                } else if !opening.preserve {
+                    // Like Ghidra, offer analysis when a binary is first opened.
+                    self.analyze_prompt = Some(AnalyzePrompt {
+                        generation: self.generation,
+                        first_open: true,
+                    });
                     self.navigate(first, true, context);
                 }
             }
@@ -2354,6 +2417,7 @@ impl DesktopApp {
                 {
                     return;
                 }
+                self.result_revision = self.result_revision.wrapping_add(1);
                 let graph = self.results.admit_graph(
                     pending.result.as_ref(),
                     PreparedGraph::new(view),
@@ -2403,6 +2467,7 @@ impl DesktopApp {
                             return;
                         }
                     };
+                    self.result_revision = self.result_revision.wrapping_add(1);
                     let code = self.results.admit_decompilation(
                         pending.result.as_ref(),
                         code,
@@ -3758,6 +3823,7 @@ impl DesktopApp {
         self.saved_analysis = false;
         self.discovery = None;
         self.discovery_job = None;
+        self.deferred_discovery = None;
         self.discovery_saved = None;
         self.discovery_running = false;
         self.discovery_summary = None;
@@ -7052,10 +7118,32 @@ impl DesktopApp {
                     assert_eq!(self.view().unwrap().address, a);
                     assert_eq!(self.selected, Some(check.pc));
                 }
+                check.code = self.code.clone();
+                let path = self.binary_path.clone().unwrap();
+                self.start_open(path, true, Some(Request::Graph { address: b }), context);
+                self.navigate_to(a, Some(check.pc), false, context);
+                assert!(self.opening.as_ref().unwrap().follow.is_none());
+                assert!(Arc::ptr_eq(
+                    self.code.as_ref().unwrap(),
+                    check.code.as_ref().unwrap()
+                ));
+            }
+            9 => {
+                assert_eq!(self.view().unwrap().address, a);
+                assert_eq!(self.selected, Some(check.pc));
+                assert!(Arc::ptr_eq(
+                    self.code.as_ref().unwrap(),
+                    check.code.as_ref().unwrap()
+                ));
+                if check.project.is_some() {
+                    assert!(self.saved_analysis && self.cached_graph && self.cached_functions);
+                    assert!(!self.dirty());
+                }
+                check.code = None;
                 self.tab = Tab::Listing;
                 crate::performance::event("native_cache_check_complete", check.step as u64);
                 eprintln!(
-                    "native cache check passed: A/B/A, exact history, selection, Refresh, project save/reopen"
+                    "native cache check passed: A/B/A, exact history, selection, Refresh, project save/reopen, worker restart with superseded navigation"
                 );
                 return true;
             }
@@ -7503,7 +7591,15 @@ mod tests {
         app.history_index = 1;
         let selected = app.selected;
         app.comment_owners.insert(0x1001, 0x1000);
+        let deferred_state = crate::discovery::Discovery::new(Some(0x1000), [0x1000], false);
+        app.deferred_discovery = Some(DiscoveryUpdate {
+            generation: app.generation,
+            saved: Arc::new(deferred_state.save()),
+            state: deferred_state,
+            publication: Ok(None),
+        });
         app.invalidate_signature_analysis();
+        assert!(app.deferred_discovery.is_none());
         assert!(app.graph.is_none() && app.canvas.is_none() && app.listing().is_empty());
         assert!(
             app.code.is_none()
@@ -11589,6 +11685,14 @@ mod tests {
         let mappings = app.semantic.mappings.to_vec();
         let semantics = app.semantics().clone();
         app.results.open(&"a".repeat(64), &[]);
+        app.results
+            .update_inputs(app.info.as_ref().unwrap().functions.clone(), vec![]);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while app.results.preparing() {
+            assert!(Instant::now() < deadline);
+            app.results.poll_inputs();
+            std::thread::yield_now();
+        }
         let binding = app.results.binding(0x1000, String::new()).unwrap();
         let graph = app.results.admit_graph(
             Some(&binding),
@@ -11729,5 +11833,146 @@ mod tests {
         app.receive(pending, response, &context);
         assert!(Arc::ptr_eq(app.call_index.as_ref().unwrap(), &publication));
         assert!(app.results.lookup(0x1000, "").complete(true));
+    }
+    #[test]
+    fn comment_and_presentation_label_import_keeps_current_results_and_sends_no_work() {
+        let mut app = retained_app();
+        let graph = app.graph.clone().unwrap();
+        let code = app.code.clone().unwrap();
+        let mut imported = app.session.as_ref().unwrap().clone();
+        imported.annotations.insert(
+            0x1004,
+            Annotation {
+                label: "display_only".into(),
+                comment: "imported comment".into(),
+                ..Default::default()
+            },
+        );
+        let (sender, receiver) = mpsc::channel();
+        app.file_job = Some(receiver);
+        sender
+            .send(FileEvent::Loaded {
+                generation: app.generation,
+                revision: app.revision,
+                hash: imported.binary_sha256.clone(),
+                result: Ok(Some((imported, "notes.json".into()))),
+            })
+            .unwrap();
+        app.poll_files(&egui::Context::default());
+        assert!(Arc::ptr_eq(app.graph.as_ref().unwrap(), &graph));
+        assert!(Arc::ptr_eq(app.code.as_ref().unwrap(), &code));
+        assert!(!app.results.preparing());
+        assert!(app.results.lookup(0x1000, "").complete(true));
+        assert!(app.pending.is_none() && app.opening.is_none() && app.queue.is_empty());
+    }
+
+    #[test]
+    fn import_of_another_functions_local_override_keeps_current_graph_and_code() {
+        let mut app = retained_app();
+        let graph = app.graph.clone().unwrap();
+        let code = app.code.clone().unwrap();
+        let mut imported = app.session.as_ref().unwrap().clone();
+        imported.local_renames.push(LocalRename {
+            identity: LocalIdentity {
+                function: 0x1040,
+                engine: crate::semantic::LOCAL_FINGERPRINT.into(),
+                storage: crate::semantic::LocalStorage::Stack,
+                offset: 8,
+                size: 4,
+                verification: "a".repeat(64),
+            },
+            name: "other_local".into(),
+        });
+        let (sender, receiver) = mpsc::channel();
+        app.file_job = Some(receiver);
+        sender
+            .send(FileEvent::Loaded {
+                generation: app.generation,
+                revision: app.revision,
+                hash: imported.binary_sha256.clone(),
+                result: Ok(Some((imported, "notes.json".into()))),
+            })
+            .unwrap();
+        app.poll_files(&egui::Context::default());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while app.results.preparing() {
+            assert!(Instant::now() < deadline);
+            app.results.poll_inputs();
+            std::thread::yield_now();
+        }
+        assert!(Arc::ptr_eq(app.graph.as_ref().unwrap(), &graph));
+        assert!(Arc::ptr_eq(app.code.as_ref().unwrap(), &code));
+        assert!(app.results.lookup(0x1000, "").complete(true));
+        assert!(
+            app.results
+                .lookup(0x1040, &app.results.local_state(0x1040))
+                .decompiled
+                .is_none()
+        );
+        assert!(app.pending.is_none() && app.opening.is_none() && app.queue.is_empty());
+    }
+    #[test]
+    fn a_cache_hit_during_reopen_retires_the_old_queued_destination() {
+        let context = egui::Context::default();
+        let mut app = retained_app();
+        let origin = app.request_origin();
+        app.opening = Some(Opening {
+            path: "fixture".into(),
+            preserve: true,
+            follow: Some(Request::Graph { address: 0x1000 }),
+            revision: app.revision,
+            follow_origin: origin,
+        });
+        app.navigate(0x1040, true, &context);
+        assert!(app.opening.as_ref().unwrap().follow.is_none());
+        app.schedule_open_follow(Request::Graph { address: 0x1000 }, origin);
+        assert_eq!(app.view().unwrap().address, 0x1040);
+        assert_eq!(app.decompiled(), "return;");
+        assert!(app.pending.is_none() && app.queue.is_empty());
+    }
+
+    #[test]
+    fn committed_worker_recovery_reuses_results_without_laundering_saved_provenance() {
+        let mut app = retained_app();
+        let code = app.code.clone().unwrap();
+        app.graph = None;
+        app.clear_decompilation();
+        let origin = app.request_origin();
+        app.schedule_open_follow(Request::Graph { address: 0x1000 }, origin);
+        assert!(Arc::ptr_eq(app.code.as_ref().unwrap(), &code));
+        assert!(app.saved_analysis && app.cached_graph);
+        assert!(app.pending.is_none() && app.queue.is_empty());
+    }
+    #[test]
+    fn identical_cache_adoption_stays_saved_and_fresh_code_adoption_becomes_dirty() {
+        let context = egui::Context::default();
+        let mut app = retained_app();
+        app.project_path = Some("snapshot.grproj".into());
+        app.saved_revision = app.revision;
+        app.saved_result_revision = app.result_revision;
+        app.navigate_to(0x1000, app.selected, false, &context);
+        assert!(!app.dirty());
+        let binding = app.results.binding(0x1000, String::new()).unwrap();
+        app.receive(
+            Pending {
+                id: 1,
+                request: Request::Decompile { address: 0x1000 },
+                started: Instant::now(),
+                selection: app.selection_generation,
+                revision: app.revision,
+                byte_origin: (app.selected, app.tab),
+                bytes: None,
+                result: Some(binding),
+            },
+            Response::Decompiled {
+                address: 0x1000,
+                text: "new analysis".into(),
+                mappings: vec![],
+                semantics: SemanticInfo::default(),
+            },
+            &context,
+        );
+        assert!(app.dirty());
+        assert_eq!(app.revision, app.saved_revision);
     }
 }
