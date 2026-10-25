@@ -125,3 +125,11 @@ PE with original synthetic packed/full runtime records and a named IAT slot.
 The contained worker regression verifies isolated function recovery, excludes
 the fragment as independent function evidence, names the confirmed import call,
 retains an unresolved register branch, and checks unchanged input bytes/hash.
+
+`pointer-tables.S` is original x86-64 ELF source for stripped PIE/non-PIE
+worker regressions: two callable targets, duplicate-only/singleton runs,
+instruction offcuts, internal labels, mixed data, init/fini single callbacks,
+and source/validation batch boundaries. Builds with `NO_UNWIND` check precision
+without requiring equal recall. `pointer_recovery.rs` also uses the original
+300-function differential corpus; unstripped symbols score the stripped worker
+results and never seed discovery.
