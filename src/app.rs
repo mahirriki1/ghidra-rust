@@ -351,9 +351,59 @@ struct AnalyzePrompt {
 /// so they never preempt navigation or each other.
 struct AnalysisPlan {
     generation: u64,
+    started: Instant,
     steps: VecDeque<AnalysisStep>,
     current: Option<AnalysisStep>,
     total: usize,
+}
+
+/// Transient presentation survives while background adoption owns `Discovery`.
+/// It is never loaded from projects or recreated by a late reply after Cancel.
+#[derive(Clone, Copy)]
+struct DiscoveryActivity {
+    generation: u64,
+    started: Instant,
+    known: Option<crate::discovery::FunctionProgress>,
+    scanning: bool,
+}
+
+#[derive(Debug)]
+struct RunPresentation {
+    phase: &'static str,
+    elapsed: Duration,
+    step: Option<(usize, usize)>,
+    progress: theme::BarProgress,
+    known: Option<crate::discovery::FunctionProgress>,
+    foreground: Option<&'static str>,
+}
+
+impl RunPresentation {
+    fn label(&self) -> String {
+        let mut label = self.phase.to_owned();
+        if let theme::BarProgress::KnownFunctions { processed, total } = self.progress {
+            label.push_str(&format!(" {processed}/{total}"));
+        }
+        if let Some((current, total)) = self.step {
+            label.push_str(&format!(" · step {current}/{total}"));
+        }
+        label.push_str(&format!(" · {:.1}s", self.elapsed.as_secs_f32()));
+        label
+    }
+}
+
+fn request_task(request: &Request) -> &'static str {
+    match request {
+        Request::Open { .. } => "Opening binary",
+        Request::Graph { .. } => "Building graph",
+        Request::Decompile { .. } | Request::DecompileWithLocals { .. } => "Decompiling",
+        Request::Discover | Request::DiscoverBatch { .. } => "Discovering functions",
+        Request::SyncFunctions { .. } => "Restoring function context",
+        Request::SyncSignatures { .. } => "Applying function signatures",
+        Request::Rename { .. } => "Renaming function",
+        Request::Bytes { .. } => "Reading bytes",
+        Request::Strings | Request::StringsWithOptions { .. } => "Finding strings",
+        Request::Crypto => "Scanning constants",
+    }
 }
 
 #[derive(Clone)]
@@ -457,6 +507,7 @@ pub struct DesktopApp {
     discovery: Option<crate::discovery::Discovery>,
     discovery_job: Option<Receiver<DiscoveryUpdate>>,
     discovery_running: bool,
+    discovery_activity: Option<DiscoveryActivity>,
     discovery_summary: Option<String>,
     worker_epoch: u64,
     /// The inventory last adopted from the current worker. Batch requests name
@@ -604,6 +655,7 @@ impl DesktopApp {
             discovery: None,
             discovery_job: None,
             discovery_running: false,
+            discovery_activity: None,
             discovery_summary: None,
             worker_epoch: 0,
             worker_inventory: None,
@@ -784,6 +836,7 @@ impl DesktopApp {
         self.signature_recovery = None;
         self.worker_inventory = None;
         self.inventory_synced = false;
+        self.discovery_activity = None;
         self.discovery = None;
         self.discovery_job = None;
         self.discovery_running = false;
@@ -858,16 +911,26 @@ impl DesktopApp {
             && self.discovery_running
             && self.signature_change.is_none()
             && self.discovery_resumes < MAX_DISCOVERY_RESUMES;
-        self.stop_worker();
         if resume && let Some(path) = self.binary_path.clone() {
+            self.stop_worker_transport();
             self.discovery_resumes += 1;
             self.start_open(path, true, None, context);
             self.discovery_running = self.client.is_some();
             self.update_discovery_summary();
+        } else {
+            self.stop_worker();
         }
     }
 
     fn stop_worker(&mut self) {
+        self.discovery_activity = None;
+        self.analysis_plan = None;
+        self.stop_worker_transport();
+    }
+
+    /// Recovery preserves the logical run, but keeps the existing byte-intent
+    /// cancellation and worker interruption accounting.
+    fn stop_worker_transport(&mut self) {
         if self.hex.is_loading() {
             self.hex
                 .cancel("Analysis stopped. Retry to read this page.");
@@ -1036,6 +1099,18 @@ impl DesktopApp {
     }
 
     fn request(&mut self, request: Request, context: &egui::Context) {
+        if matches!(request, Request::Discover)
+            && self
+                .info
+                .as_ref()
+                .is_some_and(|info| !crate::packing::has_upx_warning(info))
+            && !self
+                .opening
+                .as_ref()
+                .is_some_and(|opening| !opening.preserve)
+        {
+            self.begin_discovery_activity(Instant::now());
+        }
         if let Request::Bytes { address, length } = request {
             self.request_bytes(address, length, ByteDestination::Decode, context);
             return;
@@ -1401,6 +1476,12 @@ impl DesktopApp {
 
     fn update_discovery_summary(&mut self) {
         if let Some(state) = &self.discovery {
+            if let Some(activity) = &mut self.discovery_activity
+                && activity.generation == self.generation
+            {
+                activity.known = Some(state.progress());
+                activity.scanning = state.scanning();
+            }
             let patterns = state.patterns.as_ref().map_or(String::new(), |phase| {
                 format!(
                     " · {} pattern starts from {} KiB{}",
@@ -1446,7 +1527,9 @@ impl DesktopApp {
         }) {
             self.stop_worker();
         }
+        self.analysis_plan = None;
         // Dropping the receiver discards any background adoption in progress.
+        self.discovery_activity = None;
         self.discovery = None;
         self.discovery_job = None;
         self.discovery_running = false;
@@ -1457,10 +1540,45 @@ impl DesktopApp {
         self.request(Request::Discover, context);
     }
 
+    fn begin_discovery_activity(&mut self, now: Instant) {
+        if self
+            .discovery_activity
+            .as_ref()
+            .is_none_or(|activity| activity.generation != self.generation)
+        {
+            let started = self
+                .analysis_plan
+                .as_ref()
+                .filter(|plan| plan.generation == self.generation)
+                .map_or(now, |plan| plan.started);
+            self.discovery_activity = Some(DiscoveryActivity {
+                generation: self.generation,
+                started,
+                known: self.discovery.as_ref().map(|state| state.progress()),
+                scanning: self
+                    .discovery
+                    .as_ref()
+                    .is_some_and(|state| state.scanning()),
+            });
+        }
+    }
+
+    fn finish_discovery(&mut self) {
+        if self.discovery_running {
+            crate::performance::event("discovery_action_adopted", self.generation);
+        }
+        self.discovery_running = false;
+        self.discovery_activity = None;
+        self.worker_inventory = None;
+        self.inventory_synced = false;
+        self.finish_auto_run(AnalysisStep::Functions);
+    }
+
     fn start_discovery(&mut self, context: &egui::Context) {
         if self.info.is_none() {
             return;
         }
+        self.begin_discovery_activity(Instant::now());
         if !self.discovery_running {
             crate::performance::event("discovery_action_begin", self.generation);
         }
@@ -1517,7 +1635,7 @@ impl DesktopApp {
             Err(TryRecvError::Empty) => return,
             Err(TryRecvError::Disconnected) => {
                 self.discovery_job = None;
-                self.discovery_running = false;
+                self.stop_worker();
                 self.status = "Discovery adoption job failed".into();
                 return;
             }
@@ -1564,6 +1682,13 @@ impl DesktopApp {
             }
         }
         self.update_discovery_summary();
+        if self
+            .discovery
+            .as_ref()
+            .is_some_and(|state| state.remaining() == 0 && !state.scanning())
+        {
+            self.finish_discovery();
+        }
     }
 
     fn pump_discovery(&mut self, _context: &egui::Context) {
@@ -1598,10 +1723,7 @@ impl DesktopApp {
             }
             self.send_direct(request);
         } else if state.remaining() == 0 && !state.scanning() {
-            crate::performance::event("discovery_action_adopted", self.generation);
-            self.discovery_running = false;
-            self.worker_inventory = None;
-            self.inventory_synced = false;
+            self.finish_discovery();
             self.status = "Discovery seed queue exhausted".into();
         }
         self.update_discovery_summary();
@@ -1623,6 +1745,10 @@ impl DesktopApp {
     }
 
     fn start_auto_analysis(&mut self) {
+        self.start_auto_analysis_at(Instant::now());
+    }
+
+    fn start_auto_analysis_at(&mut self, now: Instant) {
         let options = self.analysis_options;
         let packed = self
             .info
@@ -1639,6 +1765,7 @@ impl DesktopApp {
         .collect();
         self.analysis_plan = (!steps.is_empty()).then_some(AnalysisPlan {
             generation: self.generation,
+            started: now,
             total: steps.len(),
             steps,
             current: None,
@@ -1676,6 +1803,16 @@ impl DesktopApp {
             AnalysisStep::Functions => Request::Discover,
         };
         self.request(request, context);
+    }
+
+    fn finish_auto_run(&mut self, step: AnalysisStep) {
+        if self.analysis_plan.as_ref().is_some_and(|plan| {
+            plan.generation == self.generation
+                && plan.current == Some(step)
+                && plan.steps.is_empty()
+        }) {
+            self.analysis_plan = None;
+        }
     }
 
     fn automatic(&self, step: AnalysisStep) -> bool {
@@ -1738,7 +1875,11 @@ impl DesktopApp {
         self.dispatch_queued(context);
         self.pump_discovery(context);
         self.pump_analysis(context);
-        if self.pending.is_some() || self.discovery_job.is_some() {
+        if self.pending.is_some()
+            || self.discovery_job.is_some()
+            || self.discovery_activity.is_some()
+            || self.analysis_plan.is_some()
+        {
             context.request_repaint_after(Duration::from_millis(100));
         }
     }
@@ -2450,6 +2591,7 @@ impl DesktopApp {
                 } else {
                     format!("String scan complete: {} results", self.strings.len())
                 };
+                self.finish_auto_run(AnalysisStep::Strings);
             }
             (Request::Crypto, Response::Crypto { matches, truncated }) => {
                 self.cached_crypto = false;
@@ -2464,6 +2606,7 @@ impl DesktopApp {
                     "Constant scan complete; matches are heuristic evidence"
                 }
                 .into();
+                self.finish_auto_run(AnalysisStep::Crypto);
             }
             _ => {
                 self.stop_worker();
@@ -2484,7 +2627,7 @@ impl DesktopApp {
             return;
         }
         if let Some(request) = self.queue.pop_front() {
-            if self.client.is_none() {
+            if self.client.is_none() || matches!(request, Request::Discover) {
                 self.request(request, context);
             } else {
                 self.schedule_request(request);
@@ -3442,6 +3585,7 @@ impl DesktopApp {
         self.comment_owners.clear();
         self.cached_graph = false;
         self.saved_analysis = false;
+        self.discovery_activity = None;
         self.discovery = None;
         self.discovery_job = None;
         self.discovery_saved = None;
@@ -6527,6 +6671,138 @@ impl DesktopApp {
             }))
     }
 
+    /// Live run state takes precedence over the disposable worker's current job.
+    fn analysis_presentation(&self, now: Instant) -> Option<RunPresentation> {
+        let plan = self
+            .analysis_plan
+            .as_ref()
+            .filter(|plan| plan.generation == self.generation);
+        let discovery = self
+            .discovery_activity
+            .as_ref()
+            .filter(|run| run.generation == self.generation);
+        let pending = self.pending.as_ref();
+        let started = plan
+            .map(|plan| plan.started)
+            .or_else(|| discovery.map(|run| run.started))
+            .or_else(|| pending.map(|pending| pending.started))?;
+        let elapsed = now.saturating_duration_since(started);
+        if elapsed < Duration::from_millis(200) {
+            return None;
+        }
+        let selected = plan.and_then(|plan| plan.current.or(plan.steps.front().copied()));
+        let step = plan.map(|plan| {
+            let ordinal = plan.total - plan.steps.len() + usize::from(plan.current.is_none());
+            (ordinal.min(plan.total), plan.total)
+        });
+        let known = discovery.and_then(|run| run.known);
+        let mut display = RunPresentation {
+            phase: "Analysis",
+            elapsed,
+            step,
+            progress: theme::BarProgress::Activity,
+            known,
+            foreground: None,
+        };
+        if plan.is_none() && discovery.is_none() {
+            let pending = pending?;
+            display.phase = self
+                .analysis_progress
+                .as_ref()
+                .map(|progress| match progress.stage {
+                    AnalysisStage::Seeds => "Seeding analysis",
+                    AnalysisStage::Calls => "Analyzing references",
+                    AnalysisStage::Publish => "Publishing results",
+                })
+                .unwrap_or_else(|| request_task(&pending.request));
+            return Some(display);
+        }
+        if let Some(pending) = pending
+            && matches!(
+                pending.request,
+                Request::Graph { .. }
+                    | Request::Decompile { .. }
+                    | Request::DecompileWithLocals { .. }
+                    | Request::Bytes { .. }
+                    | Request::Rename { .. }
+            )
+        {
+            display.phase = if discovery.is_some() {
+                "Discovery waiting"
+            } else {
+                "Analysis waiting"
+            };
+            display.foreground = Some(request_task(&pending.request));
+        } else if self.opening.is_some()
+            || self.signature_replay.is_some()
+            || self
+                .discovery_sync
+                .as_ref()
+                .is_some_and(|addresses| !addresses.is_empty())
+            || pending.is_some_and(|pending| {
+                matches!(
+                    pending.request,
+                    Request::Open { .. }
+                        | Request::SyncFunctions { .. }
+                        | Request::SyncSignatures { .. }
+                )
+            })
+        {
+            display.phase = "Restoring";
+        } else if let Some(task) = pending.and_then(|pending| match pending.request {
+            Request::Strings | Request::StringsWithOptions { .. } => Some("Strings"),
+            Request::Crypto => Some("Constants"),
+            _ => None,
+        }) {
+            display.phase = task;
+        } else if discovery.is_some()
+            && self
+                .analysis_progress
+                .as_ref()
+                .is_some_and(|progress| matches!(progress.stage, AnalysisStage::Publish))
+        {
+            display.phase = "Publishing";
+        } else if let Some(discovery) = discovery {
+            if self.discovery_job.is_some() {
+                display.phase = if known.is_some() {
+                    "Adopting"
+                } else {
+                    "Preparing discovery"
+                };
+            } else if pending.is_some_and(|pending| {
+                matches!(
+                    pending.request,
+                    Request::DiscoverBatch {
+                        patterns: Some(_),
+                        ..
+                    }
+                )
+            }) || discovery.scanning
+                && known.is_some_and(|work| work.processed == work.total)
+            {
+                display.phase = "Patterns";
+            } else if let Some(work) =
+                known.filter(|work| work.total != 0 && work.processed < work.total)
+            {
+                display.phase = "Functions";
+                display.progress = theme::BarProgress::KnownFunctions {
+                    processed: work.processed,
+                    total: work.total,
+                };
+            } else {
+                display.phase = "Preparing discovery";
+            }
+        } else {
+            display.phase = match selected {
+                Some(AnalysisStep::Strings) => "Strings",
+                Some(AnalysisStep::Crypto) => "Constants",
+                Some(AnalysisStep::Functions) => "Preparing discovery",
+                None => "Analysis",
+            };
+        }
+        Some(display)
+    }
+
     fn status_bar(&self, ui: &mut egui::Ui) {
         self.status_bar_at(ui, Instant::now());
     }
@@ -6543,52 +6819,34 @@ impl DesktopApp {
             |ui| {
                 ui.set_clip_rect(row.intersect(ui.clip_rect()));
                 ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
-                if let Some(pending) = &self.pending {
-                    let elapsed = now.saturating_duration_since(pending.started);
-                    // Avoid flashing the bar for jobs which finish immediately.
-                    if elapsed >= Duration::from_millis(200) {
-                        let task = match pending.request {
-                            Request::Open { .. } => "Opening binary",
-                            Request::Graph { .. } => "Building graph",
-                            Request::Decompile { .. } | Request::DecompileWithLocals { .. } => "Decompiling",
-                            Request::Discover | Request::DiscoverBatch { .. } => "Discovering functions",
-                            Request::SyncFunctions { .. } => "Restoring function context",
-                            Request::SyncSignatures { .. } => "Applying function signatures",
-                            Request::Rename { .. } => "Renaming function",
-                            Request::Bytes { .. } => "Reading bytes",
-                            Request::Strings | Request::StringsWithOptions { .. } => "Finding strings",
-                            Request::Crypto => "Scanning constants",
-                        };
-                        let stage = self.analysis_progress.as_ref().map(|progress| match progress.stage {
-                            AnalysisStage::Seeds => "Seeding analysis",
-                            AnalysisStage::Calls => "Analyzing references",
-                            AnalysisStage::Publish => "Publishing results",
-                        }).unwrap_or(task);
-                        let activity = ui.allocate_ui_with_layout(
-                            egui::vec2((row.width() * 0.45).min(360.0), row.height()),
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| theme::analysis_activity(ui, stage, elapsed),
-                        );
-                        activity.response.on_hover_ui(|ui| {
-                            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-                            ui.label(format!("{stage} · {:.1}s", elapsed.as_secs_f32()));
-                            ui.label("Analysis is running. Use Analysis → Cancel analysis to stop it.");
-                            if let Some(plan) = &self.analysis_plan {
-                                let step = plan.current.or(plan.steps.front().copied());
-                                ui.label(format!(
-                                    "Auto analysis {}/{}{}",
-                                    plan.total - plan.steps.len(), plan.total,
-                                    step.map_or(String::new(), |step| format!(" · {}", step.label())),
-                                ));
-                            }
-                            if let Some(progress) = &self.analysis_progress {
-                                ui.label(format!("{} functions examined · {} decode attempts. Total work is unknown.", progress.functions_examined, progress.decode_attempts));
-                            }
-                            if let Some(summary) = &self.discovery_summary {
-                                ui.label(summary);
-                            }
-                        });
-                    }
+                if let Some(display) = self.analysis_presentation(now) {
+                    let label = display.label();
+                    let activity = ui.allocate_ui_with_layout(
+                        egui::vec2((row.width() * 0.45).min(420.0), row.height()),
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| theme::analysis_activity(ui, &label, display.elapsed, display.progress),
+                    );
+                    activity.response.on_hover_ui(|ui| {
+                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                        ui.label(&label);
+                        if let Some(step) = self.analysis_plan.as_ref().and_then(|plan| plan.current.or(plan.steps.front().copied())) {
+                            ui.label(step.label());
+                        }
+                        ui.label("Analysis is running. Use Analysis → Cancel analysis to stop it.");
+                        ui.label("Elapsed time includes setup and waits. Steps identify selected analyses, not portions of runtime.");
+                        if let Some(work) = display.known {
+                            ui.label(format!("{} / {} known functions processed. Failed and limited attempts count as processed; in-flight work does not. The total can grow as more functions are admitted; this is not whole-program coverage.", work.processed, work.total));
+                        }
+                        if let Some(task) = display.foreground {
+                            ui.label(task);
+                        }
+                        if let Some(progress) = &self.analysis_progress {
+                            ui.label(format!("Current batch: {} functions examined · {} decode attempts.", progress.functions_examined, progress.decode_attempts));
+                        }
+                        if let Some(summary) = &self.discovery_summary {
+                            ui.label(summary);
+                        }
+                    });
                 }
                 let count = self.status_notes().count();
                 if count != 0 {
@@ -10001,6 +10259,7 @@ mod tests {
         let mut rect = egui::Rect::NOTHING;
         let mut output = context.run_ui(
             egui::RawInput {
+                time: Some(context.input(|input| input.time) + 0.25),
                 events,
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -10018,6 +10277,470 @@ mod tests {
         );
         output.textures_delta.clear();
         (output, rect)
+    }
+
+    fn run_progress_app(now: Instant) -> DesktopApp {
+        let mut app = keyboard_app();
+        app.discovery = Some(crate::discovery::Discovery::new(
+            None,
+            [0x1000, 0x1040],
+            false,
+        ));
+        app.discovery_running = true;
+        app.begin_discovery_activity(now);
+        app.update_discovery_summary();
+        app
+    }
+
+    fn run_pending(app: &DesktopApp, request: Request, started: Instant) -> Pending {
+        Pending {
+            id: 1,
+            request,
+            started,
+            selection: app.selection_generation,
+            revision: app.revision,
+            byte_origin: (app.selected, app.tab),
+            bytes: None,
+        }
+    }
+
+    fn run_commit(app: &DesktopApp, state: &mut crate::discovery::Discovery, count: usize) {
+        let request = state
+            .begin(app.generation, app.worker_epoch, app.revision)
+            .unwrap();
+        let Request::DiscoverBatch { binding, seeds, .. } = request else {
+            panic!()
+        };
+        let batch = DiscoveryBatch {
+            binding,
+            inventory: InventoryChange::Replace {
+                revision: binding.batch,
+                functions: app.info.as_ref().unwrap().functions.clone(),
+            },
+            truncated: false,
+            patterns: None,
+            outcomes: seeds
+                .iter()
+                .take(count)
+                .map(|&address| DiscoveryOutcome {
+                    address,
+                    status: DiscoveryStatus::Done,
+                })
+                .collect(),
+            analysis: CallAnalysis {
+                functions_examined: count,
+                decode_attempts: count,
+                ..Default::default()
+            },
+        };
+        crate::discovery::commit_replacement(state, app.info.as_ref().unwrap(), &batch).unwrap();
+    }
+
+    fn run_update(app: &mut DesktopApp, state: crate::discovery::Discovery) {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        app.discovery_job = Some(receiver);
+        sender
+            .send(DiscoveryUpdate {
+                generation: app.generation,
+                saved: Arc::new(state.save()),
+                state,
+                publication: Ok(None),
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn run_progress_persists_through_gaps_setup_replay_and_adoption() {
+        let start = Instant::now();
+        let now = start + Duration::from_secs(3);
+        let context = egui::Context::default();
+        let mut app = run_progress_app(start);
+        assert!(
+            app.analysis_presentation(start + Duration::from_millis(199))
+                .is_none()
+        );
+        assert!(
+            app.analysis_presentation(start + Duration::from_millis(200))
+                .is_some()
+        );
+        let work = theme::BarProgress::KnownFunctions {
+            processed: 0,
+            total: 2,
+        };
+        assert_eq!(app.analysis_presentation(now).unwrap().progress, work);
+
+        // Initial preparation has no counts; the clock starts before the job.
+        let activity = app.discovery_activity.take().unwrap();
+        app.discovery = None;
+        app.begin_discovery_activity(start);
+        let (sender, receiver) = mpsc::sync_channel(1);
+        app.discovery_job = Some(receiver);
+        assert_eq!(
+            app.analysis_presentation(now).unwrap().phase,
+            "Preparing discovery"
+        );
+        drop(sender);
+        app.discovery_job = None;
+        app.discovery_activity = Some(activity);
+        app.discovery = Some(crate::discovery::Discovery::new(
+            None,
+            [0x1000, 0x1040],
+            false,
+        ));
+
+        for request in [
+            Request::Graph { address: 0x1000 },
+            Request::Bytes {
+                address: 0x1000,
+                length: 4,
+            },
+        ] {
+            app.pending = Some(run_pending(&app, request, now));
+            let display = app.analysis_presentation(now).unwrap();
+            assert_eq!(display.phase, "Discovery waiting");
+            assert!(display.foreground.is_some());
+            assert_eq!(display.elapsed, Duration::from_secs(3));
+            assert_eq!(display.known.unwrap().total, 2);
+            assert_eq!(display.progress, theme::BarProgress::Activity);
+            assert_eq!(
+                app.pending.as_ref().unwrap().started,
+                now,
+                "run clocks do not change deadlines"
+            );
+        }
+        app.pending = Some(run_pending(
+            &app,
+            Request::SyncFunctions { functions: vec![] },
+            now,
+        ));
+        assert_eq!(app.analysis_presentation(now).unwrap().phase, "Restoring");
+        app.pending = None;
+        app.signature_replay = Some(SignatureReplay {
+            signatures: vec![],
+            context: String::new(),
+            generation: app.generation,
+            revision: app.revision,
+            epoch: app.worker_epoch,
+            sent: false,
+        });
+        assert_eq!(app.analysis_presentation(now).unwrap().phase, "Restoring");
+        app.signature_replay = None;
+        app.analysis_progress = Some(AnalysisProgress {
+            stage: AnalysisStage::Calls,
+            functions_examined: 99,
+            decode_attempts: 999,
+        });
+        assert_eq!(
+            app.analysis_presentation(now).unwrap().progress,
+            work,
+            "batch-local counts are not added"
+        );
+        app.analysis_progress = None;
+        let mut state = app.discovery.take().unwrap();
+        run_commit(&app, &mut state, 1);
+        run_update(&mut app, state);
+        let display = app.analysis_presentation(now).unwrap();
+        assert_eq!(display.phase, "Adopting");
+        assert_eq!(display.progress, theme::BarProgress::Activity);
+        assert_eq!(
+            display.known.unwrap().processed,
+            0,
+            "unaccepted results do not advance progress"
+        );
+        app.poll_discovery(&context);
+        let display = app.analysis_presentation(now).unwrap();
+        assert_eq!(
+            display.progress,
+            theme::BarProgress::KnownFunctions {
+                processed: 1,
+                total: 2
+            }
+        );
+        assert_eq!(display.elapsed, Duration::from_secs(3));
+        app.stop_worker_transport();
+        assert_eq!(
+            app.analysis_presentation(now).unwrap().elapsed,
+            Duration::from_secs(3)
+        );
+    }
+
+    #[test]
+    fn run_progress_cancel_late_adoption_fresh_resume_and_invalidation() {
+        let context = egui::Context::default();
+        let start = Instant::now();
+        let now = start + Duration::from_secs(3);
+        let mut app = run_progress_app(start);
+        let mut state = app.discovery.take().unwrap();
+        run_commit(&app, &mut state, 1);
+        run_update(&mut app, state);
+        app.stop_worker();
+        assert!(app.analysis_presentation(now).is_none());
+        app.poll_discovery(&context);
+        assert_eq!(app.discovery.as_ref().unwrap().progress().processed, 1);
+        assert!(
+            app.analysis_presentation(now).is_none(),
+            "late adoption retains results without restarting a canceled bar"
+        );
+        app.begin_discovery_activity(now);
+        assert!(
+            app.analysis_presentation(now + Duration::from_millis(199))
+                .is_none()
+        );
+        let display = app
+            .analysis_presentation(now + Duration::from_millis(200))
+            .unwrap();
+        assert_eq!(display.elapsed, Duration::from_millis(200));
+        assert_eq!(display.known.unwrap().processed, 1);
+        app.invalidate_signature_analysis();
+        assert!(
+            app.analysis_presentation(now + Duration::from_secs(1))
+                .is_none()
+        );
+        app.begin_discovery_activity(start);
+        app.generation += 1;
+        assert!(app.analysis_presentation(now).is_none());
+        app.begin_discovery_activity(start);
+        app.clear_binary();
+        assert!(app.analysis_presentation(now).is_none());
+    }
+
+    #[test]
+    fn run_progress_patterns_are_activity_and_final_adoption_settles_auto_run() {
+        let context = egui::Context::default();
+        let start = Instant::now();
+        let now = start + Duration::from_secs(3);
+        let mut app = run_progress_app(start);
+        app.analysis_options = AnalysisOptions {
+            strings: false,
+            crypto: false,
+            functions: true,
+        };
+        app.start_auto_analysis_at(start);
+        let plan = app.analysis_plan.as_mut().unwrap();
+        plan.current = plan.steps.pop_front();
+        let mut state = app.discovery.take().unwrap();
+        state.start_patterns();
+        run_commit(&app, &mut state, 2);
+        run_update(&mut app, state);
+        assert_eq!(app.analysis_presentation(now).unwrap().phase, "Adopting");
+        app.poll_discovery(&context);
+        let display = app.analysis_presentation(now).unwrap();
+        assert_eq!(display.phase, "Patterns");
+        assert_eq!(display.known.unwrap().processed, 2);
+        assert_eq!(
+            display.progress,
+            theme::BarProgress::Activity,
+            "N/N does not imply discovery completion"
+        );
+        assert!(app.discovery_running);
+        let mut state = app.discovery.take().unwrap();
+        state.patterns.as_mut().unwrap().cursor = None;
+        run_update(&mut app, state);
+        app.poll_discovery(&context);
+        assert!(app.discovery_activity.is_none());
+        assert!(!app.discovery_running);
+        app.pump_analysis(&context);
+        assert!(app.analysis_plan.is_none());
+        assert!(app.analysis_presentation(now).is_none());
+    }
+
+    #[test]
+    fn run_progress_auto_ordinals_and_origin_survive_scan_preemption() {
+        let context = egui::Context::default();
+        let start = Instant::now();
+        let now = start + Duration::from_secs(3);
+        let mut app = keyboard_app();
+        app.analysis_options.crypto = true;
+        app.start_auto_analysis_at(start);
+        app.pump_analysis(&context);
+        assert_eq!(app.analysis_presentation(now).unwrap().step, Some((1, 3)));
+        app.pending = Some(run_pending(&app, app.string_request(), now));
+        app.request(Request::Graph { address: 0x1040 }, &context);
+        assert_eq!(app.analysis_plan.as_ref().unwrap().current, None);
+        app.pending = Some(run_pending(&app, Request::Graph { address: 0x1040 }, now));
+        let display = app.analysis_presentation(now).unwrap();
+        assert_eq!(display.phase, "Analysis waiting");
+        assert_eq!(display.step, Some((1, 3)));
+        app.pending = None;
+        app.pump_analysis(&context);
+        assert_eq!(app.analysis_presentation(now).unwrap().step, Some((1, 3)));
+        app.receive(
+            run_pending(&app, app.string_request(), now),
+            Response::Strings {
+                strings: vec![],
+                truncated: false,
+            },
+            &context,
+        );
+        app.pump_analysis(&context);
+        let display = app.analysis_presentation(now).unwrap();
+        assert_eq!(display.phase, "Constants");
+        assert_eq!(display.step, Some((2, 3)));
+        assert_eq!(display.elapsed, Duration::from_secs(3));
+        app.pending = Some(run_pending(&app, Request::Crypto, now));
+        app.request(Request::Graph { address: 0x1000 }, &context);
+        assert_eq!(app.analysis_presentation(now).unwrap().step, Some((2, 3)));
+        app.pending = None;
+        app.pump_analysis(&context);
+        assert_eq!(app.analysis_presentation(now).unwrap().step, Some((2, 3)));
+        app.receive(
+            run_pending(&app, Request::Crypto, now),
+            Response::Crypto {
+                matches: vec![],
+                truncated: false,
+            },
+            &context,
+        );
+        app.pump_analysis(&context);
+        let display = app.analysis_presentation(now).unwrap();
+        assert_eq!(display.step, Some((3, 3)));
+        assert_eq!(display.elapsed, Duration::from_secs(3));
+        app.stop_worker();
+        assert!(app.analysis_presentation(now).is_none());
+    }
+
+    #[test]
+    fn run_progress_survives_recovery_open_but_terminal_failure_ends_it() {
+        let context = egui::Context::default();
+        let start = Instant::now();
+        let now = start + Duration::from_secs(3);
+        let mut app = run_progress_app(start);
+        app.binary_path = Some(std::env::current_exe().unwrap());
+        app.analysis_options = AnalysisOptions {
+            strings: false,
+            crypto: false,
+            functions: true,
+        };
+        app.start_auto_analysis_at(start);
+        app.stop_after_failure(true, &context);
+        assert!(app.client.is_some(), "recovery must start successfully");
+        let display = app.analysis_presentation(now).unwrap();
+        assert_eq!(display.phase, "Restoring");
+        assert_eq!(display.elapsed, Duration::from_secs(3));
+        assert_eq!(display.step, Some((1, 1)));
+        assert_eq!(display.known.unwrap().total, 2);
+        assert_eq!(app.discovery_activity.as_ref().unwrap().started, start);
+        app.stop_after_failure(false, &context);
+        assert!(app.analysis_presentation(now).is_none());
+        assert!(app.analysis_plan.is_none());
+    }
+
+    #[test]
+    fn run_progress_saved_results_stay_idle_and_last_scan_settles_before_navigation() {
+        let context = egui::Context::default();
+        let start = Instant::now();
+        let now = start + Duration::from_secs(3);
+        let mut app = keyboard_app();
+        let state = crate::discovery::Discovery::new(None, [0x1000], false);
+        app.discovery_saved = Some(Arc::new(state.save()));
+        app.saved_references = true;
+        app.cached_functions = true;
+        app.discovery_summary = Some("Saved discovery: partial coverage".into());
+        assert!(app.analysis_presentation(now).is_none());
+        for (strings, step) in [(true, AnalysisStep::Strings), (false, AnalysisStep::Crypto)] {
+            app.analysis_options = AnalysisOptions {
+                strings,
+                crypto: !strings,
+                functions: false,
+            };
+            app.start_auto_analysis_at(start);
+            app.pump_analysis(&context);
+            assert_eq!(app.analysis_plan.as_ref().unwrap().current, Some(step));
+            app.pending = Some(run_pending(&app, Request::Graph { address: 0x1000 }, now));
+            // Final analysis adoption may settle while foreground work is present.
+            let (request, response) = if strings {
+                (
+                    app.string_request(),
+                    Response::Strings {
+                        strings: vec![],
+                        truncated: false,
+                    },
+                )
+            } else {
+                (
+                    Request::Crypto,
+                    Response::Crypto {
+                        matches: vec![],
+                        truncated: false,
+                    },
+                )
+            };
+            app.receive(run_pending(&app, request, start), response, &context);
+            assert!(app.analysis_plan.is_none());
+            assert!(
+                app.analysis_presentation(now).is_none(),
+                "fresh standalone work retains its own 200 ms delay"
+            );
+            app.pending = None;
+        }
+    }
+
+    #[test]
+    fn run_progress_both_modes_keep_narrow_rows_and_warning_popup() {
+        let start = Instant::now();
+        let now = start + Duration::from_secs(3);
+        for width in [1440.0, 1000.0, 520.0, 260.0] {
+            let context = egui::Context::default();
+            theme::install(&context);
+            let mut app = run_progress_app(start);
+            app.status = "Very long status ".repeat(100);
+            status_frame(&context, &app, now, width, vec![]);
+            let (_, known_rect) = status_frame(&context, &app, now, width, vec![]);
+            let (sender, receiver) = mpsc::sync_channel(1);
+            app.discovery_job = Some(receiver);
+            let (output, activity_rect) = status_frame(&context, &app, now, width, vec![]);
+            assert_eq!(known_rect, activity_rect);
+            assert!(activity_rect.height() <= theme::ROW_HEIGHT + 8.0);
+            for shape in &output.shapes {
+                if let egui::epaint::Shape::Text(text) = &shape.shape {
+                    assert_eq!(text.galley.rows.len(), 1);
+                }
+            }
+            let position = text_position(&output, "    1", 0) + egui::vec2(8.0, 5.0);
+            status_frame(&context, &app, now, width, pointer_events(position));
+            let (output, _) = status_frame(&context, &app, now, width, vec![]);
+            assert!(
+                rendered_text(&output)
+                    .iter()
+                    .any(|text| text.contains("partial coverage"))
+            );
+            drop(sender);
+        }
+    }
+
+    #[test]
+    fn run_progress_hover_explains_counts_in_both_modes() {
+        let start = Instant::now();
+        let now = start + Duration::from_secs(3);
+        let context = egui::Context::default();
+        theme::install(&context);
+        context.style_mut_of(egui::Theme::Dark, |style| {
+            style.interaction.tooltip_delay = 0.0
+        });
+        let mut app = run_progress_app(start);
+        status_frame(&context, &app, now, 1000.0, vec![]);
+        for adopting in [false, true] {
+            let (_sender, receiver) = mpsc::sync_channel(1);
+            app.discovery_job = adopting.then_some(receiver);
+            let (_, rect) = status_frame(&context, &app, now, 1000.0, vec![]);
+            status_frame(
+                &context,
+                &app,
+                now,
+                1000.0,
+                vec![egui::Event::PointerMoved(egui::pos2(
+                    rect.right() - 40.0,
+                    rect.center().y,
+                ))],
+            );
+            let (output, _) = status_frame(&context, &app, now, 1000.0, vec![]);
+            assert!(
+                rendered_text(&output)
+                    .iter()
+                    .any(|text| text.contains("in-flight work does not")
+                        && text.contains("total can grow"))
+            );
+        }
     }
 
     #[test]
@@ -10081,12 +10804,6 @@ mod tests {
             ));
             app.discovery_running = true;
             app.update_discovery_summary();
-            app.analysis_plan = Some(AnalysisPlan {
-                generation: app.generation,
-                steps: VecDeque::new(),
-                current: Some(AnalysisStep::Functions),
-                total: 2,
-            });
             app.pending = Some(Pending {
                 id: 1,
                 request: Request::SyncSignatures {
