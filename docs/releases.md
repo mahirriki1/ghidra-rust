@@ -1,11 +1,8 @@
 # Building and shipping each version
 
-Rust's `cargo build --release --locked` compiles and links the native desktop.
-Windows uses the x64 MSVC linker and Windows SDK. The target-specific setting in
-`.cargo/config.toml` links the MSVC runtime statically; SQLite, engine data, and
-fonts are also included in the application. The Windows output is an EXE. Linux
-produces an ELF executable that uses compatible system libraries and a desktop
-graphics driver. Neither shipped application needs Rust, Java, or Python.
+Native release builds produce Linux ELF and Windows x64 MSVC executables.
+Engine data, fonts, and SQLite are included; neither desktop needs Rust, Java,
+or Python. See the platform guides for runtime requirements.
 
 ## Repeatable local builds
 
@@ -30,24 +27,16 @@ On Ubuntu with AppArmor user-namespace restrictions, load the distribution's
 bubblewrap profile as described in [Linux runtime compatibility](linux.md)
 before running the sandboxed tests.
 
-On Windows x64, install Rust and Visual Studio Build Tools with **Desktop
-development with C++** and the Windows SDK. From PowerShell in a local checkout:
-
-```powershell
-rustup toolchain install 1.98.1-x86_64-pc-windows-msvc --component rustfmt,clippy
-rustup run 1.98.1-x86_64-pc-windows-msvc powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-windows.ps1
-```
+For Windows prerequisites and commands, see [Build and launch](windows.md#build-and-launch)
+and [Reproduce the Windows checks and portable ZIP](windows.md#reproduce-the-windows-checks-and-portable-zip).
 
 Both scripts check formatting, unit tests, strict Clippy, the release build, and
 the real release worker integration test before packaging. **Run them locally and
 confirm the tests pass before pushing:** GitHub Actions runs the same scripts with
 `--skip-tests` (Linux) or `-SkipTests` (Windows), so hosted runs only check
 formatting and Clippy, build, and package. Branch builds run for pull requests
-(and on manual dispatch), not for every branch push. Hosted jobs restore compiled
-dependencies from a per-branch build cache (`Swatinem/rust-cache`, pinned by
-commit), so only a dependency or toolchain change rebuilds the engine from
-scratch. They write the following files under `target/dist` (or
-`CARGO_TARGET_DIR/dist`):
+(and on manual dispatch), not for every branch push. Output goes under
+`target/dist` (or `CARGO_TARGET_DIR/dist`):
 
 | Platform | Direct executable | Complete distribution |
 | --- | --- | --- |
@@ -165,8 +154,8 @@ and [workflow artifact downloads](https://docs.github.com/en/actions/tutorials/s
 
 Run the desktop checks in each platform's guide on the intended systems before
 publishing. Worker tests and headless UI tests do not test every graphics driver.
-Windows remains for trusted inputs and trusted project files; its Job Objects
-are resource controls rather than a filesystem/network sandbox.
+Follow the [Windows trust limits](windows.md) and
+[project trust boundaries](analysis.md#resource-limits-and-trust-boundaries).
 
 The packages are unsigned. Checksums detect changes when obtained through a
 trusted channel, but do not authenticate the publisher. Automatic publication

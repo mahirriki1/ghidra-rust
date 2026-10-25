@@ -21,40 +21,29 @@ machine successors, calls have separate call targets, and unresolved `BR`/`BLR`
 flow stays unresolved. This is static analysis, not emulation. Instruction-level
 internal p-code branches can conservatively leave successors unknown.
 
-Decompilation uses the same engine pipeline and genuine semantic address marks as
-x86. Optimized-away instructions can have no pseudocode counterpart. Projects
-retain their binary SHA-256, file identity protections, explicit saved-analysis
-provenance, and bounded mapping validation. The architecture/ABI cache fingerprint
-invalidates older cached results while retaining compatible JSON annotations.
-Project schema version 3 adds semantic tokens and local name overrides after
-version 2 added saved discovery; version 1 and 2 projects still open. Verified
-local renaming uses the same storage-backed subset on each architecture.
+Decompilation uses genuine engine address marks; optimized-away instructions can
+have no pseudocode counterpart. Verified local renaming uses the same
+storage-backed subset on each architecture. Projects are saved as version 4,
+including function signatures; versions 1–3 remain readable. See
+[project formats and saved analysis](analysis.md#project-formats-and-saved-analysis)
+for compatibility and provenance.
 
 ## Limits
 
 ARM32/Thumb, big-endian images, AArch64 ILP32, arm64e (including subtype capability
 bits), ARM64EC/hybrid images, other processors, universal/fat Mach-O, relocatable
-objects, raw firmware and sectionless images are not supported. The pinned engine
-embeds more processors than this desktop enables. Its ARM loader clears Thumb
-symbol bits without installing the mode context needed by this application's
-independent decoding and decompilation paths. Mapping symbols, Thumb context,
-interworking, and mixed code/data need a separate implementation and regression
-fixtures before ARM/Thumb can be enabled reliably.
+objects, raw firmware and sectionless images are not supported. ARM/Thumb needs
+explicit mode context, interworking, and mixed code/data support before enabling.
 
 ELF/Mach-O symbols and PE exports seed the function list. Mach-O LC_MAIN file
 offsets are translated through executable sections to virtual entry addresses.
 Explicit discovery follows genuine decoded direct-call targets from the entry
 and known functions on x86, x86-64, and AArch64 across the supported containers.
-It examines at most 128 function entries with an exact shared limit of 16,384
-decode attempts and at most 2,048 attempts per function. Failed decoding and work
-omitted from the displayed graph count toward the limits. Calls to their own
-fallthrough address do not seed functions. Constants and unknown indirect
-targets do not seed functions; on x86-64 ELF and PE, strictly validated
-[function-start patterns](analysis.md#function-start-patterns) can. x86-64 ELF
-also supports bounded [pointer/init metadata and FDE-corroborated tail recovery](analysis.md#elf-pointers-and-tail-boundaries);
-PE, AArch64 and Mach-O pointer recovery remain unsupported. Coverage is partial when these
-budgets are reached; complete function recovery is not guaranteed. See
-[analysis coverage and provenance](analysis.md) for call references and progress.
+Constants and unknown indirect targets do not seed functions. Strictly validated
+[function-start patterns](analysis.md#function-start-patterns) cover x86-64 ELF/PE;
+[pointer/init metadata and FDE-corroborated tails](analysis.md#elf-pointers-and-tail-boundaries)
+cover x86-64 ELF. PE, AArch64, and Mach-O pointer recovery remain unsupported.
+Coverage can be partial; see [discovery and limits](analysis.md).
 AArch64 PE reads normal packed and supported full unwind records to recover
 stripped primary entries, and names exact ADRP/LDR/BR import veneers at established
 entries and confirmed call targets. Fragment records do not independently seed
@@ -64,22 +53,17 @@ recovery and x86 import-thunk naming remain available for those architectures.
 
 Indirect branches, jump tables, exception flow, no-return calls, stripped imports,
 newer vector/ISA extensions, and platform runtime metadata can be incomplete.
-Pointer authentication and authenticated/chained fixups are not recovered. The
-existing function, graph, byte, memory, CPU, and wall-time limits apply unchanged.
-The engine revision remains unchanged. NOTICE separately attributes the adapted
-confirmed-call analysis algorithm; the `calls-v1` and `arm64pe-v1` cache fingerprints
-invalidate older cached analysis without changing the project schema or annotation format.
+Pointer authentication and authenticated/chained fixups are not recovered. See
+[analysis boundaries](analysis.md#resource-limits-and-trust-boundaries) and
+[NOTICE](../NOTICE) for limits and attribution.
 
 ## Regression fixtures
 
 `tests/fixtures/aarch64.S` is original instruction source with explicit instruction
 words. Tests generate minimal linked ELF, PE, and Mach-O containers in temporary
 directories; no AArch64 compiler, emulator, or third-party binary is required.
-The contained-worker integration test covers real disassembly, branch/loop/call
-recovery, unresolved indirect flow, decompilation with semantic mappings,
-renaming, stripped-image discovery, invalid instruction addresses, and protected
-embedded-project save/reopen. On Linux it uses production bubblewrap isolation;
-on Windows it uses the production job/watchdog worker path.
+Contained-worker tests exercise decoding, CFGs, semantic mappings, discovery,
+annotations, and embedded projects using the production worker controls.
 
 ```sh
 cargo test --locked --test aarch64
@@ -88,6 +72,6 @@ cargo test --release --locked --test aarch64
 
 These tests analyze AArch64 input with the native host worker. They do not establish
 native ARM-host desktop support or complete platform/compiler compatibility.
-Linux results do not establish native Windows execution. Windows still has
-resource controls rather than a hostile-input filesystem/network sandbox, and
-SQLite project parsing remains outside the worker.
+Linux results do not establish native Windows execution. Platform trust boundaries
+are documented in the [Linux](linux.md#worker-isolation) and [Windows](windows.md)
+guides.

@@ -1,543 +1,443 @@
 # Analysis coverage
 
-**Analysis → Discover functions** performs bounded confirmed-call discovery in
-the disposable worker. It runs on linked x86, x86-64, and little-endian AArch64
-ELF, PE, and baseline arm64 Mach-O images already supported by the desktop.
-See [architecture coverage](architectures.md) for container and ABI restrictions.
-Analyzing an AArch64 image on an x64 host does not establish native ARM-host
-desktop support.
+**Analysis → Discover functions** performs bounded discovery in a disposable
+worker for linked x86, x86-64, and little-endian AArch64 images. See
+[architecture coverage](architectures.md) for container and ABI restrictions;
+input architecture does not establish native desktop host support.
 
 ## Auto analysis
 
-Opening a binary (not a saved project) shows an **Analyze binary?** dialog, and
-**Analysis → Auto analyze…** shows the same choices later. Function discovery and
-defined strings are checked by default; FindCrypt is optional. Choices last for
-the session. Selected analyses run one at a time, only while the worker has no
-other request: strings, then FindCrypt, then discovery. Navigation preempts a
-running scan, which reruns afterwards; a failed or timed-out step is not retried.
-Automatic results do not switch the middle tab. **Analysis → Cancel analysis**
-stops the remaining steps. Packed images that disable discovery skip that step.
+Opening a binary shows **Analyze binary?**; **Analysis → Auto analyze…** reopens
+these choices. Discovery and strings default on; FindCrypt is optional. Choices
+last for the session. Selected steps run sequentially: strings, FindCrypt, then
+discovery. Navigation preempts scans, which rerun afterwards; failed or timed-out
+steps are not retried. Results do not switch tabs. **Cancel analysis** stops the
+remaining steps; detected packed images skip discovery.
 
 ## Confirmed calls and functions
 
-The walk starts from the validated image entry point and known functions supplied
-by symbols, PE exports, and supported PE runtime-function metadata. It decodes
-reachable instructions and adds only genuine direct-call targets in file-backed
-executable memory as new function candidates. Targets must meet the selected
-architecture's alignment requirements. A call to its own fallthrough address does
-not seed a function. The parent owns a deterministic session queue: entry first, then the admitted
-function inventory in its existing address order. Duplicate entries are examined
-once per session; newly confirmed callees are scheduled for later batches.
+The walk starts from the validated entry and functions supplied by symbols,
+exports, and supported runtime metadata. Genuine direct-call targets must be
+aligned, file-backed executable addresses. Calls to their own fallthrough do
+not seed functions. The deterministic session queue admits the entry first,
+then known functions in address order, then newly confirmed callees. Duplicate
+entries are examined once per session.
 
-Arbitrary constants and unresolved register targets do not create functions;
-pointer metadata/tables (x86-64 ELF) and function-start patterns are separate,
-strictly validated phases described below. Unknown indirect calls and branches remain unresolved.
-Calls are separate from intrafunction control-flow edges. An established call
-instruction is machine-code evidence; it does not reconstruct a source-language
-function boundary or prove that all possible runtime calls have been found.
+Constants and unresolved register targets do not create functions. Pointer and
+pattern recovery are separate validated phases below. Calls are separate from
+intrafunction CFG edges; machine-code call evidence does not establish source
+function boundaries or complete runtime call coverage.
 
-Each worker batch examines at most 128 explicit function seeds and makes at most
-16,384 decode attempts. The parent continues across all admitted seeds; there is
-no 128-function cumulative ceiling. Each function has a 2,048-attempt limit,
-and its displayed graph has at most 128 blocks. The shared limit is charged for failed decodes and decoded
-work omitted by display limits, so it cannot be exceeded by a final function walk.
-ARM64 import-veneer confirmation during discovery charges three attempts per
-eligible candidate against this same shared budget, before calling the engine.
-The call-reference collection is capped at 16,384 entries per batch and in the
-session aggregate. Data references have a separate 16,384-entry aggregate cap.
-Both classes are deduplicated before atomic adoption. Reaching an aggregate cap
-marks coverage partial while seed processing continues. Coverage is also partial
-while seeds remain pending or recovery limits/failures prevent a complete walk.
-A function is pending, done, partial by its own recovery limits, or failed. A
-limited walk is terminal for the session; it does not restart on each Discover.
-A batch stops before starting a function when fewer than 2,048 decode attempts
-remain, leaving that suffix pending rather than giving it a smaller own budget.
+[Work limits](#resource-limits-and-trust-boundaries) apply per batch as well as
+across the session. Failed decodes and work omitted by display limits count.
+A batch leaves a seed pending if its full walk allowance is unavailable.
+Limited walks are terminal for the session; repeated Discover does not restart
+them. Coverage remains partial while seeds are pending, walks fail or hit
+limits, or references are omitted, even if seed processing continues.
 
-The known-function inventory is a separate, larger budget: at most 262,144
-entries, 256 bytes per name, and 8 MiB of JSON-escaped names in total, so the
-largest inventory plus both reference classes fits the 32 MiB worker reply.
-Each retained function costs roughly 1.2 KiB across the worker and desktop
-processes; see [analysis measurements](analysis-performance.md#large-function-inventories).
-Entries beyond either budget are omitted and the list is marked partial. Open
-admits the entry point first and then engine symbols in address order (PE images
-prioritize exports and runtime starts nearest the entry before that). Discovery
-replies also reserve the callers that own published evidence. The
-inventory bounds cumulative seed admission; the smaller function/decode budgets
-apply independently to each batch.
+Inventory admission prioritizes the entry, then address-ordered engine symbols;
+PE additionally prioritizes exports and runtime starts nearest the entry.
+Discovery reserves callers owning published evidence. Count or name-budget
+omissions mark the inventory partial. Batch replies can be unchanged, deltas,
+or full inventories; the desktop reconstructs and validates the complete result
+before atomic adoption.
 
-Batch replies publish the inventory relative to the revision the desktop last
-adopted from the same worker: unchanged, a bounded delta of upserted and removed
-entries, or the complete list when the desktop holds no matching revision (each
-new worker's first batch, after a rename, or after more than 16,384 journaled
-changes). The desktop reconstructs and validates the complete inventory before
-committing a batch, so admission, evidence ownership and partial coverage are
-the same as with complete replies. The worker skips rebuilding the inventory
-when it can prove the result unchanged: the batch named nothing and every owner
-was already admitted, or every candidate already fit and the batch only added
-the functions it named within the same budgets. Otherwise it applies the full
-admission order above. During discovery the desktop retains one additional copy
-of the adopted inventory, bounded by the same count and name budgets.
-
-Conventional UPX PE detection still prevents discovery and decompilation of the
-packed stub. Listing, CFG, strings, and byte inspection remain available. The
-desktop neither unpacks nor executes the input.
+Conventional UPX PE detection disables discovery and decompilation of the packed
+stub. Listing, CFG, strings, and byte inspection remain available. Detection
+covers conventional UPX PE layouts, not every packer. The app neither unpacks
+nor executes inputs.
 
 ## No-return calls
 
-Calls to named functions such as `exit`, `abort`, `__stack_chk_fail`, and
-`ExitProcess` end their CFG block with no successor. Their actual call sites
-and direct targets remain available for discovery and navigation. A separate
-branch can still reach code after the call. The graph header and call list show
-**[no return]**; listing hover text and call-list hover text explain the evidence.
-This prevents padding or a neighbouring function after such a call from being
-claimed as part of its caller, including during function-start pattern validation.
+Calls to recognized names such as `exit`, `abort`, `__stack_chk_fail`, and
+`ExitProcess` end their CFG block without a successor. Actual call sites and
+direct targets remain available; a separate branch can still reach later code.
+The graph header and call list show **[no return]**, with evidence in hover text.
 
-Recognition uses the binary's original function symbols/import stubs and the
-Ghidra list for its container, with the explicit native exclusions and
-supplements documented in [the data provenance](../data/no-return/README.md).
-Names compare exactly after narrow container-specific decoration removal;
-substrings, analyst renames, and demangled leaf names never establish evidence.
-At most 4,096 named entries and import slots are retained per image; omissions
-are reported in Analysis notes. Reopening the worker rebuilds the index from
-the immutable binary, independently of saved analysis and synchronized names.
+Recognition uses original symbols/import stubs and the container's Ghidra list,
+with native exclusions and supplements in [the provenance](../data/no-return/README.md).
+Names match exactly after narrow decoration removal. Substrings, analyst renames,
+and demangled leaf names never establish evidence. Index omissions appear in
+the status-bar warning popup. Worker restart rebuilds the index from the binary.
 
-PE calls through a named IAT slot, a conventional x86 `JMP [IAT]` thunk, or an
-exact ARM64 `ADRP/LDR/BR` veneer can also establish no-return behavior. The IAT
-slot stays data, and an indirect call's runtime address remains unresolved.
-Extra thunk decodes, including failed checks, consume the walk's instruction
-budget. The verified `__libc_start_main` slots from the x86-64 ELF startup
-recognizer are supported even when `main` already has a symbol. Other ELF
-`-fno-plt` calls and register-carried import pointers remain unsupported.
+Named PE IAT calls, conventional x86 `JMP [IAT]` thunks, and exact ARM64
+`ADRP/LDR/BR` veneers can establish no-return behavior. The slot remains data;
+indirect runtime targets stay unresolved. Extra thunk checks consume the walk
+budget. Verified x86-64 ELF startup slots for `__libc_start_main` also qualify;
+other ELF `-fno-plt` calls and register-carried import pointers do not.
 
-The engine's public prototype flag is set for recognized named functions and
-resolved PE thunks before decompilation. This improves pseudocode for those
-calls; direct IAT-call termination is currently a desktop CFG guarantee only.
-The pinned engine, executable formats, compiler output, and ABI still limit
-what pseudocode can recover. No engine cache or dependency was changed.
-
-Wrapper inference is deferred: a custom function whose only action is calling
-`exit` does not automatically become no-return in its callers. Suspicious bytes
-after an unresolved call, recursive cycles, and decode failures are not proof.
-Exceptions and longjmp-style nonlocal destinations are not reconstructed.
-Old graph/discovery caches refresh under the new fingerprints; annotations and
-the SQLite schema remain compatible. Saved markers retain saved-analysis
-provenance and never seed live classification.
+The engine prototype flag improves pseudocode for recognized named functions
+and resolved PE thunks; direct IAT-call termination is a desktop CFG guarantee
+only. Custom wrappers are not inferred. Recursive cycles, failed decodes, and
+bytes after unresolved calls are not proof. Exceptions and longjmp destinations
+are not reconstructed. Saved markers never seed live classification.
 
 ## Stripped ELF startup
 
-Stripped executables have no symbol for `main`. In a dynamically linked x86-64
-ELF executable (non-PIE or PIE, with an interpreter), glibc's entry code passes
-`main` to the imported `__libc_start_main` as a pointer rather than calling it, so
-direct-call discovery from the entry cannot reach it. On open, the worker
-follows the entry's straight-line instructions in engine p-code (at most 256
-bytes and 64 instructions, with fixed p-code and tracked-value budgets) until a
-call. The call must target `__libc_start_main` through a GOT slot or an engine
-import stub that itself jumps through such a slot. Slots are identified from the
-ELF's own `GLOB_DAT`/`JUMP_SLOT` relocations against the undefined dynamic symbol,
-not from names alone. The first argument (`RDI`) must then hold either a complete
-constant or the contents of a slot whose `RELATIVE` relocation, or symbol
-relocation against a function defined in the executable, establishes the
-address. A slot is trusted only while the path has not stored to it: stores
-through the entry stack pointer are allowed, but a store at a constant address
-overlapping the slot, or at any other computed address, discards its relocated
-contents. A conditional branch, jump, unrelated call, partial register write or
-unsupported relocation ends recognition with no result rather than a guess.
+Conventional dynamically linked x86-64 ELF glibc startup passes `main` to
+`__libc_start_main` as a pointer, beyond direct-call discovery. On open, a bounded
+straight-line p-code walk follows the entry to that call through a GOT slot or
+an import stub using one. The ELF's own `GLOB_DAT`/`JUMP_SLOT` relocations against
+the undefined dynamic symbol establish the slot; names alone do not.
 
-The candidate must be an aligned file-backed executable address that is not the
-entry, an import stub or an existing function, and must not begin with only
-landing pads followed by an unconditional jump (a startup wrapper). It is then
-named `main` unless any function or data symbol already has that name, so real
-symbols always win. **Analysis notes** records the recovered address, the call
-that established it, and that the name is analysis-derived rather than an ELF
-symbol. The desktop then opens `main` as it does for unstripped binaries, and
-discovery follows its direct calls. No `_start → main` call reference is
-invented: the handoff remains an indirect call.
+`RDI` must hold a complete constant or a slot value established by a supported
+`RELATIVE` or defined-function symbol relocation. Entry-stack stores are allowed;
+a potentially aliasing store discards relocated slot contents. Conditional
+branches, jumps, unrelated calls, partial writes, and unsupported relocations
+fail closed. Candidates must be aligned file-backed executable addresses,
+exclude existing functions/import stubs/the entry, and reject startup wrappers
+consisting of landing pads and an unconditional jump.
 
-This recognizes conventional glibc startup. AArch64 (pending original dynamic
-fixtures), i386, static and static-PIE executables, musl's `_start_c` helper,
-sectionless (`sstrip`) files, and wrapper-based startup variants are not
-recognized. Functions reachable only through pointer tables or as callbacks
-use the bounded pointer phase below on x86-64 ELF, or function-start patterns
-where available.
+The recovered function is named `main` unless any function or data symbol already
+owns that name. The status-bar warning popup records the recovered address,
+establishing call, and analysis-derived name. The desktop opens it and discovery
+follows its direct calls. No `_start → main` call reference is invented.
+
+AArch64, i386, static/static-PIE, musl `_start_c`, sectionless files, and
+wrapper-based startup are not recognized. Pointer and pattern recovery can
+supply other unreachable functions only within their supported scope.
 
 ## ELF pointers and tail boundaries
 
-On x86-64 little-endian linked ELF, the same discovery option first admits
-validated `DT_INIT`/`DT_FINI` entries and matching typed init/fini arrays. These
-format-defined entries may have partial CFGs. Exact `ENDBR64; JMP` or
-`JMP` callbacks (rel8/rel32) can establish their forwarding destinations without CRT
-name inference. Then the normal seed queue drains and allocated file-backed
-non-executable data is scanned in native-width aligned slots. A run needs two distinct executable targets;
-nulls, section boundaries and invalid/unsupported slots end it. There is no
-switch-table entry-count minimum for callable tables. After table-derived seeds
-drain, corroborated direct tail jumps from the complete inventory are examined.
+On x86-64 little-endian linked ELF, discovery first admits validated
+`DT_INIT`/`DT_FINI` entries and matching typed arrays, even with partial CFGs.
+Exact `ENDBR64; JMP` or `JMP` rel8/rel32 callbacks can establish forwarding
+destinations. After queued seeds drain, native-width aligned slots in allocated,
+file-backed non-executable data are scanned. A run needs two distinct executable
+targets; nulls, section boundaries, and invalid slots end it. Corroborated direct
+tail jumps are examined after table seeds drain.
 
-ET_EXEC slots use checked absolute addresses; supported RELA records override
-bytes. PIE RELATIVE addends remain in the worker's link-time coordinates.
-Defined function symbols require local binding or non-interposable visibility;
-IFUNC resolvers are never executed. Conflicting relocations poison their slots.
-Malformed tables, unknown relocation write widths and REL/RELR are unsupported;
-dynamic relocation declarations must match the section tables.
+ET_EXEC slots use checked absolute addresses; supported RELA overrides bytes.
+PIE RELATIVE addends retain link-time coordinates. Defined function symbols need
+local binding or non-interposable visibility. IFUNC resolvers are never executed.
+Conflicting relocations poison slots; REL/RELR, unknown write widths, malformed
+tables, and mismatched dynamic/section relocation declarations are unsupported.
 
-Table entries additionally need an exact validated FDE start or a vetted
-function-start pattern, and a complete bounded CFG outside established code.
-The small `.eh_frame` reader supports DWARF32 CIE versions 1/3 with `zR` and
-PC-relative signed 32-bit pointer encoding. Unsupported augmentations/encodings,
-truncation, overlapping ranges or invalid file backing establish no FDE ranges.
-It does not unwind stacks or independently turn every FDE into a function.
-Direct unconditional jumps to exact FDE starts stop before crossing the boundary;
-validated destinations become functions with tail edges, without call references.
-Conditional cold paths retain their existing call coverage. Cold fragments are
-not modeled as separate functions.
+Table targets need an exact validated FDE start or vetted function-start pattern
+and a complete bounded CFG outside established code. The `.eh_frame` subset is
+DWARF32 CIE versions 1/3, `zR`, and PC-relative signed 32-bit pointers. Unsupported,
+truncated, overlapping, or unbacked records establish no ranges. This does not
+unwind stacks or turn every FDE into a function. Direct jumps stop at exact FDE
+boundaries; validated destinations gain tail edges without call references.
+Conditional cold paths keep their call coverage; cold fragments are not separate
+functions.
 
-Typed source cursors retain pointer-run and pending-validation positions across
-batches and worker replacement. A request has at most 128 candidate attempts,
-128 admissions, 16,384 decode attempts and 2,048 attempts per walk. The parent
-caps cumulative pointer work at 262,144 metadata-record visits, 1,048,576 slots,
-16,384 candidate attempts, 256 cursor replies and 2,097,152 reconstructed inventory
-rows. Source witnesses share a 16,384-entry session ceiling with pattern
-admissions; reaching a limit leaves coverage partial. Fresh workers rebuild
-metadata and established coverage under these same cumulative allowances.
-Instruction address-taking, PE/AArch64 pointer sources and witness persistence
-remain future work. The application remains an experimental subset.
+Cursors retain pointer-run and validation positions across batches and worker
+replacement. Cumulative work and reconstruction are bounded; exhaustion leaves
+partial coverage. Instruction address-taking, PE/AArch64 pointer sources, and
+persistent source witnesses remain unsupported.
 
 ## Function-start patterns
 
-Functions reached only through pointer tables or callbacks have no direct call.
-On x86-64 ELF and PE, once every queued function has been walked, discovery scans
-all executable file-backed sections with Ghidra's function-start byte patterns:
-the GCC set for ELF, the Windows set for PE, vendored unchanged
-with their [provenance](../data/function-starts/README.md). A match is only a
-candidate. It is admitted as a `FUN_` function only when:
+After queued functions drain, x86-64 ELF and PE discovery scans executable
+file-backed sections with Ghidra's GCC or Windows function-start patterns,
+vendored unchanged with [provenance](../data/function-starts/README.md).
+A match becomes a `FUN_` function only when:
 
-- it is aligned, not already a function, not inside an instruction decoded from
-  an established function, and not inside a PE runtime-function range;
-- for patterns marked `after="defined"`, established code ends exactly at it or
-  it begins its section (padding alone does not count);
-- its own instruction walk decodes completely within 2,048 instructions with no
-  overlap with established code, no unresolved indirect jump, no internal p-code
-  branch, and no unexplained warning; every path ends in a return, a recognized
-  no-return call or an explicit jump to a known function (running into another
-  function is rejected). Pure tail-only bodies are allowed, and direct calls
-  must target executable code outside other functions' interiors; numeric
-  `validcode` sets a minimum instruction count.
+- It is aligned, outside established instructions and PE runtime-function ranges,
+  and not already a function.
+- `after="defined"` matches begin exactly after established code or at section
+  start; padding alone does not qualify.
+- Its complete walk fits the shared [function limit](#resource-limits-and-trust-boundaries),
+  with no overlap, unresolved indirect jump, internal p-code branch, or unexplained
+  warning. Paths end in returns, recognized no-return calls, or explicit jumps to
+  known functions. Falling into another function is rejected; pure tail bodies
+  qualify. Direct calls must target code outside other functions' interiors.
+  Numeric `validcode` supplies a minimum instruction count.
 
-Candidates are examined in address order and each admitted function's code
-joins the established code immediately, so a later match inside it is
-rejected. Admitted starts become ordinary discovery seeds, so their direct
-calls are followed. `codeboundary`, `possiblefuncstart`, `setcontext` and
-patterns that require an existing function never create one. Before scanning,
-the worker decodes any established function it has not walked, so a restarted
-worker still judges candidates against all known code. Replies identify at most
-16,384 newly covered entries; the parent verifies that each is a known inventory
-entry and accepts it only once per worker epoch. A replacement worker may rebuild
-the same coverage in bounded batches under its new epoch. The parent also checks
-scan cursors against the ordered file-backed executable byte space: address gaps
-cost no scan bytes, forward cursors must land in that space, and an uncharged
-resume may advance only within the current 64 KiB match chunk. Coverage-only
-preparation is accounted by those distinct function identities
-rather than by a cursor allowance, so a full 262,144-entry inventory can be
-rebuilt across multiple bounded replies and worker epochs. Cursor work has a
-separate parent-owned ceiling of 256 accepted replies, including at most 64
-uncharged match-point resumes. The parent also permits at most 2,097,152 complete
-inventory rows to be reconstructed and validated during the pattern phase; this
-check runs before an expensive adoption. Reaching any cumulative limit ends the
-phase explicitly partial. Worker-reported match, validation, and byte counters do
-not replenish the parent-owned allowances.
+Candidates are admitted in address order and immediately join established code;
+later overlapping matches fail. Admitted functions become ordinary call-discovery
+seeds. `codeboundary`, `possiblefuncstart`, `setcontext`, and patterns requiring an
+existing function never create one. After worker replacement, bounded decoding
+reconstructs established coverage before judging new matches.
 
-Each scan step covers at most 1 MiB, 4,096 matches per 64 KiB chunk (65,536 in
-one reply), 128 validated candidates, 128 admissions and 16,384 decode attempts,
-then resumes from where it stopped. A match flood, an interrupted or stalled
-step, or a full inventory leaves the scan partial. Optimized code without a
-recognizable prologue is not recovered by patterns alone. AArch64, 32-bit x86
-and Mach-O have no pattern set yet. A small function-row glyph records the first
-pattern/pointer admission reason, source address and boundary evidence on hover.
-Witnesses are session-only: project files keep the existing discovery snapshot
-schema, omit witnesses, and retain saved-analysis provenance until recomputation.
+Scans and cumulative cursor/reconstruction work are bounded. Match floods,
+interruptions, stalled steps, or a full inventory leave coverage partial.
+Optimized code without recognizable prologues can be missed. AArch64, 32-bit x86,
+and Mach-O have no pattern set.
+
+A function-row glyph exposes the first pointer/pattern admission reason, source,
+and boundary evidence on hover. Witnesses are session-only and omitted from
+projects; reopened results retain saved provenance until recomputed.
 
 ## Switch tables
 
-A computed jump such as `jmp *table(,%rdi,8)` has no destination in its own
-encoding. When the instruction walk of a known function reaches one, the worker
-runs the engine's flow analysis with jump-table recovery for that function, as
-Ghidra's switch analyzer does, without the rest of decompilation. Each table
-must belong to the exact decoded indirect jump, and each destination must be an
-aligned file-backed executable address; duplicates are merged. The walk then
-resumes from those destinations under the same instruction budget, so calls in
-switch cases become ordinary call evidence for discovery. In the graph these
-edges are labeled `S`.
+For a computed jump, the worker can run the engine's flow analysis with jump-table
+recovery without full decompilation. Tables must belong to the exact decoded
+jump; destinations must be aligned file-backed executable addresses. Duplicates
+merge, and walking resumes under the function budget, exposing calls in cases.
+Graph edges are labeled `S`.
 
-A table the engine marks partial, one at its 256-entry limit, or one with any
-rejected destination keeps an additional unresolved successor and a warning.
-A jump without a recovered table stays unresolved, as does every jump through
-an unknown register or pointer. Engine flow may follow at most 2,048
-instructions per recovery; at most 32 tables and 1,024 entries are copied out.
-One request starts at most 32 recoveries and none after 5 seconds of recovery
-time; later functions keep their unresolved jumps with a warning, and their
-discovery outcome is partial. Destinations are never promoted to new functions,
-and a destination that is another known function's entry remains an external
-exit. Detected packed images skip recovery. Projects saved earlier remain
-readable; the changed engine fingerprint discards their cached results while
-keeping annotations.
+Table size, recovery count, and recovery time are bounded; exhausted or incomplete
+recovery remains partial with an unresolved successor and warning. Unknown
+register/pointer jumps remain unresolved. Destinations never become functions
+solely from switch evidence; another function's entry is an external exit.
+Detected packed images skip recovery.
 
 ## Direct data accesses
 
-The same discovery walk inspects already decoded instruction p-code for direct
-memory reads and writes. It records genuine memory-space input/output operands
-(including x86 absolute/RIP-relative accesses) and literal-address `LOAD`/`STORE`
-operations (including ARM64 literal loads). Read-modify-write operations retain
-both access kinds. Source function, instruction PC, target, width and access kind
-are retained; no additional instruction decode or image-byte copy is required.
+Discovery inspects decoded p-code for genuine memory operands and literal-address
+`LOAD`/`STORE`, including x86 absolute/RIP-relative accesses and ARM64 literal
+loads. Read-modify-write retains both kinds. Evidence records source function,
+instruction PC, target, width, and kind.
 
-On x86 the pass is instruction-local. On AArch64, accesses whose pointer is a
-register are revisited after the function's blocks are known, using concrete
-constants carried forward within one basic block: `ADRP`/`ADR`/`MOVZ`/`MOVK`
-results combined through `ADD`, `SUB`, `AND`, `OR`, `XOR`, shifts, extensions
-and `PIECE`/`SUBPIECE`. Such references are labeled **propagated**; literal and
-other single-instruction pointers are **instruction-local**. Knowledge is
-cleared at every block start (including single-predecessor blocks, joins and
-loop heads), at every direct or indirect call, and after unsupported or
-omitted instructions; any write invalidates overlapping register aliases such as
-`Wn` within `Xn`. Loaded values are never treated as known, so pointer chasing
-stays unresolved, and `ADRP; LDR` resolves the slot that is read, not the
-pointer stored there. Address formation alone (`LEA`, `ADR`, `ADRP`, or call
-arguments) still creates no reference. Table entries read by switch recovery
-and values carried across branches are not reported as data references. Internal p-code branches, processor-specific
-user operations and unsupported semantics omit the whole instruction with
-partial coverage. Control-flow operands are excluded. This is memory-access
-evidence, not data-object or pointer classification.
+x86 evidence is instruction-local. AArch64 additionally propagates concrete
+register constants within each basic block, for example `ADRP; ADD; LDR` and
+`MOVZ`/`MOVK` with supported arithmetic, shifts, and extensions. These accesses
+are labeled **propagated**, versus **instruction-local**. Block boundaries, calls,
+unsupported/omitted instructions, and overlapping register writes clear knowledge.
+Loaded pointers are never chased: `ADRP; LDR` identifies the slot, not its value.
+Address formation alone and call arguments create no references. Cross-branch
+values and switch-recovery table reads are excluded. Internal p-code branches,
+user operations, and unsupported semantics omit the instruction as partial.
 
-Targets must fit the selected ABI and their entire 1–64-byte access must lie in
-one validated file-backed section. Executable literal pools are accepted; zero
-fill, unmapped addresses, cross-section ranges and overflowing arithmetic are
-omitted. Instruction and function sources must be known file-backed executable
-addresses with the architecture's alignment.
-
-Each batch's shared pass budget charges at most 131,072 p-code operations, with at most
-256 per instruction and 16 inputs per operation. At most 16,384 access candidates
-are inspected, including unresolved, omitted and duplicate candidates before
-deduplication. Budget or unsupported-instruction omissions mark coverage partial.
-AArch64 propagation retains at most 16,384 compact p-code operations per
-function and 128 known register/temporary values; exhausting either, or
-accesses in instructions beyond the 128-block graph limit, also marks coverage
-partial. Propagation charges no additional decode or operation budget.
-These limits supplement the existing function, decode and worker resource limits.
+The entire access must fit the ABI and one validated file-backed section.
+Executable literal pools qualify; zero fill, unmapped/cross-section ranges,
+oversized accesses, and overflow do not. Sources must be aligned known executable
+addresses. Shared operation, candidate, and state limits mark omissions partial;
+see [limits](#resource-limits-and-trust-boundaries). This is access evidence,
+not data-object or pointer classification.
 
 ## References and progress
 
-After discovery, the middle pane's **References** tab shows incoming and outgoing
-confirmed calls for the selected function. Callers, callees, and source instruction
-addresses are navigable. A call site omitted by the caller graph's display limits
-still selects its exact address and shows an explicit notice; use **Go to** to
-inspect that address separately. Incoming references cover only the functions examined
-in committed batches of the current session; an empty list does not prove that no caller exists.
+**References** shows confirmed incoming/outgoing calls for the selected function.
+Callers, callees, and source PCs navigate directly. A call omitted by graph display
+limits still selects its exact PC with a notice; **Go to** can inspect it separately.
+References cover examined functions in committed batches. Empty does not prove
+that no references exist; absent reports remain **not analyzed**.
 
-The **Data accesses** selector shows accesses from the displayed function or
-accesses beginning at an exact hexadecimal target address. This exact-start
-filter does not search for accesses whose interior overlaps that address. Source
-buttons select the genuine instruction PC, including the explicit display-limit
-notice when necessary. Target buttons request only the accessed bytes in
-**Decode**; they do not create functions or invented semantic mappings. Byte
-inspection preserves code selection and function history; Decode displays its
-own source address. A delayed byte reply cannot replace a newer selection or
-force a switch from a newer tab.
-Rows are virtualized. Batch validation, aggregate merging, and incoming/outgoing
-index construction run in a parent background job. Committed references remain
-visible during subsequent batches and navigation.
+**X** uses the decompiler call token's genuine target, selected instructions'
+call/data targets, or otherwise the selected address/function. Multiple targets
+require an explicit choice. Context menus offer **Xrefs to…** on functions,
+instructions, and call tokens. **Data accesses** filters by displayed function
+or exact target start, not overlapping interiors. Source buttons select PCs;
+target buttons send only accessed bytes to Decode, preserving code history and
+selection. Delayed replies cannot override a newer selection or tab. Committed
+references stay visible while subsequent batches run.
 
-Saving a project stores cumulative results through the last committed discovery
-batch: per-function statuses (seeds of an unfinished batch stay pending), cumulative counters, and
-call and data references. The queue order, retry counts, and worker bindings are
-not saved. A reopened project shows these results as **Saved analysis** in the
-References tab and the discovery summary. They are display-only: **Discover**
-discards them and starts a fresh queue, so a saved "complete" state cannot
-suppress recomputation. **Analysis → Rediscover from scratch** likewise discards
-session results and examines every known function again.
+The status bar remains active through setup, adoption, foreground waits, and
+worker recovery. Known-function counts can grow and their fill can decrease as
+calls reveal work; they are not whole-program completion percentages or ETAs.
+Other phases show activity. Hover for phase/count details. Worker **Seeds**,
+**Calls** (shown as **Analyzing references**), and **Publish** stages report batch
+work; progress never resets CPU or wall-time deadlines.
 
-Saved discovery is untrusted input. Loading checks counts against the shared
-function and reference limits, strictly ordered and unique addresses under the
-same executable-code rule as seed admission, evidence owned by examined
-functions, admitted call targets, cumulative counters consistent with the saved
-batch count, and that pending, failed, limited, or capped results are marked
-partial. This establishes structural consistency, not that the evidence matches the
-instructions. Metadata and discovery share the 48 MiB metadata budget. The
-discovery record has its own format fingerprint: a mismatch, or an incompatible
-engine fingerprint, drops saved discovery while keeping annotations. Project
-schema version 2 introduced this optional record; version 1 projects still open
-without saved discovery. Current saves use version 3 for semantic tokens and local
-name overrides, and still load version 2. Older releases reject newer project
-versions. JSON v1 annotations remain readable; adding local names uses JSON v2. The existing saved function inventory keeps its saved-result
-provenance; a matching binary hash does not authenticate cached results.
-
-Legacy replies without a data report are shown as not analyzed, not as a fresh
-empty result. Work counters, sorted/unique evidence, source ownership and complete
-mapped target extents are validated before adoption.
-
-The worker reports **Seeds**, **Calls** (shown as **Analyzing references**), and
-**Publish** stages with the number of
-functions examined and decode attempts charged in that batch. The UI also shows
-cumulative functions examined, remaining seeds, committed batches, and a visible
-partial/complete indicator. The total can grow:
-following a confirmed call can reveal more work. These counts are work measures,
-not completion percentages. Cancel still terminates the disposable worker and pauses the run, retaining
-completed batches. Discover continues it after a worker restart. Interactive
-requests run between batches, without discarding program-wide evidence. On
-restart, inventory entries the fresh worker lacks or names differently (such as
-discovered functions and renames) are replayed before the next batch in
-requests packed by encoded size (at most 1,024 entries and 48 KiB of entries
-each, below the 60 KiB request limit). Interrupted seeds retry individually at
-most once; a second interruption marks them failed. When an unrelated request
-(such as a decompilation) fails, times out, or ends the worker, a running
-discovery continues on a fresh worker; after three such restarts without a
-committed batch, or when a discovery batch or name replay itself fails, the run
-pauses for explicit continuation. Pattern-scan steps report the same
-`Seeds`/`Publish` progress sequence as seed batches. Batch replies are bound to their request ID, worker
-epoch, binary generation, annotation revision at dispatch, and batch sequence.
-Selection changes and annotation display-name edits do not invalidate machine
-reference evidence from the immutable image. Stale/duplicate replies cannot
-double-count committed results. Progress messages do not reset CPU or wall-time
-deadlines. Existing binary
-identity, immutable snapshots, result validation, and platform resource controls
-continue to apply.
+Cancel terminates the worker and pauses discovery while retaining committed
+batches and the remaining queue. Discover resumes with a new elapsed clock.
+Interactive requests take priority between batches. Fresh workers receive bounded
+inventory/name replay. Interrupted seeds retry once, then fail; three unrelated
+worker restarts without a committed batch pause discovery. Batch or replay failure
+also pauses for explicit continuation. Results bind to request, worker epoch,
+binary generation, annotation revision, and batch sequence. Stale replies cannot
+double-count evidence; selection and display-name changes do not invalidate
+machine references from the immutable image.
 
 ## ARM64 PE runtime metadata and import veneers
 
-Opening a Windows ARM64 PE reads its ordered eight-byte runtime records from the
-exception directory. Normal packed records and supported version-zero full
-`.xdata` records establish primary function entries and validated file-backed
-code regions. Existing entry/export names take priority. Packed fragments and
-full records with chained phantom prologs retain regions but do not independently
-seed functions. They can still be reached through separate export or confirmed
-call evidence. Parent `.pdata` links, custom context/trap unwind codes, SVE-specific
-`save_any` forms and reserved or unsupported encodings are omitted with a partial
-coverage warning. This is metadata recovery, not stack unwinding or exception-flow
-reconstruction. Leaf functions without runtime records still require other evidence.
+Ordered runtime records from the exception directory recover primary entries and
+validated code regions from normal packed and supported version-zero full `.xdata`
+records. Entry/export names win. Packed fragments and chained phantom prologs
+retain regions but do not independently seed functions; exports or calls can
+still reach them. Parent `.pdata` links, custom context/trap unwind codes,
+SVE `save_any`, reserved/unsupported forms, unordered tables, and overlapping
+regions are omitted with partial warnings. Storage, alignment, code lengths,
+epilog indices, and opcode boundaries are validated. This is metadata recovery,
+not stack unwinding or exception flow. Leaf functions need other evidence.
 
-Directory storage is capped at 8 MiB and 500,000 records. An additional shared
-8 MiB inspection budget covers all full unwind records, including repeated
-references and failed reads. Code lengths, alignment, version, storage extents,
-epilog indices and opcode boundaries are validated. Unordered tables and groups
-of overlapping regions are omitted. The shared 262,144-function inventory cap
-and entry/export/nearest-runtime-start priority remain in effect.
-
-At established entries or confirmed direct-call targets, a bounded recognizer
-names the exact `ADRP Xn; LDR Xm,[Xn,#offset]; BR Xm` veneer when its checked
-address calculation reaches a named, aligned, file-backed non-executable IAT
-slot. Engine instructions and p-code confirm the sequence. Generic generated
-function names can be promoted; meaningful names remain intact. No byte-pattern
-scan seeds functions and the on-disk IAT value is never a runtime destination.
-The independent CFG keeps the register branch unresolved. BTI-prefixed and other
-veneer shapes, delay imports, and imported prototypes remain deferred.
-
-Naming on open checks at most 2,048 known entries, with at most 6,144 engine
-instruction attempts. Selected-function decompilation checks at most eight CFGs
-with the existing 2,048-attempt per-CFG limit, then at most 2,048 veneer candidates.
-Discovery instead charges veneer instruction attempts within its shared 16,384
-limit; reaching a candidate or instruction limit marks the report partial. Stage
-counts cover discovery work and do not include loading or separately requested
-decompilation. Conventional UPX stubs remain excluded from discovery,
-decompilation and load-time veneer decoding.
+At known entries or confirmed calls, engine instructions and p-code recognize
+exact `ADRP Xn; LDR Xm,[Xn,#offset]; BR Xm` veneers reaching a named aligned,
+file-backed non-executable IAT slot. Generic names can be promoted; meaningful
+names stay intact. No pattern scan seeds functions; on-disk IAT values are not
+runtime destinations. The CFG branch remains unresolved. BTI-prefixed/other
+shapes, delay imports, and imported prototypes remain deferred. Bounded naming
+and discovery can omit candidates as partial. Conventional UPX stubs skip
+load-time veneer decoding, discovery, and decompilation.
 
 ## Upstream provenance and remaining work
 
-The confirmed-call and call-to-fallthrough exclusion rules are adapted from
+Confirmed-call and call-to-fallthrough rules adapt
 [Ghidra FunctionAnalyzer.java](https://github.com/NationalSecurityAgency/ghidra/blob/9a723ce99952771b8368329503aa589ae233e916/Ghidra/Features/Base/src/main/java/ghidra/app/plugin/core/function/FunctionAnalyzer.java)
-at revision `9a723ce99952771b8368329503aa589ae233e916`, under Apache License 2.0.
-The Rust adaptation uses the desktop's existing instruction recovery, bounded
-queues, explicit result provenance, and public engine APIs. Attribution is
-retained in [NOTICE](../NOTICE).
-
-The direct-memory `COPY`/`LOAD`/`STORE` reference rules, and the constant
-transfer and unknown-output rules used for AArch64 block-local propagation,
-adapt a bounded subset of
+at `9a723ce99952771b8368329503aa589ae233e916`, under Apache License 2.0.
+Direct-memory `COPY`/`LOAD`/`STORE` and AArch64 constant/unknown-output rules adapt
 [Ghidra SymbolicPropogator.java](https://github.com/NationalSecurityAgency/ghidra/blob/9a723ce99952771b8368329503aa589ae233e916/Ghidra/Features/Base/src/main/java/ghidra/program/util/SymbolicPropogator.java)
-at the same revision and license. The original Java pass propagates symbolic
-state across flow and uses the Program database; this adaptation tracks only
-concrete register constants within one block and uses neither. Other direct
-memory operands use the public engine's p-code semantics. Original x86 and ARM64
-instruction fixtures test positive evidence and deliberate non-recovery, and real
-contained workers cover ARM64 literal and propagated `ADRP; ADD; LDR` accesses,
-plus a call that clobbers the base register, in ELF, PE and Mach-O.
+at the same revision. This bounded adaptation tracks concrete values within one
+block, without the Java Program database or analysis framework.
 
-The pinned `ghidra-decompiler` revision remains
-`268c3a406d8d964bc00ae2ead4d3e1e1373aaa27`; its recorded Ghidra base is
-`d6192cb3f9`. Ghidra's Java `AutoAnalysisManager` and `Analyzer` framework depend
-on its Program database and event system. These increments adapt selected
-algorithms into the native worker; they do not port that framework or add a Java
-or Python runtime dependency.
+The pinned `ghidra-decompiler` revision is
+`268c3a406d8d964bc00ae2ead4d3e1e1373aaa27`, with recorded Ghidra base `d6192cb3f9`.
+Attribution remains in [NOTICE](../NOTICE). The independent ARM64 PE reader follows
+[Microsoft's exception-handling format](https://learn.microsoft.com/en-us/cpp/build/arm64-exception-handling?view=msvc-170);
+veneer recognition uses public engine APIs. No Java or Python runtime is added.
 
-The ARM64 PE metadata reader is an independent implementation of
-[Microsoft's ARM64 exception-handling format](https://learn.microsoft.com/en-us/cpp/build/arm64-exception-handling?view=msvc-170).
-It is separate from Ghidra's Java database analyzers. The import recognizer uses
-public APIs from the unchanged pinned engine. Original assembly and synthetic PE
-metadata fixtures cover isolated runtime entries, fragments, a real named import
-call and an unresolved veneer branch through production worker containment.
+Remaining work includes cross-block propagation, speculative operand references,
+exception flow, inferred no-return wrappers, and complete stripped recovery.
+Engine decompilation may expose constructs the independent CFG cannot establish.
+There is no source/class/trait reconstruction or MSVC demangling. Plugins,
+scripting, debugger integration, and general type/variable-storage editing remain
+future capabilities.
 
-Cross-block constant propagation, speculative operand references, exception
-flow, inferred no-return wrappers, and complete stripped-function recovery are not
-supplied by this pass. Existing engine behavior may still expose some of these
-constructs during decompilation; this pass does not establish their missing
-targets for the desktop's independent CFG. Switch tables are the exception
-described above.
-
-No speed or memory improvement over Ghidra is claimed. Comparisons must measure
-end-to-end time and total memory, including workers and duplicated image bytes,
-using the same executable hash and comparable analysis scope. Native platform
-validation must be reported separately from the architecture of the input image.
-See [analysis measurements](analysis-performance.md) for the opt-in Linux
-client/worker baseline and its explicit scope limits.
+Comparisons require the same executable hash and comparable scope, end-to-end
+time, and total memory including workers and duplicated bytes. No general speed
+or memory advantage over Ghidra is claimed. Report native platform validation
+separately from input architecture; see [measurements](analysis-performance.md).
 
 ## Per-function session results
 
-The desktop retains immutable validated graph/listing and decompilation results
-with their listing indexes, highlighting and base graph geometry. Text, mappings,
-semantic tokens, inferred prototypes and unapplied-local warnings are adopted as
-one result. Mutable cameras, selections, scroll requests and egui ids remain in
-the current view. Exact instruction history is applied before synchronous cache
-adoption. Successful empty pseudocode is distinct from a missing result; failed
-analysis is not cached.
+Immutable validated listing/graph and pseudocode results retain presentation
+indexes, highlighting, geometry, mappings, semantic tokens, inferred prototypes,
+and unapplied-local warnings. View cameras and selections remain mutable;
+exact instruction history precedes cache adoption. Empty success differs from
+missing results; failed analysis is not cached.
 
-Compatibility uses the verified binary SHA-256, unchanged engine/signature
-fingerprints, the complete committed signature-state digest, ordered inventory
-and effective function-name SHA-256 digests, and complete per-function local
-identity/name digests. Inventory/name/local projections are hashed in a bounded
-background job when their inputs change. Navigation does not hash the inventory.
-Worker request/selection/revision and refresh bindings remain separate from
-cache identity. Restarting the worker retains committed compatible results;
-superseded replies cannot populate the store. Signature staging cannot publish
-under committed state, and failed staging retains committed references.
+Compatibility depends on binary SHA-256, engine/signature fingerprints,
+committed signatures, inventory, effective function names, and per-function local
+identities/names. Background jobs compute changed projections. Request, selection,
+and revision bindings still apply; stale replies and staged signatures cannot
+populate committed state. Worker restart preserves compatible results.
 
-- Local rename/remove/undo invalidates that function's decompilation only.
-- Function rename/remove/undo conservatively invalidates graph and decompilation
-  results, including callers. Committed references and byte scans remain.
-- Signature acknowledgement invalidates graph, decompilation and discovery;
-  annotations, inventory and byte scans remain.
-- Inventory address changes invalidate graph and decompilation results;
-  committed reference coverage remains attached to its publication.
-- Comment/decoded-note changes retain analysis. JSON imports compare analysis
-  projections, so comment-only imports do not restart analysis.
-- Refresh bypasses the selected function's stored components. Rediscovery
-  replaces saved reference evidence without discarding compatible function results.
+- Local rename/remove/undo invalidates that function's pseudocode.
+- Function name changes invalidate graph and pseudocode, including callers;
+  references and byte scans remain.
+- Signature acknowledgement clears graph, pseudocode, and discovery, preserving
+  annotations, inventory, and byte scans.
+- Inventory address changes invalidate graph/pseudocode; committed references
+  remain attached to their publication.
+- Comments/decoded notes retain analysis, including comment-only JSON imports.
+- Refresh bypasses stored components; rediscovery replaces saved evidence while
+  retaining compatible function results.
 
-One shared discovery snapshot owns published statuses, counters and evidence;
-incoming/outgoing indexes point into it. An absent function, pending work, a
-completed function with no references, partial work and failure stay distinct.
-The mutable bounded discovery continuation is separate from this publication.
+The [session-store budget](#resource-limits-and-trust-boundaries) accounts for
+payload capacities, prepared presentation, bookkeeping, and discovery publication.
+Inactive unpinned components are evicted least recently used. Shared snapshots
+remain charged until their last owner drops, including project-save pins.
+If pins prevent admission, current results can display uncached and discovery
+publication waits. Annotations are never evicted. Allocation accounting is not
+total process memory; preparation, uncached results, workers, and images add more.
+Saves track result revisions so older saves cannot mark newer results saved.
 
-The 64 MiB allocation budget covers retained payload capacities, prepared
-presentation, conservative index/key bookkeeping and the committed discovery
-publication. Inactive unpinned components are evicted least recently used.
-Shared snapshots stay charged until their last owner drops, including a project
-save pinning an older discovery snapshot. When pins prevent admission, the
-current bounded graph/code may be displayed without caching; discovery
-publication waits for room. Preparation, current uncached results, worker memory,
-image copies and total GUI RSS are reported separately, not hidden in the cap.
-Annotations are never evicted. Saves also track analysis-result revisions so a
-completed save cannot mark newer results saved.
+Misses use the warm worker, whose shared type knowledge can change later Refresh
+output. There is no canonical fresh replay for each miss. Projects persist only
+the displayed function; saving all retained functions needs a format migration.
 
-Misses use the existing warm worker. A stored result reflects engine knowledge
-when computed; analyzing another function can teach the engine shared global
-types, making a later Refresh print different pseudocode. No canonical fresh
-worker replay is performed for each miss. Engine fingerprints are unchanged.
-Project version 4 still persists the displayed function only. Persisting all
-retained functions requires a later project-format migration.
+## Annotations and signatures
+
+Comments appear beside Listing instructions and on Graph rows. The Decompiler
+shows each once above a genuinely mapped statement, with entry comments at top;
+unmapped ones remain under **Comments without visible code**. Double-click a
+comment, use its context menu, or press **;** for full text. **View → Annotations**
+opens a filterable address/label/comment browser. Address navigation preserves
+observed function context and history; data addresses open Decode.
+
+Local renaming requires a verified symbol with one whole stack/register storage
+mapping, including recovered parameters. Declarations and uses change together.
+Names are C identifiers of 1–64 ASCII bytes; keywords and local collisions fail.
+Globals, split/conflicting storage, dynamic/unique temporaries, fields, objects
+larger than 256 bytes, and unverified tokens are unsupported. They cannot silently
+rename an address label. Identity collection and override counts are bounded in
+[semantic.rs](../src/semantic.rs).
+
+Overrides bind to binary, function, engine, storage, type, and recovered uses.
+Revisit/restart/reopen/import replays only compatible identities. Missing,
+ambiguous, changed, or incompatible overrides stay saved and visibly **not applied**;
+Refresh cannot redirect them. **Ctrl+Z** (Command on macOS) undoes annotations.
+
+**Signature…**, the function context menu, and annotation editor expose supported
+prototypes. Unsupported inferred types require an explicit supported choice.
+Types are `void`, signed/unsigned 8/16/32/64-bit integers, and pointers up to four
+levels. Scalar `void` is return-only. The binary's ABI applies; alternate calling
+conventions, floats, aggregates, arrays, and variadics are unsupported. Up to
+32 named parameters use distinct C identifiers. Aggregate state is bounded in
+[signatures.rs](../src/signatures.rs).
+
+All signatures install before caller analysis; known direct calls use callee
+types and ordered parameters. Indirect calls, imports, and thunk propagation
+are excluded. Apply/remove/undo verifies a fresh worker and complete replay before
+atomic commit. Failure/cancel retains committed state and attempts fresh recovery;
+incompatible or missing-entry overrides remain visibly **not applied**. This is
+prototype editing, not a general type or variable-storage editor.
+
+## Strings and byte inspection
+
+Strings scans mapped bytes for ASCII and printable-ASCII UTF-16LE, not complete
+Unicode or Rust string slices. **Not scanned** differs from empty. The minimum
+defaults to 6 characters, selectable from 4–64 before the result cap; filtering
+searches loaded results only. Increase the minimum and rescan to reduce noise.
+Partial scans are labeled; [scan limits](#resource-limits-and-trust-boundaries) apply.
+
+**Hex / Memory Map**, also opened from Program Tree sections, shows mapped sections
+and their exclusive virtual/file ranges. Browse section-relative 4 KiB pages
+using **Prev/Next** or **VA (hex)**. Invalid jumps preserve the page. File bytes
+show offsets on hover; zero-filled bytes have none. Unmapped headers, overlays,
+and runtime process memory are outside this immutable snapshot view.
+
+Click/Shift-click hex or ASCII bytes, then **Decode selection** for the exact
+slice and address. Page changes clear selection. Browsing preserves navigation
+and annotations; pages/selections are transient. Reads wait for busy analysis;
+rapid paging retains the newest request only. Failed/canceled reads require
+**Retry**. Decoder behavior and constant-match caveats are in
+[coverage and provenance](crypto-signatures.md).
+
+## Project formats and saved analysis
+
+A `.grproj` SQLite snapshot stores annotations, known functions, displayed-function
+listing/graph and pseudocode, string/crypto results, selection, and committed
+discovery. It does not serialize every visited function or the engine database.
+Embedded binaries extract privately and remain owned through worker reaping;
+external binaries require explicit selection and SHA-256 verification. Source
+paths are display hints. The engine reopens the verified binary before adopting
+cached results. There is no autosave or Ghidra/IDA import.
+
+Current saves use project schema version 4, adding function signatures. Versions
+1–3 remain readable; older releases reject newer schemas. Version 2 introduced
+saved discovery; version 3 added semantic tokens and local-name overrides.
+JSON v1/v2 remain readable: legacy local overrides use v2; signatures and local
+identities recovered under signature context use v3. Signature-context upgrades
+refresh older analysis caches while retaining annotations.
+
+Saved inventory and results retain **Saved analysis** provenance until recomputed.
+Refresh replaces function results; Discover discards saved discovery and starts
+fresh rather than resuming saved statuses. **Rediscover from scratch** also
+replaces session discovery. Saved queues, retries, worker bindings, and admission
+witnesses are not persisted; unfinished batch seeds remain pending.
+
+Loading validates exact schema, bounded collections, ordered unique addresses,
+executable membership, mapping bounds, source ownership, targets, and consistency
+of partial/status/counter data. This checks structure, not instruction truth.
+Unmapped graph exits and call targets save as unresolved.
+Engine or discovery-format fingerprint mismatches discard incompatible caches
+while keeping annotations. A matching binary hash does not authenticate analysis.
+
+Saves publish complete new files atomically after destination checks, retaining
+all protected-input guards through replacement. They never patch the binary,
+including pathname aliases. See [trust boundaries](#resource-limits-and-trust-boundaries)
+for project parsing and residual filesystem limitations.
+
+## Resource limits and trust boundaries
+
+| Scope | Limit / behavior |
+| --- | --- |
+| Files | 128 MiB binary; 224 MiB project; 8 MiB JSON annotations |
+| Known functions | 262,144; omitted entries mean a partial inventory |
+| Function walk / graph | 2,048 instruction attempts / 128 displayed blocks |
+| Discovery batch | 128 seeds / 16,384 decode attempts; not cumulative ceilings |
+| References | 16,384 call refs and separately 16,384 data refs |
+| Strings | 64 MiB scanned data / 10,000 results |
+| Bytes / decode | 64 KiB input and XOR keys / 256 KiB output; oversize is rejected |
+| Pseudocode | 2 MiB returned text |
+| Session result store | 64 MiB accounted allocations; see [eviction](#per-function-session-results) |
+| Worker request | 30-second wall-time deadline; progress does not extend it |
+
+Returned-result limits do not bound the engine's internal allocations. Total
+memory includes workers, retained image copies, and uncached results. Linux
+[containment](linux.md#worker-isolation) and Windows [resource controls](windows.md#build-and-launch)
+contain worker failures; other platforms lack implemented process sandboxing.
+Projects are parsed by SQLite inside the desktop process. Schema, bounds, and
+SHA-256 checks do not authenticate saved analysis; open projects only from trusted sources.
+
+Input identities remain protected across pathname replacement. Atomic saves
+still have residual same-user parent-directory and Windows delete-sharing rename
+races; publication is not relative to retained directory handles. A stalled
+directory read can remain blocked, but cancellations do not accumulate reader
+threads. Limit sources: [model.rs](../src/model.rs), [analysis/](../src/analysis/),
+[project.rs](../src/project.rs), [session.rs](../src/session.rs),
+[semantic.rs](../src/semantic.rs), and [signatures.rs](../src/signatures.rs).
