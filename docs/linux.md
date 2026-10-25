@@ -70,8 +70,8 @@ does not run tests and does not need it.
 ## Build and desktop check
 
 Follow [building and shipping each version](releases.md) for prerequisites and
-`scripts/build-linux.sh`. Python 3.11+ is a packaging tool on the build machine
-only; it is not distributed with or used by the desktop.
+`scripts/build-linux.sh`. Python 3.11+ and OpenSSL support packaging and update
+signing tests on the build machine; neither is used by the desktop.
 
 Build the [original C fixture](../tests/fixtures/README.md) and check Listing/CFG,
 mapped pseudocode selection, call navigation/history, rename/undo, strings,
