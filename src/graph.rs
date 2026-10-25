@@ -7,6 +7,7 @@ use eframe::egui::{
     self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2, pos2, vec2,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::Arc;
 
 const WIDTH: f32 = 420.0;
 const HEADER: f32 = 32.0;
@@ -38,15 +39,21 @@ struct RoutedEdge {
     unresolved: bool,
 }
 
-struct Layout {
+/// Immutable block placement and routed edges for one view and comment set.
+/// Shared between a function's stored result and every canvas showing it.
+pub struct GraphGeometry {
     nodes: Vec<Node>,
     edges: Vec<RoutedEdge>,
     bounds: Rect,
 }
 
+type Layout = GraphGeometry;
+
 pub struct GraphCanvas {
     function: u64,
-    layout: Layout,
+    /// Geometry without comment rows, reused while the function has none.
+    base: Arc<GraphGeometry>,
+    layout: Arc<GraphGeometry>,
     zoom: f32,
     pan: Vec2,
     needs_fit: bool,
@@ -79,9 +86,15 @@ fn instruction_action(view: &FunctionView, address: u64, double_clicked: bool) -
 
 impl GraphCanvas {
     pub fn new(view: &FunctionView) -> Self {
+        Self::with_geometry(view, Arc::new(GraphGeometry::new(view)))
+    }
+
+    /// A fresh camera over prepared geometry for `view`.
+    pub fn with_geometry(view: &FunctionView, geometry: Arc<GraphGeometry>) -> Self {
         Self {
             function: view.address,
-            layout: Layout::new(view),
+            layout: geometry.clone(),
+            base: geometry,
             zoom: 1.0,
             pan: Vec2::ZERO,
             needs_fit: false,
@@ -108,8 +121,18 @@ impl GraphCanvas {
             *self = Self::new(view);
         }
         if self.comment_key != Some(key) {
-            let _layout = crate::performance::span("gui_graph_comment_layout");
-            self.layout = Layout::with_comments(view, comments);
+            let commented = view
+                .blocks
+                .iter()
+                .take(MAX_BLOCKS)
+                .flat_map(|block| &block.instructions)
+                .any(|instruction| comments.contains_key(&instruction.address));
+            self.layout = if commented {
+                let _layout = crate::performance::span("gui_graph_comment_layout");
+                Arc::new(Layout::with_comments(view, comments))
+            } else {
+                self.base.clone()
+            };
             self.comment_key = Some(key);
         }
     }
@@ -470,9 +493,33 @@ impl Node {
     }
 }
 
-impl Layout {
-    fn new(view: &FunctionView) -> Self {
+impl GraphGeometry {
+    pub fn new(view: &FunctionView) -> Self {
         Self::with_comments(view, &BTreeMap::new())
+    }
+
+    /// Allocation capacity retained by this geometry, including itself.
+    pub fn retained_bytes(&self) -> Option<usize> {
+        use crate::result_store::Bytes;
+        let mut bytes = Bytes::of::<Self>()
+            .slots::<Node>(self.nodes.capacity())
+            .slots::<RoutedEdge>(self.edges.capacity());
+        for node in &self.nodes {
+            // B-tree nodes hold at most 11 keys; charge each key's share of
+            // a minimally filled node.
+            bytes = bytes
+                .slots::<u64>(node.instruction_addresses.len().saturating_mul(16))
+                .slots::<(u64, String)>(node.rows.capacity());
+            for (_, row) in &node.rows {
+                bytes = bytes.plus(row.capacity());
+            }
+        }
+        for edge in &self.edges {
+            bytes = bytes
+                .slots::<Pos2>(edge.points.capacity())
+                .plus(edge.label.capacity());
+        }
+        bytes.total()
     }
 
     fn with_comments(view: &FunctionView, comments: &BTreeMap<u64, String>) -> Self {
