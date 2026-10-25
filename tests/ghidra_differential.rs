@@ -20,6 +20,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const REQUEST_ENV: &str = "GHIDRA_RUST_DIFF_REQUEST";
+const WORKER_ENV: &str = "GHIDRA_RUST_DIFF_WORKER";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const PER_REQUEST_SECONDS: u64 =
     if REQUEST_TIMEOUT.as_secs() > differential::DECOMPILE_TIMEOUT_SECONDS {
@@ -129,6 +130,8 @@ struct RustRun {
     info: Option<BinaryInfo>,
     functions: Vec<ghidra_rust::model::FunctionInfo>,
     analysis: ghidra_rust::model::CallAnalysis,
+    recovery: ghidra_rust::model::RecoveryAccounting,
+    admissions: Vec<ghidra_rust::model::FunctionAdmission>,
     queue_exhausted: bool,
     analysis_timed_out: bool,
     remaining: usize,
@@ -146,6 +149,8 @@ fn rust_arm(request_doc: &RunRequest) -> RustRun {
         info: None,
         functions: Vec::new(),
         analysis: Default::default(),
+        recovery: Default::default(),
+        admissions: Vec::new(),
         queue_exhausted: false,
         analysis_timed_out: false,
         remaining: 0,
@@ -159,10 +164,13 @@ fn rust_arm(request_doc: &RunRequest) -> RustRun {
         run.error = Some(bounded(&error, request_doc.limits.max_error_bytes));
     };
     let start = Instant::now();
+    let worker_executable = std::env::var_os(WORKER_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_ghidra-rust")));
     let mut worker = match WorkerClient::start_using_executable(
         eframe::egui::Context::default(),
         &request_doc.input_path,
-        Path::new(env!("CARGO_BIN_EXE_ghidra-rust")),
+        &worker_executable,
     ) {
         Ok(worker) => worker,
         Err(error) => {
@@ -245,6 +253,12 @@ fn rust_arm(request_doc: &RunRequest) -> RustRun {
     }
     // Freeze evidence before decompilation, which can name or create functions.
     run.analysis = state.snapshot();
+    run.recovery = state.recovery_accounting();
+    run.admissions = run
+        .functions
+        .iter()
+        .filter_map(|f| state.admission(f.address).copied())
+        .collect();
     run.remaining = state.remaining();
     run.timings
         .insert("discovery_ms".into(), ms(discovery_start.elapsed()).into());
@@ -375,6 +389,7 @@ fn rust_export(request_doc: &RunRequest, run: RustRun, process_ms: f64) -> Value
             "unresolved_calls": run.analysis.unresolved_calls,
             "batches": run.batches,
             "functions_capped": functions_capped, "calls_capped": calls_capped},
+        "recovery": run.recovery, "admissions": run.admissions,
         "functions": functions, "calls": calls,
         "decompilations": run.decompilations, "timings": timings,
     })
@@ -640,7 +655,8 @@ fn run_arm(
         command
             .args(["export_contained_worker", "--exact", "--ignored"])
             .args(["--nocapture", "--test-threads=1"])
-            .env(REQUEST_ENV, &request_path);
+            .env(REQUEST_ENV, &request_path)
+            .env(WORKER_ENV, suite.join("ghidra-rust-worker"));
         command
     };
     let measured = measure(&mut command, &run.join("process.log"));
@@ -707,13 +723,29 @@ fn benchmark_against_ghidra() {
     }
     let ghidra = ghidra();
     let repeats = repeats();
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/ghidra-differential");
+    // Ghidra rejects project path components beginning with '.', including
+    // app-owned .t3 worktrees. Honor the same external target path as Cargo.
+    let root = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("target"))
+        .join("ghidra-differential");
     fs::create_dir_all(&root).unwrap();
     let suite = tempfile::Builder::new()
         .prefix("run-")
         .tempdir_in(&root)
         .unwrap()
         .keep();
+    // Another worktree may rebuild the shared target while Java runs. Bind
+    // every Rust repetition to the same complete worker image and record its hash.
+    let worker_source = Path::new(env!("CARGO_BIN_EXE_ghidra-rust"));
+    let worker_hash = session::fingerprint(worker_source).unwrap();
+    let frozen_worker = suite.join("ghidra-rust-worker");
+    fs::copy(worker_source, &frozen_worker).unwrap();
+    assert_eq!(
+        session::fingerprint(&frozen_worker).unwrap(),
+        worker_hash,
+        "Worker executable changed during suite preparation"
+    );
     let inputs = suite.join("inputs");
     fs::create_dir(&inputs).unwrap();
     let selected = std::env::var("GHIDRA_RUST_BENCH_CASE").ok();
@@ -776,7 +808,7 @@ fn benchmark_against_ghidra() {
         "worktree_dirty": !git(&["status", "--porcelain"]).is_empty(),
         "rustc": command_text(Command::new("rustc").arg("-vV")),
         "engine_fingerprint": project::ENGINE_FINGERPRINT,
-        "worker_executable_sha256": session::fingerprint(Path::new(env!("CARGO_BIN_EXE_ghidra-rust"))).unwrap(),
+        "worker_executable_sha256": worker_hash,
         "controller_executable_sha256": session::fingerprint(&std::env::current_exe().unwrap()).unwrap(),
         "ghidra": {"home": ghidra.home, "version": ghidra.version, "java": ghidra.java,
             "profile": "ghidra-default-analyzers-cpu1", "max_heap": "2G",
@@ -789,14 +821,15 @@ fn benchmark_against_ghidra() {
             "truth": truths.get(&case.id), "requested": case.requested})).collect::<Vec<_>>(),
         "runs": runs,
         "limitations": [
-            "Ghidra runs its default analyzers; ghidra-rust runs contained direct-call discovery and function-start patterns. Scopes differ",
+            "Ghidra runs its default analyzers; ghidra-rust runs contained direct-call, ELF pointer and function-start pattern discovery. Scopes differ",
             "Ghidra runs without the production worker's sandbox; use trusted inputs only",
             "Ghidra's 2 GiB heap limit is not equivalent to the worker's 2 GiB address-space limit",
             "Samples are non-atomic estimates; RSS sums can double-count shared pages",
             "Filesystem caches are warmed by builds and hashing; these are not cold-cache timings",
-            "Ghidra 12.1.x and the pinned engine's upstream decompiler baseline differ",
+            "Ghidra 12.2 and the pinned engine's upstream decompiler baseline differ",
         ],
     });
+    fs::remove_file(&frozen_worker).unwrap();
     let manifest_path = suite.join("suite.json");
     publish(&manifest_path, &manifest);
     let compare = |format: &str| {
