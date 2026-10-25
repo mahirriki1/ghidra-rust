@@ -139,9 +139,8 @@ impl DecoderPanel {
                     source.bytes.len()
                 ));
             } else {
-                ui.weak("Pasted input").on_hover_text(
-                    "Copy the output, or read memory to attach decoded annotations to an address.",
-                );
+                ui.weak("Pasted input")
+                    .on_hover_text("Read memory to attach decoded annotations to an address.");
             }
         });
         let max_characters = match self.mode {
@@ -167,9 +166,8 @@ impl DecoderPanel {
         }
         let mut parameters_changed = false;
         ui.horizontal_wrapped(|ui| {
-            ui.label("Operation").on_hover_text(
-                "Hex/Base64 operations transform encoded text. Hex input mode specifies the raw bytes supplied to that operation.",
-            );
+            ui.label("Operation")
+                .on_hover_text("Hex/Base64 decode encoded text; input mode supplies raw bytes.");
             egui::ComboBox::from_id_salt("decoder-operation")
                 .selected_text(operation_name(self.operation))
                 .show_ui(ui, |ui| {
@@ -191,13 +189,14 @@ impl DecoderPanel {
                     }
                 });
             if self.operation == Operation::Xor {
-                ui.label("Key: hex:4142 or text:AB");
+                ui.label("Key");
                 parameters_changed |= ui
                     .add(
                         TextEdit::singleline(&mut self.key)
                             .desired_width(200.0)
                             .char_limit(MAX_INPUT),
                     )
+                    .on_hover_text("hex:4142 or text:AB")
                     .changed();
             }
         });
@@ -229,10 +228,8 @@ impl DecoderPanel {
         }
         if !self.candidates.is_empty() {
             ui.separator();
-            ui.colored_label(
-                crate::theme::WARNING,
-                "Unverified suggestions: readability does not establish correctness",
-            );
+            ui.colored_label(crate::theme::WARNING, "Unverified suggestions")
+                .on_hover_text("Readable output may still be incorrect.");
             let mut selected = None;
             for (index, candidate) in self.candidates.iter().enumerate() {
                 if ui.button(&candidate.label).clicked() {
