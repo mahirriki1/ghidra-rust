@@ -4,6 +4,9 @@
 //! been idle for `GHIDRA_RUST_CAPTURE_DELAY` seconds (default 6) and exits.
 //! `GHIDRA_RUST_CAPTURE_GOTO=<hex>` navigates once the binary is open,
 //! `GHIDRA_RUST_CAPTURE_TAB=<graph|strings|crypto|decode|hex|references>`
+//! `GHIDRA_RUST_CAPTURE_CACHE_CHECK=A,B` exercises cache/history/selection/Refresh;
+//! `GHIDRA_RUST_CAPTURE_PROJECT=<new.grproj>` also saves and reopens a project.
+//! The cache check uses hexadecimal function entries and asserts its results.
 //! shows that view, and `GHIDRA_RUST_CAPTURE_SELECT=<hex>` then selects one of
 //! its instructions. `GHIDRA_RUST_CAPTURE_ANALYZE=1` runs every automatic
 //! analysis first; otherwise the first-open prompt is dismissed without
@@ -14,6 +17,7 @@ use std::time::{Duration, Instant};
 
 pub struct Capture {
     path: std::path::PathBuf,
+    pub cache_check: Option<CacheCheck>,
     delay: Duration,
     pub goto: Option<u64>,
     pub select: Option<u64>,
@@ -44,6 +48,23 @@ impl Capture {
             });
         Some(Self {
             path,
+            cache_check: std::env::var("GHIDRA_RUST_CAPTURE_CACHE_CHECK")
+                .ok()
+                .map(|value| {
+                    let (a, b) = value
+                        .split_once(',')
+                        .expect("Cache check needs A,B hexadecimal function addresses");
+                    CacheCheck {
+                        a: u64::from_str_radix(a.trim_start_matches("0x"), 16).expect("A"),
+                        b: u64::from_str_radix(b.trim_start_matches("0x"), 16).expect("B"),
+                        step: 0,
+                        epoch: 0,
+                        pc: 0,
+                        graph: None,
+                        code: None,
+                        project: std::env::var_os("GHIDRA_RUST_CAPTURE_PROJECT").map(Into::into),
+                    }
+                }),
             delay: Duration::from_secs_f32(delay),
             goto: address("GHIDRA_RUST_CAPTURE_GOTO"),
             select: address("GHIDRA_RUST_CAPTURE_SELECT"),
@@ -91,4 +112,18 @@ fn write_ppm(path: &std::path::Path, image: &egui::ColorImage) -> std::io::Resul
         file.write_all(&[pixel.r(), pixel.g(), pixel.b()])?;
     }
     file.flush()
+}
+
+/// Developer-only native scenario. Assertions are exercised through the actual
+/// desktop's worker/event/render loop, without a user-visible automation flow.
+pub struct CacheCheck {
+    pub a: u64,
+    pub b: u64,
+    pub step: usize,
+    pub epoch: u64,
+    pub pc: u64,
+    pub graph: Option<crate::result_store::Shared<crate::function_presentation::PreparedGraph>>,
+    pub code:
+        Option<crate::result_store::Shared<crate::function_presentation::PreparedDecompilation>>,
+    pub project: Option<std::path::PathBuf>,
 }

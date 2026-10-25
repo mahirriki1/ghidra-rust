@@ -1,8 +1,10 @@
 //! Opt-in Linux analysis-client baseline, not a GUI or cross-tool benchmark.
+#![recursion_limit = "256"]
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod common;
 mod inventory;
 mod measurement;
+mod result_measurement;
 
 use ghidra_rust::client::{WorkerClient, WorkerEvent};
 use ghidra_rust::model::{Request, Response};
@@ -258,20 +260,40 @@ fn profile_contained_analysis_client() {
             ) else {
                 panic!("Expected Graph");
             };
-            let (Response::Decompiled { text, mappings, .. }, decompile_ms, retained_memory) =
-                sampler.request(
-                    &mut worker,
-                    Request::Decompile {
-                        address: fixture.function,
-                    },
-                )
-            else {
+            let (response, decompile_ms, retained_memory) = sampler.request(
+                &mut worker,
+                Request::Decompile {
+                    address: fixture.function,
+                },
+            );
+            let Response::Decompiled { text, mappings, .. } = &response else {
                 panic!("Expected Decompiled");
             };
-            selection::validate_mappings(&text, &mappings, &info.sections).unwrap();
+            selection::validate_mappings(text, mappings, &info.sections).unwrap();
             assert!(!mappings.is_empty());
             let through_decompile_ms = start.elapsed().as_secs_f64() * 1000.;
             assert!(sampler.max_processes >= 2, "Worker memory was not sampled");
+            let graph_blocks = view.blocks.len();
+            let pseudocode_bytes = text.len();
+            let semantic_ranges = mappings.len();
+            let mut cached = result_measurement::CachedResults::new(&info);
+            cached.admit(&info, view, response);
+            let other = info
+                .functions
+                .iter()
+                .find(|f| f.address != fixture.function)
+                .unwrap()
+                .address;
+            let (Response::Graph { view: other_view }, other_graph_ms, _) =
+                sampler.request(&mut worker, Request::Graph { address: other })
+            else {
+                panic!("Graph B");
+            };
+            let (other_code, other_decompile_ms, _) =
+                sampler.request(&mut worker, Request::Decompile { address: other });
+            cached.admit(&info, other_view, other_code);
+            let cached_visits = cached.measure([fixture.function, other]);
+            let cache_retained_memory = sampler.sample();
             let stop = Instant::now();
             drop(worker);
             while sampler
@@ -311,8 +333,10 @@ fn profile_contained_analysis_client() {
                 "data_omitted": analysis.data.as_ref().map(|data| data.omitted_accesses),
                 "data_unsupported_instructions": analysis.data.as_ref().map(|data| data.unsupported_instructions),
                 "data_partial": analysis.data.as_ref().map(|data| data.partial),
-                "analysis_partial": analysis.partial, "graph_blocks": view.blocks.len(),
-                "pseudocode_bytes": text.len(), "semantic_ranges": mappings.len(),
+                "analysis_partial": analysis.partial, "graph_blocks": graph_blocks,
+                "pseudocode_bytes": pseudocode_bytes, "semantic_ranges": semantic_ranges,
+                "cached_visits": cached_visits, "cache_retained_memory": cache_retained_memory,
+                "B_graph_miss_ms": other_graph_ms, "B_decompile_miss_ms": other_decompile_ms,
             }));
         }
     }

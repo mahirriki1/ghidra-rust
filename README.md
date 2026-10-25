@@ -150,6 +150,17 @@ unmapped declarations, and results outside the bounded graph can have no visible
 counterpart; the app does not invent one. Double-clicking a known call still
 navigates to that function.
 
+Visited functions retain their validated graph/listing and decompilation in a
+bounded 64 MiB in-memory result store. Compatible revisits and Back/Forward reuse
+prepared results immediately, without a worker request. Refresh bypasses the
+store. Local renames recompute only that function's pseudocode; function names,
+inventory changes, and committed signatures invalidate their dependent results.
+Comments and display labels retain analysis. Eviction never removes annotations.
+Cache misses use the existing warm worker: cached pseudocode reflects the engine's
+knowledge when computed and can differ after other functions teach it shared
+global types. Refresh recomputes with the worker's current knowledge. This cache
+is session-local; version 4 projects still save only the displayed function.
+
 Address comments appear beside instructions in the Listing and on their own rows
 in the Function Graph. The Decompiler shows each comment once above a genuinely
 mapped statement; function-entry comments appear at the top. Comments for

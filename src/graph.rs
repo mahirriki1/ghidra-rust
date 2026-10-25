@@ -508,7 +508,7 @@ impl GraphGeometry {
             // B-tree nodes hold at most 11 keys; charge each key's share of
             // a minimally filled node.
             bytes = bytes
-                .slots::<u64>(node.instruction_addresses.len().saturating_mul(4))
+                .slots::<u64>(node.instruction_addresses.len().saturating_mul(16))
                 .slots::<(u64, String)>(node.rows.capacity());
             for (_, row) in &node.rows {
                 bytes = bytes.plus(row.capacity());

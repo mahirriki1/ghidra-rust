@@ -45,6 +45,23 @@ pub struct Listing<'a> {
     index: &'a [(u32, u32)],
 }
 
+static EMPTY_VIEW: FunctionView = FunctionView {
+    address: 0,
+    blocks: Vec::new(),
+    edges: Vec::new(),
+    calls: Vec::new(),
+    warnings: Vec::new(),
+};
+
+impl Listing<'static> {
+    pub fn empty() -> Self {
+        Self {
+            view: &EMPTY_VIEW,
+            index: &[],
+        }
+    }
+}
+
 impl<'a> Listing<'a> {
     pub fn len(&self) -> usize {
         self.index.len()
@@ -104,6 +121,14 @@ pub struct PreparedGraph {
 }
 
 impl PreparedGraph {
+    /// Validates a live graph against the verified image before constructing
+    /// indexes or reusable geometry. Used by headless clients and profilers.
+    pub fn validate(view: FunctionView, info: &crate::model::BinaryInfo) -> Result<Self, String> {
+        let ranges = crate::selection::MappedRanges::new(&info.sections)?;
+        crate::project::validate_view(&view, &ranges, info)?;
+        Ok(Self::new(view))
+    }
+
     /// `view` must already have passed reply or project validation.
     pub fn new(view: FunctionView) -> Self {
         let geometry = crate::performance::span("gui_graph_geometry");
@@ -189,10 +214,14 @@ impl PreparedDecompilation {
         }
         crate::selection::validate_mappings(&text, &mappings, sections)
             .map_err(DecompilationError::Mappings)?;
+        semantics
+            .validate(&text, address, sections)
+            .map_err(DecompilationError::Mappings)?;
         Ok(Self::prepare(address, text, mappings, semantics))
     }
 
-    fn prepare(
+    /// Prepares already-validated output.
+    pub(crate) fn prepare(
         address: u64,
         text: String,
         mappings: Vec<CodeMapping>,
@@ -387,9 +416,14 @@ mod tests {
             Err(DecompilationError::Oversized)
         ));
         // A successful empty result is distinct from a missing one.
-        let empty =
-            PreparedDecompilation::validate(0x1000, String::new(), vec![], Default::default(), &[])
-                .unwrap();
+        let empty = PreparedDecompilation::validate(
+            0x1000,
+            String::new(),
+            vec![],
+            Default::default(),
+            &sections,
+        )
+        .unwrap();
         assert!(empty.text().is_empty() && empty.lines().is_empty());
     }
 }

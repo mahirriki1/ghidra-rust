@@ -18,6 +18,7 @@ mod elf_startup;
 pub mod file_dialog;
 pub mod function_patterns;
 pub mod function_presentation;
+pub mod function_results;
 pub mod graph;
 mod hex_ui;
 pub mod highlight;

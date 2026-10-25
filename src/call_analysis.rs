@@ -164,15 +164,55 @@ impl CallAnalysis {
 /// to measure the same construction as the GUI, after validating its evidence.
 #[doc(hidden)]
 pub struct CallIndex {
-    pub report: CallAnalysis,
+    pub report: PublishedReport,
     pub incoming: BTreeMap<u64, Vec<usize>>,
     pub outgoing: BTreeMap<u64, Vec<usize>>,
     pub data_incoming: BTreeMap<u64, Vec<usize>>,
     pub data_outgoing: BTreeMap<u64, Vec<usize>>,
 }
 
+/// Borrowable report in the one immutable discovery publication. Both project
+/// saves and every incoming/outgoing index retain the same evidence allocation.
+pub struct PublishedReport(std::sync::Arc<crate::discovery::DiscoverySnapshot>);
+impl std::ops::Deref for PublishedReport {
+    type Target = CallAnalysis;
+    fn deref(&self) -> &CallAnalysis {
+        &self.0.report
+    }
+}
+
 impl CallIndex {
     pub fn new(report: CallAnalysis) -> Self {
+        Self::from_snapshot(std::sync::Arc::new(crate::discovery::DiscoverySnapshot {
+            fingerprint: crate::discovery::DISCOVERY_FINGERPRINT.into(),
+            pending: vec![],
+            done: vec![],
+            limited: vec![],
+            failed: vec![],
+            batches: 0,
+            capped: false,
+            report,
+        }))
+    }
+
+    pub fn snapshot(&self) -> &std::sync::Arc<crate::discovery::DiscoverySnapshot> {
+        &self.report.0
+    }
+
+    pub fn function_status(&self, address: u64) -> Option<crate::discovery::Status> {
+        self.snapshot().status(address)
+    }
+
+    pub fn outgoing_references(&self, function: u64) -> impl Iterator<Item = &CallReference> {
+        self.outgoing
+            .get(&function)
+            .into_iter()
+            .flatten()
+            .map(|&row| &self.report.references[row])
+    }
+
+    pub fn from_snapshot(snapshot: std::sync::Arc<crate::discovery::DiscoverySnapshot>) -> Self {
+        let report = PublishedReport(snapshot);
         let mut incoming: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
         let mut outgoing: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
         for (index, reference) in report.references.iter().enumerate() {
@@ -200,6 +240,25 @@ impl CallIndex {
             data_incoming,
             data_outgoing,
         }
+    }
+}
+
+impl crate::result_store::Retained for CallIndex {
+    fn retained_bytes(&self) -> Option<usize> {
+        let mut bytes = crate::result_store::Bytes::of::<Self>();
+        for index in [
+            &self.incoming,
+            &self.outgoing,
+            &self.data_incoming,
+            &self.data_outgoing,
+        ] {
+            // Conservative upper bound per B-tree entry, including node slack.
+            bytes = bytes.slots::<[u8; 512]>(index.len());
+            for rows in index.values() {
+                bytes = bytes.slots::<usize>(rows.capacity());
+            }
+        }
+        bytes.total()
     }
 }
 
@@ -351,3 +410,5 @@ mod tests {
         assert_eq!(index.incoming[&0x1040], vec![0]);
     }
 }
+
+// Only index allocations: the shared snapshot is charged separately, once.

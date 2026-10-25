@@ -14,12 +14,16 @@ use crate::client::{WorkerClient, WorkerEvent};
 use crate::decoder_ui::{DecoderAction, DecoderPanel};
 use crate::discovery::DiscoverySnapshot;
 use crate::file_dialog::{FileDialogKind, FileDialogs, request_file};
+use crate::function_presentation::{
+    DecompilationError, Listing, PreparedDecompilation, PreparedGraph,
+};
+use crate::function_results::{FunctionResults, ResultBinding};
 use crate::graph::{GraphAction, GraphCanvas};
 use crate::hex_ui::{HexAction, HexPanel};
-use crate::highlight::HighlightedCode;
 use crate::model::*;
 use crate::project::{EmbeddedBinary, LoadedProject, ProjectData};
-use crate::selection::{SemanticSelection, validate_mappings};
+use crate::result_store::{ResultOrigin, Shared};
+use crate::selection::SemanticSelection;
 use crate::semantic::{LocalIdentity, LocalRename, SemanticInfo, TokenKind};
 use crate::session::{Annotation, BinaryProtection, Session};
 use crate::signature_ui::{DraftParameter, SignatureAction, SignatureEditor};
@@ -201,6 +205,38 @@ fn replay_addresses(worker: &[FunctionInfo], desired: &[FunctionInfo]) -> VecDeq
         .collect()
 }
 
+static NO_SEMANTICS: SemanticInfo = SemanticInfo {
+    prototype: None,
+    tokens: Vec::new(),
+    locals: Vec::new(),
+    warnings: Vec::new(),
+};
+
+// Field-level accessors keep the displayed results borrowable alongside
+// mutable access to other desktop fields.
+fn graph_view(graph: &Option<Shared<PreparedGraph>>) -> Option<&FunctionView> {
+    graph.as_deref().map(|graph| graph.view())
+}
+
+fn listing_of(graph: &Option<Shared<PreparedGraph>>) -> Listing<'_> {
+    graph
+        .as_deref()
+        .map_or(Listing::empty(), |graph| graph.listing())
+}
+
+fn code_text(code: &Option<Shared<PreparedDecompilation>>) -> &str {
+    code.as_deref().map_or("", |code| code.text())
+}
+
+fn code_lines(code: &Option<Shared<PreparedDecompilation>>) -> &[(usize, usize)] {
+    code.as_deref().map_or(&[], |code| code.lines())
+}
+
+fn semantics_of(code: &Option<Shared<PreparedDecompilation>>) -> &SemanticInfo {
+    code.as_deref()
+        .map_or(&NO_SEMANTICS, |code| code.semantics())
+}
+
 /// Explicit target choices for one selection, bound to the state they came from.
 struct XrefChoices {
     key: XrefKey,
@@ -243,7 +279,7 @@ struct DiscoveryPublication {
     functions: Option<Vec<FunctionInfo>>,
     inventory: crate::discovery::WorkerInventory,
     truncated: bool,
-    index: crate::call_analysis::CallIndex,
+    index: Arc<crate::call_analysis::CallIndex>,
 }
 
 struct DiscoveryUpdate {
@@ -277,6 +313,8 @@ struct Pending {
     revision: u64,
     byte_origin: (Option<u64>, Tab),
     bytes: Option<ByteBinding>,
+    /// Store identity captured when a function request was sent.
+    result: Option<ResultBinding>,
 }
 
 struct Opening {
@@ -376,6 +414,7 @@ enum FileEvent {
     ProjectSaved {
         generation: u64,
         revision: u64,
+        result_revision: u64,
         embedded: bool,
         result: Result<Option<PathBuf>, String>,
     },
@@ -398,7 +437,7 @@ struct ProjectOpen {
     binary_path: PathBuf,
     /// Prepared by the file job, so restoring a large reference index never
     /// sorts or allocates its lookup tables on the GUI thread.
-    discovery_index: Option<crate::call_analysis::CallIndex>,
+    discovery_index: Option<Arc<crate::call_analysis::CallIndex>>,
 }
 
 #[derive(Clone)]
@@ -436,6 +475,7 @@ pub struct DesktopApp {
     opening: Option<Opening>,
     queue: VecDeque<Request>,
     applied_names: BTreeMap<u64, String>,
+    reset_names: std::collections::BTreeSet<u64>,
     info: Option<BinaryInfo>,
     binary_path: Option<PathBuf>,
     binary_protection: Option<BinaryProtection>,
@@ -449,9 +489,16 @@ pub struct DesktopApp {
     selection_generation: u64,
     revision: u64,
     saved_revision: u64,
+    result_revision: u64,
+    saved_result_revision: u64,
     undo: VecDeque<Edit>,
-    view: Option<FunctionView>,
-    call_index: Option<crate::call_analysis::CallIndex>,
+    /// Retained per-function results; the displayed ones are shared, not copied.
+    results: FunctionResults,
+    graph: Option<Shared<PreparedGraph>>,
+    code: Option<Shared<PreparedDecompilation>>,
+    call_index: Option<Arc<crate::call_analysis::CallIndex>>,
+    deferred_discovery: Option<DiscoveryUpdate>,
+    deferred_restore: Option<Box<ProjectOpen>>,
     discovery: Option<crate::discovery::Discovery>,
     discovery_job: Option<Receiver<DiscoveryUpdate>>,
     discovery_running: bool,
@@ -492,17 +539,12 @@ pub struct DesktopApp {
     reference_focus: Option<(u64, u64)>,
     undisplayed_call: Option<u64>,
     canvas: Option<GraphCanvas>,
-    listing: Vec<Instruction>,
-    decompiled: String,
-    decompiled_lines: Vec<(usize, usize)>,
-    highlighted: Option<HighlightedCode>,
     saved_analysis: bool,
     cached_graph: bool,
     cached_functions: bool,
     cached_strings: bool,
     cached_crypto: bool,
     semantic: SemanticSelection,
-    semantic_info: SemanticInfo,
     selected_local: Option<usize>,
     decompiler_rename_context: bool,
     pending_code_scroll: Option<usize>,
@@ -582,6 +624,7 @@ impl DesktopApp {
             opening: None,
             queue: VecDeque::new(),
             applied_names: BTreeMap::new(),
+            reset_names: std::collections::BTreeSet::new(),
             info: None,
             binary_path: None,
             binary_protection: None,
@@ -595,9 +638,15 @@ impl DesktopApp {
             selection_generation: 0,
             revision: 0,
             saved_revision: 0,
+            result_revision: 0,
+            saved_result_revision: 0,
             undo: VecDeque::new(),
-            view: None,
+            results: FunctionResults::default(),
+            graph: None,
+            code: None,
             call_index: None,
+            deferred_discovery: None,
+            deferred_restore: None,
             discovery: None,
             discovery_job: None,
             discovery_running: false,
@@ -628,17 +677,12 @@ impl DesktopApp {
             reference_focus: None,
             undisplayed_call: None,
             canvas: None,
-            listing: Vec::new(),
-            decompiled: String::new(),
-            decompiled_lines: Vec::new(),
-            highlighted: None,
             saved_analysis: false,
             cached_graph: false,
             cached_functions: false,
             cached_strings: false,
             cached_crypto: false,
             semantic: SemanticSelection::default(),
-            semantic_info: SemanticInfo::default(),
             selected_local: None,
             decompiler_rename_context: false,
             pending_code_scroll: None,
@@ -700,6 +744,7 @@ impl DesktopApp {
 
     fn dirty(&self) -> bool {
         self.revision != self.saved_revision
+            || (self.project_path.is_some() && self.result_revision != self.saved_result_revision)
     }
 
     fn request_intent(&mut self, intent: Intent, context: &egui::Context) {
@@ -767,6 +812,8 @@ impl DesktopApp {
         self.opening_project = None;
         self.revision = 0;
         self.saved_revision = 0;
+        self.result_revision = 0;
+        self.saved_result_revision = 0;
         self.undo.clear();
         self.clear_views();
         self.status = "Binary closed".into();
@@ -782,6 +829,8 @@ impl DesktopApp {
         self.inventory_synced = false;
         self.discovery = None;
         self.discovery_job = None;
+        self.deferred_discovery = None;
+        self.deferred_restore = None;
         self.discovery_running = false;
         self.discovery_summary = None;
         self.discovery_sync = None;
@@ -803,21 +852,19 @@ impl DesktopApp {
         self.undisplayed_call = None;
         self.browser_dialog = None;
         self.focus_comment = false;
-        self.view = None;
+        self.reset_names.clear();
+        self.results.close();
+        self.graph = None;
         self.canvas = None;
-        self.listing.clear();
-        self.decompiled.clear();
+        self.code = None;
         self.semantic.clear();
         self.comment_rows_key = None;
-        self.semantic_info = SemanticInfo::default();
         self.selected_local = None;
         self.decompiler_rename_context = false;
         self.pending_code_scroll = None;
         self.pending_comment_scroll = None;
         self.pending_listing_scroll = None;
-        self.highlighted = None;
         self.saved_analysis = false;
-        self.decompiled_lines.clear();
         self.cached_graph = false;
         self.cached_functions = false;
         self.cached_strings = false;
@@ -986,6 +1033,17 @@ impl DesktopApp {
     fn send_direct_at(&mut self, request: Request, origin: RequestOrigin) {
         self.analysis_progress = None;
         self.progress_events = 0;
+        // Results computed while a signature state is staged or awaiting
+        // acknowledgement are never stored under the committed context.
+        let result = match &request {
+            Request::Graph { address } | Request::Decompile { address }
+                if self.signature_change.is_none() && self.signature_replay.is_none() =>
+            {
+                self.results
+                    .binding(*address, self.local_override_state(*address))
+            }
+            _ => None,
+        };
         let Some(client) = &mut self.client else {
             return;
         };
@@ -1022,6 +1080,7 @@ impl DesktopApp {
                     revision: origin.revision,
                     byte_origin: origin.byte_origin,
                     bytes: origin.bytes,
+                    result,
                 });
             }
             Err(error) => {
@@ -1029,6 +1088,33 @@ impl DesktopApp {
                 self.status = error;
             }
         }
+    }
+
+    /// The exact local-name override records the engine receives for `function`.
+    fn local_override_state(&self, function: u64) -> String {
+        self.results.local_state(function)
+    }
+
+    fn update_result_inputs(&mut self, reason: crate::function_results::Invalidation) {
+        self.results.inputs_changed(reason);
+        let Some(info) = &self.info else {
+            return;
+        };
+        let mut functions = info.functions.clone();
+        let locals = self
+            .session
+            .as_ref()
+            .map_or_else(Vec::new, |s| s.local_renames.clone());
+        if let Some(session) = &self.session {
+            for function in &mut functions {
+                if let Some(annotation) = session.annotations.get(&function.address)
+                    && !annotation.label.is_empty()
+                {
+                    function.name.clone_from(&annotation.label);
+                }
+            }
+        }
+        self.results.update_inputs(functions, locals);
     }
 
     fn request(&mut self, request: Request, context: &egui::Context) {
@@ -1053,7 +1139,7 @@ impl DesktopApp {
             }
             return;
         }
-        if self.signature_replay.is_some() {
+        if self.signature_replay.is_some() || self.results.preparing() {
             if self.queue.len() < HISTORY_LIMIT {
                 self.queue.push_back(request);
             }
@@ -1120,7 +1206,7 @@ impl DesktopApp {
     }
 
     fn schedule_request(&mut self, request: Request) {
-        if self.signature_replay.is_some() {
+        if self.signature_replay.is_some() || self.results.preparing() {
             if self.queue.len() < HISTORY_LIMIT {
                 self.queue.push_back(request);
             }
@@ -1298,13 +1384,26 @@ impl DesktopApp {
         }
     }
 
-    fn set_call_index(&mut self, index: Option<crate::call_analysis::CallIndex>) {
+    fn set_call_index(&mut self, index: Option<Arc<crate::call_analysis::CallIndex>>) {
         self.call_index = index;
+        self.result_revision = self.result_revision.wrapping_add(1);
         self.reference_revision = self.reference_revision.wrapping_add(1);
         self.reference_rows = None;
     }
 
     fn navigate(&mut self, address: u64, record: bool, context: &egui::Context) {
+        self.navigate_to(address, None, record, context);
+    }
+
+    /// Opens the function at `address`. `focus` is an exact instruction to
+    /// select once its graph is displayed, now or when a reply arrives.
+    fn navigate_to(
+        &mut self,
+        address: u64,
+        focus: Option<u64>,
+        record: bool,
+        context: &egui::Context,
+    ) {
         self.reference_focus = None;
         self.selected_call = None;
         self.undisplayed_call = None;
@@ -1313,18 +1412,9 @@ impl DesktopApp {
         self.selected = Some(address);
         self.address = format!("{address:x}");
         self.editor_address = None;
-        self.decompiled.clear();
-        self.semantic.clear();
-        self.comment_rows_key = None;
-        self.semantic_info = SemanticInfo::default();
-        self.selected_local = None;
-        self.decompiler_rename_context = false;
-        self.pending_code_scroll = None;
-        self.pending_comment_scroll = None;
+        self.clear_decompilation();
         self.pending_listing_scroll = None;
-        self.highlighted = None;
         self.saved_analysis = false;
-        self.decompiled_lines.clear();
         if record {
             if !self.history.is_empty() {
                 self.history.truncate(self.history_index + 1);
@@ -1337,12 +1427,169 @@ impl DesktopApp {
             }
             self.history_index = self.history.len().saturating_sub(1);
         }
-        self.view = None;
+        self.graph = None;
         self.cached_graph = false;
         self.canvas = None;
-        self.listing.clear();
-        self.status = format!("Loading function {address:#x}…");
-        self.request(Request::Graph { address }, context);
+        if let Some(pc) = focus {
+            self.selected = Some(pc);
+            self.address = format!("{pc:x}");
+            self.reference_focus = Some((address, pc));
+        }
+        let _lookup_adoption = crate::performance::span("function_result_lookup_adoption");
+        let state = self.local_override_state(address);
+        let hit = if self.signature_change.is_none() {
+            self.results.lookup(address, &state)
+        } else {
+            crate::function_results::FunctionHit {
+                graph: None,
+                decompiled: None,
+            }
+        };
+        let requests = FunctionResults::miss_requests(&hit, address, self.should_auto_decompile());
+        if let Some((graph, origin)) = hit.graph {
+            self.adopt_graph(graph, origin);
+        }
+        if let Some((code, origin)) = hit.decompiled {
+            self.adopt_decompilation(code, origin);
+        }
+        // Retire queued work for superseded selections. A full hit never sends
+        // or restarts a worker, even while another request is finishing.
+        self.queue.retain(|request| {
+            !matches!(request, Request::Graph { .. } | Request::Decompile { .. })
+        });
+        for request in requests {
+            self.status = format!("Loading function {address:#x}…");
+            self.request(request, context);
+        }
+    }
+
+    /// Analysis → Refresh function: recompute both components, bypassing the store.
+    fn refresh_function(&mut self, context: &egui::Context) {
+        let Some(address) = self.view().map(|view| view.address) else {
+            return;
+        };
+        self.results.refresh(address);
+        self.result_revision = self.result_revision.wrapping_add(1);
+        self.navigate(address, false, context);
+    }
+
+    /// Decompiler Refresh: recompute only the pseudocode, bypassing the store.
+    fn refresh_decompilation(&mut self, context: &egui::Context) {
+        let Some(address) = self.view().map(|view| view.address) else {
+            return;
+        };
+        self.results
+            .refresh_decompilation(address, crate::function_results::Invalidation::Refresh);
+        self.result_revision = self.result_revision.wrapping_add(1);
+        self.clear_decompilation();
+        self.request(Request::Decompile { address }, context);
+    }
+
+    /// Shows the stored decompilation of the displayed graph, or requests it.
+    fn load_decompilation(&mut self, address: u64) {
+        let state = self.local_override_state(address);
+        if let Some((code, origin)) = self.results.lookup(address, &state).decompiled {
+            self.adopt_decompilation(code, origin);
+        } else if self.should_auto_decompile() {
+            crate::performance::event("function_result_miss_decompile", address);
+            self.schedule_request(Request::Decompile { address });
+        }
+    }
+
+    /// Drops the displayed decompilation and every selection derived from it.
+    fn clear_decompilation(&mut self) {
+        self.code = None;
+        self.semantic.clear();
+        self.comment_rows_key = None;
+        self.selected_local = None;
+        self.selected_call = None;
+        self.decompiler_rename_context = false;
+        self.pending_code_scroll = None;
+        self.pending_comment_scroll = None;
+    }
+
+    /// Shows a function graph and listing. Live replies, stored results and
+    /// project restores all adopt through here.
+    fn adopt_graph(&mut self, graph: Shared<PreparedGraph>, origin: ResultOrigin) {
+        let _adoption = crate::performance::span("function_result_adopt_graph");
+        let address = graph.address();
+        self.canvas = Some(GraphCanvas::with_geometry(graph.view(), graph.geometry()));
+        self.cached_graph = origin == ResultOrigin::Saved;
+        self.saved_analysis = origin == ResultOrigin::Saved;
+        self.graph = Some(graph);
+        self.result_revision = self.result_revision.wrapping_add(1);
+        if let Some((function, pc)) = self.signature_restore_pc.take()
+            && function == address
+        {
+            let pc = if self.listing().contains(pc) {
+                pc
+            } else {
+                address
+            };
+            self.selected = Some(pc);
+            self.address = format!("{pc:x}");
+            self.select_instruction(pc);
+            self.pending_listing_scroll = self.listing().position(pc);
+        }
+        self.comment_rows_key = None;
+        self.status = format!("Function {address:#x} ready");
+        if let Some((caller, pc)) = self.reference_focus.take()
+            && caller == address
+        {
+            self.select_instruction(pc);
+            if let Some(row) = self.listing().position(pc) {
+                self.pending_listing_scroll = Some(row);
+                if let Some(canvas) = &mut self.canvas {
+                    canvas.reveal_instruction(pc);
+                }
+            } else {
+                self.undisplayed_call = Some(pc);
+            }
+        }
+    }
+
+    /// Shows one indivisible decompilation for the displayed graph.
+    fn adopt_decompilation(&mut self, code: Shared<PreparedDecompilation>, origin: ResultOrigin) {
+        let _adoption = crate::performance::span("function_result_adopt_decompilation");
+        self.selected_local = None;
+        self.selected_call = None;
+        self.decompiler_rename_context = false;
+        self.semantic.mappings = code.mappings().clone();
+        self.comment_rows_key = None;
+        if let Some(address) = self.selected {
+            self.semantic.select_instruction(address);
+        }
+        self.saved_analysis = origin == ResultOrigin::Saved;
+        self.pending_code_scroll = self
+            .semantic
+            .ranges
+            .first()
+            .map(|range| code.lines().partition_point(|(_, end)| *end <= range.start));
+        self.pending_comment_scroll = self.selected;
+        self.status = code
+            .semantics()
+            .warnings
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "Ready".into());
+        self.code = Some(code);
+        self.result_revision = self.result_revision.wrapping_add(1);
+    }
+
+    fn view(&self) -> Option<&FunctionView> {
+        graph_view(&self.graph)
+    }
+
+    fn listing(&self) -> Listing<'_> {
+        listing_of(&self.graph)
+    }
+
+    fn decompiled(&self) -> &str {
+        code_text(&self.code)
+    }
+
+    fn semantics(&self) -> &SemanticInfo {
+        semantics_of(&self.code)
     }
 
     fn select_instruction(&mut self, address: u64) {
@@ -1355,21 +1602,21 @@ impl DesktopApp {
         self.address = format!("{address:x}");
         self.editor_address = None;
         self.semantic.select_instruction(address);
-        self.pending_code_scroll = self.semantic.ranges.first().map(|range| {
-            self.decompiled_lines
-                .partition_point(|(_, end)| *end <= range.start)
-        });
+        self.pending_code_scroll =
+            self.semantic.ranges.first().map(|range| {
+                code_lines(&self.code).partition_point(|(_, end)| *end <= range.start)
+            });
     }
 
     fn select_decompiled_byte(&mut self, byte: usize) {
         self.xref_choices = None;
         self.pending_comment_scroll = None;
         self.decompiler_rename_context = true;
-        self.selected_local = match self.semantic_info.token_at(byte).map(|t| &t.kind) {
+        self.selected_local = match self.semantics().token_at(byte).map(|t| &t.kind) {
             Some(TokenKind::Local { local }) => *local,
             _ => None,
         };
-        self.selected_call = match self.semantic_info.token_at(byte).map(|t| &t.kind) {
+        self.selected_call = match self.semantics().token_at(byte).map(|t| &t.kind) {
             Some(TokenKind::Call { target }) => Some(*target),
             _ => None,
         };
@@ -1385,7 +1632,7 @@ impl DesktopApp {
         self.selected = Some(primary);
         self.address = format!("{primary:x}");
         self.editor_address = None;
-        self.pending_listing_scroll = self.listing.iter().position(|i| i.address == primary);
+        self.pending_listing_scroll = self.listing().position(primary);
         if self.pending_listing_scroll.is_none() {
             self.status =
                 format!("Selected instruction {primary:#x} is outside the current bounded CFG");
@@ -1505,23 +1752,43 @@ impl DesktopApp {
     }
 
     fn poll_discovery(&mut self, _context: &egui::Context) {
-        let Some(job) = &self.discovery_job else {
-            return;
-        };
-        let update = match job.try_recv() {
-            Ok(update) => update,
-            Err(TryRecvError::Empty) => return,
-            Err(TryRecvError::Disconnected) => {
-                self.discovery_job = None;
-                self.discovery_running = false;
-                self.status = "Discovery adoption job failed".into();
+        let update = if let Some(update) = self.deferred_discovery.take() {
+            update
+        } else {
+            let Some(job) = &self.discovery_job else {
                 return;
+            };
+            match job.try_recv() {
+                Ok(update) => update,
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => {
+                    self.discovery_job = None;
+                    self.discovery_running = false;
+                    self.status = "Discovery adoption job failed".into();
+                    return;
+                }
             }
         };
         let _install = crate::performance::span("gui_discovery_install_filter");
         self.discovery_job = None;
         if update.generation != self.generation {
             return;
+        }
+        if let Ok(Some(publication)) = &update.publication {
+            // Release the old display owners before reserving a new publication.
+            // An in-flight save keeps its snapshot charged via its weak lease.
+            self.call_index = None;
+            self.discovery_saved = None;
+            let protect = self
+                .view()
+                .map(|view| view.address)
+                .into_iter()
+                .collect::<Vec<_>>();
+            if !self.results.retain_discovery(&publication.index, &protect) {
+                self.deferred_discovery = Some(update);
+                _context.request_repaint_after(Duration::from_millis(20));
+                return;
+            }
         }
         self.discovery = Some(update.state);
         self.discovery_saved = Some(update.saved);
@@ -1548,6 +1815,8 @@ impl DesktopApp {
                     .as_ref()
                     .is_some_and(|state| state.remaining() != 0);
                 if changed {
+                    self.update_result_inputs(crate::function_results::Invalidation::Inventory);
+                    self.result_revision = self.result_revision.wrapping_add(1);
                     self.rebuild_filter();
                 }
                 self.discovery_resumes = 0;
@@ -1566,6 +1835,7 @@ impl DesktopApp {
         if !self.discovery_running
             || self.signature_replay.is_some()
             || self.discovery_job.is_some()
+            || self.deferred_discovery.is_some()
             || self.pending.is_some()
             || self.opening.is_some()
             || !self.queue.is_empty()
@@ -1681,7 +1951,20 @@ impl DesktopApp {
     }
 
     fn poll_worker(&mut self, context: &egui::Context) {
+        if self.results.poll_inputs()
+            && let Some(address) = self.view().map(|view| view.address)
+        {
+            self.navigate_to(address, self.selected, false, context);
+        }
+        if !self.results.preparing()
+            && let Some(project) = self.deferred_restore.take()
+        {
+            self.restore_project(*project, context);
+        }
         self.poll_discovery(context);
+        if self.results.preparing() {
+            context.request_repaint_after(Duration::from_millis(10));
+        }
         // A failed/canceled edit restores the committed state once. Recovery
         // has no staged edit, so another failure cannot start a retry loop.
         if let Some(function) = self.signature_recovery.take()
@@ -1931,6 +2214,8 @@ impl DesktopApp {
                     self.undo.clear();
                     self.revision = 0;
                     self.saved_revision = 0;
+                    self.result_revision = 0;
+                    self.saved_result_revision = 0;
                     self.session = Some(Session::new(info.sha256.clone()));
                     self.session_path = None;
                     self.project_path = None;
@@ -1962,6 +2247,15 @@ impl DesktopApp {
                     info.functions = std::mem::take(&mut previous.functions);
                     info.functions_truncated = previous.functions_truncated;
                 }
+                let reset = !self.reset_names.is_empty();
+                for address in std::mem::take(&mut self.reset_names) {
+                    if let Some(function) = info.functions.iter_mut().find(|f| f.address == address)
+                    {
+                        function.name = function_at(&worker_functions, address)
+                            .map(|f| f.name.clone())
+                            .unwrap_or_else(|| format!("FUN_{address:x}"));
+                    }
+                }
                 if let Some(session) = &self.session {
                     for function in &mut info.functions {
                         if let Some(annotation) = session.annotations.get(&function.address)
@@ -1990,6 +2284,20 @@ impl DesktopApp {
                 self.worker_inventory = None;
                 self.inventory_synced = false;
                 self.info = Some(info);
+                // A replacement worker for the same verified image keeps the
+                // stored results; a newly opened binary starts empty.
+                if !opening.preserve
+                    && let Some(info) = &self.info
+                {
+                    let committed = self
+                        .session
+                        .as_ref()
+                        .map_or(&[][..], |session| session.signatures.as_slice());
+                    self.results.open(&info.sha256, committed);
+                    self.update_result_inputs(crate::function_results::Invalidation::Inventory);
+                } else if reset {
+                    self.update_result_inputs(crate::function_results::Invalidation::FunctionNames);
+                }
                 let signatures = self
                     .signature_change
                     .as_ref()
@@ -2013,7 +2321,11 @@ impl DesktopApp {
                 self.rebuild_filter();
                 self.status = "Binary loaded".into();
                 if let Some(project) = project {
-                    self.restore_project(*project, context);
+                    if self.results.preparing() {
+                        self.deferred_restore = Some(project);
+                    } else {
+                        self.restore_project(*project, context);
+                    }
                 } else if let Some(request) = opening.follow {
                     if matches!(request, Request::Discover) {
                         self.start_discovery(context);
@@ -2032,66 +2344,24 @@ impl DesktopApp {
                 }
             }
             (Request::Graph { address }, Response::Graph { view }) if view.address == address => {
+                // Superseded replies are discarded, never stored opportunistically.
                 if pending.selection != self.selection_generation
                     || pending.revision != self.revision
+                    || pending
+                        .result
+                        .as_ref()
+                        .is_some_and(|_| !self.results.current(pending.result.as_ref()))
                 {
                     return;
                 }
-                self.listing = view
-                    .blocks
-                    .iter()
-                    .flat_map(|block| block.instructions.iter().cloned())
-                    .collect();
-                self.listing.sort_by_key(|instruction| instruction.address);
-                self.listing.dedup_by_key(|instruction| instruction.address);
-                let geometry = crate::performance::span("gui_graph_geometry");
-                self.canvas = Some(GraphCanvas::new(&view));
-                geometry.finish(view.blocks.len() as u64);
-                self.cached_graph = false;
-                self.saved_analysis = false;
-                self.view = Some(view);
-                if let Some((function, pc)) = self.signature_restore_pc.take()
-                    && function == address
-                {
-                    let pc = if self
-                        .listing
-                        .iter()
-                        .any(|instruction| instruction.address == pc)
-                    {
-                        pc
-                    } else {
-                        address
-                    };
-                    self.selected = Some(pc);
-                    self.address = format!("{pc:x}");
-                    self.select_instruction(pc);
-                    self.pending_listing_scroll = self
-                        .listing
-                        .iter()
-                        .position(|instruction| instruction.address == pc);
-                }
-                self.comment_rows_key = None;
-                self.status = format!("Function {address:#x} ready");
-                if let Some((caller, pc)) = self.reference_focus.take()
-                    && caller == address
-                {
-                    self.select_instruction(pc);
-                    if let Some(row) = self
-                        .listing
-                        .iter()
-                        .position(|instruction| instruction.address == pc)
-                    {
-                        self.pending_listing_scroll = Some(row);
-                        if let Some(canvas) = &mut self.canvas {
-                            canvas.reveal_instruction(pc);
-                        }
-                    } else {
-                        self.undisplayed_call = Some(pc);
-                    }
-                }
-                if self.should_auto_decompile() {
-                    self.schedule_request(Request::Decompile { address });
-                }
+                let graph = self.results.admit_graph(
+                    pending.result.as_ref(),
+                    PreparedGraph::new(view),
+                    ResultOrigin::Computed,
+                    Some(address),
+                );
+                self.adopt_graph(graph, ResultOrigin::Computed);
+                self.load_decompilation(address);
             }
             (
                 Request::Decompile { address: expected },
@@ -2104,85 +2374,42 @@ impl DesktopApp {
             ) if address == expected => {
                 if pending.selection == self.selection_generation
                     && pending.revision == self.revision
-                    && self
-                        .view
-                        .as_ref()
-                        .is_some_and(|view| view.address == address)
+                    && self.view().is_some_and(|view| view.address == address)
+                    && (pending.result.is_none() || self.results.current(pending.result.as_ref()))
                 {
-                    if text.len() > MAX_DECOMPILED_BYTES {
-                        self.stop_worker();
-                        self.decompiled.clear();
-                        self.semantic.clear();
-                        self.comment_rows_key = None;
-                        self.semantic_info = SemanticInfo::default();
-                        self.selected_local = None;
-                        self.selected_call = None;
-                        self.decompiler_rename_context = false;
-                        self.pending_code_scroll = None;
-                        self.pending_comment_scroll = None;
-                        self.pending_listing_scroll = None;
-                        self.decompiled_lines.clear();
-                        self.highlighted = None;
-                        self.status =
-                            "Decompiler response exceeded the 2 MiB limit; analysis worker stopped"
-                                .into();
-                        return;
-                    }
                     let sections = self
                         .info
                         .as_ref()
                         .map(|i| i.sections.as_slice())
                         .unwrap_or(&[]);
-                    if let Err(error) = validate_mappings(&text, &mappings, sections) {
-                        self.stop_worker();
-                        self.decompiled.clear();
-                        self.highlighted = None;
-                        self.semantic.clear();
-                        self.comment_rows_key = None;
-                        self.decompiled_lines.clear();
-                        self.semantic_info = SemanticInfo::default();
-                        self.selected_local = None;
-                        self.selected_call = None;
-                        self.decompiler_rename_context = false;
-                        self.status = format!("Invalid decompiler source mappings: {error}");
-                        return;
-                    }
-                    self.semantic_info = semantics;
-                    self.selected_local = None;
-                    self.selected_call = None;
-                    self.decompiler_rename_context = false;
-                    self.semantic.mappings = mappings;
-                    self.comment_rows_key = None;
-                    if let Some(address) = self.selected {
-                        self.semantic.select_instruction(address);
-                    }
-                    let highlighting = crate::performance::span("gui_highlighting");
-                    self.highlighted = Some(HighlightedCode::new(&text));
-                    highlighting.finish(text.len() as u64);
-                    self.saved_analysis = false;
-                    self.decompiled = text;
-                    let mut offset = 0;
-                    self.decompiled_lines = self
-                        .decompiled
-                        .split_inclusive('\n')
-                        .take(20_000)
-                        .map(|line| {
-                            let range = (offset, offset + line.len());
-                            offset += line.len();
-                            range
-                        })
-                        .collect();
-                    self.pending_code_scroll = self.semantic.ranges.first().map(|range| {
-                        self.decompiled_lines
-                            .partition_point(|(_, end)| *end <= range.start)
-                    });
-                    self.pending_comment_scroll = self.selected;
-                    self.status = self
-                        .semantic_info
-                        .warnings
-                        .first()
-                        .cloned()
-                        .unwrap_or_else(|| "Ready".into());
+                    // Errors and malformed output fail closed and are never stored.
+                    let code = match PreparedDecompilation::validate(
+                        address, text, mappings, semantics, sections,
+                    ) {
+                        Ok(code) => code,
+                        Err(DecompilationError::Oversized) => {
+                            self.stop_worker();
+                            self.clear_decompilation();
+                            self.pending_listing_scroll = None;
+                            self.status =
+                                "Decompiler response exceeded the 2 MiB limit; analysis worker stopped"
+                                    .into();
+                            return;
+                        }
+                        Err(DecompilationError::Mappings(error)) => {
+                            self.stop_worker();
+                            self.clear_decompilation();
+                            self.status = format!("Invalid decompiler source mappings: {error}");
+                            return;
+                        }
+                    };
+                    let code = self.results.admit_decompilation(
+                        pending.result.as_ref(),
+                        code,
+                        ResultOrigin::Computed,
+                        Some(address),
+                    );
+                    self.adopt_decompilation(code, ResultOrigin::Computed);
                 }
             }
             (Request::SyncFunctions { .. }, Response::FunctionsSynced) => {}
@@ -2254,9 +2481,13 @@ impl DesktopApp {
                         self.status = self.signature_error.clone().unwrap_or_default();
                         return;
                     }
+                    self.invalidate_signature_analysis();
+                    self.result_revision = self.result_revision.wrapping_add(1);
                     if let Some(session) = &mut self.session {
                         session.signatures = change.signatures;
                         session.upgrade_version();
+                        // Only an acknowledged state becomes the result context.
+                        self.results.signatures_committed(&session.signatures);
                     }
                     if change.undone.is_none() {
                         self.undo.push_back(Edit {
@@ -2323,6 +2554,7 @@ impl DesktopApp {
                     let committed =
                         state.commit_reply(&validation, base.as_ref(), inventory_base, &mut batch);
                     commit.finish(0);
+                    let saved = Arc::new(state.save());
                     let publication = committed.map(|adopted| {
                         adopted.map(|(inventory, changed)| {
                             let _index = crate::performance::span("parent_reference_index");
@@ -2330,12 +2562,13 @@ impl DesktopApp {
                                 functions: changed.then(|| inventory.functions().to_vec()),
                                 inventory,
                                 truncated: batch.truncated,
-                                index: crate::call_analysis::CallIndex::new(state.snapshot()),
+                                index: Arc::new(crate::call_analysis::CallIndex::from_snapshot(
+                                    saved.clone(),
+                                )),
                             }
                         })
                     });
                     let saving = crate::performance::span("parent_discovery_snapshot");
-                    let saved = Arc::new(state.save());
                     saving.finish(0);
                     let _ = sender.send(DiscoveryUpdate {
                         generation,
@@ -2383,13 +2616,17 @@ impl DesktopApp {
                         " · direct references analyzed"
                     }
                 );
-                self.set_call_index(Some(crate::call_analysis::CallIndex::new(analysis)));
+                self.set_call_index(Some(Arc::new(crate::call_analysis::CallIndex::new(
+                    analysis,
+                ))));
+                self.result_revision = self.result_revision.wrapping_add(1);
                 self.cached_functions = false;
                 self.inventory_synced = false;
                 if let Some(info) = &mut self.info {
                     info.functions = functions;
                     info.functions_truncated = truncated;
                 }
+                self.update_result_inputs(crate::function_results::Invalidation::Inventory);
                 self.rebuild_filter();
             }
             (
@@ -2410,16 +2647,13 @@ impl DesktopApp {
                     let function = &mut info.functions[index];
                     function.name = name;
                 }
+                self.update_result_inputs(crate::function_results::Invalidation::FunctionNames);
                 self.rebuild_filter();
                 self.status = "Function renamed".into();
                 if self.queue.is_empty()
-                    && self.should_auto_decompile()
-                    && self
-                        .view
-                        .as_ref()
-                        .is_some_and(|view| view.address == address)
+                    && let Some(current) = self.view().map(|view| view.address)
                 {
-                    self.send_direct(Request::Decompile { address });
+                    self.navigate(current, false, context);
                 }
             }
             (
@@ -2430,6 +2664,7 @@ impl DesktopApp {
                     Request::StringsWithOptions { minimum_length } => minimum_length,
                     _ => MIN_STRING_LENGTH,
                 });
+                self.result_revision = self.result_revision.wrapping_add(1);
                 self.cached_strings = false;
                 self.strings = strings;
                 self.strings_truncated = truncated;
@@ -2448,6 +2683,7 @@ impl DesktopApp {
                 };
             }
             (Request::Crypto, Response::Crypto { matches, truncated }) => {
+                self.result_revision = self.result_revision.wrapping_add(1);
                 self.cached_crypto = false;
                 self.crypto = matches;
                 self.crypto_truncated = truncated;
@@ -2476,7 +2712,12 @@ impl DesktopApp {
         }
         // Adopt inventory before renames/navigation, then dispatch the newest
         // byte intent before starting another automatic batch or scan.
-        if self.discovery_job.is_some() || self.pending.is_some() || self.opening.is_some() {
+        if self.discovery_job.is_some()
+            || self.deferred_discovery.is_some()
+            || self.results.preparing()
+            || self.pending.is_some()
+            || self.opening.is_some()
+        {
             return;
         }
         if let Some(request) = self.queue.pop_front() {
@@ -2644,7 +2885,21 @@ impl DesktopApp {
         let Some(session) = &mut self.session else {
             return;
         };
+        let old_label = session
+            .annotations
+            .get(&address)
+            .map(|a| a.label.as_str())
+            .unwrap_or("");
+        let name_changed = old_label != annotation.label
+            && self
+                .info
+                .as_ref()
+                .is_some_and(|info| function_at(&info.functions, address).is_some());
         let before = session.annotations.insert(address, annotation);
+        if name_changed {
+            self.update_result_inputs(crate::function_results::Invalidation::FunctionNames);
+            self.result_revision = self.result_revision.wrapping_add(1);
+        }
         let function_name = self
             .info
             .as_ref()
@@ -2693,6 +2948,13 @@ impl DesktopApp {
             return;
         }
         if let Some(session) = &mut self.session {
+            let old_label = session
+                .annotations
+                .get(&edit.address)
+                .map(|a| a.label.clone())
+                .unwrap_or_default();
+            let new_label = edit.before.as_ref().map(|a| a.label.as_str()).unwrap_or("");
+            let name_changed = old_label != new_label;
             match edit.before {
                 Some(annotation) => {
                     session.annotations.insert(edit.address, annotation);
@@ -2710,11 +2972,15 @@ impl DesktopApp {
                 .filter(|label| !label.is_empty())
                 .or(edit.function_name)
                 .unwrap_or_else(|| format!("FUN_{:x}", edit.address));
-            if self.info.as_ref().is_some_and(|info| {
-                info.functions
-                    .iter()
-                    .any(|function| function.address == edit.address)
-            }) {
+            if name_changed
+                && self.info.as_ref().is_some_and(|info| {
+                    info.functions
+                        .iter()
+                        .any(|function| function.address == edit.address)
+                })
+            {
+                self.update_result_inputs(crate::function_results::Invalidation::FunctionNames);
+                self.result_revision = self.result_revision.wrapping_add(1);
                 self.request(
                     Request::Rename {
                         address: edit.address,
@@ -2744,17 +3010,17 @@ impl DesktopApp {
         ) else {
             return;
         };
+        // Project format v4 stores the displayed function's results.
         let view = self
-            .view
-            .as_ref()
+            .view()
             .map(|view| crate::project::persistable_view(view, &info.sections));
         let data = ProjectData {
             info,
             session,
             view,
-            decompiled: (!self.decompiled.is_empty()).then(|| self.decompiled.clone()),
-            mappings: self.semantic.mappings.clone(),
-            semantics: self.semantic_info.clone(),
+            decompiled: (!self.decompiled().is_empty()).then(|| self.decompiled().to_owned()),
+            mappings: self.semantic.mappings.to_vec(),
+            semantics: self.semantics().clone(),
             strings: self.strings.clone(),
             strings_truncated: self.strings_truncated,
             crypto: self.crypto.clone(),
@@ -2764,6 +3030,7 @@ impl DesktopApp {
         };
         let generation = self.generation;
         let revision = self.revision;
+        let result_revision = self.result_revision;
         let previous = (!save_as).then(|| self.project_path.clone()).flatten();
         let embedded = self.embed_binary;
         let sender = self.file_dialogs.sender();
@@ -2777,6 +3044,7 @@ impl DesktopApp {
             FileEvent::ProjectSaved {
                 generation,
                 revision,
+                result_revision,
                 embedded,
                 result,
             }
@@ -2808,7 +3076,11 @@ impl DesktopApp {
         self.crypto_truncated = data.crypto_truncated;
         self.rebuild_string_filter();
         if let Some(saved) = data.discovery {
-            self.set_call_index(discovery_index);
+            if let Some(index) = discovery_index
+                && self.results.retain_discovery(&index, &[])
+            {
+                self.set_call_index(Some(index));
+            }
             self.discovery_summary = Some(discovery_summary(
                 "Saved discovery",
                 saved.report.functions_examined,
@@ -2839,44 +3111,49 @@ impl DesktopApp {
             })
         }) {
             let address = view.address;
-            self.listing = view
-                .blocks
-                .iter()
-                .flat_map(|block| block.instructions.iter().cloned())
-                .collect();
-            self.listing.sort_by_key(|i| i.address);
-            self.listing.dedup_by_key(|i| i.address);
-            self.canvas = Some(GraphCanvas::new(&view));
-            self.view = Some(view);
-            self.comment_rows_key = None;
-            self.saved_analysis = true;
-            self.cached_graph = true;
+            // Saved results enter the store with their provenance, so the
+            // marker stays visible on revisits until each is recomputed.
+            let binding = self
+                .results
+                .binding(address, self.local_override_state(address));
+            let graph = self.results.admit_graph(
+                binding.as_ref(),
+                PreparedGraph::new(view),
+                ResultOrigin::Saved,
+                Some(address),
+            );
+            self.adopt_graph(graph, ResultOrigin::Saved);
             self.history.push(address);
             self.history_index = 0;
             self.selected = selected;
             self.address = format!("{:x}", selected.unwrap_or(address));
-            if let Some(text) = data.decompiled {
-                self.semantic_info = data.semantics;
-                self.semantic.mappings = data.mappings;
-                self.comment_rows_key = None;
-                if let Some(address) = selected {
-                    self.semantic.select_instruction(address);
-                }
-                self.highlighted = Some(HighlightedCode::new(&text));
-                let mut offset = 0;
-                self.decompiled_lines = text
-                    .split_inclusive('\n')
-                    .take(20_000)
-                    .map(|line| {
-                        let range = (offset, offset + line.len());
-                        offset += line.len();
-                        range
-                    })
-                    .collect();
-                self.decompiled = text;
+            let sections = self
+                .info
+                .as_ref()
+                .map(|info| info.sections.as_slice())
+                .unwrap_or(&[]);
+            let code = data.decompiled.and_then(|text| {
+                PreparedDecompilation::validate(
+                    address,
+                    text,
+                    data.mappings,
+                    data.semantics,
+                    sections,
+                )
+                .ok()
+            });
+            if let Some(code) = code {
+                let code = self.results.admit_decompilation(
+                    binding.as_ref(),
+                    code,
+                    ResultOrigin::Saved,
+                    Some(address),
+                );
+                self.adopt_decompilation(code, ResultOrigin::Saved);
             } else if self.should_auto_decompile() {
                 self.schedule_request(Request::Decompile { address });
             }
+            self.saved_result_revision = self.result_revision;
             self.status = "Project opened — showing saved analysis; use Analysis → Refresh function to recompute".into();
         } else if let Some(address) = selected {
             self.navigate(address, true, context);
@@ -2899,11 +3176,11 @@ impl DesktopApp {
         self.file_task(context, move || {
             let result = (|| {
                 let project = ProjectData::load(&project_path)?;
-                let discovery_index = project
-                    .data
-                    .discovery
-                    .as_ref()
-                    .map(|saved| crate::call_analysis::CallIndex::new(saved.report.clone()));
+                let discovery_index = project.data.discovery.as_ref().map(|saved| {
+                    Arc::new(crate::call_analysis::CallIndex::from_snapshot(
+                        saved.clone(),
+                    ))
+                });
                 let binary_path = if let Some(binary) = &project.binary {
                     binary.path().to_owned()
                 } else {
@@ -3065,6 +3342,7 @@ impl DesktopApp {
             FileEvent::ProjectSaved {
                 generation,
                 revision,
+                result_revision,
                 embedded,
                 result,
             } if generation == self.generation => match result {
@@ -3072,6 +3350,7 @@ impl DesktopApp {
                     self.project_path = Some(path);
                     self.embed_binary = embedded;
                     self.saved_revision = revision;
+                    self.saved_result_revision = result_revision;
                     self.status = "Project saved (.grproj)".into();
                     self.finish_save(context);
                 }
@@ -3122,12 +3401,55 @@ impl DesktopApp {
                 }
                 match result {
                     Ok(Some((session, path))) => {
-                        let function = self.view.as_ref().map(|view| view.address);
+                        let function = self.view().map(|view| view.address);
                         let selected_pc = self.selected;
                         let signature_changed = self.session.as_ref().is_none_or(|old| {
                             signatures::state_digest(&old.signatures)
                                 != signatures::state_digest(&session.signatures)
                         });
+                        let label_projection = |notes: &Session| {
+                            notes
+                                .annotations
+                                .iter()
+                                .filter(|(address, a)| {
+                                    !a.label.is_empty()
+                                        && self.info.as_ref().is_some_and(|info| {
+                                            function_at(&info.functions, **address).is_some()
+                                        })
+                                })
+                                .map(|(&address, a)| (address, a.label.clone()))
+                                .collect::<BTreeMap<_, _>>()
+                        };
+                        let old_names = self
+                            .session
+                            .as_ref()
+                            .map(&label_projection)
+                            .unwrap_or_default();
+                        let new_names = label_projection(&session);
+                        let names_changed = old_names != new_names;
+                        self.reset_names.extend(
+                            old_names
+                                .keys()
+                                .filter(|address| !new_names.contains_key(address))
+                                .copied(),
+                        );
+                        let selected_locals_changed = function.is_some_and(|function| {
+                            let projection = |session: &Session| {
+                                session
+                                    .local_renames
+                                    .iter()
+                                    .filter(|r| r.identity.function == function)
+                                    .cloned()
+                                    .collect::<Vec<_>>()
+                            };
+                            self.session
+                                .as_ref()
+                                .is_none_or(|old| projection(old) != projection(&session))
+                        });
+                        let locals_changed = self
+                            .session
+                            .as_ref()
+                            .is_none_or(|old| old.local_renames != session.local_renames);
                         self.session = Some(session);
                         self.session_path = Some(path);
                         self.undo.clear();
@@ -3136,20 +3458,17 @@ impl DesktopApp {
                             self.saved_revision = self.revision;
                         }
                         self.editor_address = None;
-                        self.applied_names.clear();
-                        self.decompiled.clear();
-                        self.semantic.clear();
-                        self.comment_rows_key = None;
-                        self.semantic_info = SemanticInfo::default();
-                        self.selected_local = None;
-                        self.selected_call = None;
-                        self.decompiler_rename_context = false;
-                        self.pending_code_scroll = None;
-                        self.pending_comment_scroll = None;
-                        self.pending_listing_scroll = None;
-                        self.highlighted = None;
-                        self.decompiled_lines.clear();
+                        if names_changed || locals_changed {
+                            self.update_result_inputs(if names_changed {
+                                crate::function_results::Invalidation::FunctionNames
+                            } else {
+                                crate::function_results::Invalidation::LocalNames
+                            });
+                        }
                         if signature_changed {
+                            if let Some(session) = &self.session {
+                                self.results.signatures_committed(&session.signatures);
+                            }
                             self.invalidate_signature_analysis();
                             self.signature_restore_pc = function.zip(selected_pc);
                         }
@@ -3157,13 +3476,23 @@ impl DesktopApp {
                         self.rebuild_filter();
                         // A fresh engine also removes names absent from the newly
                         // loaded sidecar; current-function labels are replayed.
-                        if let Some(path) = self.binary_path.clone() {
+                        if (signature_changed || names_changed)
+                            && let Some(path) = self.binary_path.clone()
+                        {
+                            self.clear_decompilation();
                             self.start_open(
                                 path,
                                 true,
                                 function.map(|address| Request::Graph { address }),
                                 context,
                             );
+                        } else if selected_locals_changed && let Some(function) = function {
+                            self.results.refresh_decompilation(
+                                function,
+                                crate::function_results::Invalidation::LocalNames,
+                            );
+                            self.clear_decompilation();
+                            self.request(Request::Decompile { address: function }, context);
                         }
                     }
                     Ok(None) => {}
@@ -3313,7 +3642,7 @@ impl DesktopApp {
         }
         if let Some(local) = self
             .selected_local
-            .and_then(|i| self.semantic_info.locals.get(i))
+            .and_then(|i| semantics_of(&self.code).locals.get(i))
         {
             if local.signature_parameter.is_some() {
                 self.status = "Parameter names are edited in the function signature".into();
@@ -3419,21 +3748,10 @@ impl DesktopApp {
     /// immutable byte scans and exact inventory; every engine result is rebuilt.
     fn invalidate_signature_analysis(&mut self) {
         self.selection_generation = self.selection_generation.wrapping_add(1);
-        self.view = None;
+        self.graph = None;
         self.canvas = None;
-        self.listing.clear();
-        self.decompiled.clear();
-        self.decompiled_lines.clear();
-        self.highlighted = None;
-        self.semantic.clear();
-        self.semantic_info = SemanticInfo::default();
-        self.selected_local = None;
-        self.selected_call = None;
-        self.decompiler_rename_context = false;
-        self.pending_code_scroll = None;
-        self.pending_comment_scroll = None;
+        self.clear_decompilation();
         self.pending_listing_scroll = None;
-        self.comment_rows_key = None;
         self.comment_rows = CommentRows::default();
         self.comment_owners.clear();
         self.cached_graph = false;
@@ -3484,11 +3802,18 @@ impl DesktopApp {
         signatures.sort_by_key(|s| s.function);
         signatures::validate_signatures(&signatures)?;
         let path = self.binary_path.clone().ok_or("No binary is available")?;
-        let restore_function = self.view.as_ref().map_or(function, |view| view.address);
+        let restore_function = self.view().map_or(function, |view| view.address);
         let restore_pc = self.selected.map(|pc| (restore_function, pc));
         self.stop_worker();
         self.signature_recovery = None;
-        self.invalidate_signature_analysis();
+        // Pending signature edits cannot destroy committed discovery evidence.
+        // Clear the displayed function while keeping committed store/publication
+        // state until the worker acknowledges the complete new signature state.
+        self.selection_generation = self.selection_generation.wrapping_add(1);
+        self.graph = None;
+        self.canvas = None;
+        self.clear_decompilation();
+        self.pending_listing_scroll = None;
         self.signature_restore_pc = restore_pc;
         self.start_open(
             path,
@@ -3523,7 +3848,7 @@ impl DesktopApp {
         let Some(info) = &self.info else {
             return;
         };
-        let Some(function) = self.view.as_ref().map(|view| view.address) else {
+        let Some(function) = self.view().map(|view| view.address) else {
             return;
         };
         let Some(entry) = function_at(&info.functions, function) else {
@@ -3554,7 +3879,7 @@ impl DesktopApp {
                     .collect(),
                 Vec::new(),
             )
-        } else if let Some(inferred) = &self.semantic_info.prototype {
+        } else if let Some(inferred) = &semantics_of(&self.code).prototype {
             (
                 inferred.return_type,
                 inferred
@@ -3616,10 +3941,7 @@ impl DesktopApp {
         if editor.generation != self.generation
             || editor.revision != self.revision
             || editor.selection != self.selection_generation
-            || self
-                .view
-                .as_ref()
-                .is_none_or(|v| v.address != editor.function)
+            || self.view().is_none_or(|v| v.address != editor.function)
         {
             return;
         }
@@ -3652,21 +3974,18 @@ impl DesktopApp {
         crate::semantic::validate_name(name)?;
         if identity.engine != crate::semantic::local_fingerprint(&self.signature_context())
             || !self
-                .semantic_info
+                .semantics()
                 .locals
                 .iter()
                 .any(|v| &v.identity == identity)
-            || self
-                .view
-                .as_ref()
-                .is_none_or(|v| v.address != identity.function)
+            || self.view().is_none_or(|v| v.address != identity.function)
         {
             return Err(
                 "Local identity is no longer present; refresh and select the variable again".into(),
             );
         }
         if self
-            .semantic_info
+            .semantics()
             .locals
             .iter()
             .any(|v| &v.identity == identity && v.signature_parameter.is_some())
@@ -3674,7 +3993,7 @@ impl DesktopApp {
             return Err("This parameter name belongs to the function signature. Use Edit signature to rename it.".into());
         }
         if self
-            .semantic_info
+            .semantics()
             .locals
             .iter()
             .any(|v| v.identity != *identity && v.name == name)
@@ -3716,19 +4035,13 @@ impl DesktopApp {
         Ok(())
     }
 
+    /// A local-name edit or its undo changes only this function's pseudocode.
     fn refresh_local_function(&mut self, function: u64, context: &egui::Context) {
-        if self.view.as_ref().is_some_and(|v| v.address == function) {
-            self.decompiled.clear();
-            self.decompiled_lines.clear();
-            self.highlighted = None;
-            self.semantic.clear();
-            self.semantic_info = SemanticInfo::default();
-            self.selected_local = None;
-            self.selected_call = None;
-            self.decompiler_rename_context = false;
-            self.pending_code_scroll = None;
-            self.pending_comment_scroll = None;
-            self.comment_rows_key = None;
+        self.update_result_inputs(crate::function_results::Invalidation::LocalNames);
+        self.results
+            .refresh_decompilation(function, crate::function_results::Invalidation::LocalNames);
+        if self.view().is_some_and(|v| v.address == function) {
+            self.clear_decompilation();
             self.request(Request::Decompile { address: function }, context);
         }
     }
@@ -3806,18 +4119,8 @@ impl DesktopApp {
         self.editor_address = None;
         self.rebuild_filter();
         if function {
-            self.decompiled.clear();
-            self.semantic.clear();
-            self.comment_rows_key = None;
-            self.semantic_info = SemanticInfo::default();
-            self.selected_local = None;
-            self.selected_call = None;
-            self.decompiler_rename_context = false;
-            self.pending_code_scroll = None;
-            self.pending_comment_scroll = None;
+            self.clear_decompilation();
             self.pending_listing_scroll = None;
-            self.decompiled_lines.clear();
-            self.highlighted = None;
             self.request(
                 Request::Rename {
                     address,
@@ -4071,10 +4374,8 @@ impl DesktopApp {
                         ui.close();
                     }
                     ui.separator();
-                    if ui.add_enabled(self.view.is_some(), egui::Button::new("Refresh function")).clicked() {
-                        if let Some(address) = self.view.as_ref().map(|view| view.address) {
-                            self.navigate(address, false, &context);
-                        }
+                    if ui.add_enabled(self.graph.is_some(), egui::Button::new("Refresh function")).clicked() {
+                        self.refresh_function(&context);
                         ui.close();
                     }
                     for (label, request) in [
@@ -4258,7 +4559,7 @@ impl DesktopApp {
                                             if ui
                                                 .add(
                                                     egui::Button::selectable(
-                                                        self.view.as_ref().is_some_and(|v| {
+                                                        self.view().is_some_and(|v| {
                                                             v.address == item.address
                                                         }),
                                                         crop(&item.name, 100),
@@ -4441,7 +4742,7 @@ impl DesktopApp {
         let mut navigate = None;
         let mut xrefs = None;
         let mut annotate = None;
-        let displayed = self.view.as_ref().map(|view| view.address);
+        let displayed = self.view().map(|view| view.address);
         theme::rows::<()>(
             ui,
             "function-list",
@@ -4514,31 +4815,33 @@ impl DesktopApp {
         if self.comment_rows_key == Some(key) {
             return;
         }
+        let listing = listing_of(&self.graph);
+        let lines = code_lines(&self.code);
         self.comment_rows = if let Some(session) = &self.session {
             self.annotation_browser
                 .update(self.generation, self.revision, &session.annotations);
             CommentRows::new(
-                self.view.as_ref().map(|view| view.address),
-                &self.decompiled_lines,
+                graph_view(&self.graph).map(|view| view.address),
+                lines,
                 &self.semantic.mappings,
-                &self.listing,
+                listing.iter(),
                 &session.annotations,
             )
         } else {
             CommentRows::new(
                 None,
-                &self.decompiled_lines,
+                lines,
                 &self.semantic.mappings,
-                &self.listing,
+                listing.iter(),
                 &BTreeMap::new(),
             )
         };
-        if let Some(view) = &self.view {
+        if let Some(view) = graph_view(&self.graph) {
             for &address in &self.comment_rows.addresses {
                 self.comment_owners.insert(address, view.address);
             }
             if let Some(session) = &self.session {
-                for instruction in &self.listing {
+                for instruction in listing.iter() {
                     if session.annotations.contains_key(&instruction.address) {
                         self.comment_owners
                             .insert(instruction.address, view.address);
@@ -4546,10 +4849,9 @@ impl DesktopApp {
                 }
             }
         }
-        let digits = theme::address_digits(self.listing.last().map_or(0, |i| i.address));
+        let digits = theme::address_digits(listing.last().map_or(0, |i| i.address));
         let operands = theme::listing_columns(digits)[3];
-        self.listing_chars = self
-            .listing
+        self.listing_chars = listing
             .iter()
             .map(|instruction| {
                 let comment = self
@@ -4566,13 +4868,11 @@ impl DesktopApp {
             .rows
             .iter()
             .map(|row| match *row {
-                CodeRow::Source(index) => {
-                    self.decompiled_lines.get(index).map_or(0, |&(start, end)| {
-                        self.decompiled
-                            .get(start..end)
-                            .map_or(0, |line| line.chars().take(2001).count())
-                    })
-                }
+                CodeRow::Source(index) => lines.get(index).map_or(0, |&(start, end)| {
+                    code_text(&self.code)
+                        .get(start..end)
+                        .map_or(0, |line| line.chars().take(2001).count())
+                }),
                 CodeRow::Comment(address) => self
                     .annotation_browser
                     .comments
@@ -4609,14 +4909,10 @@ impl DesktopApp {
         self.update_comment_rows();
         let explicit = owner.is_some();
         let current_owner = self
-            .view
-            .as_ref()
+            .view()
             .filter(|view| {
                 address == view.address
-                    || self
-                        .listing
-                        .binary_search_by_key(&address, |i| i.address)
-                        .is_ok()
+                    || self.listing().contains(address)
                     || self
                         .semantic
                         .mappings
@@ -4632,12 +4928,9 @@ impl DesktopApp {
             // Capture the exact departure selection, including an instruction
             // reached by a single click, for predictable Back/Forward behavior.
             if let Some(selected) = self.selected {
-                if let Some(view) = &self.view
+                if let Some(view) = graph_view(&self.graph)
                     && (selected == view.address
-                        || self
-                            .listing
-                            .binary_search_by_key(&selected, |i| i.address)
-                            .is_ok()
+                        || listing_of(&self.graph).contains(selected)
                         || self
                             .semantic
                             .mappings
@@ -4691,9 +4984,9 @@ impl DesktopApp {
         if record || !matches!(self.tab, Tab::Listing | Tab::Graph) {
             self.tab = Tab::Listing;
         }
-        if self.view.as_ref().is_some_and(|view| view.address == owner) {
+        if self.view().is_some_and(|view| view.address == owner) {
             self.select_instruction(address);
-            self.pending_listing_scroll = self.listing.iter().position(|i| i.address == address);
+            self.pending_listing_scroll = self.listing().position(address);
             if let Some(canvas) = &mut self.canvas {
                 canvas.reveal_instruction(address);
             }
@@ -4702,10 +4995,9 @@ impl DesktopApp {
                 self.undisplayed_call = self.pending_listing_scroll.is_none().then_some(address);
             }
         } else {
-            self.navigate(owner, false, context);
-            self.selected = Some(address);
-            self.address = format!("{address:x}");
-            self.reference_focus = Some((owner, address));
+            // The exact destination is bound before lookup, so a stored
+            // result selects it as precisely as a delayed reply would.
+            self.navigate_to(owner, Some(address), false, context);
         }
     }
 
@@ -4780,7 +5072,7 @@ impl DesktopApp {
     }
 
     fn decompiler_call_target(&self, byte: usize) -> Option<u64> {
-        match self.semantic_info.token_at(byte)?.kind {
+        match self.semantics().token_at(byte)?.kind {
             TokenKind::Call { target } => Some(target),
             _ => None,
         }
@@ -4795,21 +5087,14 @@ impl DesktopApp {
                 .on_hover_text("Copy full pseudocode")
                 .clicked()
             {
-                context.copy_text(self.decompiled.clone());
+                context.copy_text(self.decompiled().to_owned());
             }
-            if ui.small_button("Refresh").clicked()
-                && let Some(view) = &self.view
-            {
-                self.request(
-                    Request::Decompile {
-                        address: view.address,
-                    },
-                    &context,
-                );
+            if ui.small_button("Refresh").clicked() {
+                self.refresh_decompilation(&context);
             }
             if ui
                 .add_enabled(
-                    self.view.is_some() && self.signature_replay.is_none(),
+                    self.graph.is_some() && self.signature_replay.is_none(),
                     egui::Button::new("Signature…").small(),
                 )
                 .on_hover_text("Edit return type, ordered parameters and current image ABI")
@@ -4818,15 +5103,13 @@ impl DesktopApp {
                 self.begin_signature_editor();
             }
             ui.checkbox(&mut self.auto_decompile, "Auto");
-            if !self.semantic_info.warnings.is_empty() {
+            let warnings = &semantics_of(&self.code).warnings;
+            if !warnings.is_empty() {
                 ui.colored_label(
                     theme::WARNING,
-                    format!(
-                        "{} local name(s) not applied",
-                        self.semantic_info.warnings.len()
-                    ),
+                    format!("{} local name(s) not applied", warnings.len()),
                 )
-                .on_hover_text(self.semantic_info.warnings.join("\n"));
+                .on_hover_text(warnings.join("\n"));
             }
             if self.saved_analysis {
                 ui.weak("Saved analysis").on_hover_text("Cached results from this project. Refresh to recompute with the analysis engine.");
@@ -4838,7 +5121,7 @@ impl DesktopApp {
         if self.signature_replay.is_some() {
             ui.weak("Signature state pending worker verification…");
         }
-        if let Some(view) = &self.view {
+        if let Some(view) = graph_view(&self.graph) {
             let entry = view.address;
             let function = self
                 .info
@@ -4847,7 +5130,7 @@ impl DesktopApp {
             let name = function.map(|f| f.name.as_str()).unwrap_or("function");
             let row = ui.horizontal(|ui| {
                 ui.label(
-                    RichText::new(format!("{}  {:x}", crop(name, 100), view.address))
+                    RichText::new(format!("{}  {:x}", crop(name, 100), entry))
                         .monospace()
                         .color(theme::BLUE),
                 )
@@ -4891,11 +5174,11 @@ impl DesktopApp {
                 } else {
                     "Applied signature override"
                 });
-            } else if self.semantic_info.prototype.is_some() {
+            } else if self.semantics().prototype.is_some() {
                 ui.weak("Inferred signature");
             }
         }
-        if self.decompiled.is_empty() {
+        if self.code.is_none() {
             if self
                 .info
                 .as_ref()
@@ -4930,10 +5213,7 @@ impl DesktopApp {
         let glyph = theme::glyph_width(ui);
         theme::rows::<()>(
             ui,
-            (
-                "decompiler-text",
-                self.view.as_ref().map(|view| view.address),
-            ),
+            ("decompiler-text", self.view().map(|view| view.address)),
             self.comment_rows.rows.len(),
             CODE_ROW_HEIGHT,
             self.code_chars as f32 * glyph + 12.0,
@@ -4979,17 +5259,17 @@ impl DesktopApp {
                             return;
                         }
                     };
-                    let (start, end) = self.decompiled_lines[index];
-                    let line = self.decompiled[start..end].trim_end_matches(['\n', '\r']);
+                    let Some(code) = self.code.as_deref() else {
+                        return;
+                    };
+                    let (start, end) = code.lines()[index];
+                    let line = code.text()[start..end].trim_end_matches(['\n', '\r']);
                     let visible = line
                         .char_indices()
                         .nth(2000)
                         .map_or(line.len(), |(at, _)| at);
-                    let Some(highlighted) = &self.highlighted else {
-                        return;
-                    };
-                    let mut job = highlighted.selected_line_job(
-                        &self.decompiled,
+                    let mut job = code.highlighted().selected_line_job(
+                        code.text(),
                         start..start + visible,
                         13.0,
                         &self.semantic.ranges,
@@ -5041,11 +5321,11 @@ impl DesktopApp {
                     // so capture the clicked token and its exact targets once.
                     let menu_id = response.id.with("decompiler-menu");
                     if response.secondary_clicked() {
-                        let token = pointer_byte.and_then(|byte| self.semantic_info.token_at(byte));
+                        let token = pointer_byte.and_then(|byte| self.semantics().token_at(byte));
                         let local = token
                             .filter(|t| matches!(t.kind, TokenKind::Local { .. }))
                             .cloned();
-                        let view = self.info.as_ref().zip(self.view.as_ref());
+                        let view = self.info.as_ref().zip(self.view());
                         let targets = match (token.map(|t| &t.kind), pointer_byte, view) {
                             (Some(TokenKind::Call { target }), _, _) => {
                                 TargetSet::single(XrefTarget {
@@ -5055,7 +5335,7 @@ impl DesktopApp {
                             }
                             (_, Some(byte), Some(view)) => crate::xrefs::instruction_targets(
                                 Some(view),
-                                self.call_index.as_ref(),
+                                self.call_index.as_deref(),
                                 view.1.address,
                                 self.semantic.addresses_at(byte).iter().copied(),
                             ),
@@ -5072,7 +5352,7 @@ impl DesktopApp {
                         .data(|d| d.get_temp::<DecompilerMenu>(menu_id))
                         .filter(|menu| menu.key == self.xref_key());
                     if let Some(menu) = menu {
-                        let function = self.view.as_ref().map(|view| view.address);
+                        let function = self.view().map(|view| view.address);
                         response.context_menu(|ui| {
                             if let Some(token) = &menu.local {
                                 if matches!(token.kind, TokenKind::Local { local: Some(_) }) {
@@ -5100,7 +5380,7 @@ impl DesktopApp {
             self.open_comment(address);
         } else if let Some(address) = select_comment {
             self.select_instruction(address);
-            self.pending_listing_scroll = self.listing.iter().position(|i| i.address == address);
+            self.pending_listing_scroll = self.listing().position(address);
             if let Some(canvas) = &mut self.canvas {
                 canvas.reveal_instruction(address);
             }
@@ -5110,7 +5390,7 @@ impl DesktopApp {
         } else if let Some(byte) = select_code {
             self.select_decompiled_byte(byte);
             if matches!(
-                self.semantic_info.token_at(byte).map(|t| &t.kind),
+                self.semantics().token_at(byte).map(|t| &t.kind),
                 Some(TokenKind::Local { local: None })
             ) {
                 self.status =
@@ -5133,14 +5413,13 @@ impl DesktopApp {
                 .map(|annotation| annotation.comment.clone())
                 .unwrap_or_default();
             self.name_edit = self
-                .view
-                .as_ref()
+                .view()
                 .and_then(|view| function_at(&self.info.as_ref()?.functions, view.address))
                 .map(|function| function.name.clone())
                 .unwrap_or_default();
         }
         ui.label(format!("Selected address {address:#x}"));
-        if let Some(function) = self.view.as_ref().map(|view| view.address) {
+        if let Some(function) = self.view().map(|view| view.address) {
             ui.label(format!("Function {function:#x}"));
             ui.add(
                 TextEdit::singleline(&mut self.name_edit)
@@ -5249,7 +5528,7 @@ impl DesktopApp {
             .info
             .as_ref()
             .is_some_and(|info| !crate::call_analysis::code_address(info, target.address));
-        self.reference_data = match self.call_index.as_ref() {
+        self.reference_data = match self.call_index.as_deref() {
             _ if target.kind.prefers_data() || data_address => true,
             Some(index) => match crate::xrefs::counts(index, target.address) {
                 (0, data) => data > 0,
@@ -5276,14 +5555,14 @@ impl DesktopApp {
         } else {
             self.semantic.addresses.iter().copied().collect()
         };
-        if let Some(view) = &self.view {
+        if let Some(view) = self.view() {
             set = crate::xrefs::instruction_targets(
                 self.info.as_ref().map(|info| (info, view)),
-                self.call_index.as_ref(),
+                self.call_index.as_deref(),
                 view.address,
                 pcs.iter().copied().filter(|pc| {
                     *pc == view.address
-                        || self.listing.binary_search_by_key(pc, |i| i.address).is_ok()
+                        || self.listing().contains(*pc)
                         || self
                             .semantic
                             .mappings
@@ -5293,7 +5572,7 @@ impl DesktopApp {
             );
         }
         if set.targets.is_empty() {
-            let function = self.view.as_ref().map(|view| view.address);
+            let function = self.view().map(|view| view.address);
             if let Some(address) = self.selected.or(function) {
                 let entry = Some(address) == function
                     || self
@@ -5422,7 +5701,7 @@ impl DesktopApp {
                     .on_hover_text("Accesses to later bytes, address-only uses and loaded pointers are not recorded by this analysis.");
             }
             Some((target.address, true))
-        } else if let Some(function) = self.view.as_ref().map(|view| view.address) {
+        } else if let Some(function) = self.view().map(|view| view.address) {
             let name = self
                 .reference_name(function)
                 .map_or(String::new(), |name| format!("  {}", crop(name, 80)));
@@ -5936,7 +6215,7 @@ impl DesktopApp {
             Tab::Graph => {
                 let mut navigate = None;
                 let mut xrefs = None;
-                if let Some(view) = &self.view {
+                if let Some(view) = graph_view(&self.graph) {
                     for warning in view.warnings.iter().take(3) {
                         ui.colored_label(theme::WARNING, warning);
                     }
@@ -5995,7 +6274,7 @@ impl DesktopApp {
                             (self.generation, self.revision),
                             &self.annotation_browser.comments,
                         );
-                        let call_index = self.call_index.as_ref();
+                        let call_index = self.call_index.as_deref();
                         let info = self.info.as_ref();
                         let menu = |ui: &mut egui::Ui, pc: Option<u64>| {
                             let call = pc.and_then(|pc| {
@@ -6060,10 +6339,11 @@ impl DesktopApp {
                     });
                     return;
                 }
-                let Some(view) = &self.view else {
+                let Some(view) = graph_view(&self.graph) else {
                     theme::empty_state(ui, "Select a function");
                     return;
                 };
+                let listing = listing_of(&self.graph);
                 let name = self
                     .info
                     .as_ref()
@@ -6085,7 +6365,7 @@ impl DesktopApp {
                         ui.close();
                     }
                 });
-                let digits = theme::address_digits(self.listing.last().map_or(0, |i| i.address));
+                let digits = theme::address_digits(listing.last().map_or(0, |i| i.address));
                 let columns = theme::listing_columns(digits);
                 let glyph = theme::glyph_width(ui);
                 let (header, _) = ui.allocate_exact_size(
@@ -6100,12 +6380,12 @@ impl DesktopApp {
                 let (_, output) = theme::rows::<()>(
                     ui,
                     ("instruction-list", entry),
-                    self.listing.len(),
+                    listing.len(),
                     theme::ROW_HEIGHT,
                     self.listing_chars as f32 * glyph + 12.0,
                     reveal,
                     |ui, index, rect| {
-                        let instruction = &self.listing[index];
+                        let instruction = listing.get(index)?;
                         let response = theme::row_response(
                             ui,
                             ui.scope_id().with(("listing-row", instruction.address)),
@@ -6194,7 +6474,7 @@ impl DesktopApp {
                             ui.separator();
                             let targets = crate::xrefs::instruction_targets(
                                 self.info.as_ref().map(|info| (info, view)),
-                                self.call_index.as_ref(),
+                                self.call_index.as_deref(),
                                 view.address,
                                 [instruction.address],
                             );
@@ -6666,8 +6946,8 @@ impl eframe::App for DesktopApp {
         self.draw(ui);
         crate::performance::navigation_frame(
             self.selection_generation,
-            self.view.is_some() && matches!(self.tab, Tab::Graph | Tab::Listing),
-            !self.decompiled.is_empty(),
+            self.view().is_some() && matches!(self.tab, Tab::Graph | Tab::Listing),
+            !self.decompiled().is_empty(),
         );
         frame.finish(0);
         #[cfg(feature = "capture")]
@@ -6677,6 +6957,114 @@ impl eframe::App for DesktopApp {
 
 #[cfg(feature = "capture")]
 impl DesktopApp {
+    fn capture_cache_check(
+        &mut self,
+        check: &mut crate::capture::CacheCheck,
+        context: &egui::Context,
+    ) -> bool {
+        let a = check.a;
+        let b = check.b;
+        eprintln!("native cache check step {}", check.step);
+        match check.step {
+            0 => self.navigate(a, true, context),
+            1 => {
+                assert_eq!(self.view().unwrap().address, a);
+                assert!(!self.decompiled().is_empty());
+                check.epoch = self.worker_epoch;
+                check.graph = self.graph.clone();
+                check.code = self.code.clone();
+                let (byte, pc) = self
+                    .semantic
+                    .mappings
+                    .iter()
+                    .find_map(|m| {
+                        m.addresses
+                            .iter()
+                            .find(|&&pc| pc != a && self.listing().contains(pc))
+                            .map(|&pc| (m.start, pc))
+                    })
+                    .expect("genuine mapped instruction");
+                self.select_decompiled_byte(byte);
+                assert!(self.semantic.addresses.contains(&pc));
+                self.select_instruction(pc);
+                assert!(!self.semantic.ranges.is_empty());
+                check.pc = pc;
+                self.navigate_location(pc, Some(a), true, context);
+                self.navigate(b, true, context);
+            }
+            2 => {
+                assert_eq!(self.view().unwrap().address, b);
+                self.navigate_location(check.pc, Some(a), true, context);
+                assert!(Arc::ptr_eq(
+                    self.code.as_ref().unwrap(),
+                    check.code.as_ref().unwrap()
+                ));
+                assert!(Arc::ptr_eq(
+                    self.graph.as_ref().unwrap(),
+                    check.graph.as_ref().unwrap()
+                ));
+                assert!(self.pending.is_none() && self.queue.is_empty());
+                assert_eq!(self.selected, Some(check.pc));
+                assert_eq!(self.worker_epoch, check.epoch);
+            }
+            3 => {
+                self.history_step(false, context);
+                assert_eq!(self.view().unwrap().address, b);
+                assert!(self.pending.is_none() && self.queue.is_empty());
+            }
+            4 => {
+                self.history_step(true, context);
+                assert_eq!(self.view().unwrap().address, a);
+                assert_eq!(self.selected, Some(check.pc));
+                assert!(self.pending.is_none() && self.queue.is_empty());
+                self.tab = Tab::Graph;
+            }
+            5 => self.refresh_function(context),
+            6 => {
+                assert_eq!(self.view().unwrap().address, a);
+                assert!(!Arc::ptr_eq(
+                    self.code.as_ref().unwrap(),
+                    check.code.as_ref().unwrap()
+                ));
+                assert!(!Arc::ptr_eq(
+                    self.graph.as_ref().unwrap(),
+                    check.graph.as_ref().unwrap()
+                ));
+                self.select_instruction(check.pc);
+                assert!(!self.semantic.ranges.is_empty());
+                check.graph = None;
+                check.code = None;
+                if let Some(path) = &check.project {
+                    self.project_path = Some(path.clone());
+                    self.save_project(false, context);
+                }
+            }
+            7 => {
+                if let Some(path) = &check.project {
+                    assert!(!self.dirty());
+                    assert!(path.exists());
+                    self.open_project(path.clone(), context);
+                }
+            }
+            8 => {
+                if check.project.is_some() {
+                    assert!(self.cached_graph && self.saved_analysis);
+                    assert_eq!(self.view().unwrap().address, a);
+                    assert_eq!(self.selected, Some(check.pc));
+                }
+                self.tab = Tab::Listing;
+                crate::performance::event("native_cache_check_complete", check.step as u64);
+                eprintln!(
+                    "native cache check passed: A/B/A, exact history, selection, Refresh, project save/reopen"
+                );
+                return true;
+            }
+            _ => unreachable!(),
+        }
+        check.step += 1;
+        false
+    }
+
     fn capture_tick(&mut self, context: &egui::Context) {
         use std::sync::{Mutex, OnceLock};
         static CAPTURE: OnceLock<Mutex<Option<crate::capture::Capture>>> = OnceLock::new();
@@ -6705,7 +7093,16 @@ impl DesktopApp {
             || self.file_job.is_some()
             || self.analysis_plan.is_some()
             || self.discovery_running
+            || self.results.preparing()
+            || self.deferred_restore.is_some()
             || self.info.is_none();
+        if !busy && let Some(check) = &mut capture.cache_check {
+            if self.capture_cache_check(check, context) {
+                capture.cache_check = None;
+            }
+            context.request_repaint_after(Duration::from_millis(50));
+            return;
+        }
         if !busy && let Some(address) = capture.goto.take() {
             self.tab = match capture.tab.as_deref() {
                 Some("graph") => Tab::Graph,
@@ -6720,7 +7117,7 @@ impl DesktopApp {
             return;
         }
         if !busy
-            && self.view.is_some()
+            && self.view().is_some()
             && let Some(address) = capture.select.take()
         {
             self.select_instruction(address);
@@ -6936,6 +7333,7 @@ mod tests {
                 revision: app.revision,
                 byte_origin: (app.selected, app.tab),
                 bytes: None,
+                result: None,
             },
             Response::SignaturesSynced {
                 binary_sha256,
@@ -7106,11 +7504,11 @@ mod tests {
         let selected = app.selected;
         app.comment_owners.insert(0x1001, 0x1000);
         app.invalidate_signature_analysis();
-        assert!(app.view.is_none() && app.canvas.is_none() && app.listing.is_empty());
+        assert!(app.graph.is_none() && app.canvas.is_none() && app.listing().is_empty());
         assert!(
-            app.decompiled.is_empty()
+            app.code.is_none()
                 && app.semantic.mappings.is_empty()
-                && app.semantic_info.tokens.is_empty()
+                && app.semantics().tokens.is_empty()
         );
         assert!(
             app.comment_owners.is_empty()
@@ -7136,13 +7534,13 @@ mod tests {
             size: 8,
             verification: "a".repeat(64),
         };
-        app.semantic_info
-            .locals
-            .push(crate::semantic::LocalVariable {
+        edit_semantics(&mut app, |semantics| {
+            semantics.locals.push(crate::semantic::LocalVariable {
                 identity: identity.clone(),
                 name: "values".into(),
                 signature_parameter: Some(0),
-            });
+            })
+        });
         app.selected_local = Some(0);
         app.begin_rename();
         assert!(app.signature_editor.is_some() && app.browser_dialog.is_none());
@@ -7154,13 +7552,13 @@ mod tests {
         let mut other = identity.clone();
         other.offset = 8;
         other.verification = "b".repeat(64);
-        app.semantic_info
-            .locals
-            .push(crate::semantic::LocalVariable {
+        edit_semantics(&mut app, |semantics| {
+            semantics.locals.push(crate::semantic::LocalVariable {
                 identity: other.clone(),
                 name: "local_1".into(),
                 signature_parameter: None,
-            });
+            })
+        });
         app.signature_editor = None;
         app.rename_local(&other, "renamed_local", &context).unwrap();
         assert_eq!(app.session.as_ref().unwrap().version, 3);
@@ -7176,7 +7574,7 @@ mod tests {
         for (old, expected) in [(0x1004, 0x1004), (0x1010, 0x1000)] {
             let mut app = semantic_app();
             app.auto_decompile = false;
-            let view = app.view.clone().unwrap();
+            let view = app.view().unwrap().clone();
             app.selected = Some(old);
             app.signature_restore_pc = Some((0x1000, old));
             let pending = Pending {
@@ -7187,6 +7585,7 @@ mod tests {
                 revision: app.revision,
                 byte_origin: (app.selected, app.tab),
                 bytes: None,
+                result: None,
             };
             app.receive(pending, Response::Graph { view }, &egui::Context::default());
             assert_eq!(app.selected, Some(expected));
@@ -7197,14 +7596,16 @@ mod tests {
     #[test]
     fn signature_editor_uses_structured_inference_and_discards_stale_drafts() {
         let mut app = semantic_app();
-        app.semantic_info.prototype = Some(signatures::InferredSignature {
-            return_type: None,
-            abi: "x86:LE:64:default:gcc".into(),
-            parameters: vec![signatures::InferredParameter {
-                name: "value".into(),
-                ty: None,
-            }],
-            unsupported: vec!["Floating point type is unsupported".into()],
+        edit_semantics(&mut app, |semantics| {
+            semantics.prototype = Some(signatures::InferredSignature {
+                return_type: None,
+                abi: "x86:LE:64:default:gcc".into(),
+                parameters: vec![signatures::InferredParameter {
+                    name: "value".into(),
+                    ty: None,
+                }],
+                unsupported: vec!["Floating point type is unsupported".into()],
+            })
         });
         app.begin_signature_editor();
         let editor = app.signature_editor.as_ref().unwrap();
@@ -7252,6 +7653,7 @@ mod tests {
             revision: app.revision,
             byte_origin: (app.selected, app.tab),
             bytes: None,
+            result: None,
         };
         app.string_minimum = 12;
         app.receive(
@@ -7281,6 +7683,7 @@ mod tests {
             revision: app.revision,
             byte_origin: (app.selected, app.tab),
             bytes: None,
+            result: None,
         };
         let functions = app.info.as_ref().unwrap().functions.clone();
         let function_request = pending(Request::Discover);
@@ -7322,6 +7725,7 @@ mod tests {
                 revision: app.revision,
                 byte_origin: (app.selected, app.tab),
                 bytes: None,
+                result: None,
             }
         }
         let mut app = keyboard_app();
@@ -7345,7 +7749,7 @@ mod tests {
             &egui::Context::default(),
         );
         assert!(app.status.contains("Basic block count"), "{}", app.status);
-        assert!(app.view.is_none() && app.listing.is_empty());
+        assert!(app.graph.is_none() && app.listing().is_empty());
 
         let mut app = keyboard_app();
         app.receive(
@@ -7405,6 +7809,7 @@ mod tests {
                 revision: app.revision,
                 byte_origin: (app.selected, app.tab),
                 bytes: None,
+                result: None,
             },
             Response::Renamed {
                 address: 0x1000,
@@ -7509,7 +7914,7 @@ mod tests {
         let mut app = semantic_app();
         app.tab = Tab::References;
         app.semantic.select_instruction(0x1004);
-        let function = app.view.as_ref().unwrap().address;
+        let function = app.view().unwrap().address;
         let history = app.history.clone();
         let generation = app.selection_generation;
         let selected = app.selected;
@@ -7517,7 +7922,7 @@ mod tests {
         app.read_data_reference(0x1080, 4, &context);
         assert_eq!(app.selected, selected);
         assert_eq!(app.xref_target.map(|t| t.address), Some(0x1080));
-        assert_eq!(app.view.as_ref().unwrap().address, function);
+        assert_eq!(app.view().unwrap().address, function);
         assert_eq!(app.history, history);
         assert_eq!(app.selection_generation, generation);
         assert_eq!(app.semantic.addresses, semantic_addresses);
@@ -7528,6 +7933,7 @@ mod tests {
             app.tab = Tab::References;
             app.status = "waiting".into();
             let pending = Pending {
+                result: None,
                 id: 1,
                 request: Request::Bytes {
                     address: 0x1080,
@@ -7601,6 +8007,7 @@ mod tests {
                 revision: app.revision,
                 byte_origin: (app.selected, app.tab),
                 bytes: None,
+                result: None,
             };
             let mut analysis = report.clone();
             if !valid {
@@ -8016,22 +8423,83 @@ mod tests {
         assert_eq!(app.history, [0x1000, 0x1040, 0x10c0]);
     }
 
+    fn edit_view(app: &mut DesktopApp, edit: impl FnOnce(&mut FunctionView)) {
+        let mut view = app.view().unwrap().clone();
+        edit(&mut view);
+        show_view(app, view);
+    }
+
+    fn set_listing(app: &mut DesktopApp, instructions: Vec<Instruction>) {
+        let address = instructions.first().map_or(0, |i| i.address);
+        edit_view(app, |view| {
+            view.address = address;
+            view.blocks = vec![BasicBlock {
+                address,
+                instructions,
+            }];
+        });
+    }
+
+    /// Displays `view` as an unstored live result.
+    fn show_view(app: &mut DesktopApp, view: FunctionView) {
+        let graph =
+            app.results
+                .admit_graph(None, PreparedGraph::new(view), ResultOrigin::Computed, None);
+        app.canvas = Some(GraphCanvas::with_geometry(graph.view(), graph.geometry()));
+        app.graph = Some(graph);
+    }
+
+    /// Displays one unstored decompilation, keeping the current selection.
+    fn show_code(
+        app: &mut DesktopApp,
+        text: &str,
+        mappings: Vec<CodeMapping>,
+        semantics: SemanticInfo,
+    ) {
+        let address = app.view().map_or(0, |view| view.address);
+        let code = app.results.admit_decompilation(
+            None,
+            PreparedDecompilation::prepare(address, text.into(), mappings, semantics),
+            ResultOrigin::Computed,
+            None,
+        );
+        app.semantic.mappings = code.mappings().clone();
+        app.code = Some(code);
+    }
+
+    /// Replaces the displayed decompilation's semantics, as a new reply would.
+    fn edit_semantics(app: &mut DesktopApp, edit: impl FnOnce(&mut SemanticInfo)) {
+        let mut semantics = app.semantics().clone();
+        edit(&mut semantics);
+        let text = app.decompiled().to_owned();
+        let mappings = app.semantic.mappings.to_vec();
+        show_code(app, &text, mappings, semantics);
+    }
+
+    /// Appends an instruction to the first block of the displayed graph.
+    fn push_instruction(app: &mut DesktopApp, instruction: Instruction) {
+        let mut view = app.view().unwrap().clone();
+        view.blocks[0].instructions.push(instruction);
+        show_view(app, view);
+    }
+
     fn call_navigation_app(text: &str) -> DesktopApp {
         let mut app = keyboard_app();
-        app.view = Some(FunctionView {
-            address: 0x1000,
-            blocks: vec![],
-            edges: vec![],
-            calls: vec![CallSite {
-                address: 0x1004,
-                target: Some(0x1040),
-                no_return: None,
-            }],
-            warnings: vec![],
-        });
-        app.decompiled = text.into();
-        app.highlighted = Some(HighlightedCode::new(text));
-        app.decompiled_lines = vec![(0, text.len())];
+        show_view(
+            &mut app,
+            FunctionView {
+                address: 0x1000,
+                blocks: vec![],
+                edges: vec![],
+                calls: vec![CallSite {
+                    address: 0x1004,
+                    target: Some(0x1040),
+                    no_return: None,
+                }],
+                warnings: vec![],
+            },
+        );
+        show_code(&mut app, text, vec![], SemanticInfo::default());
         app.history = vec![0x1000];
         app
     }
@@ -8048,19 +8516,23 @@ mod tests {
                 operands: "eax, 1".into(),
             })
             .collect();
-        let view = app.view.as_mut().unwrap();
+        let mut view = app.view().unwrap().clone();
         view.calls.clear();
         view.blocks = vec![BasicBlock {
             address: 0x1000,
-            instructions: instructions.clone(),
+            instructions,
         }];
-        app.canvas = Some(GraphCanvas::new(view));
-        app.listing = instructions;
-        app.semantic.mappings = vec![CodeMapping {
-            start: source.find("return").unwrap(),
-            end: source.find(';').unwrap() + 1,
-            addresses: vec![0x1004, 0x1008],
-        }];
+        show_view(&mut app, view);
+        show_code(
+            &mut app,
+            source,
+            vec![CodeMapping {
+                start: source.find("return").unwrap(),
+                end: source.find(';').unwrap() + 1,
+                addresses: vec![0x1004, 0x1008],
+            }],
+            SemanticInfo::default(),
+        );
         app.semantic.select_instruction(0x1000);
         app
     }
@@ -8105,10 +8577,7 @@ mod tests {
             mnemonic: "nop".into(),
             operands: String::new(),
         };
-        app.listing.push(instruction.clone());
-        app.view.as_mut().unwrap().blocks[0]
-            .instructions
-            .push(instruction);
+        push_instruction(&mut app, instruction);
         for (address, comment) in [
             (0x1000, "entry note"),
             (0x1004, "first */ literal"),
@@ -8123,7 +8592,7 @@ mod tests {
                 },
             );
         }
-        let original_source = app.decompiled.clone();
+        let original_source = app.decompiled().to_owned();
         let mut output = context.run_ui(egui::RawInput::default(), |ui| app.main_panel(ui));
         let listing = rendered_text(&output);
         assert!(
@@ -8151,10 +8620,10 @@ mod tests {
         assert!(position("first */ literal") < position("return café"));
         assert!(position("second note") < position("return café"));
         assert!(position("unmapped note") > position("Comments without visible code"));
-        assert_eq!(app.decompiled, original_source);
+        assert_eq!(app.decompiled(), original_source);
         let mapping = &app.semantic.mappings[0];
         assert_eq!(
-            &app.decompiled[mapping.start..mapping.end],
+            &app.decompiled()[mapping.start..mapping.end],
             "return café + 1;"
         );
         output.textures_delta.clear();
@@ -8179,7 +8648,7 @@ mod tests {
         app.undo(&context);
         app.update_comment_rows();
         assert!(app.comment_rows.rows.contains(&CodeRow::Comment(0x1008)));
-        assert_eq!(app.decompiled, original_source);
+        assert_eq!(app.decompiled(), original_source);
     }
 
     #[test]
@@ -8250,23 +8719,14 @@ mod tests {
         let context = egui::Context::default();
         theme::install(&context);
         let mut app = semantic_app();
-        app.decompiled = (0..200).map(|n| format!("statement_{n}();\n")).collect();
-        app.highlighted = Some(HighlightedCode::new(&app.decompiled));
-        let mut offset = 0;
-        app.decompiled_lines = app
-            .decompiled
-            .split_inclusive('\n')
-            .map(|line| {
-                let range = (offset, offset + line.len());
-                offset += line.len();
-                range
-            })
-            .collect();
+        let text: String = (0..200).map(|n| format!("statement_{n}();\n")).collect();
+        show_code(&mut app, &text, vec![], SemanticInfo::default());
         app.semantic.mappings = vec![CodeMapping {
-            start: app.decompiled_lines[150].0,
-            end: app.decompiled_lines[150].1 - 1,
+            start: code_lines(&app.code)[150].0,
+            end: code_lines(&app.code)[150].1 - 1,
             addresses: vec![0x1004],
-        }];
+        }]
+        .into();
         for (address, comment) in [
             (0x1004, "mapped scroll target"),
             (0x1008, "unmapped scroll target"),
@@ -8352,14 +8812,14 @@ mod tests {
             ))
         ));
         assert!(app.queue.is_empty());
-        assert_eq!(app.view.as_ref().unwrap().address, 0x1000);
+        assert_eq!(app.view().unwrap().address, 0x1000);
     }
 
     #[test]
     fn annotation_navigation_reuses_observed_owner_without_guessing_symbol_extents() {
         let context = egui::Context::default();
         let mut app = semantic_app();
-        let original_view = app.view.clone().unwrap();
+        let original_view = app.view().unwrap().clone();
         app.edit_annotation(
             0x1008,
             Annotation {
@@ -8382,13 +8842,14 @@ mod tests {
                 revision: app.revision,
                 byte_origin: (app.selected, app.tab),
                 bytes: None,
+                result: None,
             },
             Response::Graph {
                 view: original_view,
             },
             &context,
         );
-        assert_eq!(app.view.as_ref().unwrap().address, 0x1000);
+        assert_eq!(app.view().unwrap().address, 0x1000);
         assert_eq!(app.selected, Some(0x1008));
         assert_eq!(app.pending_listing_scroll, Some(2));
         app.update_comment_rows();
@@ -8435,7 +8896,7 @@ mod tests {
         let point = text_position(
             &output,
             "return café",
-            app.decompiled.find("café").unwrap() + 3,
+            app.decompiled().find("café").unwrap() + 3,
         );
         output.textures_delta.clear();
         let mut output = context.run_ui(
@@ -8495,7 +8956,7 @@ mod tests {
             output.textures_delta.clear();
             rendered_text(&output).join("\n")
         };
-        app.listing = function(0x1000);
+        set_listing(&mut app, function(0x1000));
         app.comment_rows_key = None;
         app.pending_listing_scroll = Some(1500);
         frame(&mut app);
@@ -8503,14 +8964,14 @@ mod tests {
         assert!(text.contains(&format!("{:08x}", 0x1000 + 1500 * 4)));
         assert!(!text.contains("00001000 "));
         // Another function starts at its first instruction, not at row 1500.
-        app.view.as_mut().unwrap().address = 0x9000;
-        app.listing = function(0x9000);
+        edit_view(&mut app, |view| view.address = 0x9000);
+        set_listing(&mut app, function(0x9000));
         app.comment_rows_key = None;
         let text = frame(&mut app);
         assert!(text.contains("00009000 "), "{text}");
         // Returning restores the earlier function's position.
-        app.view.as_mut().unwrap().address = 0x1000;
-        app.listing = function(0x1000);
+        edit_view(&mut app, |view| view.address = 0x1000);
+        set_listing(&mut app, function(0x1000));
         app.comment_rows_key = None;
         assert!(frame(&mut app).contains(&format!("{:08x}", 0x1000 + 1500 * 4)));
     }
@@ -8531,9 +8992,11 @@ mod tests {
         theme::install(&context);
         let mut app = semantic_app();
         let operands = "rax, qword ptr [rip + a_long_symbol_name_that_exceeds_the_pane_width]";
-        for instruction in &mut app.listing {
-            instruction.operands = operands.into();
-        }
+        edit_view(&mut app, |view| {
+            for instruction in view.blocks.iter_mut().flat_map(|b| &mut b.instructions) {
+                instruction.operands = operands.into();
+            }
+        });
         let mut output = context.run_ui(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
@@ -8559,7 +9022,7 @@ mod tests {
                 }
             })
             .collect();
-        assert_eq!(rows.len(), app.listing.len());
+        assert_eq!(rows.len(), app.listing().len());
         for row in rows {
             assert_eq!(
                 row.rows.len(),
@@ -8623,11 +9086,13 @@ mod tests {
     /// `semantic_app` with a call at 0x1004 and two accesses at 0x1008.
     fn xref_app() -> DesktopApp {
         let mut app = semantic_app();
-        app.view.as_mut().unwrap().calls = vec![CallSite {
-            address: 0x1004,
-            target: Some(0x1040),
-            no_return: None,
-        }];
+        edit_view(&mut app, |view| {
+            view.calls = vec![CallSite {
+                address: 0x1004,
+                target: Some(0x1040),
+                no_return: None,
+            }]
+        });
         let data = |target, access| DataReference {
             function: 0x1000,
             address: 0x1008,
@@ -8636,30 +9101,32 @@ mod tests {
             access,
             provenance: DataProvenance::InstructionLocal,
         };
-        app.set_call_index(Some(crate::call_analysis::CallIndex::new(CallAnalysis {
-            references: vec![
-                CallReference {
-                    caller: 0x1000,
-                    address: 0x1004,
-                    target: 0x1040,
-                },
-                CallReference {
-                    caller: 0x1040,
-                    address: 0x1044,
-                    target: 0x1040,
-                },
-            ],
-            data: Some(DataAnalysis {
+        app.set_call_index(Some(Arc::new(crate::call_analysis::CallIndex::new(
+            CallAnalysis {
                 references: vec![
-                    data(0x2000, DataAccess::Read),
-                    data(0x2010, DataAccess::Write),
+                    CallReference {
+                        caller: 0x1000,
+                        address: 0x1004,
+                        target: 0x1040,
+                    },
+                    CallReference {
+                        caller: 0x1040,
+                        address: 0x1044,
+                        target: 0x1040,
+                    },
                 ],
+                data: Some(DataAnalysis {
+                    references: vec![
+                        data(0x2000, DataAccess::Read),
+                        data(0x2010, DataAccess::Write),
+                    ],
+                    ..Default::default()
+                }),
+                functions_examined: 2,
+                decode_attempts: 8,
                 ..Default::default()
-            }),
-            functions_examined: 2,
-            decode_attempts: 8,
-            ..Default::default()
-        })));
+            },
+        ))));
         app
     }
 
@@ -8707,7 +9174,7 @@ mod tests {
             [0x2000, 0x2010]
         );
         // A decompiler expression mapped to several PCs merges their targets.
-        app.select_decompiled_byte(app.decompiled.find("return").unwrap());
+        app.select_decompiled_byte(app.decompiled().find("return").unwrap());
         app.show_selection_xrefs();
         let choices = app.xref_choices.as_ref().unwrap();
         assert_eq!(
@@ -8756,7 +9223,7 @@ mod tests {
         let mut app = xref_app();
         // A crafted saved view can claim a call into data or unmapped memory.
         for target in [0x2000, 0x1101, 0x9000] {
-            app.view.as_mut().unwrap().calls[0].target = Some(target);
+            edit_view(&mut app, |view| view.calls[0].target = Some(target));
             app.set_call_index(None);
             app.select_instruction(0x1004);
             assert_eq!(
@@ -8775,11 +9242,13 @@ mod tests {
         let source = "void f() { helper(); }";
         let mut app = call_navigation_app(source);
         let call = source.find("helper").unwrap();
-        app.semantic_info.tokens = vec![crate::semantic::SemanticToken {
-            start: call,
-            end: call + "helper".len(),
-            kind: TokenKind::Call { target: 0x1040 },
-        }];
+        edit_semantics(&mut app, |semantics| {
+            semantics.tokens = vec![crate::semantic::SemanticToken {
+                start: call,
+                end: call + "helper".len(),
+                kind: TokenKind::Call { target: 0x1040 },
+            }]
+        });
         app.select_decompiled_byte(call + 1);
         app.show_selection_xrefs();
         assert_eq!(
@@ -8913,7 +9382,7 @@ mod tests {
                 "{name}"
             );
             assert!(app.tab == Tab::References && app.reference_data);
-            assert_eq!(app.view.as_ref().unwrap().address, 0x1000);
+            assert_eq!(app.view().unwrap().address, 0x1000);
         }
     }
 
@@ -8928,7 +9397,7 @@ mod tests {
             kind: TargetKind::Function,
         });
         // Independent of the displayed function.
-        assert_eq!(app.view.as_ref().unwrap().address, 0x1000);
+        assert_eq!(app.view().unwrap().address, 0x1000);
         let frame = |app: &mut DesktopApp| {
             let mut output =
                 context.run_ui(egui::RawInput::default(), |ui| app.references_panel(ui));
@@ -9013,11 +9482,13 @@ mod tests {
         let source = "void f() { helper(); }";
         let call = source.find("helper").unwrap();
         let mut app = call_navigation_app(source);
-        app.semantic_info.tokens = vec![crate::semantic::SemanticToken {
-            start: call,
-            end: call + "helper".len(),
-            kind: TokenKind::Call { target: 0x1040 },
-        }];
+        edit_semantics(&mut app, |semantics| {
+            semantics.tokens = vec![crate::semantic::SemanticToken {
+                start: call,
+                end: call + "helper".len(),
+                kind: TokenKind::Call { target: 0x1040 },
+            }]
+        });
         app.select_decompiled_byte(call);
         assert_eq!(app.selected_call, Some(0x1040));
         app.invalidate_signature_analysis();
@@ -9052,7 +9523,7 @@ mod tests {
             output
         };
         let output = frame(&mut app, vec![]);
-        let byte = app.decompiled.find("return").unwrap() + 2;
+        let byte = app.decompiled().find("return").unwrap() + 2;
         let point = text_position(&output, "return", byte);
         frame(&mut app, secondary_events(point));
         let text = rendered_text(&frame(&mut app, vec![]));
@@ -9110,14 +9581,14 @@ mod tests {
     #[test]
     fn navigation_clears_old_semantic_links_and_cross_function_views() {
         let mut app = semantic_app();
-        app.select_decompiled_byte(app.decompiled.find("return").unwrap());
+        app.select_decompiled_byte(app.decompiled().find("return").unwrap());
         app.navigate(0x1040, true, &egui::Context::default());
         assert!(app.semantic.mappings.is_empty());
         assert!(app.semantic.addresses.is_empty());
         assert!(app.semantic.ranges.is_empty());
-        assert!(app.view.is_none());
+        assert!(app.view().is_none());
         assert!(app.canvas.is_none());
-        assert!(app.listing.is_empty());
+        assert!(app.listing().is_empty());
         app.select_decompiled_byte(0);
         assert_eq!(app.selected, Some(0x1040));
     }
@@ -9126,22 +9597,22 @@ mod tests {
     fn decompiler_navigation_uses_only_semantic_targets_even_with_duplicate_names() {
         let mut app = call_navigation_app("next()");
         assert_eq!(app.decompiler_call_target(1), None); // Legacy text cache fails closed.
-        app.semantic_info
-            .tokens
-            .push(crate::semantic::SemanticToken {
+        edit_semantics(&mut app, |semantics| {
+            semantics.tokens.push(crate::semantic::SemanticToken {
                 start: 0,
                 end: 4,
                 kind: TokenKind::Call { target: 0x1040 },
-            });
+            })
+        });
         assert_eq!(app.decompiler_call_target(1), Some(0x1040));
         assert_eq!(app.decompiler_call_target(4), None);
         app.info.as_mut().unwrap().functions.push(FunctionInfo {
             address: 0x1080,
             name: "next".into(),
         });
-        app.view.as_mut().unwrap().calls.clear();
+        edit_view(&mut app, |view| view.calls.clear());
         assert_eq!(app.decompiler_call_target(1), Some(0x1040));
-        app.semantic_info.tokens.clear();
+        edit_semantics(&mut app, |semantics| semantics.tokens.clear());
         assert_eq!(app.decompiler_call_target(1), None);
     }
 
@@ -9152,13 +9623,13 @@ mod tests {
         let source = "void entry() { next(); }";
         let mut app = call_navigation_app(source);
         let start = source.find("next").unwrap();
-        app.semantic_info
-            .tokens
-            .push(crate::semantic::SemanticToken {
+        edit_semantics(&mut app, |semantics| {
+            semantics.tokens.push(crate::semantic::SemanticToken {
                 start,
                 end: start + 4,
                 kind: TokenKind::Call { target: 0x1040 },
-            });
+            })
+        });
         let mut output = context.run_ui(egui::RawInput::default(), |ui| app.side_panel(ui));
         let point = output
             .shapes
@@ -9220,21 +9691,21 @@ mod tests {
             size: 4,
             verification: "a".repeat(64),
         };
-        let byte = app.decompiled.find("café").unwrap();
-        app.semantic_info
-            .locals
-            .push(crate::semantic::LocalVariable {
+        let byte = app.decompiled().find("café").unwrap();
+        edit_semantics(&mut app, |semantics| {
+            semantics.locals.push(crate::semantic::LocalVariable {
                 identity: identity.clone(),
                 name: "café".into(),
                 signature_parameter: None,
-            });
-        app.semantic_info
-            .tokens
-            .push(crate::semantic::SemanticToken {
+            })
+        });
+        edit_semantics(&mut app, |semantics| {
+            semantics.tokens.push(crate::semantic::SemanticToken {
                 start: byte,
                 end: byte + "café".len(),
                 kind: TokenKind::Local { local: Some(0) },
-            });
+            })
+        });
         app.edit_annotation(
             0x1004,
             Annotation {
@@ -9242,8 +9713,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        let original = app.decompiled.clone();
-        let original_semantics = app.semantic_info.clone();
+        let original = app.decompiled().to_owned();
+        let original_semantics = app.semantics().clone();
         // Exercise native egui pointer selection, keyboard dispatch, modal text
         // selection/replacement, Enter application, and Ctrl+Z outside editors.
         theme::install(&context);
@@ -9305,6 +9776,7 @@ mod tests {
                 revision: app.revision,
                 byte_origin: (app.selected, app.tab),
                 bytes: None,
+                result: None,
             },
             Response::Decompiled {
                 address: 0x1000,
@@ -9327,7 +9799,7 @@ mod tests {
             .unwrap();
         assert!(comment < statement);
         assert_eq!(rows.iter().filter(|row| row.contains("keep me")).count(), 1);
-        assert_eq!(app.decompiled, renamed);
+        assert_eq!(app.decompiled(), renamed);
         output.textures_delta.clear();
         keyboard_frame(&context, &mut app, vec![]);
         keyboard_frame(
@@ -9479,8 +9951,8 @@ mod tests {
         );
         assert_eq!(app.project_path, Some(project_path));
         assert!(app.saved_analysis);
-        assert!(app.highlighted.is_some());
-        assert!(app.decompiled.contains("restored_entry"));
+        assert!(app.code.is_some());
+        assert!(app.decompiled().contains("restored_entry"));
         let context = egui::Context::default();
         theme::install(&context);
         let mut output = context.run_ui(egui::RawInput::default(), |ui| app.side_panel(ui));
@@ -9494,7 +9966,7 @@ mod tests {
                 .any(|row| row.contains("restored statement comment"))
         );
         output.textures_delta.clear();
-        assert_eq!(app.decompiled, source);
+        assert_eq!(app.decompiled(), source);
         assert_eq!(app.history, [0x1000]);
         assert_eq!(app.strings[0].text, "saved string");
         assert!(app.strings_truncated);
@@ -9522,6 +9994,7 @@ mod tests {
         app.after_save = Some(Intent::Close);
         tx.send(FileEvent::ProjectSaved {
             generation: app.generation,
+            result_revision: app.result_revision,
             revision: saved,
             embedded: true,
             result: Ok(Some("analysis.grproj".into())),
@@ -9537,6 +10010,7 @@ mod tests {
         app.after_save = app.intent.take();
         tx.send(FileEvent::ProjectSaved {
             generation: app.generation,
+            result_revision: app.result_revision,
             revision: app.revision,
             embedded: true,
             result: Ok(None),
@@ -9598,7 +10072,9 @@ mod tests {
         };
         app.restore_project(
             ProjectOpen {
-                discovery_index: Some(crate::call_analysis::CallIndex::new(saved.report.clone())),
+                discovery_index: Some(Arc::new(crate::call_analysis::CallIndex::from_snapshot(
+                    saved.clone(),
+                ))),
                 project: LoadedProject {
                     data,
                     binary: None,
@@ -9737,6 +10213,7 @@ mod tests {
             revision: 0,
             byte_origin: (None, Tab::Listing),
             bytes: None,
+            result: None,
         };
         app.receive(
             pending,
@@ -9751,7 +10228,7 @@ mod tests {
             },
             &egui::Context::default(),
         );
-        assert!(app.view.is_none());
+        assert!(app.view().is_none());
         let pending = Pending {
             id: 2,
             request: Request::Decompile { address: 0x1000 },
@@ -9760,6 +10237,7 @@ mod tests {
             revision: 0,
             byte_origin: (None, Tab::Listing),
             bytes: None,
+            result: None,
         };
         app.revision = 1;
         app.receive(
@@ -9772,7 +10250,7 @@ mod tests {
             },
             &egui::Context::default(),
         );
-        assert!(app.decompiled.is_empty());
+        assert!(app.decompiled().is_empty());
     }
 
     #[test]
@@ -9781,6 +10259,7 @@ mod tests {
         theme::install(&context);
         let mut app = DesktopApp::empty(None);
         app.pending = Some(Pending {
+            result: None,
             id: 1,
             request: Request::Decompile { address: 0x1000 },
             started: Instant::now() - Duration::from_secs(2),
@@ -9907,6 +10386,7 @@ mod tests {
             revision: app.revision,
             byte_origin: (app.selected, app.tab),
             bytes: None,
+            result: None,
         };
         app.start_auto_analysis();
         app.pending = Some(pending(&app, Request::Graph { address: 0x1000 }));
@@ -9988,6 +10468,7 @@ mod tests {
             batch: 1,
         };
         app.pending = Some(Pending {
+            result: None,
             id: 7,
             request: Request::DiscoverBatch {
                 binding,
@@ -10064,8 +10545,11 @@ mod tests {
             },
         };
         app.discovery = Some(state);
-        app.call_index = Some(crate::call_analysis::CallIndex::new(CallAnalysis::default()));
+        app.call_index = Some(Arc::new(crate::call_analysis::CallIndex::new(
+            CallAnalysis::default(),
+        )));
         app.pending = Some(Pending {
+            result: None,
             id: 7,
             request,
             started: Instant::now(),
@@ -10109,6 +10593,7 @@ mod tests {
         let mut app = keyboard_app();
         let started = Instant::now() - Duration::from_secs(3);
         app.pending = Some(Pending {
+            result: None,
             id: 7,
             request: Request::Discover,
             started,
@@ -10161,6 +10646,7 @@ mod tests {
         let context = egui::Context::default();
         let mut app = keyboard_app();
         app.pending = Some(Pending {
+            result: None,
             id: 7,
             request: Request::Discover,
             started: Instant::now(),
@@ -10185,6 +10671,7 @@ mod tests {
         assert!(app.pending.is_none());
         assert!(app.status.contains("unexpected request ID"));
         app.pending = Some(Pending {
+            result: None,
             id: 7,
             request: Request::Discover,
             started: Instant::now(),
@@ -10216,6 +10703,7 @@ mod tests {
             revision: 0,
             byte_origin: (None, Tab::Listing),
             bytes: None,
+            result: None,
         };
         app.revision += 1;
         app.receive(
@@ -10236,13 +10724,13 @@ mod tests {
         let context = egui::Context::default();
         for pc in [0x1004, 0x104c] {
             let mut app = semantic_app();
-            let view = app.view.clone().unwrap();
+            let view = app.view().unwrap().clone();
             app.auto_decompile = false;
             // From another function, the caller is loaded before selecting.
             app.navigate(0x1040, true, &context);
             app.navigate_reference(0x1000, pc, &context);
             assert!(app.semantic.mappings.is_empty());
-            assert!(app.view.is_none());
+            assert!(app.view().is_none());
             let pending = Pending {
                 id: 1,
                 request: Request::Graph { address: 0x1000 },
@@ -10251,6 +10739,7 @@ mod tests {
                 revision: app.revision,
                 byte_origin: (app.selected, app.tab),
                 bytes: None,
+                result: None,
             };
             app.receive(pending, Response::Graph { view }, &context);
             assert_eq!(app.selected, Some(pc));
@@ -10263,7 +10752,7 @@ mod tests {
             // Within the displayed caller, selection is immediate.
             let mut app = semantic_app();
             app.navigate_reference(0x1000, pc, &context);
-            assert_eq!(app.view.as_ref().unwrap().address, 0x1000);
+            assert_eq!(app.view().unwrap().address, 0x1000);
             assert_eq!(app.selected, Some(pc));
             assert_eq!(app.pending_listing_scroll, (pc == 0x1004).then_some(1));
             assert_eq!(app.undisplayed_call, (pc == 0x104c).then_some(pc));
@@ -10275,7 +10764,7 @@ mod tests {
     fn reference_history_records_exact_source_instructions_and_owners() {
         let context = egui::Context::default();
         let mut app = semantic_app();
-        let caller = app.view.clone().unwrap();
+        let caller = app.view().unwrap().clone();
         app.auto_decompile = false;
         app.select_instruction(0x1008);
         // A callsite in another function is recorded as its exact instruction.
@@ -10297,6 +10786,7 @@ mod tests {
                 revision: app.revision,
                 byte_origin: (app.selected, app.tab),
                 bytes: None,
+                result: None,
             },
             Response::Graph { view: caller },
             &context,
@@ -10332,6 +10822,7 @@ mod tests {
         ];
         app.info.as_mut().unwrap().file_len = 0x2220;
         app.pending = Some(Pending {
+            result: None,
             id: 99,
             request: Request::Graph { address: 0x1000 },
             started: Instant::now(),
@@ -10346,6 +10837,7 @@ mod tests {
     fn deferred_bytes(app: &mut DesktopApp) -> Pending {
         let (request, origin) = app.discovery_bytes.take().expect("deferred byte action");
         Pending {
+            result: None,
             id: 100,
             request,
             started: Instant::now(),
@@ -10404,11 +10896,11 @@ mod tests {
         let selection = app.selection_generation;
         let revision = app.revision;
         let history = app.history.clone();
-        let code = app.decompiled.clone();
-        let mappings = serde_json::to_string(&app.semantic.mappings).unwrap();
+        let code = app.decompiled().to_owned();
+        let mappings = serde_json::to_string(app.semantic.mappings.as_ref()).unwrap();
         let semantic_addresses = app.semantic.addresses.clone();
-        let view = serde_json::to_string(&app.view).unwrap();
-        let listing = serde_json::to_string(&app.listing).unwrap();
+        let view = serde_json::to_string(&app.view()).unwrap();
+        let listing = serde_json::to_string(&app.listing().iter().collect::<Vec<_>>()).unwrap();
         let dirty = app.dirty();
         app.open_hex_section(1, &context);
         assert!(app.tab == Tab::Hex);
@@ -10442,17 +10934,20 @@ mod tests {
         assert_eq!(app.revision, revision);
         assert_eq!(app.history, history);
         assert_eq!(app.history_index, 1);
-        assert_eq!(app.decompiled, code);
+        assert_eq!(app.decompiled(), code);
         assert_eq!(
-            serde_json::to_string(&app.semantic.mappings).unwrap(),
+            serde_json::to_string(app.semantic.mappings.as_ref()).unwrap(),
             mappings
         );
         assert_eq!(app.semantic.addresses, semantic_addresses);
-        assert_eq!(serde_json::to_string(&app.view).unwrap(), view);
-        assert_eq!(serde_json::to_string(&app.listing).unwrap(), listing);
+        assert_eq!(serde_json::to_string(&app.view()).unwrap(), view);
+        assert_eq!(
+            serde_json::to_string(&app.listing().iter().collect::<Vec<_>>()).unwrap(),
+            listing
+        );
         assert_eq!(app.dirty(), dirty);
         assert!(app.canvas.is_some());
-        assert!(app.highlighted.is_some());
+        assert!(app.code.is_some());
     }
 
     #[test]
@@ -10998,18 +11493,22 @@ mod tests {
     fn accepted_decompiler_output_renders_highlighted_utf8_and_clears_on_close() {
         let context = egui::Context::default();
         theme::install(&context);
-        let mut app = DesktopApp::empty(None);
-        app.view = Some(FunctionView {
-            address: 0x1000,
-            blocks: Vec::new(),
-            edges: Vec::new(),
-            calls: Vec::new(),
-            warnings: Vec::new(),
-        });
+        let mut app = keyboard_app();
+        show_view(
+            &mut app,
+            FunctionView {
+                address: 0x1000,
+                blocks: Vec::new(),
+                edges: Vec::new(),
+                calls: Vec::new(),
+                warnings: Vec::new(),
+            },
+        );
         let text =
             "uint4 café(int param_1) {\n /* multiline\n    🦀 */\n return param_1 + 0x10;\n}\n";
         app.receive(
             Pending {
+                result: None,
                 id: 1,
                 request: Request::Decompile { address: 0x1000 },
                 started: Instant::now(),
@@ -11026,31 +11525,35 @@ mod tests {
             },
             &context,
         );
-        assert_eq!(app.decompiled, text);
-        assert!(app.highlighted.is_some());
+        assert_eq!(app.decompiled(), text);
+        assert!(app.code.is_some());
         let mut output = context.run_ui(egui::RawInput::default(), |ui| app.side_panel(ui));
         assert!(!output.shapes.is_empty());
         output.textures_delta.clear();
         app.clear_binary();
-        assert!(app.highlighted.is_none());
-        assert!(app.decompiled.is_empty());
+        assert!(app.code.is_none());
+        assert!(app.decompiled().is_empty());
     }
 
     #[test]
     fn desktop_rejects_oversized_decompiler_text_before_highlighting() {
         let context = egui::Context::default();
-        let mut app = DesktopApp::empty(None);
-        app.view = Some(FunctionView {
-            address: 0x1000,
-            blocks: Vec::new(),
-            edges: Vec::new(),
-            calls: Vec::new(),
-            warnings: Vec::new(),
-        });
+        let mut app = keyboard_app();
+        show_view(
+            &mut app,
+            FunctionView {
+                address: 0x1000,
+                blocks: Vec::new(),
+                edges: Vec::new(),
+                calls: Vec::new(),
+                warnings: Vec::new(),
+            },
+        );
         for extra in [0, 1] {
             let text = format!("//{}", "x".repeat(MAX_DECOMPILED_BYTES - 2 + extra));
             app.receive(
                 Pending {
+                    result: None,
                     id: 1,
                     request: Request::Decompile { address: 0x1000 },
                     started: Instant::now(),
@@ -11068,15 +11571,163 @@ mod tests {
                 &context,
             );
             if extra == 0 {
-                assert_eq!(app.decompiled.len(), MAX_DECOMPILED_BYTES);
-                assert!(app.highlighted.is_some());
+                assert_eq!(app.decompiled().len(), MAX_DECOMPILED_BYTES);
+                assert!(app.code.is_some());
             } else {
-                assert!(app.decompiled.is_empty());
-                assert!(app.highlighted.is_none());
-                assert!(app.decompiled_lines.is_empty());
+                assert!(app.decompiled().is_empty());
+                assert!(app.code.is_none());
+                assert!(code_lines(&app.code).is_empty());
                 assert!(app.status.contains("exceeded the 2 MiB limit"));
                 assert!(app.client.is_none());
             }
         }
+    }
+    fn retained_app() -> DesktopApp {
+        let mut app = semantic_app();
+        let view = app.view().unwrap().clone();
+        let text = app.decompiled().to_owned();
+        let mappings = app.semantic.mappings.to_vec();
+        let semantics = app.semantics().clone();
+        app.results.open(&"a".repeat(64), &[]);
+        let binding = app.results.binding(0x1000, String::new()).unwrap();
+        let graph = app.results.admit_graph(
+            Some(&binding),
+            PreparedGraph::new(view),
+            ResultOrigin::Saved,
+            None,
+        );
+        let code = app.results.admit_decompilation(
+            Some(&binding),
+            PreparedDecompilation::prepare(0x1000, text, mappings, semantics),
+            ResultOrigin::Saved,
+            None,
+        );
+        app.adopt_graph(graph, ResultOrigin::Saved);
+        app.adopt_decompilation(code, ResultOrigin::Saved);
+        let binding = app.results.binding(0x1040, String::new()).unwrap();
+        app.results.admit_graph(
+            Some(&binding),
+            PreparedGraph::new(FunctionView {
+                address: 0x1040,
+                blocks: vec![BasicBlock {
+                    address: 0x1040,
+                    instructions: vec![Instruction {
+                        address: 0x1040,
+                        bytes: vec![0xc3],
+                        mnemonic: "ret".into(),
+                        operands: String::new(),
+                    }],
+                }],
+                edges: vec![],
+                calls: vec![],
+                warnings: vec![],
+            }),
+            ResultOrigin::Computed,
+            None,
+        );
+        app.results.admit_decompilation(
+            Some(&binding),
+            PreparedDecompilation::prepare(
+                0x1040,
+                "return;".into(),
+                vec![],
+                SemanticInfo::default(),
+            ),
+            ResultOrigin::Computed,
+            None,
+        );
+        app
+    }
+
+    #[test]
+    fn full_hits_restore_exact_instruction_history_and_saved_provenance_synchronously() {
+        let context = egui::Context::default();
+        let mut app = retained_app();
+        let graph = app.graph.clone().unwrap();
+        let code = app.code.clone().unwrap();
+        app.navigate_location(0x1008, Some(0x1000), true, &context);
+        app.navigate(0x1040, true, &context);
+        assert_eq!(app.view().unwrap().address, 0x1040);
+        assert!(!app.saved_analysis);
+        app.history_step(false, &context);
+        assert_eq!(app.selected, Some(0x1008));
+        assert!(Arc::ptr_eq(app.graph.as_ref().unwrap(), &graph));
+        assert!(Arc::ptr_eq(app.code.as_ref().unwrap(), &code));
+        assert!(app.cached_graph && app.saved_analysis);
+        assert!(app.reference_focus.is_none());
+        assert!(app.pending_listing_scroll.is_some());
+        app.history_step(true, &context);
+        assert_eq!(app.view().unwrap().address, 0x1040);
+        app.navigate_location(0x1004, Some(0x1000), true, &context);
+        assert_eq!(app.selected, Some(0x1004));
+        assert!(!app.semantic.ranges.is_empty());
+        assert!(app.client.is_none() && app.pending.is_none() && app.queue.is_empty());
+    }
+
+    #[test]
+    fn old_function_reply_after_refresh_cannot_display_or_enter_the_store() {
+        let context = egui::Context::default();
+        let mut app = retained_app();
+        let old = app.results.binding(0x1000, String::new()).unwrap();
+        app.results
+            .refresh_decompilation(0x1000, crate::function_results::Invalidation::Refresh);
+        app.clear_decompilation();
+        app.receive(
+            Pending {
+                id: 1,
+                request: Request::Decompile { address: 0x1000 },
+                started: Instant::now(),
+                selection: app.selection_generation,
+                revision: app.revision,
+                byte_origin: (app.selected, app.tab),
+                bytes: None,
+                result: Some(old),
+            },
+            Response::Decompiled {
+                address: 0x1000,
+                text: "late stale result".into(),
+                mappings: vec![],
+                semantics: SemanticInfo::default(),
+            },
+            &context,
+        );
+        assert!(app.code.is_none());
+        let hit = app.results.lookup(0x1000, "");
+        assert!(hit.graph.is_some() && hit.decompiled.is_none());
+    }
+
+    #[test]
+    fn result_adoption_during_save_stays_dirty_and_failed_signature_ack_keeps_committed_references()
+    {
+        let context = egui::Context::default();
+        let mut app = retained_app();
+        app.project_path = Some("snapshot.grproj".into());
+        let revision = app.result_revision;
+        app.navigate(0x1040, true, &context);
+        let (sender, receiver) = mpsc::channel();
+        app.file_job = Some(receiver);
+        sender
+            .send(FileEvent::ProjectSaved {
+                generation: app.generation,
+                revision: app.revision,
+                result_revision: revision,
+                embedded: true,
+                result: Ok(Some("snapshot.grproj".into())),
+            })
+            .unwrap();
+        app.poll_files(&context);
+        assert!(app.dirty());
+        let publication = Arc::new(crate::call_analysis::CallIndex::new(CallAnalysis::default()));
+        app.set_call_index(Some(publication.clone()));
+        let (pending, mut response) = signature_ack(&mut app, vec![test_signature()], None);
+        if let Response::SignaturesSynced { unapplied, .. } = &mut response {
+            unapplied.push(SignatureStatus {
+                function: 0x1000,
+                reason: "not applied".into(),
+            });
+        }
+        app.receive(pending, response, &context);
+        assert!(Arc::ptr_eq(app.call_index.as_ref().unwrap(), &publication));
+        assert!(app.results.lookup(0x1000, "").complete(true));
     }
 }

@@ -6,7 +6,8 @@
 //! repeated snapshots of one payload never count twice or bypass the budget.
 //! Only reconstructible analysis is stored; annotations never enter the store.
 
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -18,7 +19,8 @@ pub const RESULT_STORE_BUDGET: usize = 64 * 1024 * 1024;
 
 /// Fixed bookkeeping charged per stored component: the index slot, the shared
 /// allocation header, and its key.
-const COMPONENT_OVERHEAD: usize = 256;
+// Includes sparse B-tree node slack, Arc headers, context and key storage.
+const COMPONENT_OVERHEAD: usize = 2048;
 
 /// Allocation bytes a value retains, including its own size. `None` means the
 /// count overflowed; such a value can never be admitted.
@@ -120,9 +122,9 @@ pub struct ProgramContext {
     /// the engine could not apply.
     pub signature_state: String,
     /// Advances whenever the analyzed function inventory changes.
-    pub inventory_state: u64,
+    pub inventory_state: String,
     /// Advances whenever a function name replayed to the engine changes.
-    pub function_name_state: u64,
+    pub function_name_state: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -249,11 +251,21 @@ pub struct StoreUsage {
     pub pinned: usize,
     pub uncached: usize,
     pub records: usize,
+    /// Temporary context/preparation allocations, outside retained payloads.
+    pub preparation: usize,
+}
+
+struct ExternalLease {
+    alive: Box<dyn Fn() -> bool + Send + Sync>,
+    bytes: usize,
+    identity: usize,
 }
 
 pub struct ResultStore<G, D> {
     context: Option<Arc<ProgramContext>>,
-    records: HashMap<u64, Record<G, D>>,
+    records: BTreeMap<u64, Record<G, D>>,
+    external: RefCell<Vec<ExternalLease>>,
+    metadata: usize,
     ledger: Arc<Ledger>,
     uncached: Arc<Ledger>,
     budget: usize,
@@ -265,7 +277,9 @@ impl<G: Retained, D: Retained> ResultStore<G, D> {
     pub fn new(budget: usize) -> Self {
         Self {
             context: None,
-            records: HashMap::new(),
+            records: BTreeMap::new(),
+            external: RefCell::new(Vec::new()),
+            metadata: 0,
             ledger: Arc::default(),
             uncached: Arc::default(),
             budget,
@@ -293,6 +307,7 @@ impl<G: Retained, D: Retained> ResultStore<G, D> {
     pub fn clear(&mut self) {
         self.invalidate_all();
         self.context = None;
+        self.metadata = 0;
     }
 
     fn invalidate_all(&mut self) {
@@ -334,13 +349,13 @@ impl<G: Retained, D: Retained> ResultStore<G, D> {
         protect: Option<u64>,
     ) -> Admission<G> {
         let Some(bytes) = self.admission_bytes(&key.context, &value, 0) else {
-            return Admission::Uncached(self.uncached_slot(value));
+            return Admission::Uncached(self.uncached(value));
         };
         if let Some(record) = self.records.get_mut(&key.address) {
             record.graph = None;
         }
         if !self.make_room(bytes, &[key.address, protect.unwrap_or(key.address)]) {
-            return Admission::Uncached(self.uncached_slot(value));
+            return Admission::Uncached(self.uncached(value));
         }
         let shared = Stored::charge(value, bytes, &self.ledger);
         self.record(key.address).graph = Some(Component {
@@ -363,13 +378,13 @@ impl<G: Retained, D: Retained> ResultStore<G, D> {
         let address = key.function.address;
         let state = key.local_override_state.len();
         let Some(bytes) = self.admission_bytes(&key.function.context, &value, state) else {
-            return Admission::Uncached(self.uncached_slot(value));
+            return Admission::Uncached(self.uncached(value));
         };
         if let Some(record) = self.records.get_mut(&address) {
             record.decompiled = None;
         }
         if !self.make_room(bytes, &[address, protect.unwrap_or(address)]) {
-            return Admission::Uncached(self.uncached_slot(value));
+            return Admission::Uncached(self.uncached(value));
         }
         let shared = Stored::charge(value, bytes, &self.ledger);
         self.record(address).decompiled = Some((
@@ -383,13 +398,92 @@ impl<G: Retained, D: Retained> ResultStore<G, D> {
         Admission::Stored(shared)
     }
 
-    /// Charges a non-evictable shared allocation, such as the committed
-    /// discovery publication, after making room by evicting function results.
-    /// It is always kept: dropping it could misreport reference coverage.
-    pub fn charge_retained<T: Retained>(&mut self, value: T, protect: &[u64]) -> Shared<T> {
-        let bytes = value.retained_bytes().unwrap_or(usize::MAX / 4);
-        self.make_room(bytes, protect);
-        Stored::charge(value, bytes, &self.ledger)
+    /// Reserve shared discovery allocations without taking ownership. The
+    /// charge survives index replacement while a save still pins the snapshot.
+    /// Failed reservation defers publication; it never exceeds the cap.
+    pub fn retain_publication<
+        T: Retained + Send + Sync + 'static,
+        U: Retained + Send + Sync + 'static,
+    >(
+        &mut self,
+        snapshot: &Arc<T>,
+        indexes: &Arc<U>,
+        protect: &[u64],
+    ) -> bool {
+        self.reap_external();
+        let snapshot_id = Arc::as_ptr(snapshot) as usize;
+        let index_id = Arc::as_ptr(indexes) as usize;
+        let leases = self.external.borrow();
+        let snapshot_bytes = if leases.iter().any(|lease| lease.identity == snapshot_id) {
+            0
+        } else {
+            let Some(bytes) = snapshot
+                .retained_bytes()
+                .and_then(|n| n.checked_add(COMPONENT_OVERHEAD))
+            else {
+                return false;
+            };
+            bytes
+        };
+        let index_bytes =
+            if index_id == snapshot_id || leases.iter().any(|lease| lease.identity == index_id) {
+                0
+            } else {
+                let Some(bytes) = indexes
+                    .retained_bytes()
+                    .and_then(|n| n.checked_add(COMPONENT_OVERHEAD))
+                else {
+                    return false;
+                };
+                bytes
+            };
+        drop(leases);
+        let Some(bytes) = snapshot_bytes.checked_add(index_bytes) else {
+            return false;
+        };
+        if !self.make_room(bytes, protect) {
+            return false;
+        }
+        for (identity, bytes, alive) in [
+            (snapshot_id, snapshot_bytes, {
+                let weak = Arc::downgrade(snapshot);
+                Box::new(move || weak.strong_count() != 0) as Box<dyn Fn() -> bool + Send + Sync>
+            }),
+            (index_id, index_bytes, {
+                let weak = Arc::downgrade(indexes);
+                Box::new(move || weak.strong_count() != 0) as Box<dyn Fn() -> bool + Send + Sync>
+            }),
+        ] {
+            if bytes != 0 {
+                self.ledger.charged.fetch_add(bytes, Ordering::AcqRel);
+                self.external.borrow_mut().push(ExternalLease {
+                    alive,
+                    bytes,
+                    identity,
+                });
+            }
+        }
+        true
+    }
+
+    fn reap_external(&self) {
+        self.external.borrow_mut().retain(|lease| {
+            if (lease.alive)() {
+                true
+            } else {
+                self.ledger.charged.fetch_sub(lease.bytes, Ordering::AcqRel);
+                false
+            }
+        });
+    }
+
+    pub fn set_metadata_bytes(&mut self, bytes: usize) -> bool {
+        let extra = bytes.saturating_sub(self.metadata);
+        if !self.make_room(extra, &[]) {
+            return false;
+        }
+        self.metadata = bytes;
+        true
     }
 
     /// Refresh: both components of one function are recomputed.
@@ -416,6 +510,7 @@ impl<G: Retained, D: Retained> ResultStore<G, D> {
     }
 
     pub fn usage(&self) -> StoreUsage {
+        self.reap_external();
         let (indexed, indexed_pinned) =
             self.records
                 .values()
@@ -423,7 +518,7 @@ impl<G: Retained, D: Retained> ResultStore<G, D> {
                     let (bytes, held) = record.indexed();
                     (total.saturating_add(bytes), pinned.saturating_add(held))
                 });
-        let charged = self.ledger.charged();
+        let charged = self.ledger.charged().saturating_add(self.metadata);
         StoreUsage {
             budget: self.budget,
             charged,
@@ -433,6 +528,7 @@ impl<G: Retained, D: Retained> ResultStore<G, D> {
                 .saturating_add(indexed_pinned),
             uncached: self.uncached.charged(),
             records: self.records.len(),
+            preparation: 0,
         }
     }
 
@@ -455,8 +551,9 @@ impl<G: Retained, D: Retained> ResultStore<G, D> {
     /// Evicts least recently used, unprotected, unpinned components until
     /// `bytes` more fit. Pinned components stay: evicting them frees nothing.
     fn make_room(&mut self, bytes: usize, protect: &[u64]) -> bool {
+        self.reap_external();
         loop {
-            let charged = self.ledger.charged();
+            let charged = self.ledger.charged().saturating_add(self.metadata);
             if charged
                 .checked_add(bytes)
                 .is_some_and(|total| total <= self.budget)
@@ -489,7 +586,9 @@ impl<G: Retained, D: Retained> ResultStore<G, D> {
         }
     }
 
-    fn uncached_slot<T: Retained>(&mut self, value: T) -> Shared<T> {
+    /// Charges a displayable result to the uncached-current slot without
+    /// storing it. Only the displayed graph and decompilation use this slot.
+    pub fn uncached<T: Retained>(&mut self, value: T) -> Shared<T> {
         self.counters.uncached += 1;
         let bytes = value.retained_bytes().unwrap_or(0);
         Stored::charge(value, bytes, &self.uncached)
@@ -527,8 +626,8 @@ mod tests {
             engine_fingerprint: "engine",
             signature_fingerprint: "signatures",
             signature_state: signature_state.into(),
-            inventory_state: 0,
-            function_name_state: 0,
+            inventory_state: String::new(),
+            function_name_state: String::new(),
         })
     }
 
@@ -726,17 +825,23 @@ mod tests {
     }
 
     #[test]
-    fn retained_discovery_charges_shrink_room_for_function_results() {
-        let mut store = Store::new(unit() * 2);
-        let current = context("");
-        store.set_context(current.clone());
-        store.admit_graph(&key(&current, 1), Blob(UNIT), ResultOrigin::Computed, None);
-        store.admit_graph(&key(&current, 2), Blob(UNIT), ResultOrigin::Computed, None);
-        let publication = store.charge_retained(Blob(unit()), &[2]);
-        assert!(store.lookup(&key(&current, 1), "").graph.is_none());
-        assert!(store.lookup(&key(&current, 2), "").graph.is_some());
-        assert_eq!(store.usage().charged, unit() * 2);
-        drop(publication);
-        assert_eq!(store.usage().charged, unit());
+    fn retained_publications_remain_charged_until_the_save_snapshot_drops() {
+        let mut store = Store::new(RESULT_STORE_BUDGET);
+        let saved = Arc::new(Blob(2000));
+        let index = Arc::new(Blob(1000));
+        assert!(store.retain_publication(&saved, &index, &[]));
+        let charged = store.usage().charged;
+        assert!(store.retain_publication(&saved, &index, &[]));
+        assert_eq!(store.usage().charged, charged);
+        drop(index);
+        assert_eq!(store.usage().charged, 2000 + COMPONENT_OVERHEAD);
+        drop(saved);
+        assert_eq!(store.usage().charged, 0);
+        assert!(!store.retain_publication(
+            &Arc::new(Blob(RESULT_STORE_BUDGET)),
+            &Arc::new(Blob(1)),
+            &[]
+        ));
+        assert_eq!(store.usage().charged, 0);
     }
 }
