@@ -141,6 +141,25 @@ fn stripped_o2_bank_tail_boundaries_and_replacement() {
             functions.len()
         );
         assert!(hits >= 321);
+        let register = truth
+            .iter()
+            .find(|f| {
+                f["names"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|n| n == "register_tm_clones")
+            })
+            .unwrap();
+        assert!(recovered.contains(&address(register)));
+        assert_eq!(
+            state
+                .admission(address(register) + case.load_base)
+                .unwrap()
+                .reason,
+            AdmissionReason::CrtForwarder
+        );
+
         let bank: Vec<_> = primary
             .iter()
             .filter(|f| {
@@ -239,6 +258,11 @@ fn small_tables_offcuts_labels_singletons_and_unwind_free_precision() {
                     AdmissionReason::InitMetadata
                 );
             }
+            let forward = address("crt_forward_target");
+            assert!(functions.iter().any(|f| f.address == forward));
+            let witness = state.admission(forward).unwrap();
+            assert_eq!(witness.reason, AdmissionReason::CrtForwarder);
+            assert_eq!(witness.owner, Some(address("init_callback")));
             for name in ["singleton", "computed_label_a", "computed_label_b"] {
                 assert!(
                     functions.iter().all(|f| f.address != address(name)),

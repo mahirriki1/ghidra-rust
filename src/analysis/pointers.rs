@@ -189,6 +189,7 @@ impl LoadedProgram {
                                 continue;
                             };
                             if kind != EdgeKind::Branch
+                                || walk.switched.contains(&(source, entry))
                                 || entry == address
                                 || !state.metadata.fdes.contains_key(&entry)
                             {
@@ -395,7 +396,9 @@ impl LoadedProgram {
             &Bounds {
                 tail_entry: None,
                 sections: &self.info.sections,
-                is_function: &|a| known(a) || metadata.fdes.contains_key(&a),
+                is_function: &|a| {
+                    known(a) || metadata.fdes.contains_key(&a) || metadata.forwarders.contains(&a)
+                },
                 pe_ranges: &self.pe_ranges,
             },
             &mut budget,

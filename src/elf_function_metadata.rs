@@ -1,5 +1,5 @@
 //! A bounded ELF64 init/fini and `.eh_frame` range reader, not an unwinder.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use object::elf;
 use object::read::elf::{Dyn, SectionHeader};
@@ -13,6 +13,7 @@ pub(crate) struct FunctionMetadata {
     pub fdes: BTreeMap<u64, u64>,
     pub symbols: BTreeMap<u64, u64>,
     pub callbacks: Vec<FunctionAdmission>,
+    pub forwarders: BTreeSet<u64>,
     pub records: usize,
     pub partial: bool,
 }
@@ -203,17 +204,31 @@ impl FunctionMetadata {
                     None => continue,
                 };
             }
-            let Some(body) = crate::pe_symbols::mapped_bytes(bytes, &info.sections, pc, 5, true)
+            let Some(prefix) = crate::pe_symbols::mapped_bytes(bytes, &info.sections, pc, 2, true)
             else {
                 continue;
             };
-            if body[0] != 0xe9 {
-                continue;
-            }
-            let offset = i64::from(i32::from_le_bytes(
-                body[1..5].try_into().expect("five bytes"),
-            ));
-            let Some(entry) = pc.checked_add(5).and_then(|p| p.checked_add_signed(offset)) else {
+            let (length, offset) = match prefix[0] {
+                0xeb => (2, i64::from(prefix[1] as i8)),
+                0xe9 => {
+                    let Some(body) =
+                        crate::pe_symbols::mapped_bytes(bytes, &info.sections, pc, 5, true)
+                    else {
+                        continue;
+                    };
+                    (
+                        5,
+                        i64::from(i32::from_le_bytes(
+                            body[1..5].try_into().expect("five bytes"),
+                        )),
+                    )
+                }
+                _ => continue,
+            };
+            let Some(entry) = pc
+                .checked_add(length)
+                .and_then(|p| p.checked_add_signed(offset))
+            else {
                 continue;
             };
             if entry == callback.entry || !crate::call_analysis::code_address(info, entry) {
@@ -229,6 +244,12 @@ impl FunctionMetadata {
                 table: None,
             });
         }
+        let allowance = MAX_FUNCTION_ADMISSIONS.saturating_sub(result.callbacks.len());
+        if forwarders.len() > allowance {
+            result.partial = true;
+            forwarders.truncate(allowance);
+        }
+        result.forwarders.extend(forwarders.iter().map(|w| w.entry));
         result.callbacks.extend(forwarders);
         result
     }
