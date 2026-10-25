@@ -10875,6 +10875,7 @@ mod tests {
             revision: app.revision,
             byte_origin: (app.selected, app.tab),
             bytes: None,
+            result: None,
         }
     }
 
@@ -11390,6 +11391,7 @@ mod tests {
                 revision: 0,
                 byte_origin: (None, Tab::Listing),
                 bytes: None,
+                result: None,
             });
             status_frame(&context, &app, now, width, vec![]);
             let (output, idle_rect) = status_frame(
