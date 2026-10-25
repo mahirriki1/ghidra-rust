@@ -10,20 +10,32 @@ use std::time::{Duration, Instant};
 
 pub struct CachedResults {
     pub results: FunctionResults,
+    publication: Option<std::sync::Arc<ghidra_rust::call_analysis::CallIndex>>,
 }
 impl CachedResults {
-    pub fn new(info: &BinaryInfo) -> Self {
+    pub fn new(info: &BinaryInfo, functions: &[ghidra_rust::model::FunctionInfo]) -> Self {
         let mut results = FunctionResults::default();
         results.open(&info.sha256, &[]);
-        results.update_inputs(info.functions.clone(), vec![]);
+        results.update_inputs(functions.to_vec(), vec![]);
         let deadline = Instant::now() + Duration::from_secs(5);
         while results.preparing() {
             assert!(Instant::now() < deadline);
             results.poll_inputs();
             std::thread::yield_now();
         }
-        Self { results }
+        Self {
+            results,
+            publication: None,
+        }
     }
+    pub fn publish(&mut self, snapshot: std::sync::Arc<ghidra_rust::discovery::DiscoverySnapshot>) {
+        let index = std::sync::Arc::new(ghidra_rust::call_analysis::CallIndex::from_snapshot(
+            snapshot,
+        ));
+        assert!(self.results.retain_discovery(&index, &[]));
+        self.publication = Some(index);
+    }
+
     pub fn admit(&mut self, info: &BinaryInfo, view: FunctionView, response: Response) {
         let address = view.address;
         let binding = self.results.binding(address, String::new()).unwrap();

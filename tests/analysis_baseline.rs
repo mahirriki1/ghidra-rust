@@ -276,7 +276,8 @@ fn profile_contained_analysis_client() {
             let graph_blocks = view.blocks.len();
             let pseudocode_bytes = text.len();
             let semantic_ranges = mappings.len();
-            let mut cached = result_measurement::CachedResults::new(&info);
+            let mut cached = result_measurement::CachedResults::new(&info, &functions);
+            cached.publish(std::sync::Arc::new(state.save()));
             cached.admit(&info, view, response);
             let other = info
                 .functions
