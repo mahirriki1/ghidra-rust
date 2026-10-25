@@ -1853,6 +1853,7 @@ impl DesktopApp {
         }
         self.discovery_running = false;
         self.discovery_activity = None;
+        self.update_discovery_summary();
         self.worker_inventory = None;
         self.inventory_synced = false;
         self.finish_auto_run(AnalysisStep::Functions);
@@ -11134,15 +11135,55 @@ mod tests {
             "N/N does not imply discovery completion"
         );
         assert!(app.discovery_running);
+        assert!(
+            app.discovery_summary
+                .as_ref()
+                .unwrap()
+                .contains("· running")
+        );
         let mut state = app.discovery.take().unwrap();
-        state.patterns.as_mut().unwrap().cursor = None;
+        let phase = state.patterns.as_mut().unwrap();
+        phase.cursor = None;
+        phase.admitted = 7;
+        phase.scanned_bytes = 8192;
         run_update(&mut app, state);
         app.poll_discovery(&context);
         assert!(app.discovery_activity.is_none());
         assert!(!app.discovery_running);
+        let summary = app.discovery_summary.as_ref().unwrap();
+        assert!(!summary.contains("· running") && !summary.contains("· paused"));
+        assert!(summary.contains("7 pattern starts from 8 KiB"));
         app.pump_analysis(&context);
         assert!(app.analysis_plan.is_none());
         assert!(app.analysis_presentation(now).is_none());
+    }
+
+    #[test]
+    fn final_seed_adoption_keeps_partial_warning_without_live_status() {
+        let context = egui::Context::default();
+        theme::install(&context);
+        let start = Instant::now();
+        let mut app = run_progress_app(start);
+        let mut state = crate::discovery::Discovery::new(None, [0x1000, 0x1040], true);
+        run_commit(&app, &mut state, 2);
+        run_update(&mut app, state);
+        app.poll_discovery(&context);
+        assert!(!app.discovery_running);
+        assert!(app.discovery_activity.is_none());
+        assert!(
+            app.analysis_presentation(start + Duration::from_secs(3))
+                .is_none()
+        );
+        let summary = app.discovery_summary.as_ref().unwrap();
+        assert!(summary.contains("partial coverage"));
+        assert!(!summary.contains("· running") && !summary.contains("· paused"));
+        assert!(app.status_notes().any(|note| note == summary));
+        status_frame(&context, &app, start, 1000.0, vec![]);
+        let (output, _) = status_frame(&context, &app, start, 1000.0, vec![]);
+        let position = text_position(&output, "    1", 0) + egui::vec2(8.0, 5.0);
+        status_frame(&context, &app, start, 1000.0, pointer_events(position));
+        let (output, _) = status_frame(&context, &app, start, 1000.0, vec![]);
+        assert!(rendered_text(&output).iter().any(|text| text == summary));
     }
 
     #[test]
