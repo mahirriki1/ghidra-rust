@@ -581,5 +581,13 @@ survived restart and reusing the same result left the project clean. The four
 full native hit lookup/adoption spans were 9, 8, 8, 7 microseconds (p95
 9 microseconds); this tiny sample measures synchronous adoption separately from
 frame submission and does not establish end-to-end latency. The parent trace
-ended with `trace_health` and no dropped records. Native Windows remains a
-separate validation; this run did not use a Windows VM.
+ended with `trace_health` and no dropped records.
+
+Native Windows was validated separately on a Windows 11 Pro x64 virtual machine.
+`scripts/build-windows.ps1` passed formatting, the debug tests (359 library
+tests plus integration suites, including the PE fixture), strict Clippy, the
+release build, the release PE/AArch64 worker tests and packaging. The release
+desktop then repeated the same A/B/A, exact history, selection, Refresh, v4
+save/reopen and worker-restart assertions on the fixture, and they passed. The
+virtual machine renders OpenGL in software through Microsoft's D3D12-based
+compatibility layer, so that run provides no rendering-latency evidence.
