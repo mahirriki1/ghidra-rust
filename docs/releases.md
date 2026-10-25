@@ -80,7 +80,9 @@ before shipping to another machine.
 The **Automatic main release** workflow runs for every push to `main`, including
 merged pull requests. It prepares the next patch version (for example, `v0.0.4`,
 then `v0.0.5`), builds Linux and Windows, verifies the complete package
-set and checksums, and publishes a GitHub Release. Its description starts with
+set and checksums, and publishes a GitHub Release. While the version is `0.x`,
+each release is published as a **pre-release** and is never marked latest; the
+first `1.0.0` manifest version publishes the first stable release. Its description starts with
 detailed bullets from every added or amended `docs/release-notes/*.md` entry
 since the previous published version. Add an entry with each PR or direct change;
 see [writing release notes](release-notes/README.md) for the format and local
@@ -115,8 +117,8 @@ pipeline instead of starting duplicate unversioned native builds. Both platforms
 must pass before publication; partial asset uploads remain in an unpublished draft
 and can be resumed by rerunning the workflow, which refreshes the draft's notes.
 A rerun of an already published release leaves its notes and assets intact.
-A slower older main update does not replace the current main update as the
-latest release. The published executables, archives,
+For stable versions, a slower older main update does not replace the current main
+update as the latest release. The published executables, archives,
 and four adjacent `.sha256` files are permanent release assets.
 
 The preparation and publication jobs use the repository's built-in `GITHUB_TOKEN`
