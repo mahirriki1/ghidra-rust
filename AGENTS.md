@@ -67,7 +67,7 @@ fingerprints, correctness tests, and upstream attribution in `NOTICE`.
   Do not infer links from matching text, row numbers, or nearest addresses.
 - Keep call double-click navigation and back/forward history working alongside
   single-click selection synchronization.
-- Maintain the existing bindings: `L`, `G`, `;`, `Space`, `Alt+Left/Right`, and
+- Maintain the existing bindings: `L`, `G`, `;`, `X`, `F1`, `Space`, `Alt+Left/Right`, and
   `Ctrl+S/Z`. Respect text-field focus, modal dialogs, repeat keys, and file jobs.
 - Keep expensive analysis, decoding, directory reads, and project I/O off the
   GUI thread. Use bounded work, virtualized lists, cached geometry/highlighting,
@@ -108,7 +108,7 @@ fingerprints, correctness tests, and upstream attribution in `NOTICE`.
 Use the toolchain pinned in `.github/workflows/ci.yml` (currently Rust 1.98.1,
 edition 2024), a native C/C++ toolchain, and an OpenGL-capable desktop. Linux GUI
 analysis also requires bubblewrap and working unprivileged user namespaces.
-Native Windows builds use x64 MSVC tools and a Windows SDK; see `README.md`.
+Native Windows builds use x64 MSVC tools and a Windows SDK; see [the Windows guide](docs/windows.md).
 
 ```sh
 cargo run --release --locked
