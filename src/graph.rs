@@ -150,8 +150,8 @@ impl GraphCanvas {
             if ui.button("+").clicked() {
                 zoom_change *= 1.2;
             }
-            ui.label(format!("{:.0}%", self.zoom * 100.0));
-            ui.small("Drag to pan · Ctrl+wheel to zoom · double-click a call to follow");
+            ui.label(format!("{:.0}%", self.zoom * 100.0))
+                .on_hover_text("Drag to pan · Ctrl+wheel to zoom · double-click a call to follow");
         });
         ui.horizontal_wrapped(|ui| {
             for (kind, label) in [

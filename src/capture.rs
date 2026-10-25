@@ -3,9 +3,11 @@
 //! `GHIDRA_RUST_CAPTURE_TO=<file.ppm>` writes one frame after the desktop has
 //! been idle for `GHIDRA_RUST_CAPTURE_DELAY` seconds (default 6) and exits.
 //! `GHIDRA_RUST_CAPTURE_GOTO=<hex>` navigates once the binary is open,
-//! `GHIDRA_RUST_CAPTURE_TAB=graph` shows the function graph, and
-//! `GHIDRA_RUST_CAPTURE_SELECT=<hex>` then selects one of its instructions.
-//! The first-open analysis prompt is dismissed without analyzing.
+//! `GHIDRA_RUST_CAPTURE_TAB=<graph|strings|crypto|decode|hex|references>`
+//! shows that view, and `GHIDRA_RUST_CAPTURE_SELECT=<hex>` then selects one of
+//! its instructions. `GHIDRA_RUST_CAPTURE_ANALYZE=1` runs every automatic
+//! analysis first; otherwise the first-open prompt is dismissed without
+//! analyzing. `GHIDRA_RUST_CAPTURE_SIZE=<width>x<height>` resizes the window.
 use eframe::egui;
 use std::io::Write;
 use std::time::{Duration, Instant};
@@ -15,7 +17,9 @@ pub struct Capture {
     delay: Duration,
     pub goto: Option<u64>,
     pub select: Option<u64>,
-    pub graph: bool,
+    pub tab: Option<String>,
+    pub analyze: bool,
+    pub size: Option<egui::Vec2>,
     idle_since: Option<Instant>,
     requested: bool,
 }
@@ -32,13 +36,20 @@ impl Capture {
                 .ok()
                 .and_then(|value| u64::from_str_radix(value.trim_start_matches("0x"), 16).ok())
         };
-        let graph = std::env::var("GHIDRA_RUST_CAPTURE_TAB").is_ok_and(|tab| tab == "graph");
+        let size = std::env::var("GHIDRA_RUST_CAPTURE_SIZE")
+            .ok()
+            .and_then(|size| {
+                let (width, height) = size.split_once('x')?;
+                Some(egui::vec2(width.parse().ok()?, height.parse().ok()?))
+            });
         Some(Self {
             path,
             delay: Duration::from_secs_f32(delay),
             goto: address("GHIDRA_RUST_CAPTURE_GOTO"),
             select: address("GHIDRA_RUST_CAPTURE_SELECT"),
-            graph,
+            tab: std::env::var("GHIDRA_RUST_CAPTURE_TAB").ok(),
+            analyze: std::env::var_os("GHIDRA_RUST_CAPTURE_ANALYZE").is_some(),
+            size,
             idle_since: None,
             requested: false,
         })
