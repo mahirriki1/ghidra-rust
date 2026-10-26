@@ -187,7 +187,7 @@ fn rust_arm(request_doc: &RunRequest) -> RustRun {
             path: request_doc.input_path.to_string_lossy().into_owned(),
         },
     ) {
-        Ok((Response::Opened { info }, elapsed)) => {
+        Ok((Response::Opened { info, .. }, elapsed)) => {
             run.timings.insert("open_ms".into(), elapsed.into());
             info
         }

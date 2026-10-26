@@ -59,7 +59,7 @@ pub struct GraphCanvas {
     needs_fit: bool,
     needs_initial_view: bool,
     reveal: Option<u64>,
-    comment_key: Option<(u64, u64)>,
+    comment_key: Option<(u64, u64, u64)>,
     /// The instruction under the last secondary click, kept while its context
     /// menu stays open and the pointer moves. Reset with the function.
     context: Option<u64>,
@@ -110,26 +110,33 @@ impl GraphCanvas {
     }
 
     /// Refresh only derived geometry, retaining the user's camera and pending
-    /// reveal. Previews are bounded and cached by the app's annotation revision.
+    /// reveal. Previews are bounded and cached by the app's annotation and
+    /// name revisions. `call_names` holds names of verified direct-call targets
+    /// by call-instruction address.
     pub fn set_comments(
         &mut self,
         view: &FunctionView,
-        key: (u64, u64),
+        key: (u64, u64, u64),
         comments: &BTreeMap<u64, String>,
+        call_names: impl FnOnce() -> BTreeMap<u64, String>,
     ) {
         if self.function != view.address {
             *self = Self::new(view);
         }
         if self.comment_key != Some(key) {
+            let call_names = &call_names();
             let commented = view
                 .blocks
                 .iter()
                 .take(MAX_BLOCKS)
                 .flat_map(|block| &block.instructions)
-                .any(|instruction| comments.contains_key(&instruction.address));
+                .any(|instruction| {
+                    comments.contains_key(&instruction.address)
+                        || call_names.contains_key(&instruction.address)
+                });
             self.layout = if commented {
                 let _layout = crate::performance::span("gui_graph_comment_layout");
-                Arc::new(Layout::with_comments(view, comments))
+                Arc::new(Layout::annotated(view, comments, call_names))
             } else {
                 self.base.clone()
             };
@@ -518,7 +525,7 @@ impl Node {
 
 impl GraphGeometry {
     pub fn new(view: &FunctionView) -> Self {
-        Self::with_comments(view, &BTreeMap::new())
+        Self::annotated(view, &BTreeMap::new(), &BTreeMap::new())
     }
 
     /// Allocation capacity retained by this geometry, including itself.
@@ -545,7 +552,11 @@ impl GraphGeometry {
         bytes.total()
     }
 
-    fn with_comments(view: &FunctionView, comments: &BTreeMap<u64, String>) -> Self {
+    fn annotated(
+        view: &FunctionView,
+        comments: &BTreeMap<u64, String>,
+        call_names: &BTreeMap<u64, String>,
+    ) -> Self {
         let no_return: BTreeSet<_> = view
             .calls
             .iter()
@@ -631,11 +642,14 @@ impl GraphGeometry {
                         .instructions
                         .iter()
                         .flat_map(|instruction| {
+                            let callee = call_names
+                                .get(&instruction.address)
+                                .map_or(String::new(), |name| format!("  {name}"));
                             let mut rows = vec![(
                                 instruction.address,
                                 crop(
                                     &format!(
-                                        "{:08x}  {:<8} {}",
+                                        "{:08x}  {:<8} {}{callee}",
                                         instruction.address,
                                         instruction.mnemonic,
                                         instruction.operands
@@ -1359,7 +1373,7 @@ mod tests {
         let mut graph = GraphCanvas::new(&view);
         let context = egui::Context::default();
         let mut comments = BTreeMap::from([(address, "branch comment */ literal".into())]);
-        graph.set_comments(&view, (1, 1), &comments);
+        graph.set_comments(&view, (1, 1, 0), &comments, BTreeMap::new);
         // Keep the entry on screen at readable scale for an actual paint check.
         graph.zoom = 1.0;
         graph.pan = vec2(5.0, 5.0);
@@ -1389,7 +1403,7 @@ mod tests {
         output.textures_delta.clear();
         graph.pan = camera.1;
         comments.insert(address, "edited".into());
-        graph.set_comments(&view, (1, 2), &comments);
+        graph.set_comments(&view, (1, 2, 0), &comments, BTreeMap::new);
         assert_eq!((graph.zoom, graph.pan), camera);
         assert!(
             graph
@@ -1400,7 +1414,7 @@ mod tests {
                 .any(|(pc, text)| *pc == address && text == "; edited")
         );
         comments.clear();
-        graph.set_comments(&view, (1, 3), &comments);
+        graph.set_comments(&view, (1, 3, 0), &comments, BTreeMap::new);
         assert!(
             !graph
                 .layout

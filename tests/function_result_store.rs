@@ -241,7 +241,7 @@ fn worker_cache_case(path: &std::path::Path, a: u64, b: u64) {
     )
     .unwrap();
     let mut count = 0;
-    let Response::Opened { info } = request(
+    let Response::Opened { info, .. } = request(
         &mut worker,
         Request::Open {
             path: path.to_string_lossy().into_owned(),

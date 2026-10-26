@@ -121,7 +121,7 @@ fn reply_nodes(kind: &str) -> Option<usize> {
     const ADDRESS: usize = 9;
     const INSTRUCTION: usize = 9 + MAX_INSTRUCTION_BYTES;
     let nodes = match kind {
-        "opened" => FUNCTION * MAX_FUNCTIONS + SECTION * MAX_SECTIONS + MAX_WARNINGS,
+        "opened" => FUNCTION * MAX_FUNCTIONS + SECTION * MAX_SECTIONS + MAX_WARNINGS + 8,
         "functions" | "discovery_batch" => {
             FUNCTION * MAX_FUNCTIONS
                 + CALL * MAX_CALL_REFERENCES
@@ -150,6 +150,7 @@ fn reply_nodes(kind: &str) -> Option<usize> {
         "bytes" => MAX_BYTE_READ,
         "strings" => 7 * MAX_STRING_RESULTS,
         "crypto" => 9 * MAX_CRYPTO_MATCHES,
+        "symbol_names" => 7 * MAX_SYMBOL_NAME_PAGE_RECORDS + 10,
         "progress" | "renamed" | "error" | "functions_synced" => 0,
         _ => return None,
     };
@@ -207,7 +208,11 @@ pub(crate) fn check_reply(line: &[u8]) -> Result<ReplyShape, String> {
             let nodes = reply_nodes(&kind).ok_or_else(|| A::Error::custom("unknown reply kind"))?;
             let mut budget = Budget {
                 nodes,
-                max_string: MAX_DECOMPILED_BYTES,
+                max_string: if kind == "symbol_names" {
+                    MAX_SYMBOL_RAW_BYTES
+                } else {
+                    MAX_DECOMPILED_BYTES
+                },
             };
             while access.next_key_seed(Count(&mut budget))?.is_some() {
                 access.next_value_seed(Count(&mut budget))?;
@@ -242,6 +247,10 @@ pub(crate) fn check_reply(line: &[u8]) -> Result<ReplyShape, String> {
     deserializer
         .end()
         .map_err(|e| format!("Invalid worker response: {e}"))?;
+    // Pages are packed by encoded record size; a page and its envelope fit here.
+    if shape.kind == "symbol_names" && line.len() > MAX_SYMBOL_NAME_PAGE_BYTES + 512 {
+        return Err("Invalid worker response: symbol-name page exceeds its size limit".into());
+    }
     Ok(shape)
 }
 

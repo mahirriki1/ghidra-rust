@@ -12,6 +12,7 @@ if ([Environment]::OSVersion.Platform -ne 'Win32NT') {
 
 $root = Split-Path $PSScriptRoot -Parent
 $previousFixture = $env:GHIDRA_RUST_TEST_PE
+$previousCppFixture = $env:GHIDRA_RUST_TEST_PE_CPP
 Push-Location $root
 try {
     $compiler = & rustc -vV
@@ -40,6 +41,12 @@ try {
         & cmd.exe /d /c "`"$vcvars`" && cl /nologo /Od /Zi /Fo`"$fixtureDir\sample.obj`" /Fd`"$fixtureDir\compiler.pdb`" /Fe`"$fixture`" `"$source`" /link /INCREMENTAL:NO /PDB:`"$fixtureDir\sample.pdb`" /EXPORT:branch_loop /EXPORT:base64_message /EXPORT:aes_sbox_prefix"
         if ($LASTEXITCODE -ne 0) { throw 'Building the original PE fixture failed.' }
         $env:GHIDRA_RUST_TEST_PE = $fixture
+        # An MSVC C++ DLL whose decorated exports must stay raw.
+        $cppFixture = Join-Path $fixtureDir 'demangle.dll'
+        $cppSource = Join-Path $root 'tests\fixtures\demangle_program.cpp'
+        & cmd.exe /d /c "`"$vcvars`" && cl /nologo /Od /LD /Fo`"$fixtureDir\demangle.obj`" /Fe`"$cppFixture`" `"$cppSource`" /link /INCREMENTAL:NO"
+        if ($LASTEXITCODE -ne 0) { throw 'Building the original C++ DLL fixture failed.' }
+        $env:GHIDRA_RUST_TEST_PE_CPP = $cppFixture
     }
 
     & cargo fmt --all --check
@@ -63,5 +70,6 @@ try {
     & "$PSScriptRoot\package-windows.ps1"
 } finally {
     $env:GHIDRA_RUST_TEST_PE = $previousFixture
+    $env:GHIDRA_RUST_TEST_PE_CPP = $previousCppFixture
     Pop-Location
 }

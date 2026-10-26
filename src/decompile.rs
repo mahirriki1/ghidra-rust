@@ -10,6 +10,7 @@ use crate::model::{
 };
 use crate::selection::ExecutableRanges;
 use crate::semantic::{LocalRename, MAX_TOKENS, SemanticInfo, SemanticToken, TokenKind};
+use crate::symbol_names::SymbolTable;
 use ghidra_decompiler::action::{Action, ActionBase, ActionGroupList};
 use ghidra_decompiler::architecture::Architecture;
 use ghidra_decompiler::error::{Error, Result};
@@ -186,6 +187,29 @@ pub fn render_with_context(
     signature_context: &str,
     signature_owned: bool,
 ) -> Result<(String, Vec<CodeMapping>, SemanticInfo)> {
+    render_named(
+        program,
+        address,
+        sections,
+        renames,
+        signature_context,
+        signature_owned,
+        None,
+    )
+}
+
+/// [`render_with_context`] that prints worker-derived display names for the
+/// declaration and verified direct-call name tokens. Names are chosen while
+/// emitting, so every mapping and token offset measures the final text.
+pub fn render_named(
+    program: &mut Program,
+    address: u64,
+    sections: &[SectionInfo],
+    renames: &[LocalRename],
+    signature_context: &str,
+    signature_owned: bool,
+    names: Option<Arc<SymbolTable>>,
+) -> Result<(String, Vec<CodeMapping>, SemanticInfo)> {
     crate::semantic::validate_renames(renames, Some(address)).map_err(Error::Lowlevel)?;
     if signature_context.len() > 96 || (signature_owned && signature_context.is_empty()) {
         return Err(Error::Lowlevel(
@@ -214,7 +238,7 @@ pub fn render_with_context(
         pretty.set_max_line_size(line_size)?;
     }
     pretty.set_indent_increment(printer.base().emit.get_indent_increment());
-    pretty.lowlevel = Box::new(LocationEmitter::new(Arc::clone(&capture)));
+    pretty.lowlevel = Box::new(LocationEmitter::new(Arc::clone(&capture), address, names));
     let original_action = architecture
         .allacts
         .actionmap
@@ -287,11 +311,15 @@ struct LocationEmitter {
     saturated: bool,
     declarations: Vec<Option<usize>>,
     declaration_overflow: usize,
+    function: u64,
+    names: Option<Arc<SymbolTable>>,
 }
 
 impl LocationEmitter {
-    fn new(capture: Shared) -> Self {
+    fn new(capture: Shared, function: u64, names: Option<Arc<SymbolTable>>) -> Self {
         Self {
+            function,
+            names,
             base: EmitBase::new(),
             text: Vec::new(),
             capture,
@@ -531,11 +559,10 @@ impl Emit for LocationEmitter {
         &mut self,
         text: &str,
         _highlight: SyntaxHighlight,
-        _function: Option<&FuncMark>,
+        function: Option<&FuncMark>,
         op: Option<OpMark>,
     ) -> Result<()> {
         let start = self.text.len();
-        self.token(text, op)?;
         // Function prototypes have no CALL op. Indirect calls never enter this map.
         let target = op.and_then(|op| {
             self.capture
@@ -545,8 +572,22 @@ impl Emit for LocationEmitter {
                 .get(&op.id)
                 .copied()
         });
+        let entry = function.map(|mark| mark.entry.get_offset());
+        // Only a verified direct-call target, or this function's own
+        // declaration, has an exact address. Everything else keeps engine text.
+        let named = match (target, op) {
+            (Some(target), _) => entry.is_none_or(|entry| entry == target).then_some(target),
+            (None, None) => entry.filter(|&entry| entry == self.function),
+            (None, Some(_)) => None,
+        };
+        let names = self.names.clone();
+        let shown = named
+            .zip(names.as_deref())
+            .and_then(|(address, names)| names.display_for(address, text))
+            .unwrap_or(text);
+        self.token(shown, op)?;
         if let Some(target) = target {
-            self.semantic_token(start, text, TokenKind::Call { target });
+            self.semantic_token(start, shown, TokenKind::Call { target });
         }
         Ok(())
     }
@@ -704,7 +745,7 @@ mod tests {
             (OpId(1), 0x401013),
             (OpId(2), 0x401016),
         ]);
-        let mut emitter = LocationEmitter::new(Arc::clone(&capture));
+        let mut emitter = LocationEmitter::new(Arc::clone(&capture), 0, None);
         let first = OpMark {
             id: OpId(0),
             time: 1,
@@ -739,7 +780,7 @@ mod tests {
             .unwrap()
             .operations
             .extend([(OpId(0), 0x401010), (OpId(1), 0x401013)]);
-        let mut emitter = LocationEmitter::new(Arc::clone(&capture));
+        let mut emitter = LocationEmitter::new(Arc::clone(&capture), 0, None);
         emitter
             .begin_statement(Some(OpMark {
                 id: OpId(0),
@@ -779,7 +820,7 @@ mod tests {
     #[test]
     fn oversized_unicode_and_nested_statements_stay_bounded() {
         let capture = Shared::default();
-        let mut emitter = LocationEmitter::new(Arc::clone(&capture));
+        let mut emitter = LocationEmitter::new(Arc::clone(&capture), 0, None);
         for _ in 0..MAX_STATEMENT_DEPTH + 20 {
             emitter.begin_statement(None).unwrap();
         }

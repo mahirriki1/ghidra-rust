@@ -71,8 +71,9 @@ fn protocol(
                     loaded = None;
                     let program = LoadedProgram::open(&path)?;
                     let info = program.info.clone();
+                    let symbols = Some(program.symbol_names().clone());
                     loaded = Some(program);
-                    Ok(Response::Opened { info })
+                    Ok(Response::Opened { info, symbols })
                 }
                 request => loaded
                     .as_mut()
@@ -276,6 +277,11 @@ mod tests {
                 functions_truncated: true,
                 warnings: vec!["\u{1}".repeat(512); 64],
             },
+            symbols: Some(SymbolNameSummary {
+                digest: "f".repeat(64),
+                records: usize::MAX,
+                truncated: true,
+            }),
         }));
     }
 

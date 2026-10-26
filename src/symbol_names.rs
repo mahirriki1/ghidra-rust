@@ -1,10 +1,12 @@
-//! Worker-only demangling primitives for the upcoming symbol-name table.
+//! Bounded symbol-name tables: worker-only demangling plus the parent's
+//! validated, paged copy.
 //!
-//! This module is not wired into loading, transport, presentation or projects.
-//! Call it only in a disposable analysis worker, under its existing memory and
-//! deadline limits. Input, emitted text, formatter calls and supported parser
-//! recursion are bounded here; backend work that emits no text still relies on
-//! process containment. Unwinding panics become omissions, not partial names.
+//! [`demangle`] and [`SymbolTable::build`] run only in a disposable analysis
+//! worker, under its existing memory and deadline limits. Input, emitted text,
+//! formatter calls and supported parser recursion are bounded here; backend
+//! work that emits no text still relies on process containment. Unwinding
+//! panics become omissions, not partial names. The desktop never demangles:
+//! it validates pages into [`SymbolNames`] and only looks names up.
 //!
 //! Raw names and addresses remain the caller's identity. Results are display
 //! text only and must never establish types, references or no-return evidence.
@@ -12,9 +14,13 @@
 
 use std::fmt::{self, Write};
 
+use sha2::{Digest, Sha256};
+
 use crate::model::{
-    MAX_SYMBOL_DISPLAY_BYTES, MAX_SYMBOL_FORMAT_WRITES, MAX_SYMBOL_RAW_BYTES,
-    SYMBOL_DEMANGLE_RECURSION_LIMIT,
+    MAX_SYMBOL_DISPLAY_BYTES, MAX_SYMBOL_FORMAT_WRITES, MAX_SYMBOL_NAME_PAGE_BYTES,
+    MAX_SYMBOL_NAME_PAGE_RECORDS, MAX_SYMBOL_NAME_RECORDS, MAX_SYMBOL_NAME_TABLE_BYTES,
+    MAX_SYMBOL_RAW_BYTES, SYMBOL_DEMANGLE_RECURSION_LIMIT, SymbolName, SymbolNamePage,
+    SymbolNameSummary, symbol_record_bytes,
 };
 
 /// Container-specific linker decoration, supplied from validated image metadata.
@@ -181,6 +187,322 @@ impl Write for CappedName {
     }
 }
 
+/// Container suffix the pinned engine appends to an import stub whose
+/// demangled name collides with a defined function.
+const PLT_SUFFIX: &str = "@plt";
+
+/// One engine function entry at open, before any analyst replay.
+pub struct SymbolSource<'a> {
+    pub address: u64,
+    /// The exact original symbol: the loader symbol the engine recorded, or the
+    /// PE metadata name, never a shortened or collision-suffixed engine name.
+    pub raw: &'a str,
+    /// The engine's own name for this function at open.
+    pub engine: &'a str,
+}
+
+/// The worker's immutable table for one opened image. Records exist only
+/// where display or lookup gains something: a demangled name, or a raw symbol
+/// the engine name does not spell exactly.
+pub struct SymbolTable {
+    records: Vec<SymbolName>,
+    /// Aligned with `records`; never sent. Pseudocode substitutes a display
+    /// name only for a token that still spells the engine's open-time name.
+    engine: Vec<Box<str>>,
+    summary: SymbolNameSummary,
+}
+
+impl Default for SymbolTable {
+    fn default() -> Self {
+        Self::build(std::iter::empty(), SymbolFormat::Other)
+    }
+}
+
+impl SymbolTable {
+    /// `sources` must be in strictly increasing address order; others are
+    /// skipped. Records beyond the count or byte budget are omitted.
+    pub fn build<'a>(
+        sources: impl IntoIterator<Item = SymbolSource<'a>>,
+        format: SymbolFormat,
+    ) -> Self {
+        let mut records = Vec::new();
+        let mut engine = Vec::new();
+        let mut bytes = 0usize;
+        let mut truncated = false;
+        let mut previous = None;
+        for source in sources {
+            if previous.is_some_and(|previous| previous >= source.address)
+                || !valid_text(source.raw, MAX_SYMBOL_RAW_BYTES)
+                || source.engine.len() > MAX_SYMBOL_RAW_BYTES
+            {
+                continue;
+            }
+            previous = Some(source.address);
+            let display = match demangle(source.raw, format) {
+                DemangleOutcome::Display(name) => Some(name.text),
+                _ => None,
+            }
+            .and_then(|mut display| {
+                // Keep the engine's import-stub disambiguation visible.
+                if source.engine.ends_with(PLT_SUFFIX) && !source.raw.ends_with(PLT_SUFFIX) {
+                    if display.len() + PLT_SUFFIX.len() > MAX_SYMBOL_DISPLAY_BYTES {
+                        return None;
+                    }
+                    display.push_str(PLT_SUFFIX);
+                }
+                (display != source.raw).then_some(display)
+            });
+            if display.is_none() && source.raw == source.engine {
+                continue;
+            }
+            let record = SymbolName {
+                address: source.address,
+                raw: source.raw.to_owned(),
+                display,
+            };
+            let size = symbol_record_bytes(&record);
+            if records.len() == MAX_SYMBOL_NAME_RECORDS
+                || size > MAX_SYMBOL_NAME_TABLE_BYTES - bytes
+            {
+                truncated = true;
+                break;
+            }
+            bytes += size;
+            records.push(record);
+            engine.push(source.engine.into());
+        }
+        let summary = SymbolNameSummary {
+            digest: digest(&records),
+            records: records.len(),
+            truncated,
+        };
+        Self {
+            records,
+            engine,
+            summary,
+        }
+    }
+
+    pub fn summary(&self) -> &SymbolNameSummary {
+        &self.summary
+    }
+
+    /// Records from `cursor`, packed by count and encoded size. A cursor at the
+    /// end of a non-empty table is rejected rather than answered empty.
+    pub fn page(&self, cursor: usize) -> Result<SymbolNamePage, String> {
+        if cursor >= self.records.len() {
+            return Err("Symbol-name cursor is outside the table".into());
+        }
+        let mut bytes = 0;
+        let entries: Vec<_> = self.records[cursor..]
+            .iter()
+            .take(MAX_SYMBOL_NAME_PAGE_RECORDS)
+            .enumerate()
+            .take_while(|(index, record)| {
+                bytes += symbol_record_bytes(record);
+                *index == 0 || bytes <= MAX_SYMBOL_NAME_PAGE_BYTES
+            })
+            .map(|(_, record)| record.clone())
+            .collect();
+        let end = cursor + entries.len();
+        Ok(SymbolNamePage {
+            digest: self.summary.digest.clone(),
+            cursor,
+            next: (end < self.records.len()).then_some(end),
+            entries,
+        })
+    }
+
+    /// The display name to print for a function-name token at an exact,
+    /// engine-verified `address`, only while `text` is the engine's open-time
+    /// name. Analyst renames and other text are never replaced.
+    pub fn display_for(&self, address: u64, text: &str) -> Option<&str> {
+        let index = self
+            .records
+            .binary_search_by_key(&address, |record| record.address)
+            .ok()?;
+        (*self.engine[index] == *text)
+            .then(|| self.records[index].display.as_deref())
+            .flatten()
+    }
+}
+
+fn valid_text(text: &str, limit: usize) -> bool {
+    !text.is_empty() && text.len() <= limit && !text.chars().any(disallowed)
+}
+
+fn hash_record(hash: &mut Sha256, record: &SymbolName) {
+    hash.update(record.address.to_le_bytes());
+    hash.update((record.raw.len() as u64).to_le_bytes());
+    hash.update(record.raw.as_bytes());
+    match &record.display {
+        Some(display) => {
+            hash.update([1]);
+            hash.update((display.len() as u64).to_le_bytes());
+            hash.update(display.as_bytes());
+        }
+        None => hash.update([0]),
+    }
+}
+
+/// Order-sensitive identity of a complete table.
+pub fn digest(records: &[SymbolName]) -> String {
+    let mut hash = Sha256::new();
+    for record in records {
+        hash_record(&mut hash, record);
+    }
+    format!("{:x}", hash.finalize())
+}
+
+/// A validated, adopted table. Lookups are by exact address; text queries
+/// compare exact strings and never become identities.
+#[derive(Debug, Default)]
+pub struct SymbolNames {
+    digest: String,
+    records: Box<[SymbolName]>,
+    truncated: bool,
+}
+
+impl SymbolNames {
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+
+    pub fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    pub fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
+    pub fn get(&self, address: u64) -> Option<&SymbolName> {
+        self.records
+            .binary_search_by_key(&address, |record| record.address)
+            .ok()
+            .map(|index| &self.records[index])
+    }
+
+    /// First address whose exact raw symbol or display name is `query`.
+    pub fn find(&self, query: &str) -> Option<u64> {
+        let exact = |pick: fn(&SymbolName) -> Option<&str>| {
+            self.records
+                .iter()
+                .find(|record| pick(record) == Some(query))
+                .map(|record| record.address)
+        };
+        exact(|record| Some(&record.raw)).or_else(|| exact(|record| record.display.as_deref()))
+    }
+
+    /// Allocation capacity retained by this table.
+    pub fn retained_bytes(&self) -> usize {
+        self.records.iter().fold(
+            size_of::<Self>() + self.digest.capacity() + size_of_val(&*self.records),
+            |bytes, record| {
+                bytes + record.raw.capacity() + record.display.as_ref().map_or(0, String::capacity)
+            },
+        )
+    }
+}
+
+/// Parent-side accumulation of one worker table's pages. Every page must
+/// continue the previous cursor, match the announced digest and stay within
+/// the per-page and cumulative bounds; the completed records must hash to it.
+pub struct SymbolNameFetch {
+    summary: SymbolNameSummary,
+    records: Vec<SymbolName>,
+    bytes: usize,
+    hash: Sha256,
+}
+
+impl SymbolNameFetch {
+    pub fn new(summary: SymbolNameSummary) -> Result<Self, String> {
+        if summary.records > MAX_SYMBOL_NAME_RECORDS
+            || summary.digest.len() != 64
+            || !summary
+                .digest
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return Err("Invalid symbol-name table summary".into());
+        }
+        Ok(Self {
+            records: Vec::with_capacity(summary.records.min(MAX_SYMBOL_NAME_PAGE_RECORDS)),
+            summary,
+            bytes: 0,
+            hash: Sha256::new(),
+        })
+    }
+
+    pub fn summary(&self) -> &SymbolNameSummary {
+        &self.summary
+    }
+
+    /// Next cursor to request, or `None` when every record arrived.
+    pub fn cursor(&self) -> Option<usize> {
+        (self.records.len() < self.summary.records).then_some(self.records.len())
+    }
+
+    /// Validates and appends one page; nothing is appended on error.
+    pub fn accept(&mut self, page: SymbolNamePage) -> Result<(), String> {
+        let cursor = self.cursor().ok_or("Unexpected symbol-name page")?;
+        let end = cursor.saturating_add(page.entries.len());
+        let mut previous = self.records.last().map(|record| record.address);
+        let mut page_bytes = 0usize;
+        for record in &page.entries {
+            if previous.is_some_and(|previous| previous >= record.address)
+                || !valid_text(&record.raw, MAX_SYMBOL_RAW_BYTES)
+                || record.display.as_deref().is_some_and(|display| {
+                    !valid_text(display, MAX_SYMBOL_DISPLAY_BYTES) || display == record.raw
+                })
+            {
+                return Err("Invalid or unordered symbol-name record".into());
+            }
+            previous = Some(record.address);
+            page_bytes = page_bytes.saturating_add(symbol_record_bytes(record));
+        }
+        if page.digest != self.summary.digest
+            || page.cursor != cursor
+            || page.entries.is_empty()
+            || page.entries.len() > MAX_SYMBOL_NAME_PAGE_RECORDS
+            || end > self.summary.records
+            || page.next != (end < self.summary.records).then_some(end)
+            || page.entries.len() > 1 && page_bytes > MAX_SYMBOL_NAME_PAGE_BYTES
+            || page_bytes > MAX_SYMBOL_NAME_TABLE_BYTES - self.bytes
+        {
+            return Err("Symbol-name page does not continue its table within bounds".into());
+        }
+        if end == self.summary.records {
+            let mut hash = self.hash.clone();
+            for record in &page.entries {
+                hash_record(&mut hash, record);
+            }
+            if format!("{:x}", hash.finalize()) != self.summary.digest {
+                return Err("Symbol-name pages do not match their table digest".into());
+            }
+        }
+        for record in &page.entries {
+            hash_record(&mut self.hash, record);
+        }
+        self.bytes += page_bytes;
+        self.records.extend(page.entries);
+        Ok(())
+    }
+
+    /// The adopted table once [`Self::cursor`] is `None`.
+    pub fn finish(self) -> Option<SymbolNames> {
+        (self.records.len() == self.summary.records).then(|| SymbolNames {
+            digest: self.summary.digest,
+            records: self.records.into_boxed_slice(),
+            truncated: self.summary.truncated,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,5 +640,190 @@ mod tests {
             demangle(&raw, SymbolFormat::Other),
             DemangleOutcome::Omitted(_)
         ));
+    }
+
+    fn source<'a>(address: u64, raw: &'a str, engine: &'a str) -> SymbolSource<'a> {
+        SymbolSource {
+            address,
+            raw,
+            engine,
+        }
+    }
+
+    fn fetch_all(table: &SymbolTable) -> SymbolNames {
+        let mut fetch = SymbolNameFetch::new(table.summary().clone()).unwrap();
+        while let Some(cursor) = fetch.cursor() {
+            fetch.accept(table.page(cursor).unwrap()).unwrap();
+        }
+        fetch.finish().unwrap()
+    }
+
+    #[test]
+    fn tables_keep_exact_raw_identities_and_omit_names_with_nothing_to_add() {
+        let table = SymbolTable::build(
+            [
+                source(0x1000, "_ZN4demo3fooEi", "demo::foo"),
+                source(0x1010, "_ZN4demo3fooEd", "demo::foo"),
+                source(0x1020, "?foo@@YAXH@Z", "?foo@@YAXH@Z"),
+                source(0x1030, "main", "main"),
+                // A collision-suffixed PE engine name keeps its exact source symbol.
+                source(0x1040, "?bar@@YAXXZ", "?bar@@YAXXZ_1040"),
+                source(0x1050, "_ZN4demo3fooEi", "demo::foo@plt"),
+                source(0x1050, "_ZN4demo3barEv", "demo::bar"),
+                source(0x1060, "_Z\u{1}bad", "x"),
+            ],
+            SymbolFormat::Other,
+        );
+        let names = fetch_all(&table);
+        let raw: Vec<_> = (0..7)
+            .filter_map(|i| names.get(0x1000 + i * 0x10))
+            .map(|record| (record.raw.as_str(), record.display.as_deref()))
+            .collect();
+        assert_eq!(
+            raw,
+            [
+                ("_ZN4demo3fooEi", Some("demo::foo")),
+                ("_ZN4demo3fooEd", Some("demo::foo")),
+                ("?bar@@YAXXZ", None),
+                ("_ZN4demo3fooEi", Some("demo::foo@plt")),
+            ]
+        );
+        assert!(names.get(0x1020).is_none(), "MSVC names stay raw");
+        assert!(!names.truncated());
+        // Overloads share a display name; exact raw lookup still separates them.
+        assert_eq!(names.find("_ZN4demo3fooEd"), Some(0x1010));
+        assert_eq!(names.find("demo::foo"), Some(0x1000));
+        assert_eq!(names.find("demo"), None);
+    }
+
+    #[test]
+    fn pseudocode_names_replace_only_the_engine_open_time_text() {
+        let table = SymbolTable::build(
+            [source(0x1000, "__RNvC4demo3foo", "__RNvC4demo3foo")],
+            SymbolFormat::MachO,
+        );
+        assert_eq!(
+            table.display_for(0x1000, "__RNvC4demo3foo"),
+            Some("demo::foo")
+        );
+        assert_eq!(table.display_for(0x1000, "analyst_label"), None);
+        assert_eq!(table.display_for(0x1001, "__RNvC4demo3foo"), None);
+    }
+
+    #[test]
+    fn pages_are_bounded_and_reassemble_the_announced_table() {
+        let raws: Vec<String> = (0..3000)
+            .map(|i| format!("_ZN4demo{}name{i}Ev", 4 + i.to_string().len()))
+            .collect();
+        let long = format!("_ZN4demo{}{}Ev", 2000, "x".repeat(2000));
+        let mut sources: Vec<_> = raws
+            .iter()
+            .enumerate()
+            .map(|(i, raw)| source(0x1000 + i as u64, raw, "engine"))
+            .collect();
+        sources.push(source(0x10_0000, &long, "engine"));
+        let table = SymbolTable::build(sources, SymbolFormat::Other);
+        assert_eq!(table.summary().records, 3001);
+        let mut cursor = Some(0);
+        let mut pages = 0;
+        while let Some(at) = cursor {
+            let page = table.page(at).unwrap();
+            let bytes: usize = page.entries.iter().map(symbol_record_bytes).sum();
+            assert!(page.entries.len() <= MAX_SYMBOL_NAME_PAGE_RECORDS);
+            assert!(page.entries.len() == 1 || bytes <= MAX_SYMBOL_NAME_PAGE_BYTES);
+            let encoded = serde_json::to_vec(&crate::model::WorkerResponse {
+                id: u64::MAX,
+                response: crate::model::Response::SymbolNames { page: page.clone() },
+            })
+            .unwrap();
+            crate::bounded::check_reply(&encoded).unwrap();
+            cursor = page.next;
+            pages += 1;
+        }
+        assert!(pages >= 3, "{pages} pages");
+        assert!(table.page(3001).is_err());
+        let names = fetch_all(&table);
+        assert_eq!(names.len(), 3001);
+        assert_eq!(names.digest(), table.summary().digest);
+        assert_eq!(
+            names.get(0x1000 + 2999).unwrap().display.as_deref(),
+            Some("demo::name2999")
+        );
+        assert!(names.retained_bytes() > 3001 * size_of::<SymbolName>());
+    }
+
+    #[test]
+    fn tables_stop_at_their_record_and_byte_budgets() {
+        let raws: Vec<String> = (0..=MAX_SYMBOL_NAME_RECORDS)
+            .map(|i| format!("r{i}"))
+            .collect();
+        let table = SymbolTable::build(
+            raws.iter()
+                .enumerate()
+                .map(|(i, raw)| source(i as u64, raw, "engine")),
+            SymbolFormat::Other,
+        );
+        assert_eq!(table.summary().records, MAX_SYMBOL_NAME_RECORDS);
+        assert!(table.summary().truncated);
+        let raw = "x".repeat(MAX_SYMBOL_RAW_BYTES);
+        let table = SymbolTable::build(
+            (0..4096).map(|i| source(i, &raw, "engine")),
+            SymbolFormat::Other,
+        );
+        let bytes: usize = (0..table.summary().records)
+            .map(|_| {
+                symbol_record_bytes(&SymbolName {
+                    address: 0,
+                    raw: raw.clone(),
+                    display: None,
+                })
+            })
+            .sum();
+        assert!(table.summary().truncated && bytes <= MAX_SYMBOL_NAME_TABLE_BYTES);
+        let oversized = "x".repeat(MAX_SYMBOL_RAW_BYTES + 1);
+        assert_eq!(
+            SymbolTable::build([source(1, &oversized, "engine")], SymbolFormat::Other)
+                .summary()
+                .records,
+            0
+        );
+    }
+
+    #[test]
+    fn fetch_rejects_pages_that_do_not_continue_the_announced_table() {
+        let table = SymbolTable::build(
+            [
+                source(0x1000, "_ZN4demo3fooEi", "demo::foo"),
+                source(0x1010, "_ZN4demo3barEv", "demo::bar"),
+            ],
+            SymbolFormat::Other,
+        );
+        let page = table.page(0).unwrap();
+        let fetch = || SymbolNameFetch::new(table.summary().clone()).unwrap();
+        let rejected = |edit: &dyn Fn(&mut SymbolNamePage)| {
+            let mut page = page.clone();
+            edit(&mut page);
+            let mut fetch = fetch();
+            assert!(fetch.accept(page).is_err());
+            assert_eq!(fetch.cursor(), Some(0), "nothing appended");
+        };
+        rejected(&|page| page.digest = "0".repeat(64));
+        rejected(&|page| page.cursor = 1);
+        rejected(&|page| page.next = Some(2));
+        rejected(&|page| page.entries.reverse());
+        rejected(&|page| page.entries.clear());
+        rejected(&|page| page.entries[1].display = Some("demo::baz".into()));
+        rejected(&|page| page.entries[0].display = Some(page.entries[0].raw.clone()));
+        rejected(&|page| page.entries[0].raw.push('\n'));
+        rejected(&|page| page.entries[0].display = Some("x".repeat(MAX_SYMBOL_DISPLAY_BYTES + 1)));
+        let mut complete = fetch();
+        complete.accept(page.clone()).unwrap();
+        assert_eq!(complete.cursor(), None);
+        assert!(complete.accept(page).is_err(), "no page after the last");
+        let mut summary = table.summary().clone();
+        summary.records = MAX_SYMBOL_NAME_RECORDS + 1;
+        assert!(SymbolNameFetch::new(summary).is_err());
+        let empty = SymbolTable::default();
+        assert!(fetch_all(&empty).is_empty());
     }
 }

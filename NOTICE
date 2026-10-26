@@ -109,12 +109,12 @@ fixtures and exact import-veneer recognizer use the pinned engine's public APIs.
 
 Native demangling dependencies
 
-The worker-only symbol-name helper in src/symbol_names.rs uses public APIs from
+The worker-only symbol-name table in src/symbol_names.rs uses public APIs from
 cpp_demangle 0.5.1 (https://github.com/gimli-rs/cpp_demangle) and rustc-demangle
 0.1.28 (https://github.com/rust-lang/rustc-demangle). Both offer MIT OR Apache-2.0
 licensing. These packages were already engine dependencies; the desktop's
 packaged third-party notices retain their license texts. No MSVC demangler
-source is copied or linked by this foundation. See docs/demangling.md.
+source is copied or linked. See docs/demangling.md.
 The generated deferred-backreference regression in src/symbol_names.rs adapts
 the recursion_limit_backref_free_bypass test construction from rustc-demangle
 0.1.28 src/v0.rs under Apache-2.0, using a smaller bounded input and rejecting

@@ -97,7 +97,7 @@ fn real_worker_reads_section_pages_and_clipped_zero_filled_tails() {
     );
     let original = std::fs::read(&binary).unwrap();
     let mut worker = Process::start();
-    let Response::Opened { info } = worker.request(Request::Open {
+    let Response::Opened { info, .. } = worker.request(Request::Open {
         path: binary.to_string_lossy().into_owned(),
     }) else {
         panic!("cannot open page fixture")
@@ -176,7 +176,7 @@ fn real_worker_browses_decompiles_decodes_scans_and_recovers_from_bad_open() {
     let base64 = address("base64_message");
     let aes = address("aes_sbox_prefix");
     let mut worker = Process::start();
-    let Response::Opened { info } = worker.request(Request::Open {
+    let Response::Opened { info, .. } = worker.request(Request::Open {
         path: binary.to_string_lossy().into_owned(),
     }) else {
         panic!("cannot open fixture")
@@ -295,7 +295,7 @@ fn real_worker_browses_decompiles_decodes_scans_and_recovers_from_bad_open() {
         loaded.data.session.annotations[&branch].comment,
         "project round-trip"
     );
-    let Response::Opened { info: reopened } = worker.request(Request::Open {
+    let Response::Opened { info: reopened, .. } = worker.request(Request::Open {
         path: loaded
             .binary
             .as_ref()
