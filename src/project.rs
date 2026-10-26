@@ -1480,6 +1480,16 @@ mod tests {
                     address: 0x1004,
                     target: 0x1008,
                 }],
+                addresses: Some(Box::new(crate::model::AddressAnalysis {
+                    references: vec![crate::model::AddressReference {
+                        function: 0x1000,
+                        address: 0x1000,
+                        target: 0x1008,
+                        provenance: crate::model::DataProvenance::InstructionLocal,
+                    }],
+                    candidates_examined: 1,
+                    ..Default::default()
+                })),
                 functions_examined: 1,
                 decode_attempts: 3,
                 ..Default::default()
@@ -1549,15 +1559,37 @@ mod tests {
             data.discovery.as_ref().unwrap().report.references
         );
         assert_eq!(loaded.pending, [0x1008]);
+        assert_eq!(
+            loaded.report.addresses.as_ref().unwrap().references,
+            data.discovery
+                .as_ref()
+                .unwrap()
+                .report
+                .addresses
+                .as_ref()
+                .unwrap()
+                .references
+        );
 
-        // A different discovery format drops only discovery.
-        let mut other = (**data.discovery.as_ref().unwrap()).clone();
-        other.fingerprint = "discovery-v0".into();
-        let mut older = data.clone();
-        older.discovery = Some(Arc::new(other));
-        older.save(&path, &protection, true).unwrap();
-        let reopened = ProjectData::load(&path).unwrap();
-        assert!(reopened.data.discovery.is_none() && reopened.cache_compatible);
+        // A different discovery format drops only discovery, including the
+        // previous release's format, which carries no address evidence.
+        for fingerprint in [
+            "discovery-v0",
+            "discovery-v1-calls-v1-data-v1-switch-v1-patterns-v2-noreturn-v1-pointers-v1",
+        ] {
+            let mut other = (**data.discovery.as_ref().unwrap()).clone();
+            other.fingerprint = fingerprint.into();
+            other.report.addresses = None;
+            let mut older = data.clone();
+            older.discovery = Some(Arc::new(other));
+            older.save(&path, &protection, true).unwrap();
+            let reopened = ProjectData::load(&path).unwrap();
+            assert!(reopened.data.discovery.is_none() && reopened.cache_compatible);
+            assert_eq!(
+                reopened.data.session.annotations[&0x1000].comment,
+                "saved note"
+            );
+        }
 
         // Version 2 metadata predates semantic tokens; no text fallback is inferred.
         data.save(&path, &protection, true).unwrap();

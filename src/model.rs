@@ -16,8 +16,8 @@ pub const MAX_FUNCTION_NAME_BYTES: usize = 256;
 /// inventory serializes to at most 43 * 262_144 + 8 MiB + 1 bytes (19.7 MB).
 pub const MAX_FUNCTION_NAME_JSON_BYTES: usize = 8 * 1024 * 1024;
 /// Largest encoded worker reply, excluding its newline. Fits the largest
-/// function inventory (19.7 MB) with either both reference classes (about
-/// 4.1 MB) or worst-case section metadata (6.8 MB).
+/// function inventory (19.7 MB) with either all three reference classes
+/// (about 6.3 MB) or worst-case section metadata (6.8 MB).
 pub const MAX_REPLY_BYTES: usize = 32 * 1024 * 1024;
 /// Largest byte range one `Bytes` request may read.
 pub const MAX_BYTE_READ: usize = 64 * 1024;
@@ -76,6 +76,14 @@ pub const MAX_DATA_OPERATIONS: usize = 131_072;
 pub const MAX_DATA_OPERATIONS_PER_INSTRUCTION: usize = 256;
 pub const MAX_DATA_OPERATION_INPUTS: usize = 16;
 pub const MAX_DATA_ACCESS_BYTES: u32 = 64;
+/// Address-taking evidence, separate from data accesses. References are
+/// capped per reply and per discovery publication; candidates per batch.
+pub const MAX_ADDRESS_REFERENCES: usize = 16_384;
+pub const MAX_ADDRESS_CANDIDATES: usize = 16_384;
+/// Lowest target accepted as address-taking evidence. Smaller values are far
+/// more often counts, flags or offsets than pointers, so low-address images
+/// deliberately lose these references.
+pub const MIN_ADDRESS_REFERENCE_TARGET: u64 = 0x1000;
 /// Cumulative ELF metadata records, pointer slots and candidate attempts per discovery.
 pub const MAX_METADATA_RECORDS: usize = MAX_DATA_OPERATIONS;
 pub const MAX_POINTER_SLOTS: usize = 8 * MAX_DATA_OPERATIONS;
@@ -133,6 +141,34 @@ pub struct DataAnalysis {
     pub partial: bool,
 }
 
+/// A concrete pointer-width address materialized by the instruction at
+/// `address` (x86 LEA or immediate, AArch64 ADRP/ADD or constant composition)
+/// into a general register or a stored value. This records address formation,
+/// not a proven source-language pointer, a memory access, or a runtime use.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AddressReference {
+    pub function: u64,
+    pub address: u64,
+    pub target: u64,
+    pub provenance: DataProvenance,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AddressAnalysis {
+    #[serde(deserialize_with = "crate::bounded::vec::<_, _, { MAX_ADDRESS_REFERENCES }>")]
+    pub references: Vec<AddressReference>,
+    /// Pointer-width values reaching a register or store sink, charged
+    /// before validation and deduplication.
+    pub candidates_examined: usize,
+    /// Candidates outside every file-backed section, below
+    /// [`MIN_ADDRESS_REFERENCE_TARGET`], or wider than the ABI.
+    pub omitted_candidates: usize,
+    pub unsupported_instructions: usize,
+    pub partial: bool,
+}
+
 /// An established direct call decoded from `address` while walking `caller`.
 /// This records machine-code evidence, not a recovered source-language call.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -166,6 +202,10 @@ pub struct CallAnalysis {
     /// empty computation.
     #[serde(default)]
     pub data: Option<DataAnalysis>,
+    /// Address-taking evidence. `None` is unavailable or not recomputed;
+    /// `Some` with no references is an examined empty result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub addresses: Option<Box<AddressAnalysis>>,
     pub functions_examined: usize,
     /// Charged decode attempts, including failures and instructions omitted by
     /// display limits. This is a work count, not the size of a displayed graph.
