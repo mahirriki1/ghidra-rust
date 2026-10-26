@@ -43,6 +43,7 @@ pub mod session;
 mod signature_ui;
 pub mod signatures;
 mod switch_analysis;
+pub mod symbol_names;
 pub mod theme;
 mod update_ui;
 pub mod updater;
