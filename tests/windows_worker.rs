@@ -1,6 +1,8 @@
 //! Real Windows worker through the production suspended-spawn and job path.
 #![cfg(windows)]
 
+mod linkage;
+
 use ghidra_rust::client::{WorkerClient, WorkerEvent};
 use ghidra_rust::discovery::Discovery;
 use ghidra_rust::model::{FileIdentity, Request, Response};
@@ -143,6 +145,20 @@ fn real_windows_worker_and_embedded_project_round_trip() {
     ) else {
         panic!("Windows worker did not open PE fixture");
     };
+    let declarations = linkage::read(|query| request(&mut worker, query), &info);
+    assert!(
+        declarations
+            .exports
+            .iter()
+            .any(|export| export.raw.as_deref() == Some("branch_loop")
+                && export.target.address() == Some(address))
+    );
+    assert!(
+        declarations
+            .imports
+            .iter()
+            .any(|import| import.library.is_some() && import.slot.is_some())
+    );
     assert_eq!(info.format, "PE");
     assert!(
         info.functions
@@ -377,6 +393,10 @@ fn real_windows_worker_and_embedded_project_round_trip() {
     ) else {
         panic!("Windows worker did not reopen embedded project input");
     };
+    assert_eq!(
+        declarations.digest,
+        linkage::read(|query| request(&mut reopened, query), &fresh).digest
+    );
     loaded.data.validate_against(&fresh).unwrap();
     let Response::Decompiled {
         text: replayed,

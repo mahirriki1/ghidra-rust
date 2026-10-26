@@ -208,6 +208,52 @@ addresses. Shared operation, candidate, and state limits mark omissions partial;
 see [limits](#resource-limits-and-trust-boundaries). This is access evidence,
 not data-object or pointer classification.
 
+## Import/export declaration metadata
+
+The worker provides a separate paged import/export metadata request. Desktop
+Symbol Tree browsing and navigation are pending integration. The request reads
+the worker's immutable image snapshot once, on demand, and caches the resulting
+table; opening a binary and ordinary function replies do not carry this table.
+Metadata never loads another library, resolves a runtime address, infers a
+prototype or creates a function. Demangled names use the existing bounded worker
+demanglers and remain separate from exact raw identities.
+
+- PE retains library names, named and ordinal imports, export aliases and
+  ordinal-only exports, mapped data, and directory-bounded forwarders. Conventional
+  RVA-based delay-import descriptors share the normal import limit. Old VA-form
+  and unknown delay variants remain partial; delay declarations do not seed the
+  engine, no-return recognition or prototypes. Exact conventional x86 and ARM64
+  thunks are associated only among the first 2,048 established functions; later
+  discovery does not revise an already-published metadata snapshot.
+- ELF reads dynamic symbols, version requirements/definitions and supported
+  JUMP_SLOT/GLOB_DAT relocations. A version requirement can identify a library;
+  `DT_NEEDED` alone cannot assign an import owner. Weak declarations and symbol
+  versions are retained. Existing engine import stubs also require an
+  unambiguous raw identity and a conventional encoded jump to that symbol's
+  verified relocation slot. Other PLT/veneer forms stay unresolved. IFUNC exports
+  are tagged as resolvers; TLS and absolute declarations have no code destination.
+- Thin Mach-O reads external nlist declarations, checked two-level library
+  ordinals and indirect-symbol pointer/stub locations. Self, main-executable,
+  dynamic-lookup and flat-namespace scopes remain distinct from dependencies.
+  Private externs are excluded. dyld binding opcode programs, chained fixups and
+  export-trie-only definitions are unsupported and explicitly mark partial
+  coverage. No native macOS execution is established by these parser tests.
+
+Each table permits at most 10,000 imports, 16,384 exports, 1,024 libraries and
+16,384 additional locations, with 4 MiB total JSON-escaped text. A cumulative
+500,000-entry/8 MiB work budget bounds format scans, including duplicate records
+and names. Pages have at most 1,024 records and 64 KiB encoded data. Pages bind to
+the image SHA-256, metadata policy and an ordered table digest; accumulation
+checks exact cursors, IDs, library references, names, counts, address membership
+and duplicate/conflicting locations before adoption. Slots must be fully
+file-backed at the ABI pointer width. Mapped zero-filled exports retain their
+data address but provide no file bytes beyond the existing Hex/Decode limits.
+
+The table is transient. Reopening a verified project reconstructs it from the
+image without changing SQLite or annotation JSON schemas or the engine cache
+fingerprint. Table and grouping APIs expose retained-allocation accounting for
+the pending desktop integration with its shared result-store budget.
+
 ## Address formation
 
 Discovery also records where an instruction materializes a concrete address

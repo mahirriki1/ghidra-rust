@@ -2,6 +2,7 @@
 #![cfg(target_os = "linux")]
 
 mod inventory;
+mod linkage;
 
 use ghidra_rust::client::{WorkerClient, WorkerEvent};
 use ghidra_rust::model::{CallAnalysis, DataAccess, Request, Response};
@@ -254,6 +255,13 @@ fn sandboxed_linux_worker_and_embedded_project_round_trip() {
     ) else {
         panic!("Sandboxed worker did not open ELF fixture");
     };
+    let declarations = linkage::read(|query| request(&mut worker, query), &info);
+    assert!(
+        declarations
+            .imports
+            .iter()
+            .any(|import| import.raw.as_deref() == Some("puts"))
+    );
     assert_eq!(info.format, "ELF");
     assert_eq!(Path::new(&info.path), binary.canonicalize().unwrap());
     assert_eq!(
@@ -386,6 +394,10 @@ fn sandboxed_linux_worker_and_embedded_project_round_trip() {
     ) else {
         panic!("Sandboxed worker did not reopen the embedded input");
     };
+    assert_eq!(
+        declarations.digest,
+        linkage::read(|query| request(&mut reopened, query), &fresh).digest
+    );
     loaded.data.validate_against(&fresh).unwrap();
     assert_ne!(fresh.source_identity, project.info.source_identity);
     drop(loaded);

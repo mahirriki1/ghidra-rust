@@ -151,6 +151,10 @@ fn reply_nodes(kind: &str) -> Option<usize> {
         "strings" => 7 * MAX_STRING_RESULTS,
         "crypto" => 9 * MAX_CRYPTO_MATCHES,
         "symbol_names" => 7 * MAX_SYMBOL_NAME_PAGE_RECORDS + 10,
+        // The widest record: a tag, eleven scalar fields and nothing nested.
+        "linkage" => {
+            25 * crate::linkage::MAX_LINKAGE_PAGE_RECORDS + crate::linkage::MAX_LINKAGE_GAPS + 32
+        }
         "progress" | "renamed" | "error" | "functions_synced" => 0,
         _ => return None,
     };
@@ -210,6 +214,8 @@ pub(crate) fn check_reply(line: &[u8]) -> Result<ReplyShape, String> {
                 nodes,
                 max_string: if kind == "symbol_names" {
                     MAX_SYMBOL_RAW_BYTES
+                } else if kind == "linkage" {
+                    MAX_SYMBOL_RAW_BYTES + crate::linkage::MAX_LINKAGE_LABEL_BYTES
                 } else {
                     MAX_DECOMPILED_BYTES
                 },
@@ -250,6 +256,9 @@ pub(crate) fn check_reply(line: &[u8]) -> Result<ReplyShape, String> {
     // Pages are packed by encoded record size; a page and its envelope fit here.
     if shape.kind == "symbol_names" && line.len() > MAX_SYMBOL_NAME_PAGE_BYTES + 512 {
         return Err("Invalid worker response: symbol-name page exceeds its size limit".into());
+    }
+    if shape.kind == "linkage" && line.len() > crate::linkage::MAX_LINKAGE_PAGE_BYTES + 512 {
+        return Err("Invalid worker response: linkage page exceeds its size limit".into());
     }
     Ok(shape)
 }

@@ -1,6 +1,7 @@
 //! Native workers analyze original AArch64 bytes; they never execute the input.
 #![cfg(any(target_os = "linux", windows))]
 mod common;
+mod linkage;
 
 use ghidra_rust::client::{WorkerClient, WorkerEvent};
 use ghidra_rust::model::{
@@ -225,6 +226,7 @@ fn contained_aarch64_workers_analyze_elf_pe_macho_and_reopen_projects() {
         let Response::Opened { info, .. } = response else {
             panic!("Open {format}: {response:?}");
         };
+        let declarations = linkage::read(|query| request(&mut worker, query), &info);
         assert_eq!(info.architecture, "AArch64");
         assert_eq!(info.format, format);
         assert_eq!(info.entry, base);
@@ -384,6 +386,10 @@ fn contained_aarch64_workers_analyze_elf_pe_macho_and_reopen_projects() {
         ) else {
             panic!("Reopen {format}");
         };
+        assert_eq!(
+            declarations.digest,
+            linkage::read(|query| request(&mut reopened, query), &fresh).digest
+        );
         loaded.data.validate_against(&fresh).unwrap();
         drop(loaded);
         assert!(extracted.is_file());

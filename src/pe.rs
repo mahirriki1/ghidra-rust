@@ -4,8 +4,9 @@ use std::collections::BTreeMap;
 use crate::model::{MAX_FUNCTIONS, SectionInfo};
 
 mod arm64;
+mod linkage;
 
-pub(crate) const MAX_IMPORTS: usize = 10_000;
+pub(crate) use crate::linkage::MAX_IMPORTS;
 const MAX_TABLE_ENTRIES: u32 = 500_000;
 const MAX_DIRECTORY_BYTES: u32 = 8 * 1024 * 1024;
 pub(crate) const MAX_NAME_BYTES: usize = 256;
@@ -119,7 +120,28 @@ impl<'a> Image<'a> {
 
 /// Read only metadata already present in this immutable image. Pointer-bearing
 /// tables are translated through nonoverlapping, file-backed mapped regions.
-pub(crate) fn parse(bytes: &[u8], sections: &[SectionInfo]) -> Result<Option<PeMetadata>, String> {
+struct Headers<'a> {
+    image: Image<'a>,
+    header: &'a [u8],
+    directory_start: usize,
+    count: usize,
+    is64: bool,
+    machine: u16,
+}
+
+impl Headers<'_> {
+    fn directory(&self, index: usize) -> Option<(u32, u32)> {
+        if index >= self.count {
+            return None;
+        }
+        let at = self.directory_start + index * 8;
+        let rva = u32_at(self.header, at)?;
+        let size = u32_at(self.header, at + 4)?;
+        (rva != 0 && size != 0).then_some((rva, size))
+    }
+}
+
+fn headers<'a>(bytes: &'a [u8], sections: &[SectionInfo]) -> Result<Option<Headers<'a>>, String> {
     if !bytes.starts_with(b"MZ") {
         return Ok(None);
     }
@@ -200,21 +222,38 @@ pub(crate) fn parse(bytes: &[u8], sections: &[SectionInfo]) -> Result<Option<PeM
         regions,
         base,
     };
-    let directory = |index: usize| -> Option<(u32, u32)> {
-        if index >= count {
-            return None;
-        }
-        let at = directory_start + index * 8;
-        let rva = u32_at(header, at)?;
-        let size = u32_at(header, at + 4)?;
-        (rva != 0 && size != 0).then_some((rva, size))
+    Ok(Some(Headers {
+        image,
+        header,
+        directory_start,
+        count,
+        is64,
+        machine,
+    }))
+}
+
+pub(crate) fn linkage(
+    bytes: &[u8],
+    sections: &[SectionInfo],
+) -> Result<Option<crate::analysis::linkage::Builder>, String> {
+    Ok(headers(bytes, sections)?.map(|headers| linkage::parse(&headers)))
+}
+
+pub(crate) fn parse(bytes: &[u8], sections: &[SectionInfo]) -> Result<Option<PeMetadata>, String> {
+    let Some(headers) = headers(bytes, sections)? else {
+        return Ok(None);
     };
+    let image = &headers.image;
+    let header = headers.header;
+    let is64 = headers.is64;
+    let machine = headers.machine;
+    let directory = |index| headers.directory(index);
     let mut metadata = PeMetadata::default();
     if let Some(entry) = u32_at(header, 16).and_then(|rva| image.function_address(rva, None)) {
         metadata.function(entry, "entry".into());
     }
     if let Some((rva, size)) = directory(0) {
-        exports(&image, rva, size, &mut metadata);
+        exports(image, rva, size, &mut metadata);
     }
     if matches!(machine, 0x8664 | 0xaa64)
         && is64
@@ -224,13 +263,13 @@ pub(crate) fn parse(bytes: &[u8], sections: &[SectionInfo]) -> Result<Option<PeM
             .and_then(|rva| image.address(rva))
             .unwrap_or(image.base);
         if machine == 0xaa64 {
-            arm64::runtime_functions(&image, rva, size, entry, &mut metadata);
+            arm64::runtime_functions(image, rva, size, entry, &mut metadata);
         } else {
-            runtime_functions(&image, rva, size, entry, &mut metadata);
+            runtime_functions(image, rva, size, entry, &mut metadata);
         }
     }
     if let Some((rva, size)) = directory(1) {
-        imports(&image, rva, size, is64, &mut metadata);
+        imports(image, rva, size, is64, &mut metadata);
     }
     Ok(Some(metadata))
 }

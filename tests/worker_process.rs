@@ -1,6 +1,8 @@
 //! Exercise the real disposable process, not just an in-process protocol mock.
 #![cfg(target_os = "linux")]
 
+mod linkage;
+
 use ghidra_rust::model::{Request, Response, WorkerRequest, WorkerResponse};
 use object::{Object, ObjectSymbol};
 use std::io::{BufRead, BufReader, Write};
@@ -71,6 +73,74 @@ impl Drop for Process {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+#[test]
+fn real_worker_publishes_declarations_from_its_immutable_snapshot() {
+    use ghidra_rust::linkage::ExportTarget;
+    let directory = tempfile::tempdir().unwrap();
+    let binary = directory.path().join("linkage.so");
+    let output = Command::new("gcc")
+        .args(["-O0", "-fPIC", "-shared"])
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/linkage.c"
+        ))
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut worker = Process::start();
+    let Response::Opened { info, .. } = worker.request(Request::Open {
+        path: binary.to_string_lossy().into_owned(),
+    }) else {
+        panic!("Open original shared library");
+    };
+    // Replace only this test's private file, before metadata is requested.
+    // Declaration extraction must still use the already-analyzed snapshot.
+    std::fs::write(&binary, b"replaced private fixture").unwrap();
+    let table = linkage::read(|request| worker.request(request), &info);
+    let puts = table
+        .imports
+        .iter()
+        .find(|import| import.raw.as_deref() == Some("puts"))
+        .unwrap();
+    assert_eq!(
+        table.libraries[puts.library.unwrap() as usize].name,
+        "libc.so.6"
+    );
+    assert!(puts.version.as_deref().unwrap().starts_with("GLIBC_"));
+    assert!(puts.slot.is_some());
+    let weak = table
+        .imports
+        .iter()
+        .find(|import| import.raw.as_deref() == Some("optional_hook"))
+        .unwrap();
+    assert!(weak.weak);
+    assert_eq!(weak.library, None);
+    let function = table
+        .exports
+        .iter()
+        .find(|export| export.raw.as_deref() == Some("_ZN4demo3fooEv"))
+        .unwrap();
+    assert_eq!(function.display.as_deref(), Some("demo::foo"));
+    assert!(matches!(function.target, ExportTarget::Code { .. }));
+    assert!(
+        table
+            .exports
+            .iter()
+            .any(|export| export.raw.as_deref() == Some("exported_word")
+                && matches!(export.target, ExportTarget::Data { .. }))
+    );
+    assert_eq!(
+        table.digest,
+        linkage::read(|request| worker.request(request), &info).digest
+    );
 }
 
 #[test]

@@ -478,7 +478,7 @@ fn request_task(request: &Request) -> &'static str {
         Request::Bytes { .. } => "Reading bytes",
         Request::Strings | Request::StringsWithOptions { .. } => "Finding strings",
         Request::Crypto => "Scanning constants",
-        Request::SymbolNames { .. } => "Reading symbol names",
+        Request::SymbolNames { .. } | Request::Linkage { .. } => "Reading symbol names",
     }
 }
 
