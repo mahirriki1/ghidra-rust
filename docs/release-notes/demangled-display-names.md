@@ -1,7 +1,8 @@
 - Show compact Itanium C++ and Rust (legacy and v0) function names, such as
   `demo::Widget::operator+`, in Functions, the symbol tree, Listing and Function
   Graph call targets, References rows, headers, and the pseudocode declaration
-  and verified direct-call tokens. Hover shows the exact raw symbol.
+  and verified direct-call tokens. Long names truncate to one row, and hover
+  shows the full name with the exact raw symbol.
 - Itanium and Rust PE exports, such as a Rust dylib's v0 exports, now get
   display names. ELF and Mach-O names the engine already demangled keep the
   same text and now show their raw symbol on hover.

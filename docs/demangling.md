@@ -5,8 +5,10 @@ qualified names, such as `demo::Widget::operator+` or `demo::foo<int>`, without
 parameter lists, return types or Rust legacy hashes. They appear in Functions,
 the symbol tree, Listing and Function Graph call targets, References rows,
 headers and Go to. Pseudocode prints them in the function's own declaration and
-in verified direct-call tokens. Hovering one of these names shows the exact raw
-symbol, with no other text. MSVC-decorated names remain raw; see
+in verified direct-call tokens. Long names truncate to one row; hovering shows
+the full shown name with the exact raw symbol beneath it (call tokens and call
+rows keep their existing action line). The pseudocode declaration itself has no
+hover; the decompiler header above it does. MSVC-decorated names remain raw; see
 [the MSVC release gate](#msvc-release-gate).
 
 Display names are C-like analysis text, not compilable C++ or Rust. They never
