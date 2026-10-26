@@ -339,9 +339,8 @@ Remaining work includes cross-block propagation, call-argument and loaded-pointe
 references, speculative operand references,
 exception flow, inferred no-return wrappers, and complete stripped recovery.
 Engine decompilation may expose constructs the independent CFG cannot establish.
-There is no source/class/trait reconstruction. Itanium C++ and Rust names have
-compact [display names](demangling.md); MSVC-decorated names stay raw until a
-bounded backend passes review. Plugins,
+There is no source/class/trait reconstruction. Itanium C++, Rust and (in PE
+images) MSVC names have compact [display names](demangling.md). Plugins,
 scripting, debugger integration, and general type/variable-storage editing remain
 future capabilities.
 

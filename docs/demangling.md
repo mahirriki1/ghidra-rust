@@ -8,8 +8,8 @@ headers and Go to. Pseudocode prints them in the function's own declaration and
 in verified direct-call tokens. Long names truncate to one row; hovering shows
 the full shown name with the exact raw symbol beneath it (call tokens and call
 rows keep their existing action line). The pseudocode declaration itself has no
-hover; the decompiler header above it does. MSVC-decorated names remain raw; see
-[the MSVC release gate](#msvc-release-gate).
+hover; the decompiler header above it does. MSVC-decorated names in PE images use a
+locally maintained, hardened backend; see [the MSVC backend](#msvc-backend).
 
 Display names are C-like analysis text, not compilable C++ or Rust. They never
 establish types, prototypes, classes, references or no-return behavior.
@@ -112,31 +112,56 @@ bytes remain shortened; the table's display name can be longer. PE functions
 are registered without engine demangling, so Itanium or Rust PE exports gain
 display names only through this table.
 
-## MSVC release gate
+The Rust and Itanium direct crates offer MIT OR Apache-2.0 licenses; packaging
+already collects their license texts from the resolved Cargo packages. The MSVC
+path crate reuses the locked `bitflags` 2.13.2 and `itoa` 1.0.18 packages. No new
+runtime or registry package/version is introduced.
 
-MSVC-looking names return `BackendUnavailable` and stay raw everywhere. Do not
-replace this with a call to an unbounded convenience API or treat
-`catch_unwind` as stack-overflow or OOM containment.
+## MSVC backend
 
-The published [`symbolic-demangle` 13.9.0 archive](https://crates.io/api/v1/crates/symbolic-demangle/13.9.0/download)
-(SHA-256 `2a213276280a1a737ff5fb89ae2a70ba51d1d4608e74736beb92f257f125f1aa`)
-contains an MSVC-only feature and a vendored native Rust parser. Its
-`src/lib.rs` passes a recursion limit of 128. However,
-`vendor/msvc-demangler/lib.rs` clones memorized name/type trees on backreferences
-without a cumulative node/clone budget (`memorize_name`, `memorize_type`,
-`read_var_type_inner`, `read_func_params`). `serialize` constructs a `Vec<u8>`
-through recursive serializer methods without an output/work budget. Limiting the
-accepted String after that allocation does not bound transient expansion. The
-vendored README describes a recursion-limit modification, not additional work
-or output controls. This release has not passed the project's MSVC acceptance
-gate and is not a dependency.
+PE callers select `SymbolFormat::Pe`. MSVC-looking `?` names then use the local
+`ghidra-rust-msvc-demangler` path crate in `third_party/msvc-demangler/` and
+report `DemangleBackend::Msvc`. Other formats retain `BackendUnavailable` for
+those names. These are additive enum variants; `demangle` and the result
+structure signatures are unchanged. Compact names include namespaces, templates,
+constructors, destructors, operators (including conversion targets) and special
+names such as `vftable`. Ordinary function parameters and return types are omitted.
+The raw identity remains borrowed and unchanged. Parser or budget failures
+produce whole-name fallback; no prefix is published.
 
-Before enabling MSVC, use an audited backend with explicit parser depth,
-node/backreference expansion, serializer work and output limits. Account for
-destruction depth as well. A hardened fork must retain its upstream license and
-attribution and be pinned independently of the engine. That is separate future
-work. This document does not claim an exploitable upstream vulnerability or that
-no other release can meet these requirements.
+The source is the Rust parser vendored in the published
+[`symbolic-demangle` 13.9.0 archive](https://crates.io/api/v1/crates/symbolic-demangle/13.9.0/download),
+SHA-256 `2a213276280a1a737ff5fb89ae2a70ba51d1d4608e74736beb92f257f125f1aa`.
+Its upstream recursion limit alone did not meet our release gate: memorized-tree
+clones and serialization were unbudgeted. We maintain the patched source here,
+independently of the engine. Exact provenance, unchanged upstream license texts,
+modifications and the destruction-depth argument are recorded in
+[`third_party/msvc-demangler/README.md`](../third_party/msvc-demangler/README.md).
+
+The application supplies these shared `model.rs` limits:
+
+| Boundary | Limit and enforcement |
+| --- | --- |
+| Input | `MAX_SYMBOL_RAW_BYTES`: 4,096 UTF-8 bytes before parsing |
+| Parser depth | `SYMBOL_DEMANGLE_RECURSION_LIMIT`: 128 guarded AST-returning helper calls |
+| Expanded tree depth | 128 logical AST edges/nodes along a path, checked on helper returns and before clones; rejected temporaries add at most two wrapper edges, bounding recursive drop to 130 logical levels |
+| Parse/clone expansion | `MAX_SYMBOL_MSVC_PARSE_WORK`: 32,768 cumulative units for helper entries, tree-node visits and payload bytes, including all clone preflights, deduplication comparisons, nested parses and hidden function types |
+| Serialization work | `MAX_SYMBOL_FORMAT_WRITES`: 8,192 total method entries, parameter visits and attempted sink appends; includes no-output visits |
+| Output | `MAX_SYMBOL_DISPLAY_BYTES`: 1,024 bytes; a capped sink checks before each append, then strict UTF-8 and shared display-character validation |
+
+The parse budget is conservative and counts repeated walks, not only distinct
+nodes. Backreference trees are checked and fully charged before cloning. Input
+scanners and leaf allocation are bounded by input bytes; output, cloned payloads,
+AST expansion and traversal scratch space have explicit bounds. These counters
+are not instruction-level CPU or total process-memory meters. Allocator overhead,
+linear scans, runtime/stack overhead, and unexpected abort/OOM/backend defects
+still require the worker's resource limits and deadline. `catch_unwind` only
+handles unwinding panics. No unsafe code is used. This remains a best-effort
+MSVC grammar subset, with conservative fallback for rejected valid names.
+
+Run `cargo test --locked -p ghidra-rust-msvc-demangler` separately to exercise
+the vendored crate's internal adversarial checks; ordinary root `cargo test`
+also covers PE integration, raw identity and fallback through `symbol_names`.
 
 ## Tests
 
@@ -152,6 +177,10 @@ pseudocode call tokens, label precedence, no-return refusal and project reopen
 in the sandboxed worker. Rust executables that link `std` carry a `.tbss`
 section that the loader currently rejects as overlapping, which is why that
 fixture avoids `std`. `tests/windows_worker.rs` checks a Rust v0 dylib's exports
-and an MSVC-built DLL of the same C++ fixture, whose decorated exports stay raw;
+and an MSVC-built DLL of the same C++ fixture, whose decorated exports display
+demangled;
 `scripts/build-windows.ps1` builds that DLL and sets `GHIDRA_RUST_TEST_PE_CPP`.
-Native macOS remains unvalidated.
+On native Windows, the original `tests/fixtures/demangle_msvc.cpp` is also
+compiled with MSVC to an object; tests inspect constructors, destructors,
+operators, templates, nested/anonymous namespaces, overload identities and a
+vftable without executing it. Native macOS remains unvalidated.
