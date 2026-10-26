@@ -246,7 +246,7 @@ fn sandboxed_linux_worker_and_embedded_project_round_trip() {
     // the Ubuntu release runner must execute its own ELF loader in bubblewrap.
     let mut worker =
         WorkerClient::start_using_executable(context.clone(), &binary, executable).unwrap();
-    let Response::Opened { info } = request(
+    let Response::Opened { info, .. } = request(
         &mut worker,
         Request::Open {
             path: binary.to_string_lossy().into_owned(),
@@ -378,7 +378,7 @@ fn sandboxed_linux_worker_and_embedded_project_round_trip() {
     let mut reopened =
         WorkerClient::start_using_executable(context, &extracted, executable).unwrap();
     reopened.retain_source(Arc::new(embedded));
-    let Response::Opened { info: fresh } = request(
+    let Response::Opened { info: fresh, .. } = request(
         &mut reopened,
         Request::Open {
             path: extracted.to_string_lossy().into_owned(),
@@ -570,7 +570,7 @@ fn open(binary: &Path) -> (WorkerClient, ghidra_rust::model::BinaryInfo) {
             path: binary.to_string_lossy().into_owned(),
         },
     );
-    let Response::Opened { info } = response else {
+    let Response::Opened { info, .. } = response else {
         panic!(
             "Sandboxed worker did not open {}: {response:?}",
             binary.display()
@@ -1053,5 +1053,277 @@ fn no_return_calls_end_blocks_and_keep_neighbours_separate() {
                 "{name}: after_abort not recovered"
             );
         }
+    }
+}
+
+/// Every page of the worker's open-time symbol-name table, validated.
+fn symbol_names(
+    worker: &mut WorkerClient,
+    summary: ghidra_rust::model::SymbolNameSummary,
+) -> ghidra_rust::symbol_names::SymbolNames {
+    let mut pages = ghidra_rust::symbol_names::SymbolNameFetch::new(summary).unwrap();
+    while let Some(cursor) = pages.cursor() {
+        let Response::SymbolNames { page } = request(worker, Request::SymbolNames { cursor })
+        else {
+            panic!("Sandboxed worker did not return symbol names");
+        };
+        pages.accept(page).unwrap();
+    }
+    pages.finish().unwrap()
+}
+
+fn open_with_names(
+    binary: &Path,
+) -> (
+    WorkerClient,
+    ghidra_rust::model::BinaryInfo,
+    ghidra_rust::model::SymbolNameSummary,
+) {
+    let mut worker = WorkerClient::start_using_executable(
+        eframe::egui::Context::default(),
+        binary,
+        Path::new(env!("CARGO_BIN_EXE_ghidra-rust")),
+    )
+    .unwrap();
+    let response = request(
+        &mut worker,
+        Request::Open {
+            path: binary.to_string_lossy().into_owned(),
+        },
+    );
+    let Response::Opened {
+        info,
+        symbols: Some(summary),
+    } = response
+    else {
+        panic!(
+            "Sandboxed worker did not open {}: {response:?}",
+            binary.display()
+        );
+    };
+    (worker, info, summary)
+}
+
+/// Call tokens of `function` with their exact pseudocode text.
+fn call_tokens(worker: &mut WorkerClient, function: u64) -> (String, Vec<(u64, String)>) {
+    let Response::Decompiled {
+        text, semantics, ..
+    } = request(worker, Request::Decompile { address: function })
+    else {
+        panic!("Sandboxed worker did not decompile {function:#x}");
+    };
+    let calls = semantics
+        .tokens
+        .iter()
+        .filter_map(|token| match token.kind {
+            ghidra_rust::semantic::TokenKind::Call { target } => {
+                Some((target, text[token.start..token.end].to_owned()))
+            }
+            _ => None,
+        })
+        .collect();
+    (text, calls)
+}
+
+#[test]
+fn demangled_cpp_names_keep_raw_identities_through_worker_and_project() {
+    let directory = tempfile::tempdir().unwrap();
+    let binary = directory.path().join("demangle");
+    let compiled = Command::new("g++")
+        .args(["-O0", "-fno-pie", "-no-pie"])
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/demangle_program.cpp"
+        ))
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .expect("Linux demangling integration tests require G++");
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let original = std::fs::read(&binary).unwrap();
+    let int_raw = "_ZN16demangle_fixture10overloadedEi";
+    let double_raw = "_ZN16demangle_fixture10overloadedEd";
+    let exit_raw = "_ZN16demangle_fixture4exitEi";
+    let (overload_int, overload_double, fixture_exit, main) = (
+        symbol(&binary, int_raw),
+        symbol(&binary, double_raw),
+        symbol(&binary, exit_raw),
+        symbol(&binary, "main"),
+    );
+    let (mut worker, info, summary) = open_with_names(&binary);
+    let names = symbol_names(&mut worker, summary.clone());
+    for (address, raw, display) in [
+        (overload_int, int_raw, "demangle_fixture::overloaded"),
+        (overload_double, double_raw, "demangle_fixture::overloaded"),
+        (fixture_exit, exit_raw, "demangle_fixture::exit"),
+    ] {
+        let record = names.get(address).unwrap();
+        assert_eq!(
+            (record.raw.as_str(), record.display.as_deref()),
+            (raw, Some(display))
+        );
+        assert_eq!(names.find(raw), Some(address));
+    }
+    assert!(names.get(main).is_none(), "plain names need no record");
+    // The inventory keeps the engine's existing effective names.
+    let engine_name = |address| {
+        info.functions
+            .iter()
+            .find(|function| function.address == address)
+            .map(|function| function.name.clone())
+    };
+    assert_eq!(
+        engine_name(overload_int).as_deref(),
+        Some("demangle_fixture::overloaded")
+    );
+    // A demangled leaf name is not no-return evidence.
+    let Response::Graph { view } = request(&mut worker, Request::Graph { address: main }) else {
+        panic!("Sandboxed worker did not return main's CFG");
+    };
+    let exit_call = view
+        .calls
+        .iter()
+        .find(|call| call.target == Some(fixture_exit))
+        .expect("main calls the fixture exit");
+    assert!(exit_call.no_return.is_none());
+    let (text, calls) = call_tokens(&mut worker, main);
+    for target in [overload_int, overload_double, fixture_exit] {
+        let expected = names.get(target).unwrap().display.clone().unwrap();
+        assert!(
+            calls.contains(&(target, expected)),
+            "{target:#x} in {calls:?}\n{text}"
+        );
+    }
+    assert!(!text.contains(int_raw), "{text}");
+    // An analyst name replaces the display name in pseudocode as well.
+    assert!(matches!(
+        request(
+            &mut worker,
+            Request::Rename {
+                address: overload_int,
+                name: "analyst_label".into(),
+            },
+        ),
+        Response::Renamed { .. }
+    ));
+    let (_, calls) = call_tokens(&mut worker, main);
+    assert!(
+        calls.contains(&(overload_int, "analyst_label".into())),
+        "{calls:?}"
+    );
+    assert!(calls.contains(&(overload_double, "demangle_fixture::overloaded".into())));
+    // Projects persist the address-bound label, never a derived display name.
+    let protection = worker.protection().bind_snapshot(&info).unwrap();
+    let mut session = Session::new(info.sha256.clone());
+    session.annotations.insert(
+        overload_int,
+        Annotation {
+            label: "analyst_label".into(),
+            comment: String::new(),
+            decoded: vec![],
+        },
+    );
+    let project = ProjectData {
+        semantics: Default::default(),
+        info,
+        session,
+        view: None,
+        decompiled: None,
+        mappings: vec![],
+        strings: vec![],
+        strings_truncated: false,
+        crypto: vec![],
+        crypto_truncated: false,
+        selected_address: Some(overload_int),
+        discovery: None,
+    };
+    let project_path = directory.path().join("demangle.grproj");
+    project.save(&project_path, &protection, true).unwrap();
+    drop(worker);
+    let loaded = ProjectData::load(&project_path).unwrap();
+    assert!(loaded.cache_compatible);
+    assert_eq!(
+        loaded.data.session.annotations[&overload_int].label,
+        "analyst_label"
+    );
+    assert_eq!(loaded.data.session.annotations.len(), 1);
+    assert_eq!(
+        loaded
+            .data
+            .info
+            .functions
+            .iter()
+            .find(|function| function.address == overload_int)
+            .map(|function| function.name.as_str()),
+        Some("demangle_fixture::overloaded")
+    );
+    // The table is reconstructed from the verified embedded image.
+    let embedded = loaded.binary.as_ref().unwrap().clone();
+    let extracted = embedded.path().to_owned();
+    let mut reopened = WorkerClient::start_using_executable(
+        eframe::egui::Context::default(),
+        &extracted,
+        Path::new(env!("CARGO_BIN_EXE_ghidra-rust")),
+    )
+    .unwrap();
+    reopened.retain_source(Arc::new(embedded));
+    let Response::Opened {
+        symbols: Some(fresh),
+        ..
+    } = request(
+        &mut reopened,
+        Request::Open {
+            path: extracted.to_string_lossy().into_owned(),
+        },
+    )
+    else {
+        panic!("Sandboxed worker did not reopen the embedded input");
+    };
+    assert_eq!(fresh, summary);
+    assert_eq!(std::fs::read(&binary).unwrap(), original);
+}
+
+#[test]
+fn rust_v0_executable_names_are_demangled_without_hashes() {
+    let directory = tempfile::tempdir().unwrap();
+    let binary = directory.path().join("demangle_program");
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let compiled = Command::new(rustc)
+        .args([
+            "--edition=2024",
+            "--crate-name=demangle_program",
+            "-Csymbol-mangling-version=v0",
+            "-Copt-level=0",
+            "-Cpanic=abort",
+            "-Clink-arg=-lc",
+        ])
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/demangle_program.rs"
+        ))
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .expect("The pinned Rust toolchain is required for the original fixture");
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let (mut worker, _, summary) = open_with_names(&binary);
+    let names = symbol_names(&mut worker, summary);
+    let main = symbol(&binary, "main");
+    let (_, calls) = call_tokens(&mut worker, main);
+    for display in ["demangle_program::demangle_probe", "demangle_program::café"] {
+        let address = names.find(display).expect(display);
+        let raw = &names.get(address).unwrap().raw;
+        assert!(raw.starts_with("_R"), "{raw}");
+        assert_eq!(names.find(raw), Some(address));
+        assert_eq!(symbol(&binary, raw), address);
+        assert!(calls.contains(&(address, display.into())), "{calls:?}");
     }
 }

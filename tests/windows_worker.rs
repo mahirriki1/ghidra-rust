@@ -90,7 +90,7 @@ fn stripped_pe_runtime_functions_load_without_explicit_discovery() {
         &executable,
     )
     .unwrap();
-    let Response::Opened { info } = request(
+    let Response::Opened { info, .. } = request(
         &mut worker,
         Request::Open {
             path: binary.to_string_lossy().into_owned(),
@@ -135,7 +135,7 @@ fn real_windows_worker_and_embedded_project_round_trip() {
     let context = eframe::egui::Context::default();
     let mut worker = WorkerClient::start_using_executable(context.clone(), &binary, &executable)
         .expect("start production Windows worker in a resource-limited job");
-    let Response::Opened { info } = request(
+    let Response::Opened { info, .. } = request(
         &mut worker,
         Request::Open {
             path: binary.to_string_lossy().into_owned(),
@@ -369,7 +369,7 @@ fn real_windows_worker_and_embedded_project_round_trip() {
     let mut reopened = WorkerClient::start_using_executable(context, &extracted, &executable)
         .expect("start worker for extracted Windows project input");
     reopened.retain_source(Arc::new(embedded));
-    let Response::Opened { info: fresh } = request(
+    let Response::Opened { info: fresh, .. } = request(
         &mut reopened,
         Request::Open {
             path: extracted.to_string_lossy().into_owned(),
@@ -455,5 +455,147 @@ fn real_windows_worker_and_embedded_project_round_trip() {
             }
             Err(_) => std::thread::sleep(Duration::from_millis(10)),
         }
+    }
+}
+
+/// Opens `binary` and reads every validated page of its symbol-name table.
+fn open_names(
+    binary: &Path,
+) -> (
+    WorkerClient,
+    ghidra_rust::model::BinaryInfo,
+    ghidra_rust::symbol_names::SymbolNames,
+) {
+    let mut worker = WorkerClient::start_using_executable(
+        eframe::egui::Context::default(),
+        binary,
+        Path::new(env!("CARGO_BIN_EXE_ghidra-rust")),
+    )
+    .unwrap();
+    let response = request(
+        &mut worker,
+        Request::Open {
+            path: binary.to_string_lossy().into_owned(),
+        },
+    );
+    let Response::Opened {
+        info,
+        symbols: Some(summary),
+    } = response
+    else {
+        panic!(
+            "Windows worker did not open {}: {response:?}",
+            binary.display()
+        );
+    };
+    let mut pages = ghidra_rust::symbol_names::SymbolNameFetch::new(summary).unwrap();
+    while let Some(cursor) = pages.cursor() {
+        let Response::SymbolNames { page } = request(&mut worker, Request::SymbolNames { cursor })
+        else {
+            panic!("Windows worker did not return symbol names");
+        };
+        pages.accept(page).unwrap();
+    }
+    (worker, info, pages.finish().unwrap())
+}
+
+fn exports(binary: &Path) -> Vec<(String, u64)> {
+    let bytes = std::fs::read(binary).unwrap();
+    let image = object::File::parse(bytes.as_slice()).unwrap();
+    image
+        .exports()
+        .unwrap()
+        .into_iter()
+        .map(|export| {
+            (
+                String::from_utf8(export.name().to_vec()).unwrap(),
+                export.address(),
+            )
+        })
+        .collect()
+}
+
+// Flip this to expect display names once a reviewed MSVC backend is mapped
+// for PE images in `analysis::symbol_format`.
+#[test]
+fn msvc_decorated_exports_stay_raw_without_a_reviewed_backend() {
+    let Some(binary) = std::env::var_os("GHIDRA_RUST_TEST_PE_CPP").map(PathBuf::from) else {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "Windows CI must compile and set GHIDRA_RUST_TEST_PE_CPP"
+        );
+        eprintln!("Set GHIDRA_RUST_TEST_PE_CPP to an MSVC build of demangle_program.cpp");
+        return;
+    };
+    let decorated: Vec<_> = exports(&binary)
+        .into_iter()
+        .filter(|(name, _)| name.starts_with('?'))
+        .collect();
+    assert!(decorated.len() >= 4, "{decorated:?}");
+    let (_worker, info, names) = open_names(&binary);
+    for (raw, address) in &decorated {
+        assert!(names.get(*address).is_none(), "{raw} gained a display name");
+        assert!(
+            info.functions
+                .iter()
+                .any(|function| function.address == *address && function.name == *raw),
+            "{raw} must keep its exact export name"
+        );
+    }
+}
+
+#[test]
+fn rust_v0_dylib_exports_are_demangled_with_raw_identities() {
+    let directory = tempfile::tempdir().unwrap();
+    let binary = directory.path().join("demangle_program.dll");
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let compiled = std::process::Command::new(rustc)
+        .args([
+            "--edition=2024",
+            "--crate-name=demangle_program",
+            "--crate-type=dylib",
+            "-Csymbol-mangling-version=v0",
+            "-Copt-level=0",
+            "-Cpanic=abort",
+        ])
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/demangle_program.rs"))
+        .arg("-o")
+        .arg(&binary)
+        .current_dir(directory.path())
+        .output()
+        .expect("The pinned Rust toolchain is required for the original fixture");
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let exported = exports(&binary);
+    let (mut worker, _info, names) = open_names(&binary);
+    let main = exported
+        .iter()
+        .find(|(name, _)| name == "main")
+        .expect("exported fixture main")
+        .1;
+    let Response::Decompiled {
+        text, semantics, ..
+    } = request(&mut worker, Request::Decompile { address: main })
+    else {
+        panic!("Windows worker did not decompile the Rust fixture");
+    };
+    for display in ["demangle_program::demangle_probe", "demangle_program::café"] {
+        let address = names.find(display).expect(display);
+        let raw = &names.get(address).unwrap().raw;
+        assert!(raw.starts_with("_R"), "{raw}");
+        assert!(
+            exported.contains(&(raw.clone(), address)),
+            "{raw} is not exported"
+        );
+        assert!(
+            semantics.tokens.iter().any(|token| {
+                matches!(token.kind, TokenKind::Call { target } if target == address)
+                    && &text[token.start..token.end] == display
+            }),
+            "{display} call token\n{text}"
+        );
     }
 }

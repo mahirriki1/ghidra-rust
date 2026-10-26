@@ -1322,7 +1322,7 @@ fn start_open(
     .unwrap();
     let spawn_ms = milliseconds(start);
     sampler.attach(executable);
-    let Response::Opened { info } = sampler.request(
+    let Response::Opened { info, .. } = sampler.request(
         &mut worker,
         Request::Open {
             path: fixture

@@ -259,6 +259,7 @@ struct ReferenceRowsKey {
     generation: u64,
     references: u64,
     revision: u64,
+    names: u64,
     data: bool,
     scope: Option<u64>,
     explicit: bool,
@@ -434,6 +435,37 @@ impl RunPresentation {
     }
 }
 
+/// Pages of one worker's symbol-name table, bound to the binary generation and
+/// worker epoch that announced it.
+struct SymbolFetch {
+    generation: u64,
+    epoch: u64,
+    pages: crate::symbol_names::SymbolNameFetch,
+}
+
+/// Shown name for an exact inventory entry, and its original symbol when that
+/// differs. A non-empty analyst label wins, then the worker's display name,
+/// then the effective inventory name. Text never becomes an identity.
+fn function_display<'a>(
+    session: Option<&'a Session>,
+    symbols: Option<&'a crate::symbol_names::SymbolNames>,
+    function: &'a FunctionInfo,
+) -> (&'a str, Option<&'a str>) {
+    let record = symbols.and_then(|symbols| symbols.get(function.address));
+    let shown = session
+        .and_then(|session| session.annotations.get(&function.address))
+        .map(|annotation| annotation.label.as_str())
+        .filter(|label| !label.is_empty())
+        .or_else(|| record.and_then(|record| record.display.as_deref()))
+        .unwrap_or(&function.name);
+    (
+        shown,
+        record
+            .map(|record| record.raw.as_str())
+            .filter(|raw| *raw != shown),
+    )
+}
+
 fn request_task(request: &Request) -> &'static str {
     match request {
         Request::Open { .. } => "Opening binary",
@@ -446,6 +478,7 @@ fn request_task(request: &Request) -> &'static str {
         Request::Bytes { .. } => "Reading bytes",
         Request::Strings | Request::StringsWithOptions { .. } => "Finding strings",
         Request::Crypto => "Scanning constants",
+        Request::SymbolNames { .. } => "Reading symbol names",
     }
 }
 
@@ -564,6 +597,13 @@ pub struct DesktopApp {
     discovery_activity: Option<DiscoveryActivity>,
     discovery_summary: Option<String>,
     worker_epoch: u64,
+    /// Validated symbol names for the binary generation they belong to.
+    symbol_names: Option<(u64, crate::symbol_names::SymbolNames)>,
+    symbol_fetch: Option<SymbolFetch>,
+    /// A table digest that failed validation for a generation is not retried.
+    symbol_failed: Option<(u64, String)>,
+    /// Advances when displayed function names change without an annotation edit.
+    symbol_revision: u64,
     /// The inventory last adopted from the current worker. Batch requests name
     /// its revision while `inventory_synced` records that `info.functions` is
     /// still that inventory; every other inventory write clears it.
@@ -627,7 +667,7 @@ pub struct DesktopApp {
     /// Lowercased effective labels, aligned with `info.functions` and valid for
     /// `filter_keys_revision`.
     filter_keys: Vec<String>,
-    filter_keys_revision: u64,
+    filter_keys_revision: (u64, u64),
     filter_query: String,
     /// Next inventory index to examine while a filter is in progress.
     filter_cursor: Option<usize>,
@@ -646,7 +686,7 @@ pub struct DesktopApp {
     comment_edit: String,
     annotation_browser: AnnotationBrowser,
     comment_rows: CommentRows,
-    comment_rows_key: Option<(u64, u64, u64)>,
+    comment_rows_key: Option<(u64, u64, u64, u64)>,
     /// Only exact PCs observed in a recovered CFG or genuine print mapping.
     comment_owners: BTreeMap<u64, u64>,
     editor_address: Option<u64>,
@@ -719,6 +759,10 @@ impl DesktopApp {
             discovery_activity: None,
             discovery_summary: None,
             worker_epoch: 0,
+            symbol_names: None,
+            symbol_fetch: None,
+            symbol_failed: None,
+            symbol_revision: 0,
             worker_inventory: None,
             inventory_synced: false,
             discovery_sync: None,
@@ -766,7 +810,7 @@ impl DesktopApp {
             function_filter: String::new(),
             filtered_functions: Vec::new(),
             filter_keys: Vec::new(),
-            filter_keys_revision: 0,
+            filter_keys_revision: (0, 0),
             filter_query: String::new(),
             filter_cursor: None,
             string_filter: String::new(),
@@ -1298,7 +1342,9 @@ impl DesktopApp {
             || self.pending.as_ref().is_some_and(|pending| {
                 matches!(
                     pending.request,
-                    Request::DiscoverBatch { .. } | Request::SyncFunctions { .. }
+                    Request::DiscoverBatch { .. }
+                        | Request::SyncFunctions { .. }
+                        | Request::SymbolNames { .. }
                 )
             })
         {
@@ -2272,6 +2318,7 @@ impl DesktopApp {
             }
         }
         self.dispatch_queued(context);
+        self.pump_symbol_names();
         self.pump_discovery(context);
         self.pump_analysis(context);
         if self.pending.is_some()
@@ -2347,6 +2394,12 @@ impl DesktopApp {
                 self.dispatch_queued(context);
                 return;
             }
+            if matches!(pending.request, Request::SymbolNames { .. })
+                && let Some(fetch) = self.symbol_fetch.take()
+            {
+                // Raw/effective names stay usable; this table is not retried.
+                self.symbol_failed = Some((fetch.generation, fetch.pages.summary().digest.clone()));
+            }
             let signature_failure = self.signature_change.is_some();
             self.stop_after_failure(resumes_discovery(&pending.request), context);
             if signature_failure {
@@ -2419,7 +2472,7 @@ impl DesktopApp {
             return;
         }
         match (pending.request, response) {
-            (Request::Open { .. }, Response::Opened { mut info }) => {
+            (Request::Open { .. }, Response::Opened { mut info, symbols }) => {
                 let Some(opening) = self.opening.take() else {
                     return;
                 };
@@ -2579,6 +2632,7 @@ impl DesktopApp {
                         sent: false,
                     });
                 }
+                self.begin_symbol_names(symbols);
                 self.rebuild_filter();
                 self.status = "Binary loaded".into();
                 if let Some(project) = project {
@@ -2955,6 +3009,9 @@ impl DesktopApp {
                 };
                 self.finish_auto_run(AnalysisStep::Strings);
             }
+            (Request::SymbolNames { cursor }, Response::SymbolNames { page }) => {
+                self.receive_symbol_names(cursor, page, context);
+            }
             (Request::Crypto, Response::Crypto { matches, truncated }) => {
                 self.result_revision = self.result_revision.wrapping_add(1);
                 self.cached_crypto = false;
@@ -3035,7 +3092,7 @@ impl DesktopApp {
             crate::selection::MappedRanges::new(&info.sections)
         };
         match response {
-            Response::Opened { info } => {
+            Response::Opened { info, .. } => {
                 validate_info(info, MAX_FUNCTION_NAME_BYTES, true).map(|_| ())
             }
             Response::Graph { view } => validate_view(
@@ -3069,9 +3126,10 @@ impl DesktopApp {
     /// Inventories can hold 262,144 entries, so large filters span frames
     /// instead of blocking input. Keys are lowercased once per name revision.
     fn step_filter(&mut self, budget: Duration) -> bool {
-        // Annotation edits and undo change effective labels.
-        if self.filter_keys_revision != self.revision {
-            self.filter_keys_revision = self.revision;
+        // Annotation edits, undo and adopted symbol names change effective labels.
+        let revision = (self.revision, self.symbol_revision);
+        if self.filter_keys_revision != revision {
+            self.filter_keys_revision = revision;
             self.filter_keys.clear();
             self.filtered_functions.clear();
             self.filter_cursor = Some(0);
@@ -3099,14 +3157,19 @@ impl DesktopApp {
         while index < functions.len() {
             let function = &functions[index];
             if index == self.filter_keys.len() {
-                let label = self
-                    .session
+                let symbols = self
+                    .symbol_names
                     .as_ref()
-                    .and_then(|session| session.annotations.get(&function.address))
-                    .map(|annotation| annotation.label.as_str())
-                    .filter(|label| !label.is_empty())
-                    .unwrap_or(&function.name);
-                self.filter_keys.push(label.to_lowercase());
+                    .filter(|(generation, _)| *generation == self.generation)
+                    .map(|(_, names)| names);
+                let (label, raw) = function_display(self.session.as_ref(), symbols, function);
+                // A query cannot contain NUL, so it never spans both names.
+                let mut key = label.to_lowercase();
+                if let Some(raw) = raw {
+                    key.push('\0');
+                    key.push_str(&raw.to_lowercase());
+                }
+                self.filter_keys.push(key);
             }
             let matched = self.filter_keys[index].contains(&self.filter_query)
                 || hex && {
@@ -3943,7 +4006,18 @@ impl DesktopApp {
             .get(&address)
             .map(|note| note.label.clone())
             .filter(|name| !name.is_empty())
-            .or_else(|| function.map(|function| function.name.clone()))
+            .or_else(|| {
+                function.map(|function| {
+                    let shown = function_display(Some(session), self.symbols(), function).0;
+                    // A display name too long to commit as a label is not offered.
+                    if shown.len() <= 256 {
+                        shown
+                    } else {
+                        &function.name
+                    }
+                    .to_owned()
+                })
+            })
             .unwrap_or_default();
         self.browser_dialog = Some(BrowserDialog {
             kind: BrowserDialogKind::Rename {
@@ -4357,6 +4431,8 @@ impl DesktopApp {
                     .find(|function| function.name == query)
                     .map(|function| function.address)
             })
+            // Exact original symbol, then exact demangled display name.
+            .or_else(|| self.symbols()?.find(query))
             .ok_or("Enter a hexadecimal address or an exact function/label name")?;
         if !info
             .sections
@@ -4875,17 +4951,22 @@ impl DesktopApp {
                                     .show_rows(ui, 20.0, info.functions.len(), |ui, rows| {
                                         for index in rows {
                                             let item = &info.functions[index];
+                                            let (label, raw) = function_display(
+                                                self.session.as_ref(),
+                                                self.symbols(),
+                                                item,
+                                            );
                                             if ui
                                                 .add(
                                                     egui::Button::selectable(
                                                         self.view().is_some_and(|v| {
                                                             v.address == item.address
                                                         }),
-                                                        crop(&item.name, 100),
+                                                        crop(label, 100),
                                                     )
                                                     .truncate(),
                                                 )
-                                                .on_hover_text(&item.name)
+                                                .on_hover_text(name_hover(label, raw))
                                                 .clicked()
                                             {
                                                 function = Some(item.address);
@@ -5097,13 +5178,8 @@ impl DesktopApp {
             None,
             |ui, row, rect| {
                 let function = &info.functions[self.filtered_functions[row]];
-                let label = self
-                    .session
-                    .as_ref()
-                    .and_then(|session| session.annotations.get(&function.address))
-                    .map(|annotation| annotation.label.as_str())
-                    .filter(|label| !label.is_empty())
-                    .unwrap_or(&function.name);
+                let (label, raw) =
+                    function_display(self.session.as_ref(), self.symbols(), function);
                 let response = theme::row_response(
                     ui,
                     ui.scope_id().with(("function-row", function.address)),
@@ -5139,8 +5215,12 @@ impl DesktopApp {
                 let detail = witness
                     .map(|w| format!("\n{}", w.hover_text()))
                     .unwrap_or_default();
-                let response =
-                    response.on_hover_text(format!("{:x}  {}{}", function.address, label, detail));
+                let response = response.on_hover_text(format!(
+                    "{:x}  {}{}",
+                    function.address,
+                    name_hover(label, raw),
+                    detail
+                ));
                 if response.clicked() {
                     navigate = Some(function.address);
                 }
@@ -5173,7 +5253,12 @@ impl DesktopApp {
     }
 
     fn update_comment_rows(&mut self) {
-        let key = (self.generation, self.selection_generation, self.revision);
+        let key = (
+            self.generation,
+            self.selection_generation,
+            self.revision,
+            self.symbol_revision,
+        );
         if self.comment_rows_key == Some(key) {
             return;
         }
@@ -5213,6 +5298,17 @@ impl DesktopApp {
         }
         let digits = theme::address_digits(listing.last().map_or(0, |i| i.address));
         let operands = theme::listing_columns(digits)[3];
+        let calls: BTreeMap<u64, usize> = graph_view(&self.graph)
+            .into_iter()
+            .flat_map(|view| &view.calls)
+            .filter_map(|call| {
+                let name = self.reference_name(call.target?)?;
+                Some((
+                    call.address,
+                    name.chars().count().min(LISTING_CALL_NAME) + 3,
+                ))
+            })
+            .collect();
         self.listing_chars = listing
             .iter()
             .map(|instruction| {
@@ -5221,7 +5317,8 @@ impl DesktopApp {
                     .comments
                     .get(&instruction.address)
                     .map_or(0, |comment| comment.chars().count() + 4);
-                operands + instruction.operands.chars().count() + comment
+                let call = calls.get(&instruction.address).copied().unwrap_or(0);
+                operands + instruction.operands.chars().count() + call + comment
             })
             .max()
             .unwrap_or(0);
@@ -5535,19 +5632,10 @@ impl DesktopApp {
         }
         if let Some(view) = graph_view(&self.graph) {
             let entry = view.address;
-            let function = self
-                .info
-                .as_ref()
-                .and_then(|info| function_at(&info.functions, view.address));
-            let name = function.map(|f| f.name.as_str()).unwrap_or("function");
-            let row = ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(format!("{}  {:x}", crop(name, 100), entry))
-                        .monospace()
-                        .color(theme::BLUE),
-                )
-            });
-            let response = row.inner;
+            let (name, raw) = self.function_names(entry).unwrap_or(("function", None));
+            let response = ui
+                .horizontal(|ui| function_title(ui, name, raw, entry))
+                .inner;
             response.context_menu(|ui| {
                 if ui.button("Edit signature…").clicked() {
                     self.begin_signature_editor();
@@ -5719,10 +5807,17 @@ impl DesktopApp {
                             && let Some(target) = self.decompiler_call_target(start + byte)
                         {
                             let clicked = response.double_clicked();
+                            let go = format!("Double-click to go to {target:#x}");
+                            let hover = match self.function_names(target) {
+                                Some((_, Some(raw))) => {
+                                    format!("{}\n{go}", crop(raw, MAX_HOVER_NAME))
+                                }
+                                _ => go,
+                            };
                             response
                                 .clone()
                                 .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                .on_hover_text(format!("Double-click to go to {target:#x}"));
+                                .on_hover_text(hover);
                             if clicked {
                                 navigate = Some(target);
                             }
@@ -6046,15 +6141,140 @@ impl DesktopApp {
 
     /// Display label for an exact function entry; never reference evidence.
     fn reference_name(&self, address: u64) -> Option<&str> {
+        self.function_names(address).map(|(shown, _)| shown)
+    }
+
+    /// [`function_display`] for an exact inventory entry.
+    fn function_names(&self, address: u64) -> Option<(&str, Option<&str>)> {
         let function = function_at(&self.info.as_ref()?.functions, address)?;
-        Some(
-            self.session
+        Some(function_display(
+            self.session.as_ref(),
+            self.symbols(),
+            function,
+        ))
+    }
+
+    /// The adopted symbol-name table of the displayed binary.
+    fn symbols(&self) -> Option<&crate::symbol_names::SymbolNames> {
+        self.symbol_names
+            .as_ref()
+            .filter(|(generation, _)| *generation == self.generation)
+            .map(|(_, names)| names)
+    }
+
+    /// A worker announced its open-time table. A replacement worker for the
+    /// same image keeps an adopted table or continues an unfinished one.
+    fn begin_symbol_names(&mut self, summary: Option<crate::model::SymbolNameSummary>) {
+        let Some(summary) = summary else {
+            self.symbol_fetch = None;
+            return;
+        };
+        let generation = self.generation;
+        if self
+            .symbols()
+            .is_some_and(|names| names.digest() == summary.digest)
+            || self
+                .symbol_failed
                 .as_ref()
-                .and_then(|s| s.annotations.get(&address))
-                .map(|a| a.label.as_str())
-                .filter(|n| !n.is_empty())
-                .unwrap_or(&function.name),
-        )
+                .is_some_and(|failed| *failed == (generation, summary.digest.clone()))
+        {
+            self.symbol_fetch = None;
+            return;
+        }
+        if let Some(fetch) = &mut self.symbol_fetch
+            && fetch.generation == generation
+            && *fetch.pages.summary() == summary
+        {
+            fetch.epoch = self.worker_epoch;
+            return;
+        }
+        self.symbol_fetch = match crate::symbol_names::SymbolNameFetch::new(summary) {
+            Ok(pages) => Some(SymbolFetch {
+                generation,
+                epoch: self.worker_epoch,
+                pages,
+            }),
+            Err(error) => {
+                self.status = error;
+                None
+            }
+        };
+        self.adopt_symbol_names();
+    }
+
+    /// Adopts a completely received table; partial pages are never displayed.
+    fn adopt_symbol_names(&mut self) {
+        if self
+            .symbol_fetch
+            .as_ref()
+            .is_none_or(|fetch| fetch.pages.cursor().is_some())
+        {
+            return;
+        }
+        let fetch = self.symbol_fetch.take().expect("checked symbol fetch");
+        if let Some(names) = fetch.pages.finish() {
+            crate::performance::event("symbol_names_retained_bytes", names.retained_bytes() as u64);
+            self.symbol_names = Some((fetch.generation, names));
+            self.symbol_revision = self.symbol_revision.wrapping_add(1);
+            self.rebuild_filter();
+        }
+    }
+
+    /// Requests the next page while the worker is otherwise idle; user
+    /// actions and replays go first, discovery and scans afterwards.
+    fn pump_symbol_names(&mut self) {
+        if self.client.is_none()
+            || self.pending.is_some()
+            || self.opening.is_some()
+            || !self.queue.is_empty()
+            || self.signature_replay.is_some()
+            || self.discovery_job.is_some()
+            || self.deferred_discovery.is_some()
+            || self.discovery_bytes.is_some()
+            || self.results.preparing()
+        {
+            return;
+        }
+        let Some(cursor) = self
+            .symbol_fetch
+            .as_ref()
+            .filter(|fetch| fetch.generation == self.generation && fetch.epoch == self.worker_epoch)
+            .and_then(|fetch| fetch.pages.cursor())
+        else {
+            return;
+        };
+        self.send_direct(Request::SymbolNames { cursor });
+    }
+
+    fn receive_symbol_names(
+        &mut self,
+        cursor: usize,
+        page: crate::model::SymbolNamePage,
+        context: &egui::Context,
+    ) {
+        let Some(fetch) = self.symbol_fetch.as_mut().filter(|fetch| {
+            fetch.generation == self.generation
+                && fetch.epoch == self.worker_epoch
+                && fetch.pages.cursor() == Some(cursor)
+        }) else {
+            // Another binary or table replaced this request; drop the page.
+            return;
+        };
+        let accepted = if page.cursor == cursor {
+            fetch.pages.accept(page)
+        } else {
+            Err("Symbol-name page answers another cursor".into())
+        };
+        if let Err(error) = accepted {
+            let digest = fetch.pages.summary().digest.clone();
+            self.symbol_failed = Some((fetch.generation, digest));
+            self.symbol_fetch = None;
+            self.stop_worker();
+            self.status = format!("Invalid worker response: symbol names: {error}; worker stopped");
+            return;
+        }
+        self.adopt_symbol_names();
+        context.request_repaint();
     }
 
     fn read_data_reference(&mut self, target: u64, size: u32, context: &egui::Context) {
@@ -6161,6 +6381,7 @@ impl DesktopApp {
             generation: self.generation,
             references: self.reference_revision,
             revision: self.revision,
+            names: self.symbol_revision,
             data: self.reference_data,
             scope: Some(scope),
             explicit,
@@ -6632,6 +6853,11 @@ impl DesktopApp {
                 } else {
                     reference.target
                 };
+                let (shown, raw) = self
+                    .function_names(counterpart)
+                    .unwrap_or(("function", None));
+                let action =
+                    "Click to open the call instruction · double-click to open the function";
                 let response = theme::row_response(
                     ui,
                     ui.scope_id().with(("call-reference", row)),
@@ -6639,9 +6865,10 @@ impl DesktopApp {
                     false,
                     false,
                 )
-                .on_hover_text(
-                    "Click to open the call instruction · double-click to open the function",
-                );
+                .on_hover_text(match raw {
+                    Some(raw) => format!("{}\n{action}", crop(raw, MAX_HOVER_NAME)),
+                    None => action.to_owned(),
+                });
                 let cell = |x: f32, width: f32| {
                     egui::Rect::from_x_y_ranges(
                         rect.left() + x..=rect.left() + x + width,
@@ -6657,11 +6884,7 @@ impl DesktopApp {
                 theme::cell_text(
                     ui,
                     cell(function_x, site_x - function_x),
-                    RichText::new(format!(
-                        "{counterpart:x} {}",
-                        crop(self.reference_name(counterpart).unwrap_or("function"), 60)
-                    ))
-                    .monospace(),
+                    RichText::new(format!("{counterpart:x} {}", crop(shown, 60))).monospace(),
                     theme::SYNTAX_FUNCTION,
                 );
                 theme::cell_text(
@@ -6745,21 +6968,35 @@ impl DesktopApp {
                             ScrollArea::vertical().max_height(100.0).show(ui, |ui| {
                                 for call in view.calls.iter().take(256) {
                                     if let Some(target) = call.target {
+                                        let (name, raw) = self
+                                            .function_names(target)
+                                            .map_or((None, None), |(name, raw)| (Some(name), raw));
+                                        let evidence = call.no_return.map_or_else(
+                                            || "Direct call".into(),
+                                            |e| e.description(),
+                                        );
+                                        let label = format!(
+                                            "{:x} → {:x}{}{}",
+                                            call.address,
+                                            target,
+                                            name.map_or(String::new(), |name| format!(
+                                                "  {}",
+                                                crop(name, 80)
+                                            )),
+                                            if call.no_return.is_some() {
+                                                " [no return]"
+                                            } else {
+                                                ""
+                                            }
+                                        );
                                         if ui
-                                            .button(format!(
-                                                "{:x} → {:x}{}",
-                                                call.address,
-                                                target,
-                                                if call.no_return.is_some() {
-                                                    " [no return]"
-                                                } else {
-                                                    ""
+                                            .add(egui::Button::new(label).truncate())
+                                            .on_hover_text(match name {
+                                                Some(name) => {
+                                                    format!("{}\n{evidence}", name_hover(name, raw))
                                                 }
-                                            ))
-                                            .on_hover_text(call.no_return.map_or_else(
-                                                || "Direct call".into(),
-                                                |e| e.description(),
-                                            ))
+                                                None => evidence,
+                                            })
                                             .clicked()
                                         {
                                             navigate = Some(target);
@@ -6786,10 +7023,27 @@ impl DesktopApp {
                         });
                     }
                     if let Some(canvas) = &mut self.canvas {
+                        let names = |target| {
+                            let function = function_at(&self.info.as_ref()?.functions, target)?;
+                            let symbols = self
+                                .symbol_names
+                                .as_ref()
+                                .filter(|(generation, _)| *generation == self.generation)
+                                .map(|(_, names)| names);
+                            Some(function_display(self.session.as_ref(), symbols, function).0)
+                        };
                         canvas.set_comments(
                             view,
-                            (self.generation, self.revision),
+                            (self.generation, self.revision, self.symbol_revision),
                             &self.annotation_browser.comments,
+                            || {
+                                view.calls
+                                    .iter()
+                                    .filter_map(|call| {
+                                        Some((call.address, names(call.target?)?.to_owned()))
+                                    })
+                                    .collect()
+                            },
                         );
                         let call_index = self.call_index.as_deref();
                         let info = self.info.as_ref();
@@ -6858,19 +7112,9 @@ impl DesktopApp {
                     return;
                 };
                 let listing = listing_of(&self.graph);
-                let name = self
-                    .info
-                    .as_ref()
-                    .and_then(|info| function_at(&info.functions, view.address))
-                    .map(|f| f.name.as_str())
-                    .unwrap_or("function");
                 let entry = view.address;
-                ui.label(
-                    RichText::new(format!("{}  {:x}", crop(name, 120), view.address))
-                        .monospace()
-                        .color(theme::BLUE),
-                )
-                .context_menu(|ui| {
+                let (name, raw) = self.function_names(entry).unwrap_or(("function", None));
+                function_title(ui, name, raw, entry).context_menu(|ui| {
                     if ui.button("Xrefs to this function").clicked() {
                         listing_xrefs = Some(XrefTarget {
                             address: entry,
@@ -6907,6 +7151,13 @@ impl DesktopApp {
                             self.selected == Some(instruction.address),
                             self.semantic.addresses.contains(&instruction.address),
                         );
+                        let call = view
+                            .calls
+                            .iter()
+                            .find(|call| call.address == instruction.address);
+                        let callee = call
+                            .and_then(|call| call.target)
+                            .and_then(|target| self.function_names(target));
                         if ui.is_rect_visible(rect) {
                             let mut job = theme::listing_row(
                                 instruction.address,
@@ -6915,6 +7166,13 @@ impl DesktopApp {
                                 &instruction.mnemonic,
                                 &instruction.operands,
                             );
+                            if let Some((name, _)) = callee {
+                                job.append(
+                                    &format!("  {}", crop(name, LISTING_CALL_NAME)),
+                                    0.0,
+                                    theme::mono_format(theme::SYNTAX_FUNCTION),
+                                );
+                            }
                             if let Some(comment) =
                                 self.annotation_browser.comments.get(&instruction.address)
                             {
@@ -6934,11 +7192,10 @@ impl DesktopApp {
                                 theme::TEXT,
                             );
                         }
-                        let call = view
-                            .calls
-                            .iter()
-                            .find(|call| call.address == instruction.address);
                         let mut hover = Vec::new();
+                        if let Some((_, Some(raw))) = callee {
+                            hover.push(crop(raw, MAX_HOVER_NAME));
+                        }
                         if instruction.bytes.len() > theme::LISTING_BYTES {
                             hover.push(hex(&instruction.bytes));
                         }
@@ -8001,6 +8258,42 @@ fn parse_address(text: &str) -> Result<u64, String> {
     .map_err(|_| "Enter a hexadecimal address".into())
 }
 
+/// Characters of a raw or displayed name shown in one tooltip.
+const MAX_HOVER_NAME: usize = 512;
+
+/// The shown name, and the raw symbol beneath it when that differs.
+fn name_hover(shown: &str, raw: Option<&str>) -> String {
+    match raw {
+        Some(raw) => format!(
+            "{}\n{}",
+            crop(shown, MAX_HOVER_NAME),
+            crop(raw, MAX_HOVER_NAME)
+        ),
+        None => crop(shown, MAX_HOVER_NAME),
+    }
+}
+
+/// A function header that truncates long names rather than widening its dock.
+fn function_title(
+    ui: &mut egui::Ui,
+    name: &str,
+    raw: Option<&str>,
+    address: u64,
+) -> egui::Response {
+    let title = format!("{}  {address:x}", crop(name, 120));
+    let response = ui.add(
+        egui::Label::new(RichText::new(&title).monospace().color(theme::BLUE))
+            .truncate()
+            .show_tooltip_when_elided(raw.is_none()),
+    );
+    match raw {
+        Some(raw) => response.on_hover_text(name_hover(name, Some(raw))),
+        None => response,
+    }
+}
+/// Characters of a call target's name appended to a Listing row.
+const LISTING_CALL_NAME: usize = 120;
+
 fn crop(text: &str, maximum: usize) -> String {
     let mut chars = text.chars();
     let mut result: String = chars.by_ref().take(maximum).collect();
@@ -8668,6 +8961,130 @@ mod tests {
         app.address = "1000".into();
         app.rebuild_filter();
         app
+    }
+
+    fn symbol_reply(
+        app: &DesktopApp,
+        cursor: usize,
+        page: crate::model::SymbolNamePage,
+    ) -> (Pending, Response) {
+        (
+            Pending {
+                id: 1,
+                request: Request::SymbolNames { cursor },
+                started: Instant::now(),
+                selection: app.selection_generation,
+                revision: app.revision,
+                byte_origin: (app.selected, app.tab),
+                bytes: None,
+                result: None,
+            },
+            Response::SymbolNames { page },
+        )
+    }
+
+    fn demangled_app() -> (DesktopApp, crate::symbol_names::SymbolTable) {
+        let mut app = keyboard_app();
+        // A PE export keeps its raw engine name; only the table demangles it.
+        app.info.as_mut().unwrap().functions[0].name = "_ZN4demo3fooEv".into();
+        let table = crate::symbol_names::SymbolTable::build(
+            [crate::symbol_names::SymbolSource {
+                address: 0x1000,
+                raw: "_ZN4demo3fooEv",
+                engine: "_ZN4demo3fooEv",
+            }],
+            crate::symbol_names::SymbolFormat::Other,
+        );
+        app.begin_symbol_names(Some(table.summary().clone()));
+        (app, table)
+    }
+
+    #[test]
+    fn demangled_names_display_filter_and_go_to_by_either_form_while_labels_win() {
+        let context = egui::Context::default();
+        let (mut app, table) = demangled_app();
+        assert_eq!(app.function_names(0x1000), Some(("_ZN4demo3fooEv", None)));
+        let (pending, reply) = symbol_reply(&app, 0, table.page(0).unwrap());
+        app.receive(pending, reply, &context);
+        assert!(app.symbol_fetch.is_none());
+        assert_eq!(
+            app.function_names(0x1000),
+            Some(("demo::foo", Some("_ZN4demo3fooEv")))
+        );
+        assert_eq!(app.function_names(0x1040), Some(("next", None)));
+        // Names alone never become annotations, history or unsaved changes.
+        assert!(app.session.as_ref().unwrap().annotations.is_empty());
+        assert_eq!((app.revision, app.undo.len()), (0, 0));
+        assert_eq!(
+            app.info.as_ref().unwrap().functions[0].name,
+            "_ZN4demo3fooEv"
+        );
+        assert_eq!(app.resolve_location("_ZN4demo3fooEv"), Ok(0x1000));
+        assert_eq!(app.resolve_location("demo::foo"), Ok(0x1000));
+        assert!(app.resolve_location("demo::fo").is_err());
+        for query in ["DEMO::F", "3fooev"] {
+            app.function_filter = query.into();
+            app.restart_filter();
+            assert_eq!(app.filtered_functions, [0], "{query}");
+        }
+        app.edit_annotation(
+            0x1000,
+            Annotation {
+                label: "analyst_name".into(),
+                ..Annotation::default()
+            },
+        );
+        assert_eq!(
+            app.function_names(0x1000),
+            Some(("analyst_name", Some("_ZN4demo3fooEv")))
+        );
+        assert_eq!(app.reference_name(0x1000), Some("analyst_name"));
+        app.function_filter = "analyst".into();
+        app.restart_filter();
+        assert_eq!(app.filtered_functions, [0]);
+        // The label stays bound to the address, never to either name.
+        let session = app.session.as_ref().unwrap();
+        assert_eq!(session.annotations.len(), 1);
+        assert_eq!(session.annotations[&0x1000].label, "analyst_name");
+        assert_eq!(app.resolve_location("analyst_name"), Ok(0x1000));
+        assert_eq!(app.resolve_location("_ZN4demo3fooEv"), Ok(0x1000));
+    }
+
+    #[test]
+    fn stale_and_invalid_symbol_pages_never_adopt_names_or_retry() {
+        let context = egui::Context::default();
+        let (mut app, table) = demangled_app();
+        let page = table.page(0).unwrap();
+        // Another worker epoch or binary generation cannot complete this table.
+        app.worker_epoch += 1;
+        let (pending, reply) = symbol_reply(&app, 0, page.clone());
+        app.receive(pending, reply, &context);
+        assert!(app.symbols().is_none() && app.symbol_fetch.is_some());
+        app.worker_epoch -= 1;
+        app.generation += 1;
+        let (pending, reply) = symbol_reply(&app, 0, page.clone());
+        app.receive(pending, reply, &context);
+        assert!(app.symbols().is_none());
+        app.generation -= 1;
+        let mut tampered = page.clone();
+        tampered.entries[0].display = Some("demo::bar".into());
+        let (pending, reply) = symbol_reply(&app, 0, tampered);
+        app.receive(pending, reply, &context);
+        assert!(app.status.contains("symbol names"), "{}", app.status);
+        assert!(app.symbols().is_none() && app.symbol_fetch.is_none());
+        assert_eq!(app.function_names(0x1000), Some(("_ZN4demo3fooEv", None)));
+        // A replacement worker announcing the same table does not refetch it.
+        app.begin_symbol_names(Some(table.summary().clone()));
+        assert!(app.symbol_fetch.is_none());
+        // An adopted table also survives a replacement worker for the same image.
+        app.symbol_failed = None;
+        app.begin_symbol_names(Some(table.summary().clone()));
+        let (pending, reply) = symbol_reply(&app, 0, page);
+        app.receive(pending, reply, &context);
+        assert!(app.symbols().is_some());
+        app.worker_epoch += 1;
+        app.begin_symbol_names(Some(table.summary().clone()));
+        assert!(app.symbol_fetch.is_none() && app.symbols().is_some());
     }
 
     #[test]

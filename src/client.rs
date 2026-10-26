@@ -115,7 +115,7 @@ impl WorkerClient {
                                         crate::performance::span("reply_reader_validation");
                                     // The sandbox sees only /input/binary. Keep the
                                     // actual user-selected path in the desktop model.
-                                    if let crate::model::Response::Opened { info } =
+                                    if let crate::model::Response::Opened { info, .. } =
                                         &mut reply.response
                                     {
                                         if let Err(error) = reader_protection.verify_identity(info)

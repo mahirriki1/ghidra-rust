@@ -11,6 +11,25 @@ pub const MAX_STRING_RESULTS: usize = 10_000;
 /// over 260,000 runtime functions. Discovery has its own smaller work budgets.
 pub const MAX_FUNCTIONS: usize = 262_144;
 pub const MAX_FUNCTION_NAME_BYTES: usize = 256;
+/// Limits for the worker-only demangled-name backend. Raw identities are never
+/// truncated to meet a display budget; callers keep the original name separately.
+pub const MAX_SYMBOL_RAW_BYTES: usize = 4096;
+pub const MAX_SYMBOL_DISPLAY_BYTES: usize = 1024;
+pub const MAX_SYMBOL_FORMAT_WRITES: usize = 8192;
+/// Itanium parser and renderer depth. Rust v0 additionally has its own pinned
+/// backend depth limit (500); neither replaces the worker's resource controls.
+pub const SYMBOL_DEMANGLE_RECURSION_LIMIT: u32 = 128;
+/// Worker-derived symbol-name table: exact original symbols and compact
+/// display names, kept apart from the function inventory and never persisted.
+/// Records beyond either table bound are omitted; their functions keep the
+/// effective inventory name.
+pub const MAX_SYMBOL_NAME_RECORDS: usize = 65_536;
+/// Total [`symbol_record_bytes`] of one table.
+pub const MAX_SYMBOL_NAME_TABLE_BYTES: usize = 8 * 1024 * 1024;
+/// One symbol-name reply holds at most this many records and encoded record
+/// bytes, whichever fills first. A single record always fits.
+pub const MAX_SYMBOL_NAME_PAGE_RECORDS: usize = 1024;
+pub const MAX_SYMBOL_NAME_PAGE_BYTES: usize = 64 * 1024;
 /// Total JSON-escaped bytes of all inventory names, excluding quotation marks.
 /// With 43 bytes per entry for structure and 20-digit addresses, a full
 /// inventory serializes to at most 43 * 262_144 + 8 MiB + 1 bytes (19.7 MB).
@@ -605,6 +624,51 @@ pub fn validate_functions(
     Ok(())
 }
 
+/// One function's exact original symbol and its worker-derived display name.
+/// `raw` is identity evidence only for display and lookup; the inventory name
+/// stays the engine/replay name. `display` never carries type information.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SymbolName {
+    pub address: u64,
+    pub raw: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<String>,
+}
+
+/// Upper bound on one record's JSON encoding: braces, keys, quotes, a 20-digit
+/// address and separators around the escaped strings.
+pub fn symbol_record_bytes(record: &SymbolName) -> usize {
+    json_escaped_len(&record.raw)
+        + record
+            .display
+            .as_deref()
+            .map_or(0, |display| json_escaped_len(display) + 16)
+        + 48
+}
+
+/// Identity of the table a worker derived at open; pages must reproduce it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SymbolNameSummary {
+    /// SHA-256 over every record, in order (see `symbol_names::digest`).
+    pub digest: String,
+    pub records: usize,
+    /// Records were omitted by the table bounds.
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SymbolNamePage {
+    pub digest: String,
+    pub cursor: usize,
+    /// Cursor of the following page; absent on the last page.
+    pub next: Option<usize>,
+    #[serde(deserialize_with = "crate::bounded::vec::<_, _, { MAX_SYMBOL_NAME_PAGE_RECORDS }>")]
+    pub entries: Vec<SymbolName>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SectionInfo {
     pub name: String,
@@ -849,6 +913,10 @@ pub enum Request {
         minimum_length: usize,
     },
     Crypto,
+    /// One page of the symbol-name table derived when the image was opened.
+    SymbolNames {
+        cursor: usize,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -863,6 +931,9 @@ pub struct SignatureStatus {
 pub enum Response {
     Opened {
         info: BinaryInfo,
+        /// Absent from workers that derive no symbol-name table.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        symbols: Option<SymbolNameSummary>,
     },
     Graph {
         view: FunctionView,
@@ -915,6 +986,9 @@ pub enum Response {
         #[serde(deserialize_with = "crate::bounded::vec::<_, _, { MAX_CRYPTO_MATCHES }>")]
         matches: Vec<CryptoMatch>,
         truncated: bool,
+    },
+    SymbolNames {
+        page: SymbolNamePage,
     },
     Error {
         message: String,

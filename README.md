@@ -20,6 +20,8 @@ are recorded separately; no general speed advantage over Ghidra is claimed yet.
   references, and bounded recovery from supported metadata, pointer tables,
   and function-start patterns.
 - Strings, Hex / Memory Map, byte decoding, and FindCrypt-style constant scans.
+- Compact C++/Rust display names with the raw symbol on hover; MSVC names stay
+  raw. See [demangling](docs/demangling.md).
 - Function labels, comments, supported local renames, and limited function
   signature editing.
 - Portable `.grproj` snapshots with optional embedded binaries.
@@ -93,7 +95,7 @@ every visited function is saved in a project.
 | --- | --- |
 | `F1` | Open Keyboard shortcuts |
 | `L` | Rename the selected function, address label, or supported local |
-| `G` | Go to a hexadecimal address or exact known function/label name |
+| `G` | Go to a hexadecimal address or exact function, label, raw or display name |
 | `;` | Edit the comment at the selected address |
 | `X` | Show references to the selection's exact target |
 | `Space` | Switch Listing / Function Graph |
@@ -191,6 +193,7 @@ network sandbox. Use trusted inputs.** See the [Windows guide](docs/windows.md).
 | Windows installation, building, and troubleshooting | [Windows](docs/windows.md) |
 | Formats, instruction sets, and ABI exclusions | [Architecture coverage](docs/architectures.md) |
 | Discovery, editing, project formats, and limits | [Analysis coverage](docs/analysis.md) |
+| C++/Rust display names and the MSVC gate | [Demangling](docs/demangling.md) |
 | Constant signatures and decoding | [Coverage and provenance](docs/crypto-signatures.md) |
 | Measurement methods and recorded results | [Analysis measurements](docs/analysis-performance.md) |
 | Packaging and publishing releases | [Release workflow](docs/releases.md) |

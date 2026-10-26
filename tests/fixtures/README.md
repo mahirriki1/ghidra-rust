@@ -70,6 +70,25 @@ not a copied signature database. This fixture does not establish broad processor
 compiler, binary-format, C++, or Rust compatibility. Compiler-generated startup
 code and addresses can vary with the compiler and system libraries.
 
+## Demangling backend
+
+`demangle.rs` and `demangle.cpp` are original name-handling fixtures compiled to
+temporary object files by `tests/demangle_backend.rs`, never executed. The Rust
+v0 case runs on native Linux and Windows with the pinned Rust toolchain and
+includes a Unicode identifier. The C++ overload/template case requires G++ on
+Linux. These test the non-UI [demangling backend](../../docs/demangling.md), not application
+loader support for relocatable objects. Legacy Rust uses literal regression
+cases; the stable pinned compiler requires unstable options to emit that format.
+
+`demangle_program.cpp` and `demangle_program.rs` are original linked fixtures
+for [display names](../../docs/demangling.md), analyzed and never executed.
+`tests/linux_worker.rs` links the C++ file with G++ and the `no_std` Rust file
+with the pinned rustc (v0 mangling, linking libc) into temporary executables.
+On Windows, `tests/windows_worker.rs` builds the Rust file as a dylib, and
+`scripts/build-windows.ps1` builds the C++ file as an MSVC DLL beneath ignored
+`target/windows-fixture` and sets `GHIDRA_RUST_TEST_PE_CPP`; without that
+variable the MSVC check skips locally.
+
 ## Differential corpus
 
 `differential/corpus.c` and `differential/many_functions.c` are original C for
