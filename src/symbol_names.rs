@@ -17,10 +17,10 @@ use std::fmt::{self, Write};
 use sha2::{Digest, Sha256};
 
 use crate::model::{
-    MAX_SYMBOL_DISPLAY_BYTES, MAX_SYMBOL_FORMAT_WRITES, MAX_SYMBOL_NAME_PAGE_BYTES,
-    MAX_SYMBOL_NAME_PAGE_RECORDS, MAX_SYMBOL_NAME_RECORDS, MAX_SYMBOL_NAME_TABLE_BYTES,
-    MAX_SYMBOL_RAW_BYTES, SYMBOL_DEMANGLE_RECURSION_LIMIT, SymbolName, SymbolNamePage,
-    SymbolNameSummary, symbol_record_bytes,
+    MAX_SYMBOL_DISPLAY_BYTES, MAX_SYMBOL_FORMAT_WRITES, MAX_SYMBOL_MSVC_PARSE_WORK,
+    MAX_SYMBOL_NAME_PAGE_BYTES, MAX_SYMBOL_NAME_PAGE_RECORDS, MAX_SYMBOL_NAME_RECORDS,
+    MAX_SYMBOL_NAME_TABLE_BYTES, MAX_SYMBOL_RAW_BYTES, SYMBOL_DEMANGLE_RECURSION_LIMIT, SymbolName,
+    SymbolNamePage, SymbolNameSummary, symbol_record_bytes,
 };
 
 /// Container-specific linker decoration, supplied from validated image metadata.
@@ -28,6 +28,7 @@ use crate::model::{
 pub enum SymbolFormat {
     Other,
     MachO,
+    Pe,
 }
 
 /// Which parser produced display text, not proof of the source language.
@@ -37,6 +38,7 @@ pub enum SymbolFormat {
 pub enum DemangleBackend {
     Rust,
     Itanium,
+    Msvc,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -92,9 +94,30 @@ fn demangle_inner(raw: &str, format: SymbolFormat) -> DemangleOutcome {
             raw
         };
     if name.starts_with('?') {
-        // The reviewed published MSVC wrapper bounds recursive parsing, but
-        // exposes no AST expansion/work or output budget. Do not call it here.
-        return DemangleOutcome::Omitted(NameOmission::BackendUnavailable);
+        if format != SymbolFormat::Pe {
+            return DemangleOutcome::Omitted(NameOmission::BackendUnavailable);
+        }
+        let limits = ghidra_rust_msvc_demangler::Limits {
+            input_bytes: MAX_SYMBOL_RAW_BYTES,
+            output_bytes: MAX_SYMBOL_DISPLAY_BYTES,
+            format_work: MAX_SYMBOL_FORMAT_WRITES,
+            parse_work: MAX_SYMBOL_MSVC_PARSE_WORK,
+            depth: SYMBOL_DEMANGLE_RECURSION_LIMIT as usize,
+        };
+        return match ghidra_rust_msvc_demangler::demangle(name, limits) {
+            Ok(text) => {
+                let mut output = CappedName::new();
+                let result = output.write_str(&text);
+                output.finish(result, DemangleBackend::Msvc)
+            }
+            Err(error) => DemangleOutcome::Omitted(if error.is_output_limit() {
+                NameOmission::OutputLimit
+            } else if error.is_work_limit() || error.is_recursion_limit_exceeded() {
+                NameOmission::WorkLimit
+            } else {
+                NameOmission::Invalid
+            }),
+        };
     }
     if !name.starts_with("_R") && !name.starts_with("_Z") {
         return DemangleOutcome::Plain;
@@ -527,6 +550,64 @@ mod tests {
             ("_ZN4demo6WidgetplEi", "demo::Widget::operator+"),
         ] {
             assert_eq!(display(raw, SymbolFormat::Other), expected);
+        }
+    }
+
+    #[test]
+    fn msvc_compact_pe_names_preserve_raw_identity_and_fallbacks() {
+        for (raw, expected) in [
+            ("??0Widget@demo@@QEAA@XZ", "demo::Widget::Widget"),
+            ("??1Widget@demo@@QEAA@XZ", "demo::Widget::~Widget"),
+            ("??HWidget@demo@@QEAAHH@Z", "demo::Widget::operator+"),
+            (
+                "??$identity@H@inner@demo@@YAHH@Z",
+                "demo::inner::identity<int>",
+            ),
+            (
+                "?foo@?A0x12345678@demo@@YAXXZ",
+                "demo::`anonymous namespace'::foo",
+            ),
+            ("??_7Widget@demo@@6B@", "demo::Widget::`vftable'"),
+        ] {
+            let original = raw.to_owned();
+            assert_eq!(
+                demangle(raw, SymbolFormat::Pe),
+                DemangleOutcome::Display(DemangledName {
+                    text: expected.into(),
+                    backend: DemangleBackend::Msvc,
+                })
+            );
+            assert_eq!(raw, original);
+            assert_eq!(
+                demangle(raw, SymbolFormat::MachO),
+                DemangleOutcome::Omitted(NameOmission::BackendUnavailable)
+            );
+        }
+        for raw in ["?overloaded@@YAHH@Z", "?overloaded@@YANN@Z"] {
+            assert_eq!(display(raw, SymbolFormat::Pe), "overloaded");
+        }
+        let long = format!("?{}@@YAXXZ", "a".repeat(MAX_SYMBOL_DISPLAY_BYTES + 1));
+        assert_eq!(
+            demangle(&long, SymbolFormat::Pe),
+            DemangleOutcome::Omitted(NameOmission::OutputLimit)
+        );
+        let hidden_bomb = format!("?f@@YAXV?$T@H@@{}@Z", "0".repeat(3000));
+        let output_bomb = format!("??$f@V{}@@{}@@YAXXZ", "a".repeat(32), "0".repeat(40));
+        let deep = format!("?x@@3{}HA", "PEA".repeat(1000));
+        for raw in [
+            hidden_bomb,
+            output_bomb,
+            deep,
+            "?".into(),
+            "?foo@@YAXXZjunk".into(),
+        ] {
+            assert!(
+                matches!(
+                    demangle(&raw, SymbolFormat::Pe),
+                    DemangleOutcome::Omitted(_)
+                ),
+                "{raw}"
+            );
         }
     }
 

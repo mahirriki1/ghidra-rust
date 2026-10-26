@@ -1563,11 +1563,12 @@ fn select_functions(
     ))
 }
 
-/// The demangler's view of a validated container. PE stays `Other`, so
-/// MSVC-decorated names remain raw until a reviewed backend is selected here.
+/// The demangler's view of a validated container. Only PE selects the
+/// bounded MSVC backend for `?`-decorated names.
 fn symbol_format(container: &str) -> crate::symbol_names::SymbolFormat {
     match container {
         "Mach-O" => crate::symbol_names::SymbolFormat::MachO,
+        "PE" => crate::symbol_names::SymbolFormat::Pe,
         _ => crate::symbol_names::SymbolFormat::Other,
     }
 }
