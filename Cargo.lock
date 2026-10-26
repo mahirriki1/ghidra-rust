@@ -996,7 +996,7 @@ dependencies = [
 
 [[package]]
 name = "ghidra-rust"
-version = "0.0.3"
+version = "0.0.43"
 dependencies = [
  "base64 0.22.1",
  "cpp_demangle",
