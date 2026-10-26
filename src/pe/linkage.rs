@@ -195,8 +195,12 @@ fn exports(image: &Image<'_>, rva: u32, size: u32, out: &mut Builder) {
         } else {
             image
                 .address(target_rva)
-                .map_or(ExportTarget::Unresolved, |address| ExportTarget::Data {
-                    address,
+                .map_or(ExportTarget::Unresolved, |address| {
+                    if image.function_address(target_rva, None).is_some() {
+                        ExportTarget::Code { address }
+                    } else {
+                        ExportTarget::Data { address }
+                    }
                 })
         };
         out.export(ExportSpec {

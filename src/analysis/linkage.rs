@@ -219,6 +219,12 @@ impl Builder {
         }
         let (raw, version) = self.identity(spec.raw, spec.ordinal, spec.version)?;
         let target = match spec.target {
+            ExportTarget::Forwarder { target }
+                if !valid_text(&target, MAX_SYMBOL_RAW_BYTES + MAX_LINKAGE_LABEL_BYTES) =>
+            {
+                self.gap(LinkageGap::Malformed);
+                ExportTarget::Unresolved
+            }
             ExportTarget::Forwarder { target } if !self.charge(json_escaped_len(&target)) => {
                 ExportTarget::Unresolved
             }
@@ -329,11 +335,7 @@ impl Builder {
         });
         for export in &mut self.exports {
             export.target = match std::mem::replace(&mut export.target, ExportTarget::Unresolved) {
-                ExportTarget::Code { address } | ExportTarget::Data { address }
-                    if code(address) =>
-                {
-                    ExportTarget::Code { address }
-                }
+                ExportTarget::Code { address } if code(address) => ExportTarget::Code { address },
                 ExportTarget::Resolver { address } if code(address) => {
                     ExportTarget::Resolver { address }
                 }
@@ -808,7 +810,11 @@ fn elf_table<Elf: FileHeader<Endian = Endianness>>(
             _ if section == elf::SHN_ABS || section == elf::SHN_COMMON => ExportTarget::Unresolved,
             elf::STT_FUNC => ExportTarget::Code { address },
             elf::STT_GNU_IFUNC => ExportTarget::Resolver { address },
-            elf::STT_OBJECT | elf::STT_NOTYPE => ExportTarget::Data { address },
+            elf::STT_OBJECT => ExportTarget::Data { address },
+            elf::STT_NOTYPE if crate::call_analysis::code_address(info, address) => {
+                ExportTarget::Code { address }
+            }
+            elf::STT_NOTYPE => ExportTarget::Data { address },
             elf::STT_TLS => ExportTarget::Unresolved,
             _ => continue,
         };
@@ -1162,8 +1168,10 @@ fn macho_table<Mach: MachHeader<Endian = Endianness>>(
                     raw: Some(raw),
                     ordinal: None,
                     version: None,
-                    target: if valid_section {
+                    target: if valid_section && crate::call_analysis::code_address(info, address) {
                         ExportTarget::Code { address }
+                    } else if valid_section {
+                        ExportTarget::Data { address }
                     } else {
                         ExportTarget::Unresolved
                     },
@@ -1351,7 +1359,7 @@ mod tests {
         assert!(locations.is_empty());
         assert_eq!(exports[0].display.as_deref(), Some("demo::foo"));
         assert_eq!(exports[0].target, ExportTarget::Data { address: 0x2100 });
-        assert_eq!(exports[1].target, ExportTarget::Code { address: 0x1010 });
+        assert_eq!(exports[1].target, ExportTarget::Data { address: 0x1010 });
         assert_eq!(exports[2].target, ExportTarget::Unresolved);
         assert!(table.summary().gaps.contains(&LinkageGap::Malformed));
         // The table passes the desktop's own validation.
@@ -1715,6 +1723,27 @@ mod tests {
         assert!(builder.scan_bytes(1, MAX_LINKAGE_SCAN_BYTES));
         assert!(!builder.scan_bytes(1, 1));
         assert!(builder.gaps.contains(&LinkageGap::ScanLimit));
+    }
+
+    #[test]
+    fn elf_typed_data_in_executable_memory_remains_data() {
+        let mut image = elf_image(false);
+        // STT_OBJECT "table" intentionally lives inside executable .text.
+        put(&mut image.bytes, 0x300 + 6 * 24 + 6, &7u16.to_le_bytes());
+        put(
+            &mut image.bytes,
+            0x300 + 6 * 24 + 8,
+            &0x820u64.to_le_bytes(),
+        );
+        let table = table(&image.bytes, &image.info, None, &[]);
+        let (_, _, exports, _) = records(&table);
+        let data = exports
+            .iter()
+            .find(|export| export.raw.as_deref() == Some("table"))
+            .unwrap();
+        assert_eq!(data.target, ExportTarget::Data { address: 0x820 });
+        let mut fetch = LinkageFetch::new(table.summary().clone(), &image.info.sha256).unwrap();
+        fetch.accept(table.page(0).unwrap(), &image.info).unwrap();
     }
 
     // Original synthetic arm64 Mach-O: two dylibs, special and invalid

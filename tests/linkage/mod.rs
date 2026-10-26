@@ -22,9 +22,14 @@ pub fn read(mut request: impl FnMut(Request) -> Response, info: &BinaryInfo) -> 
             assert_eq!(fetch.summary(), &summary);
         }
         let fetch = fetch.get_or_insert_with(|| LinkageFetch::new(summary, &info.sha256).unwrap());
+        assert_eq!(page.digest, fetch.summary().digest);
+        assert_eq!(page.cursor, cursor);
         digest = Some(page.digest.clone());
         if !page.entries.is_empty() {
             fetch.accept(page, info).unwrap();
+        } else {
+            assert_eq!(fetch.summary().records(), 0);
+            assert_eq!(page.next, None);
         }
         if let Some(next) = fetch.cursor() {
             cursor = next;

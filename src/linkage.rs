@@ -119,7 +119,7 @@ pub enum ExportTarget {
     Code { address: u64 },
     /// An ELF IFUNC resolver in file-backed code, not the resolved function.
     Resolver { address: u64 },
-    /// A mapped non-code address, possibly zero-filled.
+    /// Mapped data, possibly zero-filled or declared inside executable memory.
     Data { address: u64 },
     /// Forwarded to another image; never followed.
     Forwarder { target: String },
@@ -568,9 +568,7 @@ impl LinkageFetch {
                     ExportTarget::Code { address } | ExportTarget::Resolver { address } => {
                         mapping.code(*address)
                     }
-                    ExportTarget::Data { address } => {
-                        mapping.mapped(*address) && !mapping.code(*address)
-                    }
+                    ExportTarget::Data { address } => mapping.mapped(*address),
                     ExportTarget::Forwarder { target } => {
                         valid_text(target, MAX_SYMBOL_RAW_BYTES + MAX_LINKAGE_LABEL_BYTES)
                     }
@@ -1167,7 +1165,7 @@ mod tests {
                 display: None,
                 ordinal: None,
                 version: None,
-                target: ExportTarget::Data { address: 0x1000 },
+                target: ExportTarget::Data { address: 0x8000 },
             })
         });
         rejected(&|page| {
