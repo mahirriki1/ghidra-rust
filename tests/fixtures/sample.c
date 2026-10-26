@@ -32,6 +32,13 @@ NOINLINE unsigned int read_write_word(unsigned int value) {
     return reference_word;
 }
 
+/* Stores a string's address: address-taking evidence beside a data write. */
+const char *volatile fixture_label = base64_message;
+
+NOINLINE void remember_label(void) {
+    fixture_label = "address taken";
+}
+
 NOINLINE unsigned int branch_loop(unsigned int count) {
     unsigned int total = 0;
     for (unsigned int index = 0; index < count; ++index) {
@@ -55,6 +62,7 @@ int main(int argc, char **argv) {
     (void)argv;
     char decoded[sizeof(xor_message) + 1];
     decode_xor(decoded);
+    remember_label();
     puts(base64_message);
     puts(decoded);
     fixture_sink = branch_loop((unsigned int)argc + 5);

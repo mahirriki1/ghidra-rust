@@ -64,7 +64,8 @@ pub fn code_address(info: &BinaryInfo, address: u64) -> bool {
 }
 
 /// A worker function inventory as reference evidence owners. `data` adds the
-/// data-analysis instruction checks applied when a reply carries data evidence.
+/// data-analysis instruction checks applied when a reply carries data or
+/// address evidence.
 pub fn validate_inventory(
     info: &BinaryInfo,
     functions: &[FunctionInfo],
@@ -91,7 +92,7 @@ pub fn validate_inventory(
 
 impl CallAnalysis {
     pub fn validate(&self, info: &BinaryInfo, functions: &[FunctionInfo]) -> Result<(), String> {
-        validate_inventory(info, functions, self.data.is_some())?;
+        validate_inventory(info, functions, self.instruction_evidence())?;
         self.validate_evidence(info, functions)
     }
 
@@ -116,7 +117,15 @@ impl CallAnalysis {
         if let Some(data) = &self.data {
             data.validate_evidence(info, functions, self.decode_attempts)?;
         }
+        if let Some(addresses) = &self.addresses {
+            addresses.validate_evidence(info, functions, self.decode_attempts)?;
+        }
         Ok(())
+    }
+
+    /// Whether evidence owners need the data-analysis instruction checks.
+    pub(crate) fn instruction_evidence(&self) -> bool {
+        self.data.is_some() || self.addresses.is_some()
     }
 
     /// Accounting consistent with `batches` committed worker replies; one batch
@@ -169,6 +178,9 @@ pub struct CallIndex {
     pub outgoing: BTreeMap<u64, Vec<usize>>,
     pub data_incoming: BTreeMap<u64, Vec<usize>>,
     pub data_outgoing: BTreeMap<u64, Vec<usize>>,
+    /// Address-taking evidence by exact target and by owning function.
+    pub address_incoming: BTreeMap<u64, Vec<usize>>,
+    pub address_outgoing: BTreeMap<u64, Vec<usize>>,
 }
 
 /// Borrowable report in the one immutable discovery publication. Both project
@@ -233,12 +245,28 @@ impl CallIndex {
                     .push(index);
             }
         }
+        let mut address_incoming: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
+        let mut address_outgoing: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
+        if let Some(addresses) = &report.addresses {
+            for (index, reference) in addresses.references.iter().enumerate() {
+                address_incoming
+                    .entry(reference.target)
+                    .or_default()
+                    .push(index);
+                address_outgoing
+                    .entry(reference.function)
+                    .or_default()
+                    .push(index);
+            }
+        }
         Self {
             report,
             incoming,
             outgoing,
             data_incoming,
             data_outgoing,
+            address_incoming,
+            address_outgoing,
         }
     }
 }
@@ -251,6 +279,8 @@ impl crate::result_store::Retained for CallIndex {
             &self.outgoing,
             &self.data_incoming,
             &self.data_outgoing,
+            &self.address_incoming,
+            &self.address_outgoing,
         ] {
             // Conservative upper bound per B-tree entry, including node slack.
             bytes = bytes.slots::<[u8; 512]>(index.len());

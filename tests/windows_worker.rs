@@ -279,6 +279,8 @@ fn real_windows_worker_and_embedded_project_round_trip() {
     saved.validate(&info).unwrap();
     assert!(!saved.report.references.is_empty());
     assert!(!saved.report.data.as_ref().unwrap().references.is_empty());
+    // Address-taking evidence is examined even when this batch finds none.
+    assert!(saved.report.addresses.is_some());
     let mut session = Session::new(info.sha256.clone());
     session.version = 2;
     session.local_renames.push(local_rename.clone());
@@ -344,6 +346,10 @@ fn real_windows_worker_and_embedded_project_round_trip() {
     assert_eq!(
         restored.report.data.as_ref().unwrap().references,
         original.report.data.as_ref().unwrap().references
+    );
+    assert_eq!(
+        restored.report.addresses.as_ref().unwrap().references,
+        original.report.addresses.as_ref().unwrap().references
     );
     assert_eq!(restored.pending, original.pending);
     assert_eq!(

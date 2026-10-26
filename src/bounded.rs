@@ -118,6 +118,7 @@ fn reply_nodes(kind: &str) -> Option<usize> {
     const SECTION: usize = 13;
     const CALL: usize = 7;
     const DATA: usize = 13;
+    const ADDRESS: usize = 9;
     const INSTRUCTION: usize = 9 + MAX_INSTRUCTION_BYTES;
     let nodes = match kind {
         "opened" => FUNCTION * MAX_FUNCTIONS + SECTION * MAX_SECTIONS + MAX_WARNINGS,
@@ -125,6 +126,7 @@ fn reply_nodes(kind: &str) -> Option<usize> {
             FUNCTION * MAX_FUNCTIONS
                 + CALL * MAX_CALL_REFERENCES
                 + DATA * MAX_DATA_REFERENCES
+                + ADDRESS * MAX_ADDRESS_REFERENCES
                 + 5 * MAX_ANALYSIS_FUNCTIONS
                 + 16
         }

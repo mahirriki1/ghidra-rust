@@ -1,7 +1,8 @@
 //! Exact cross-reference targets and queries over validated reference evidence.
 //!
-//! Targets come only from decoded call sites, confirmed call/data evidence
-//! owned by an exact instruction, or an address the user explicitly chose.
+//! Targets come only from decoded call sites, confirmed call, data-access or
+//! address-taking evidence owned by an exact instruction, or an address the
+//! user explicitly chose.
 //! Names are for display and filtering; they never establish a target, and
 //! no target is derived from matching text or a nearby address. The rules are
 //! independent of the desktop so a later scripting surface can reuse them.
@@ -22,6 +23,8 @@ pub enum TargetKind {
     CallTarget,
     /// The start of a confirmed direct memory access by an instruction.
     DataAccess,
+    /// An address an instruction materializes into a register or store.
+    TakenAddress,
     /// The first byte of a scanned string.
     StringStart,
     /// An exact address the user selected or entered.
@@ -34,14 +37,18 @@ impl TargetKind {
             Self::Function => "function",
             Self::CallTarget => "call target",
             Self::DataAccess => "data access target",
+            Self::TakenAddress => "taken address",
             Self::StringStart => "string start",
             Self::Address => "address",
         }
     }
 
-    /// Whether data accesses are the natural first view for this target.
+    /// Whether data references are the natural first view for this target.
     pub fn prefers_data(self) -> bool {
-        matches!(self, Self::DataAccess | Self::StringStart)
+        matches!(
+            self,
+            Self::DataAccess | Self::TakenAddress | Self::StringStart
+        )
     }
 }
 
@@ -106,7 +113,8 @@ fn at_pc<'a, R>(
 
 /// Exact call and data targets of instructions `pcs` in function `owner`.
 /// Call targets come from the displayed graph when it is `owner`'s, and from
-/// confirmed call evidence; data targets only from confirmed data evidence.
+/// confirmed call evidence; data targets only from confirmed data-access or
+/// address-taking evidence.
 /// Graph call sites are only bounded by view validation (projects may supply
 /// them), so their targets must also be aligned, file-backed code in `info`,
 /// the rule reference evidence and semantic call tokens already satisfy.
@@ -152,6 +160,19 @@ pub fn instruction_targets(
                 });
             }
         }
+        if let Some(addresses) = &report.addresses {
+            for reference in at_pc(
+                &addresses.references,
+                index.address_outgoing.get(&owner),
+                pc,
+                |r| r.address,
+            ) {
+                set.push(XrefTarget {
+                    address: reference.target,
+                    kind: TargetKind::TakenAddress,
+                });
+            }
+        }
     }
     set
 }
@@ -172,6 +193,8 @@ pub enum AccessFilter {
     All,
     Read,
     Write,
+    /// Address-taking evidence only.
+    Address,
 }
 
 impl AccessFilter {
@@ -180,8 +203,17 @@ impl AccessFilter {
             Self::All => true,
             Self::Read => access == DataAccess::Read,
             Self::Write => access == DataAccess::Write,
+            Self::Address => false,
         }
     }
+}
+
+/// One displayed data-reference row: an index into the access or the
+/// address-taking evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DataRow {
+    Access(usize),
+    Address(usize),
 }
 
 /// One displayed call row: an index into the report's call evidence.
@@ -277,54 +309,90 @@ pub fn call_rows<'a>(
     rows
 }
 
-/// Data-access rows beginning exactly at `target`, or made by `function`.
+/// Data-reference rows beginning exactly at `target`, or made by `function`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DataScope {
     StartingAt(u64),
     From(u64),
 }
 
-/// Indices of data evidence in `scope`, filtered by access kind and `filter`
-/// over the accessing function's known name and the function, instruction and
-/// target addresses. Accesses that merely overlap `target` are not included.
+/// Data accesses and address-taking evidence in `scope`, filtered by kind
+/// and `filter` over the owning function's known name and the function,
+/// instruction and target addresses, ordered by function and instruction.
+/// Evidence that merely lies inside a range starting at `target` is excluded.
 pub fn data_rows<'a>(
     index: &CallIndex,
     scope: DataScope,
     access: AccessFilter,
     filter: &TextFilter,
     name: impl Fn(u64) -> Option<&'a str>,
-) -> Vec<usize> {
-    let Some(data) = &index.report.data else {
-        return Vec::new();
+) -> Vec<DataRow> {
+    let (accesses, addresses) = match scope {
+        DataScope::StartingAt(target) => (
+            index.data_incoming.get(&target),
+            index.address_incoming.get(&target),
+        ),
+        DataScope::From(function) => (
+            index.data_outgoing.get(&function),
+            index.address_outgoing.get(&function),
+        ),
     };
-    let indices = match scope {
-        DataScope::StartingAt(target) => index.data_incoming.get(&target),
-        DataScope::From(function) => index.data_outgoing.get(&function),
-    };
+    fn slice(rows: Option<&Vec<usize>>) -> &[usize] {
+        rows.map(Vec::as_slice).unwrap_or(&[])
+    }
     let mut scratch = String::with_capacity(16);
-    indices
-        .map(Vec::as_slice)
-        .unwrap_or(&[])
-        .iter()
-        .copied()
-        .filter(|&i| {
+    let mut matches =
+        |addresses: [u64; 3]| filter.matches(&addresses, &[name(addresses[0])], &mut scratch);
+    let mut rows = Vec::new();
+    if let Some(data) = &index.report.data
+        && access != AccessFilter::Address
+    {
+        for &i in slice(accesses) {
             let reference = &data.references[i];
-            access.admits(reference.access)
-                && filter.matches(
-                    &[reference.function, reference.address, reference.target],
-                    &[name(reference.function)],
-                    &mut scratch,
-                )
-        })
-        .collect()
+            if access.admits(reference.access)
+                && matches([reference.function, reference.address, reference.target])
+            {
+                rows.push(((reference.function, reference.address), DataRow::Access(i)));
+            }
+        }
+    }
+    if let Some(taken) = &index.report.addresses
+        && matches!(access, AccessFilter::All | AccessFilter::Address)
+    {
+        for &i in slice(addresses) {
+            let reference = &taken.references[i];
+            if matches([reference.function, reference.address, reference.target]) {
+                rows.push(((reference.function, reference.address), DataRow::Address(i)));
+            }
+        }
+    }
+    // Both inputs are already ordered; a stable sort keeps accesses first.
+    rows.sort_by_key(|&(key, _)| key);
+    rows.into_iter().map(|(_, row)| row).collect()
 }
 
 /// Exact-address evidence counts, for choosing and labelling a view.
-pub fn counts(index: &CallIndex, address: u64) -> (usize, usize) {
-    (
-        index.incoming.get(&address).map_or(0, Vec::len),
-        index.data_incoming.get(&address).map_or(0, Vec::len),
-    )
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Counts {
+    pub calls: usize,
+    pub accesses: usize,
+    pub addresses: usize,
+}
+
+impl Counts {
+    pub fn data(self) -> usize {
+        self.accesses + self.addresses
+    }
+}
+
+pub fn counts(index: &CallIndex, address: u64) -> Counts {
+    let count =
+        |rows: &std::collections::BTreeMap<u64, Vec<usize>>| rows.get(&address).map_or(0, Vec::len);
+    Counts {
+        calls: count(&index.incoming),
+        accesses: count(&index.data_incoming),
+        addresses: count(&index.address_incoming),
+    }
 }
 
 #[cfg(test)]
@@ -367,6 +435,22 @@ mod tests {
                 ],
                 ..Default::default()
             }),
+            addresses: Some(Box::new(AddressAnalysis {
+                references: [
+                    (0x1000, 0x1006, 0x2000),
+                    (0x1040, 0x1046, 0x2000),
+                    (0x1040, 0x104c, 0x1040),
+                ]
+                .into_iter()
+                .map(|(function, address, target)| AddressReference {
+                    function,
+                    address,
+                    target,
+                    provenance: DataProvenance::InstructionLocal,
+                })
+                .collect(),
+                ..Default::default()
+            })),
             ..Default::default()
         })
     }
@@ -395,6 +479,11 @@ mod tests {
                     .is_empty()
             );
         }
+        // Address-taking evidence is offered as its own target kind.
+        assert_eq!(
+            addresses(&instruction_targets(None, Some(&index), 0x1040, [0x104c])),
+            [(0x1040, TargetKind::TakenAddress)]
+        );
         // Several mapped PCs merge distinct targets without duplicates.
         let set = instruction_targets(None, Some(&index), 0x1000, [0x1004, 0x1008, 0x100c]);
         assert_eq!(
@@ -595,9 +684,15 @@ mod tests {
         let names = |_| None;
         let all = TextFilter::default();
         let at = |access| data_rows(&index, DataScope::StartingAt(0x2000), access, &all, names);
-        assert_eq!(at(AccessFilter::All), [0, 2]);
-        assert_eq!(at(AccessFilter::Read), [0]);
-        assert_eq!(at(AccessFilter::Write), [2]);
+        use DataRow::{Access, Address};
+        // Both classes, ordered by owner and instruction.
+        assert_eq!(
+            at(AccessFilter::All),
+            [Address(0), Access(0), Access(2), Address(1)]
+        );
+        assert_eq!(at(AccessFilter::Read), [Access(0)]);
+        assert_eq!(at(AccessFilter::Write), [Access(2)]);
+        assert_eq!(at(AccessFilter::Address), [Address(0), Address(1)]);
         // An access starting inside a range is not an access starting at it.
         assert_eq!(
             data_rows(
@@ -607,7 +702,7 @@ mod tests {
                 &all,
                 names
             ),
-            Vec::<usize>::new()
+            Vec::<DataRow>::new()
         );
         assert_eq!(
             data_rows(
@@ -617,10 +712,27 @@ mod tests {
                 &TextFilter::new("2010"),
                 names
             ),
-            [1]
+            [Access(1)]
         );
-        assert_eq!(counts(&index, 0x2000), (0, 2));
-        assert_eq!(counts(&index, 0x1080), (2, 0));
+        let counted = |calls, accesses, addresses| Counts {
+            calls,
+            accesses,
+            addresses,
+        };
+        assert_eq!(counts(&index, 0x2000), counted(0, 2, 2));
+        assert_eq!(counts(&index, 0x1080), counted(2, 0, 0));
+        // A function whose entry is also taken as an address.
+        assert_eq!(counts(&index, 0x1040), counted(1, 0, 1));
+        assert_eq!(
+            data_rows(
+                &index,
+                DataScope::StartingAt(0x1040),
+                AccessFilter::All,
+                &all,
+                names
+            ),
+            [Address(2)]
+        );
         let legacy = CallIndex::new(CallAnalysis::default());
         assert!(
             data_rows(
