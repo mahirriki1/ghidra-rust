@@ -3,6 +3,9 @@
 //! Job objects limit resource use and lifetime. They do not isolate the worker
 //! from the user's files, registry, credentials, or network.
 
+mod update_directory;
+pub(crate) use update_directory::PinnedUpdateDirectory;
+
 use crate::model::FileIdentity;
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -174,19 +177,6 @@ pub fn open_for_identity(path: &Path) -> io::Result<File> {
     let file = OpenOptions::new()
         .access_mode(FILE_READ_ATTRIBUTES)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)?;
-    verify_regular_file(&file)?;
-    Ok(file)
-}
-
-/// Open a cleanup candidate itself, without following its final reparse point.
-/// Denying write/delete sharing pins its name and contents until handle deletion.
-pub fn open_for_deletion(path: &Path) -> io::Result<File> {
-    validate_local_path(path)?;
-    let file = OpenOptions::new()
-        .access_mode(DELETE | FILE_READ_ATTRIBUTES)
-        .share_mode(FILE_SHARE_READ)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)?;
     verify_regular_file(&file)?;

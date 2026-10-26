@@ -3,7 +3,9 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
@@ -17,6 +19,9 @@ use tempfile::{NamedTempFile, TempDir};
 
 use crate::session::{BinaryProtection, safe_destination};
 
+mod backup_cleanup;
+use backup_cleanup::BackupCleanup;
+
 const REPOSITORY: &str = "mahirriki1/ghidra-rust";
 const RELEASES_URL: &str = "https://api.github.com/repos/mahirriki1/ghidra-rust/releases";
 const DOWNLOAD_ROOT: &str = "https://github.com/mahirriki1/ghidra-rust/releases/download/";
@@ -27,7 +32,9 @@ const MAX_BINARY: u64 = 512 * 1024 * 1024;
 const MAX_NOTICES: u64 = 16 * 1024 * 1024;
 const MAX_NOTES: usize = 32 * 1024;
 const BACKUP_RANDOM_CHARS: usize = 6;
+#[cfg(windows)]
 const MAX_BACKUP_ENTRIES_SCANNED: usize = 4096;
+#[cfg(windows)]
 const MAX_BACKUPS_REMOVED: usize = 128;
 
 pub fn supported() -> bool {
@@ -582,6 +589,7 @@ fn check_destination(
     Ok(destination.to_owned())
 }
 
+#[cfg(any(windows, test))]
 fn is_backup_name(name: &std::ffi::OsStr) -> bool {
     let Some(name) = name.to_str() else {
         return false;
@@ -604,81 +612,13 @@ fn is_backup_name(name: &std::ffi::OsStr) -> bool {
         && random.bytes().all(|byte| byte.is_ascii_alphanumeric())
 }
 
-/// Cleanup is deliberately best effort, bounded, and confined to this directory.
-/// All guards retain open descriptors, including the executable that was running
-/// and the three files just published. Failure to identify a file keeps it.
-fn prune_backups(directory: &Path, protections: &[BinaryProtection]) {
-    let Ok(entries) = fs::read_dir(directory) else {
-        return;
-    };
-    let mut removed = 0;
-    for entry in entries.take(MAX_BACKUP_ENTRIES_SCANNED) {
-        if removed == MAX_BACKUPS_REMOVED {
-            break;
-        }
-        let Ok(entry) = entry else { continue };
-        if !is_backup_name(&entry.file_name()) {
-            continue;
-        }
-        let path = entry.path();
-        let Ok(metadata) = fs::symlink_metadata(&path) else {
-            continue;
-        };
-        if !metadata.file_type().is_file() {
-            continue;
-        }
-        #[cfg(windows)]
-        let file = crate::windows::open_for_deletion(&path);
-        #[cfg(target_os = "linux")]
-        let file = {
-            use std::os::unix::fs::OpenOptionsExt;
-            OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-                .open(&path)
-        };
-        #[cfg(not(any(windows, target_os = "linux")))]
-        // Updating is unsupported here; do not weaken no-follow guarantees.
-        let file: std::io::Result<File> =
-            Err(std::io::Error::other("Unsupported updater platform"));
-        let Ok(file) = file else { continue };
-        let Some(identity) = crate::model::FileIdentity::from_file(&file) else {
-            continue;
-        };
-        if !file.metadata().is_ok_and(|metadata| metadata.is_file())
-            || protections.iter().any(|guard| {
-                guard.file_identity() == identity || safe_destination(&path, guard).is_err()
-            })
-        {
-            continue;
-        }
-        #[cfg(windows)]
-        let deleted = crate::windows::delete_open_file(&file);
-        #[cfg(not(windows))]
-        let deleted = {
-            // unlink does not follow a final symlink. Recheck the name's type
-            // and identity immediately before unlinking; keep replaced entries.
-            let unchanged = fs::symlink_metadata(&path).is_ok_and(|metadata| {
-                metadata.file_type().is_file()
-                    && crate::model::FileIdentity::from_metadata(&metadata) == Some(identity)
-            });
-            if !unchanged {
-                continue;
-            }
-            fs::remove_file(&path)
-        };
-        if deleted.is_ok() {
-            removed += 1;
-        }
-    }
-}
-
 fn install(prepared: &Prepared, protections: &[BinaryProtection]) -> Result<Installed, String> {
     let release = &prepared.release;
     let destination = check_destination(release, protections)?;
     let parent = destination
         .parent()
         .ok_or("Executable has no installation directory")?;
+    let mut cleanup = BackupCleanup::prepare(parent, &release.executable);
     let cancel = AtomicBool::new(false);
     let progress = AtomicU64::new(0);
     let mut staged = NamedTempFile::new_in(parent)
@@ -781,8 +721,10 @@ fn install(prepared: &Prepared, protections: &[BinaryProtection]) -> Result<Inst
             .map_err(|error| error.to_string())?;
     }
     check_destination(release, protections)?;
+    cleanup.check_member(staged.path(), staged.as_file());
+    cleanup.check_member(notices.path(), notices.as_file());
+    cleanup.check_member(backup.path(), backup.as_file());
     let (backup_file, backup_path) = backup.keep().map_err(|error| error.to_string())?;
-    #[cfg(windows)]
     drop(backup_file);
     let (notices_file, notices_path) = notices.keep().map_err(|error| error.to_string())?;
     #[cfg(windows)]
@@ -818,22 +760,29 @@ fn install(prepared: &Prepared, protections: &[BinaryProtection]) -> Result<Inst
     // Publication has succeeded; cleanup must never turn success into failure
     // or enter rollback. Pin and verify all retained identities first. The new
     // backup is the version that was running, even if the new app cannot start.
+    #[cfg(windows)]
     let _ = (|| -> Result<(), String> {
+        let Some(backup_file) = cleanup.recovery_file(&backup_path) else {
+            return Ok(());
+        };
         let published = BinaryProtection::from_open_file(&destination, published_file)?;
         let notices = BinaryProtection::from_open_file(&notices_path, notices_file)?;
-        #[cfg(windows)]
-        let backup = BinaryProtection::open(&backup_path)?;
-        #[cfg(not(windows))]
         let backup = BinaryProtection::from_open_file(&backup_path, backup_file)?;
-        #[cfg(windows)]
         if !backup.same_source(&release.executable) {
             return Ok(());
         }
+        // These are the actual owned identities, not a path reopened after
+        // publication. Membership mismatch disables cleanup atomically.
+        cleanup.check_guard(&destination, &published);
+        cleanup.check_guard(&backup_path, &backup);
+        cleanup.check_guard(&notices_path, &notices);
         let mut guards = protections.to_vec();
         guards.extend([release.executable.clone(), published, backup, notices]);
-        prune_backups(parent, &guards);
+        cleanup.prune(&guards);
         Ok(())
     })();
+    #[cfg(not(windows))]
+    drop((published_file, notices_file));
     Ok(Installed {
         executable: destination,
         backup: backup_path,
@@ -1097,7 +1046,7 @@ mod tests {
     }
 
     #[test]
-    fn successful_install_prunes_only_exact_older_backups_and_keeps_protected_aliases() {
+    fn successful_install_applies_platform_retention_and_keeps_protected_aliases() {
         let (installation, prepared) = prepared();
         let old = [
             "0.0.1-Ab09Zx",
@@ -1157,7 +1106,13 @@ mod tests {
         fs::write(&nested_backup, b"nested file").unwrap();
 
         let installed = install(&prepared, &[protection]).unwrap();
+        #[cfg(windows)]
         assert!(old.iter().all(|path| !path.exists()));
+        #[cfg(not(windows))]
+        assert!(
+            old.iter()
+                .all(|path| fs::read(path).unwrap() == b"older recovery copy")
+        );
         assert_eq!(fs::read(&installed.backup).unwrap(), b"old executable");
         assert!(is_backup_name(installed.backup.file_name().unwrap()));
         assert_eq!(fs::read(&installed.executable).unwrap(), b"new executable");
@@ -1196,7 +1151,7 @@ mod tests {
                 alias
             })
             .collect();
-        prune_backups(installation.path(), &guards);
+        BackupCleanup::prepare(installation.path(), &guards[0]).prune(&guards);
         for (alias, path) in aliases.iter().zip(paths) {
             assert_eq!(fs::read(alias).unwrap(), fs::read(path).unwrap());
         }
@@ -1247,19 +1202,332 @@ mod tests {
         let (installation, prepared) = prepared();
         let old = backup_path(installation.path(), "0.0.1-abc123");
         fs::write(&old, b"old recovery copy").unwrap();
-        // Creation/publication require write+search, but enumeration requires
-        // read permission. This causes a real cleanup I/O error after publishing.
+        // Linux keeps all copies without enumeration or deletion, including
+        // when the installation directory cannot be enumerated.
         fs::set_permissions(installation.path(), fs::Permissions::from_mode(0o300)).unwrap();
-        let cannot_enumerate = fs::read_dir(installation.path()).is_err();
         let result = install(&prepared, &[]);
         fs::set_permissions(installation.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let installed = result.unwrap();
         assert_eq!(fs::read(installed.executable).unwrap(), b"new executable");
-        if cannot_enumerate {
-            assert_eq!(fs::read(old).unwrap(), b"old recovery copy");
-        } else {
-            eprintln!("Directory permission failure unavailable when running with DAC override");
+        assert_eq!(fs::read(old).unwrap(), b"old recovery copy");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_cleanup_cannot_follow_substituted_parents_or_delete_replacements() {
+        use std::os::unix::fs::symlink;
+        let outer = tempfile::tempdir().unwrap();
+        let installation = outer.path().join("installation");
+        let retained = outer.path().join("retained");
+        let outside = outer.path().join("outside");
+        fs::create_dir(&installation).unwrap();
+        fs::create_dir(&outside).unwrap();
+        let input = installation.join("protected-input");
+        fs::write(&input, b"input").unwrap();
+        let guard = BinaryProtection::open(&input).unwrap();
+        let cleanup = BackupCleanup::prepare(&installation, &guard);
+        let candidate = backup_path(&installation, "0.0.1-Old123");
+        fs::write(&candidate, b"old backup").unwrap();
+        let outside_candidate = backup_path(&outside, "0.0.1-Old123");
+        fs::hard_link(&input, &outside_candidate).unwrap();
+        fs::rename(&installation, &retained).unwrap();
+        symlink(&outside, &installation).unwrap();
+        cleanup.prune(std::slice::from_ref(&guard));
+        assert_eq!(fs::read(&outside_candidate).unwrap(), b"input");
+        assert_eq!(
+            fs::read(backup_path(&retained, "0.0.1-Old123")).unwrap(),
+            b"old backup"
+        );
+        let protected_alias = backup_path(&retained, "0.0.1-Alias1");
+        fs::hard_link(retained.join("protected-input"), &protected_alias).unwrap();
+        cleanup.prune(&[guard]);
+        assert_eq!(fs::read(protected_alias).unwrap(), b"input");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_cleanup_stays_with_the_pinned_directory_after_parent_substitution() {
+        use backup_cleanup::Boundary;
+        for after_seal in [false, true] {
+            for ancestor in [false, true] {
+                let outer = tempfile::tempdir().unwrap();
+                let parent = outer.path().join("parent");
+                let installation = parent.join("installation");
+                let outside_parent = outer.path().join("outside");
+                let outside = outside_parent.join("installation");
+                let retained = outer.path().join("retained");
+                fs::create_dir_all(&installation).unwrap();
+                fs::create_dir_all(&outside).unwrap();
+                let executable = installation.join("app");
+                fs::write(&executable, b"retained executable").unwrap();
+                let guard = BinaryProtection::open(&executable).unwrap();
+                let cleanup = BackupCleanup::prepare(&installation, &guard);
+                assert!(cleanup.available());
+                // Exercise directory confinement independently of any sharing
+                // restriction imposed by the running-file protection handle.
+                drop(guard);
+                let name = "0.0.1-Old123";
+                let candidate = backup_path(&installation, name);
+                let outside_candidate = backup_path(&outside, name);
+                fs::write(&candidate, b"old backup").unwrap();
+                fs::write(&outside_candidate, b"outside copy").unwrap();
+                let substituted = if ancestor { &parent } else { &installation };
+                let redirect = if ancestor { &outside_parent } else { &outside };
+                let (mut attempted, mut swapped) = (false, false);
+                cleanup.prune_with(&[], |boundary, entry| {
+                    let selected = if after_seal {
+                        matches!(boundary, Boundary::Open)
+                            && entry == candidate.file_name().unwrap()
+                    } else {
+                        matches!(boundary, Boundary::Seal)
+                    };
+                    if !selected {
+                        return;
+                    }
+                    attempted = true;
+                    match fs::rename(substituted, &retained) {
+                        Ok(()) => {
+                            let result = std::process::Command::new("cmd.exe")
+                                .args(["/d", "/c", "mklink", "/J"])
+                                .arg(substituted)
+                                .arg(redirect)
+                                .output()
+                                .unwrap();
+                            assert!(
+                                result.status.success(),
+                                "{}",
+                                String::from_utf8_lossy(&result.stderr)
+                            );
+                            swapped = true;
+                        }
+                        Err(error) => {
+                            assert!(
+                                matches!(error.raw_os_error(), Some(5 | 32)),
+                                "unexpected replacement failure: {error}"
+                            );
+                        }
+                    }
+                });
+                assert!(
+                    attempted,
+                    "the attacker operation completed or was rejected at the synchronized boundary"
+                );
+                eprintln!(
+                    "Windows directory substitution: ancestor={ancestor}, sealed={after_seal}, completed={swapped}"
+                );
+                assert_eq!(fs::read(&outside_candidate).unwrap(), b"outside copy");
+                let actual = if swapped {
+                    if ancestor {
+                        retained.join("installation")
+                    } else {
+                        retained.clone()
+                    }
+                } else {
+                    installation.clone()
+                };
+                assert!(!backup_path(&actual, name).exists());
+                assert_eq!(
+                    fs::read(actual.join("app")).unwrap(),
+                    b"retained executable"
+                );
+                if swapped {
+                    fs::remove_dir(substituted).unwrap();
+                }
+            }
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_cleanup_rejects_protected_substitutions_and_prevents_postcheck_swaps() {
+        use backup_cleanup::Boundary;
+        for phase in 0..3 {
+            for which in 0..6 {
+                let (installation, prepared) = prepared();
+                let installed = install(&prepared, &[]).unwrap();
+                let input = installation.path().join("input");
+                let extra = installation.path().join("extra");
+                fs::write(&input, b"input").unwrap();
+                fs::write(&extra, b"extra").unwrap();
+                let extra_guard = BinaryProtection::open(&extra).unwrap();
+                let renamed = installation.path().join("renamed-extra");
+                fs::rename(&extra, &renamed).unwrap();
+                let paths = [
+                    &installed.backup,
+                    &installed.executable,
+                    &installed.backup,
+                    &installed.notices,
+                    &input,
+                    &renamed,
+                ];
+                let expected: Vec<_> = paths.iter().map(|path| fs::read(path).unwrap()).collect();
+                let mut guards = vec![prepared.release.executable.clone()];
+                for path in &paths[1..5] {
+                    guards.push(BinaryProtection::open(path).unwrap());
+                }
+                guards.push(extra_guard);
+                let cleanup = BackupCleanup::prepare(installation.path(), &guards[1]);
+                assert!(cleanup.available());
+                let candidate = backup_path(installation.path(), "0.0.1-Old123");
+                let replacement = installation.path().join("replacement-alias");
+                let retired = installation.path().join("retired-old-backup");
+                fs::write(&candidate, b"old backup").unwrap();
+                fs::hard_link(paths[which], &replacement).unwrap();
+                let (mut attempted, mut replaced) = (false, false);
+                cleanup.prune_with(&guards, |boundary, name| {
+                    let selected = match (phase, boundary) {
+                        (0, Boundary::Seal) => true,
+                        (1, Boundary::Open) | (2, Boundary::Delete) => {
+                            name == candidate.file_name().unwrap()
+                        }
+                        _ => false,
+                    };
+                    if !selected {
+                        return;
+                    }
+                    attempted = true;
+                    if phase == 2 {
+                        assert!(
+                            fs::rename(&candidate, &retired).is_err(),
+                            "the validated DELETE handle must prevent substitution"
+                        );
+                        assert!(fs::rename(&replacement, &candidate).is_err());
+                    } else {
+                        match fs::rename(&candidate, &retired) {
+                            Ok(()) => {
+                                fs::rename(&replacement, &candidate).unwrap();
+                                replaced = true;
+                            }
+                            Err(error) => {
+                                assert_eq!(phase, 1, "pre-seal replacement must run: {error}");
+                                assert!(
+                                    matches!(error.raw_os_error(), Some(5 | 32)),
+                                    "unexpected replacement failure: {error}"
+                                );
+                            }
+                        }
+                    }
+                });
+                assert!(attempted);
+                if phase == 0 {
+                    assert!(replaced);
+                }
+                for (path, expected) in paths.iter().zip(expected) {
+                    assert_eq!(fs::read(path).unwrap(), expected);
+                }
+                if replaced {
+                    assert_eq!(
+                        fs::read(&candidate).unwrap(),
+                        fs::read(paths[which]).unwrap()
+                    );
+                } else {
+                    assert!(!candidate.exists());
+                    assert_eq!(
+                        fs::read(&replacement).unwrap(),
+                        fs::read(paths[which]).unwrap()
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_membership_mismatches_disable_the_entire_cleanup_pass() {
+        for which in 0..3 {
+            let (installation, prepared) = prepared();
+            let installed = install(&prepared, &[]).unwrap();
+            let paths = [&installed.executable, &installed.backup, &installed.notices];
+            let guards: Vec<_> = paths
+                .iter()
+                .map(|path| BinaryProtection::open(path).unwrap())
+                .collect();
+            let mut cleanup = BackupCleanup::prepare(installation.path(), &guards[0]);
+            assert!(cleanup.available());
+            let old = backup_path(installation.path(), "0.0.1-Old123");
+            fs::write(&old, b"old backup").unwrap();
+            let moved = installation.path().join("retained-output");
+            fs::rename(paths[which], &moved).unwrap();
+            fs::write(paths[which], b"replacement").unwrap();
+            cleanup.check_guard(paths[which], &guards[which]);
+            assert!(!cleanup.available());
+            cleanup.prune(&guards);
+            assert_eq!(fs::read(old).unwrap(), b"old backup");
+            assert_eq!(fs::read(paths[which]).unwrap(), b"replacement");
+            assert!(moved.is_file());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_cleanup_keeps_reserved_names_and_obeys_the_removal_limit() {
+        let (installation, prepared) = prepared();
+        let protected = backup_path(installation.path(), "0.0.1-Input1");
+        fs::write(&protected, b"input").unwrap();
+        let guard = BinaryProtection::open(&protected).unwrap();
+        fs::rename(&protected, installation.path().join("renamed-input")).unwrap();
+        fs::write(&protected, b"reserved path replacement").unwrap();
+        let copies: Vec<_> = (0..MAX_BACKUPS_REMOVED + 3)
+            .map(|index| {
+                let path = backup_path(installation.path(), &format!("0.0.1-{index:06}"));
+                fs::write(&path, b"old backup").unwrap();
+                path
+            })
+            .collect();
+        install(&prepared, &[guard]).unwrap();
+        assert_eq!(copies.iter().filter(|path| path.exists()).count(), 3);
+        assert_eq!(fs::read(protected).unwrap(), b"reserved path replacement");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_staged_identity_mismatch_and_unavailable_capabilities_keep_backups() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::*;
+        let (installation, prepared) = prepared();
+        let old = backup_path(installation.path(), "0.0.1-Old123");
+        fs::write(&old, b"old backup").unwrap();
+        let mut cleanup = BackupCleanup::prepare(installation.path(), &prepared.release.executable);
+        assert!(cleanup.available());
+        let staged = NamedTempFile::new_in(installation.path()).unwrap();
+        fs::rename(staged.path(), installation.path().join("retained-stage")).unwrap();
+        fs::write(staged.path(), b"replacement stage").unwrap();
+        cleanup.check_member(staged.path(), staged.as_file());
+        assert!(!cleanup.available());
+        cleanup.prune(std::slice::from_ref(&prepared.release.executable));
+        assert_eq!(fs::read(&old).unwrap(), b"old backup");
+        drop(staged);
+
+        // An existing directory writer prevents the restrictive preparation
+        // handle. This must disable cleanup without blocking publication.
+        let writer = OpenOptions::new()
+            .access_mode(FILE_ADD_FILE | SYNCHRONIZE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(installation.path())
+            .unwrap();
+        let unavailable = BackupCleanup::prepare(installation.path(), &prepared.release.executable);
+        assert!(!unavailable.available());
+        let installed = install(&prepared, &[]).unwrap();
+        assert_eq!(fs::read(installed.executable).unwrap(), b"new executable");
+        assert_eq!(fs::read(installed.backup).unwrap(), b"old executable");
+        assert_eq!(fs::read(old).unwrap(), b"old backup");
+        drop(writer);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_non_ascii_protected_names_conservatively_disable_cleanup() {
+        let (installation, prepared) = prepared();
+        let old = backup_path(installation.path(), "0.0.1-Old123");
+        let input = installation.path().join("input-caf\u{e9}");
+        fs::write(&old, b"old backup").unwrap();
+        fs::write(&input, b"input").unwrap();
+        let guard = BinaryProtection::open(&input).unwrap();
+        let installed = install(&prepared, &[guard]).unwrap();
+        assert_eq!(fs::read(old).unwrap(), b"old backup");
+        assert_eq!(fs::read(input).unwrap(), b"input");
+        assert_eq!(fs::read(installed.executable).unwrap(), b"new executable");
     }
 
     #[cfg(windows)]
@@ -1280,7 +1548,7 @@ mod tests {
         assert_eq!(fs::read(installed.executable).unwrap(), b"new executable");
         drop(locked);
         let guards = [BinaryProtection::open(&installed.backup).unwrap()];
-        prune_backups(installation.path(), &guards);
+        BackupCleanup::prepare(installation.path(), &guards[0]).prune(&guards);
         assert!(!old.exists());
         assert_eq!(fs::read(installed.backup).unwrap(), b"old executable");
     }

@@ -206,17 +206,32 @@ redistributing an updated app.
 
 Recovery copies use `ghidra-rust-previous-VERSION-XXXXXX` (with `.exe` on Windows),
 where `VERSION` is a valid semantic version and `XXXXXX` is six ASCII letters or
-digits. After successful publication, the updater keeps the just-created recovery
-copy and removes older regular files matching exactly that pattern, only in the
-installation directory. Cleanup runs here because the exact new backup and input
-identity guards are still available; no startup or modification-time heuristic
+digits. On Windows, after successful publication, the updater keeps the
+just-created recovery copy and removes older regular files matching exactly that
+pattern, only in the installation directory. Cleanup runs here because the exact
+new backup and input identity guards are still available; no startup or modification-time heuristic
 is needed. Even if the new app fails to start, that backup is the version that
 was running before the update. Failed or rolled-back installations never prune.
+
+Linux retains all recovery copies; remove obsolete copies manually after
+confirming that the new version works. Linux pathname deletion cannot guarantee
+that a concurrently replaced name still identifies the file that was checked.
+The updater therefore performs no Linux cleanup moves or deletions.
+
+Windows cleanup prepares a directory capability before publication, validates
+membership of the running and staged files, then verifies published outputs in
+that same directory. Enumeration and candidate opens remain relative to the
+retained directory handle if an ancestor is renamed. Deletion uses the validated
+candidate handle. Unsupported containment, identity or filename comparisons
+(including non-ASCII protected basenames) disable pruning for that update.
+These safeguards govern cleanup; the existing publication and rollback operations
+still use paths and are not a general guarantee against concurrent namespace
+changes during installation.
 
 Cleanup skips symlinks, Windows reparse points/junctions, protected inputs and
 hard-link aliases of protected or retained files. It is best effort: errors do
 not fail the update, and running or locked previous executables on Windows are
-kept. Each update scans at most 4,096 directory entries and removes at most 128
+kept. Each Windows update scans at most 4,096 directory entries and removes at most 128
 copies, so inaccessible files or a large directory may leave additional copies
 for later updates or manual removal. Similarly named files and nested directories
 are left alone. Dependency-notice files are retained.

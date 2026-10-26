@@ -107,6 +107,7 @@ impl BinaryProtection {
         self.identity == other.identity
     }
 
+    #[cfg(windows)]
     pub(crate) fn file_identity(&self) -> FileIdentity {
         self.identity
     }

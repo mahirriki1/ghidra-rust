@@ -1,4 +1,4 @@
-- Successful in-app updates retain the just-created previous executable and prune
+- Successful Windows in-app updates retain the just-created previous executable and prune
   older recovery copies only after the verified replacement has been published.
   Failed installations and rollbacks leave existing recovery copies alone.
 - Cleanup only considers regular files in the installation directory with the
