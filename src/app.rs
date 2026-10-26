@@ -29,7 +29,9 @@ use crate::session::{Annotation, BinaryProtection, Session};
 use crate::signature_ui::{DraftParameter, SignatureAction, SignatureEditor};
 use crate::signatures::{self, FunctionSignature};
 use crate::theme;
-use crate::xrefs::{AccessFilter, CallDirection, CallRow, TargetKind, TargetSet, XrefTarget};
+use crate::xrefs::{
+    AccessFilter, CallDirection, CallRow, DataRow, TargetKind, TargetSet, XrefTarget,
+};
 
 const DEADLINE: Duration = Duration::from_secs(30);
 /// Consecutive automatic discovery resumes after unrelated worker failures.
@@ -239,6 +241,9 @@ fn semantics_of(code: &Option<Shared<PreparedDecompilation>>) -> &SemanticInfo {
         .map_or(&NO_SEMANTICS, |code| code.semantics())
 }
 
+/// Bytes Decode reads at a taken address, which has no access width.
+const ADDRESS_DECODE_BYTES: u32 = 64;
+
 /// Explicit target choices for one selection, bound to the state they came from.
 struct XrefChoices {
     key: XrefKey,
@@ -265,7 +270,7 @@ struct ReferenceRowsKey {
 struct ReferenceRows {
     key: ReferenceRowsKey,
     calls: Vec<CallRow>,
-    data: Vec<usize>,
+    data: Vec<DataRow>,
 }
 
 /// Decompiler context captured by the opening secondary click.
@@ -589,6 +594,8 @@ pub struct DesktopApp {
     xref_choices: Option<XrefChoices>,
     /// Direct target of a decompiler call token chosen by the user.
     selected_call: Option<u64>,
+    /// Generation and exact start of the string row chosen for X.
+    string_focus: Option<(u64, u64)>,
     analysis_progress: Option<AnalysisProgress>,
     progress_events: usize,
     reference_focus: Option<(u64, u64)>,
@@ -732,6 +739,7 @@ impl DesktopApp {
             reference_revision: 0,
             xref_choices: None,
             selected_call: None,
+            string_focus: None,
             analysis_progress: None,
             progress_events: 0,
             reference_focus: None,
@@ -944,6 +952,7 @@ impl DesktopApp {
         self.reference_access = AccessFilter::All;
         self.xref_choices = None;
         self.selected_call = None;
+        self.string_focus = None;
         self.reference_focus = None;
         self.undisplayed_call = None;
         self.browser_dialog = None;
@@ -1550,6 +1559,7 @@ impl DesktopApp {
         }
         self.result_scope = Some(address);
         self.reference_focus = None;
+        self.string_focus = None;
         self.selected_call = None;
         self.undisplayed_call = None;
         self.selection_generation = self.selection_generation.wrapping_add(1);
@@ -1745,6 +1755,7 @@ impl DesktopApp {
     }
 
     fn select_instruction(&mut self, address: u64) {
+        self.string_focus = None;
         self.selected_call = None;
         self.xref_choices = None;
         self.pending_comment_scroll = Some(address);
@@ -1761,6 +1772,7 @@ impl DesktopApp {
     }
 
     fn select_decompiled_byte(&mut self, byte: usize) {
+        self.string_focus = None;
         self.xref_choices = None;
         self.pending_comment_scroll = None;
         self.decompiler_rename_context = true;
@@ -2852,13 +2864,24 @@ impl DesktopApp {
                     analysis.references.len(),
                     analysis.data.as_ref().map_or_else(
                         || "data not analyzed".into(),
-                        |data| format!("{} data accesses", data.references.len())
+                        |data| format!(
+                            "{} data accesses · {} addresses",
+                            data.references.len(),
+                            analysis
+                                .addresses
+                                .as_ref()
+                                .map_or(0, |addresses| addresses.references.len())
+                        )
                     ),
                     analysis.functions_examined,
                     analysis.decode_attempts,
                     if truncated
                         || analysis.partial
                         || analysis.data.as_ref().is_some_and(|data| data.partial)
+                        || analysis
+                            .addresses
+                            .as_ref()
+                            .is_some_and(|addresses| addresses.partial)
                     {
                         " · partial coverage"
                     } else {
@@ -4818,6 +4841,8 @@ impl DesktopApp {
     fn symbol_tree(&mut self, ui: &mut egui::Ui) {
         let mut function = None;
         let mut read = None;
+        let mut string_read = false;
+        let mut string_xrefs = None;
         let mut section_index = None;
         let mut scan_strings = false;
         ScrollArea::both()
@@ -4912,17 +4937,27 @@ impl DesktopApp {
                                         .show_rows(ui, 20.0, self.strings.len(), |ui, rows| {
                                             for index in rows {
                                                 let string = &self.strings[index];
-                                                if ui
+                                                let response = ui
                                                     .add(
                                                         egui::Button::selectable(
-                                                            false,
+                                                            self.string_focus
+                                                                == Some((
+                                                                    self.generation,
+                                                                    string.address,
+                                                                )),
                                                             crop(&string.text, 100),
                                                         )
                                                         .truncate(),
                                                     )
-                                                    .on_hover_text(&string.text)
-                                                    .clicked()
-                                                {
+                                                    .on_hover_text(&string.text);
+                                                response.context_menu(|ui| {
+                                                    if ui.button("Xrefs to…").clicked() {
+                                                        string_xrefs = Some(string.address);
+                                                        ui.close();
+                                                    }
+                                                });
+                                                if response.clicked() {
+                                                    string_read = true;
                                                     let length = if string.encoding.contains("16") {
                                                         string
                                                             .text
@@ -4977,9 +5012,20 @@ impl DesktopApp {
             self.navigate(address, true, &context);
         }
         if let Some((address, length)) = read {
-            self.select_instruction(address);
+            if string_read {
+                self.select_string(address);
+            } else {
+                self.select_instruction(address);
+            }
             self.tab = Tab::Decode;
             self.request(Request::Bytes { address, length }, &context);
+        }
+        if let Some(address) = string_xrefs {
+            self.select_string(address);
+            self.open_xrefs(XrefTarget {
+                address,
+                kind: TargetKind::StringStart,
+            });
         }
         if let Some(index) = section_index {
             self.open_hex_section(index, &context);
@@ -5896,10 +5942,10 @@ impl DesktopApp {
             .is_some_and(|info| !crate::call_analysis::code_address(info, target.address));
         self.reference_data = match self.call_index.as_deref() {
             _ if target.kind.prefers_data() || data_address => true,
-            Some(index) => match crate::xrefs::counts(index, target.address) {
-                (0, data) => data > 0,
-                _ => false,
-            },
+            Some(index) => {
+                let counts = crate::xrefs::counts(index, target.address);
+                counts.calls == 0 && counts.data() > 0
+            }
             None => false,
         };
         self.tab = Tab::References;
@@ -5909,6 +5955,12 @@ impl DesktopApp {
     /// call and data evidence of every selected instruction in the displayed
     /// function, else the selected address itself.
     fn selection_xref_targets(&self) -> TargetSet {
+        if let Some(address) = self.string_target() {
+            return TargetSet::single(XrefTarget {
+                address,
+                kind: TargetKind::StringStart,
+            });
+        }
         if let Some(target) = self.selected_call {
             return TargetSet::single(XrefTarget {
                 address: target,
@@ -5956,6 +6008,25 @@ impl DesktopApp {
             }
         }
         set
+    }
+
+    /// The exact start of the string row last chosen in Strings or the
+    /// program tree, while it is still the selection and no code view has
+    /// taken focus. Listing and Graph keep their code-selection scope.
+    fn string_target(&self) -> Option<u64> {
+        self.string_focus
+            .filter(|&(generation, address)| {
+                generation == self.generation
+                    && self.selected == Some(address)
+                    && !matches!(self.tab, Tab::Listing | Tab::Graph)
+            })
+            .map(|(_, address)| address)
+    }
+
+    /// Selects a string row's start and makes it the X target.
+    fn select_string(&mut self, address: u64) {
+        self.select_instruction(address);
+        self.string_focus = Some((self.generation, address));
     }
 
     fn show_selection_xrefs(&mut self) {
@@ -6064,7 +6135,7 @@ impl DesktopApp {
             );
             if target.kind == TargetKind::StringStart {
                 ui.weak("Exact start").on_hover_text(
-                    "First-byte accesses only; excludes interior accesses and loaded pointers.",
+                    "First-byte references only; excludes interior bytes and loaded pointers.",
                 );
             }
             Some((target.address, true))
@@ -6142,31 +6213,53 @@ impl DesktopApp {
     fn data_references_panel(&mut self, ui: &mut egui::Ui, scope: Option<(u64, bool)>) {
         let context = ui.ctx().clone();
         let Some(index) = &self.call_index else {
-            theme::empty_state(ui, "Data accesses not analyzed");
+            theme::empty_state(ui, "Data references not analyzed");
             return;
         };
-        let Some(data) = &index.report.data else {
-            theme::empty_state(ui, "Data-access results unavailable");
+        if index.report.data.is_none() && index.report.addresses.is_none() {
+            theme::empty_state(ui, "Data references unavailable");
             return;
-        };
+        }
+        let report = &index.report;
         ui.horizontal_wrapped(|ui| {
             if self.saved_references {
                 ui.colored_label(theme::WARNING, "Saved analysis")
                     .on_hover_text("Saved references; run Discover to recompute.");
             }
-            ui.weak(format!(
-                "{} direct accesses · {} unresolved · {} omitted · {} unsupported",
-                data.references.len(),
-                data.unresolved_accesses,
-                data.omitted_accesses,
-                data.unsupported_instructions
-            ))
-            .on_hover_text(format!(
-                "Examined functions · {} p-code operations · {} candidates. Excludes address-only values and loaded pointers.",
-                data.operations_charged, data.accesses_examined
-            ));
-            if data.partial || index.report.partial {
-                ui.colored_label(theme::WARNING, "Partial access coverage")
+            if let Some(data) = &report.data {
+                ui.weak(format!(
+                    "{} direct accesses · {} unresolved · {} omitted · {} unsupported",
+                    data.references.len(),
+                    data.unresolved_accesses,
+                    data.omitted_accesses,
+                    data.unsupported_instructions
+                ))
+                .on_hover_text(format!(
+                    "Examined functions · {} p-code operations · {} candidates. Excludes loaded pointers.",
+                    data.operations_charged, data.accesses_examined
+                ));
+            }
+            match &report.addresses {
+                Some(addresses) => {
+                    ui.weak(format!(
+                        "· {} addresses taken",
+                        addresses.references.len()
+                    ))
+                    .on_hover_text(format!(
+                        "Concrete addresses formed in registers or stored values · {} candidates · {} omitted. Not proof of pointer use.",
+                        addresses.candidates_examined, addresses.omitted_candidates
+                    ));
+                }
+                None => {
+                    ui.weak("· Addresses not analyzed")
+                        .on_hover_text("Run Discover to recompute.");
+                }
+            }
+            if report.partial
+                || report.data.as_ref().is_some_and(|data| data.partial)
+                || report.addresses.as_ref().is_some_and(|addresses| addresses.partial)
+            {
+                ui.colored_label(theme::WARNING, "Partial")
                     .on_hover_text("Work limits, unsupported instructions or incomplete function walks.");
             }
         });
@@ -6175,12 +6268,13 @@ impl DesktopApp {
         };
         ui.horizontal(|ui| {
             theme::tab(ui, &mut self.reference_access, AccessFilter::All, "All");
-            theme::tab(ui, &mut self.reference_access, AccessFilter::Read, "Reads");
+            theme::tab(ui, &mut self.reference_access, AccessFilter::Read, "Read");
+            theme::tab(ui, &mut self.reference_access, AccessFilter::Write, "Write");
             theme::tab(
                 ui,
                 &mut self.reference_access,
-                AccessFilter::Write,
-                "Writes",
+                AccessFilter::Address,
+                "Address",
             );
             ui.separator();
             self.reference_filter_field(ui);
@@ -6189,21 +6283,20 @@ impl DesktopApp {
         let (Some(index), Some(rows)) = (&self.call_index, &self.reference_rows) else {
             return;
         };
-        let Some(data) = &index.report.data else {
-            return;
-        };
+        let report = &index.report;
         let rows = rows.data.as_slice();
         ui.horizontal(|ui| {
             ui.label(if explicit {
-                format!("{} accesses starting at {address:#x}", rows.len())
+                format!("{} references starting at {address:#x}", rows.len())
             } else {
-                format!("{} accesses from this function", rows.len())
+                format!("{} references from this function", rows.len())
             })
             .on_hover_text("Examined functions only; empty does not mean no references.");
         });
         let mut source = None;
         let mut read = None;
         let mut target = None;
+        let mut open = None;
         let glyph = theme::glyph_width(ui);
         let size_x = 11.0 * glyph;
         let target_x = size_x + 6.0 * glyph;
@@ -6211,13 +6304,14 @@ impl DesktopApp {
         theme::column_header(
             ui,
             &[
-                ("Access", 0.0),
+                ("Kind", 0.0),
                 ("Size", size_x),
                 ("Target", target_x),
                 ("Source", source_x),
             ],
             0.0,
         );
+        let functions = self.info.as_ref().map(|info| info.functions.as_slice());
         theme::rows::<()>(
             ui,
             "data-references",
@@ -6226,7 +6320,41 @@ impl DesktopApp {
             source_x + 60.0 * glyph,
             None,
             |ui, row, rect| {
-                let reference = &data.references[rows[row]];
+                // Rows are validated indices into the same immutable report.
+                let (function, pc, destination, size, provenance, kind, color) = match rows[row] {
+                    DataRow::Access(i) => {
+                        let reference = &report.data.as_ref()?.references[i];
+                        let (kind, color) = match reference.access {
+                            DataAccess::Read => ("Read", theme::EDGE_TRUE),
+                            DataAccess::Write => ("Write", theme::SYNTAX_VARIABLE),
+                        };
+                        (
+                            reference.function,
+                            reference.address,
+                            reference.target,
+                            Some(reference.size),
+                            reference.provenance,
+                            kind,
+                            color,
+                        )
+                    }
+                    DataRow::Address(i) => {
+                        let reference = &report.addresses.as_ref()?.references[i];
+                        (
+                            reference.function,
+                            reference.address,
+                            reference.target,
+                            None,
+                            reference.provenance,
+                            "Address",
+                            theme::SYNTAX_KEYWORD,
+                        )
+                    }
+                };
+                let propagated = provenance == DataProvenance::Propagated;
+                let over_kind = ui
+                    .input(|input| input.pointer.hover_pos())
+                    .is_some_and(|pos| pos.x < rect.left() + size_x);
                 let response = theme::row_response(
                     ui,
                     ui.scope_id().with(("data-reference", row)),
@@ -6234,86 +6362,82 @@ impl DesktopApp {
                     false,
                     false,
                 )
-                .on_hover_text(
-                    if reference.provenance == DataProvenance::Propagated
-                        && ui
-                            .input(|input| input.pointer.hover_pos())
-                            .is_some_and(|pos| pos.x < rect.left() + size_x)
-                    {
-                        "* Address from register constants in this block."
-                    } else {
-                        "Click to open the accessing instruction"
-                    },
-                );
+                .on_hover_text(match (over_kind, propagated, size) {
+                    (true, true, _) => "* Address from register constants in this block.",
+                    (true, false, None) => "Address taken",
+                    _ => "Click to open the source instruction",
+                });
                 let cell = |x: f32, width: f32| {
                     egui::Rect::from_x_y_ranges(
                         rect.left() + x..=rect.left() + x + width,
                         rect.y_range(),
                     )
                 };
-                let (access, color) = match reference.access {
-                    DataAccess::Read => ("Read", theme::EDGE_TRUE),
-                    DataAccess::Write => ("Write", theme::SYNTAX_VARIABLE),
-                };
-                let access = if reference.provenance == DataProvenance::Propagated {
-                    format!("{access}*")
+                let kind = if propagated {
+                    format!("{kind}*")
                 } else {
-                    access.to_owned()
+                    kind.to_owned()
                 };
                 theme::cell_text(
                     ui,
                     cell(0.0, size_x),
-                    RichText::new(access).monospace(),
+                    RichText::new(kind).monospace(),
                     color,
                 );
                 theme::cell_text(
                     ui,
                     cell(size_x, target_x - size_x),
-                    RichText::new(format!("{}B", reference.size)).monospace(),
+                    RichText::new(size.map_or_else(|| "—".to_owned(), |size| format!("{size}B")))
+                        .monospace(),
                     theme::MUTED,
                 );
                 theme::cell_text(
                     ui,
                     cell(target_x, source_x - target_x),
-                    RichText::new(format!("{:x}", reference.target)).monospace(),
+                    RichText::new(format!("{destination:x}")).monospace(),
                     theme::SYNTAX_CONSTANT,
                 );
                 let name = self
-                    .reference_name(reference.function)
+                    .reference_name(function)
                     .map_or(String::new(), |name| format!(" {}", crop(name, 40)));
                 theme::cell_text(
                     ui,
                     rect.with_min_x(rect.left() + source_x),
-                    RichText::new(format!(
-                        "{:x} @ {:x}{name}",
-                        reference.address, reference.function
-                    ))
-                    .monospace(),
+                    RichText::new(format!("{pc:x} @ {function:x}{name}")).monospace(),
                     theme::TEXT,
                 );
                 if response.clicked() {
-                    source = Some((reference.function, reference.address));
+                    source = Some((function, pc));
                 }
                 response.context_menu(|ui| {
-                    if ui.button("Go to accessing instruction").clicked() {
-                        source = Some((reference.function, reference.address));
+                    if ui.button("Go to source instruction").clicked() {
+                        source = Some((function, pc));
+                        ui.close();
+                    }
+                    // A taken code address opens only an established entry;
+                    // other bytes are inspected, never made a function.
+                    if functions
+                        .is_some_and(|functions| function_at(functions, destination).is_some())
+                        && ui
+                            .button(format!("Open function {destination:x}"))
+                            .clicked()
+                    {
+                        open = Some(destination);
+                        ui.close();
+                    }
+                    let length = size.unwrap_or(ADDRESS_DECODE_BYTES);
+                    if ui
+                        .button(format!("Decode {length} bytes at {destination:x}"))
+                        .clicked()
+                    {
+                        read = Some((destination, length));
                         ui.close();
                     }
                     if ui
-                        .button(format!(
-                            "Decode {} bytes at {:x}",
-                            reference.size, reference.target
-                        ))
+                        .button(format!("References starting at {destination:x}"))
                         .clicked()
                     {
-                        read = Some((reference.target, reference.size));
-                        ui.close();
-                    }
-                    if ui
-                        .button(format!("Accesses starting at {:x}", reference.target))
-                        .clicked()
-                    {
-                        target = Some(reference.target);
+                        target = Some((destination, size.is_none()));
                         ui.close();
                     }
                 });
@@ -6322,12 +6446,18 @@ impl DesktopApp {
         );
         if let Some((function, pc)) = source {
             self.navigate_reference(function, pc, &context);
+        } else if let Some(address) = open {
+            self.navigate(address, true, &context);
         } else if let Some((address, size)) = read {
             self.read_data_reference(address, size, &context);
-        } else if let Some(address) = target {
+        } else if let Some((address, taken)) = target {
             self.open_xrefs(XrefTarget {
                 address,
-                kind: TargetKind::DataAccess,
+                kind: if taken {
+                    TargetKind::TakenAddress
+                } else {
+                    TargetKind::DataAccess
+                },
             });
         }
     }
@@ -6348,7 +6478,7 @@ impl DesktopApp {
             }
             ui.separator();
             theme::tab(ui, &mut self.reference_data, false, "Calls");
-            theme::tab(ui, &mut self.reference_data, true, "Data accesses");
+            theme::tab(ui, &mut self.reference_data, true, "Data references");
             ui.separator();
             let response = ui.add(
                 TextEdit::singleline(&mut self.reference_query)
@@ -6381,8 +6511,16 @@ impl DesktopApp {
                 self.reference_query.clear();
             }
             if let (Some(index), Some(target)) = (&self.call_index, self.xref_target) {
-                let (calls, data) = crate::xrefs::counts(index, target.address);
-                ui.weak(format!("{calls} calls · {data} accesses"));
+                let counts = crate::xrefs::counts(index, target.address);
+                ui.weak(format!(
+                    "{} calls · {} data refs",
+                    counts.calls,
+                    counts.data()
+                ))
+                .on_hover_text(format!(
+                    "{} accesses · {} address taken",
+                    counts.accesses, counts.addresses
+                ));
             }
         });
         if let Some(address) = open {
@@ -6961,7 +7099,7 @@ impl DesktopApp {
                             selected == Some(string.address),
                             false,
                         )
-                        .on_hover_text("Click to load into Decode · right-click for accesses");
+                        .on_hover_text("Click to load into Decode · X for xrefs");
                         theme::cell_text(
                             ui,
                             rect,
@@ -6981,7 +7119,7 @@ impl DesktopApp {
                             theme::SYNTAX_CONSTANT,
                         );
                         response.context_menu(|ui| {
-                            if ui.button("Data accesses at this exact start").clicked() {
+                            if ui.button("Xrefs to…").clicked() {
                                 xrefs = Some(string.address);
                                 ui.close();
                             }
@@ -6999,9 +7137,10 @@ impl DesktopApp {
                     },
                 );
                 if let Some((address, length)) = read {
-                    self.select_instruction(address);
+                    self.select_string(address);
                     self.request(Request::Bytes { address, length }, &context);
                 } else if let Some(address) = xrefs {
+                    self.select_string(address);
                     self.open_xrefs(XrefTarget {
                         address,
                         kind: TargetKind::StringStart,
@@ -7178,6 +7317,11 @@ impl DesktopApp {
                         saved.report.partial
                             || saved.remaining() != 0
                             || saved.report.data.as_ref().is_some_and(|data| data.partial)
+                            || saved
+                                .report
+                                .addresses
+                                .as_ref()
+                                .is_some_and(|addresses| addresses.partial)
                     })
             }))
     }
@@ -10474,12 +10618,12 @@ mod tests {
         assert!(app.reference_data);
         let text = frame(&mut app);
         assert!(text.iter().any(|t| t == "Exact start"));
-        assert!(text.iter().any(|t| t == "1 accesses starting at 0x2010"));
+        assert!(text.iter().any(|t| t == "1 references starting at 0x2010"));
         app.reference_access = AccessFilter::Read;
         assert!(
             frame(&mut app)
                 .iter()
-                .any(|t| t == "0 accesses starting at 0x2010")
+                .any(|t| t == "0 references starting at 0x2010")
         );
         // Current function resets to the displayed function's own accesses.
         app.reference_access = AccessFilter::All;
@@ -10487,8 +10631,90 @@ mod tests {
         assert!(
             frame(&mut app)
                 .iter()
-                .any(|t| t == "2 accesses from this function")
+                .any(|t| t == "2 references from this function")
         );
+    }
+
+    #[test]
+    fn string_rows_own_x_and_list_taken_addresses_with_their_own_filter() {
+        let mut app = xref_app();
+        let mut report = app.call_index.as_ref().unwrap().report.clone();
+        report.addresses = Some(Box::new(AddressAnalysis {
+            references: vec![AddressReference {
+                function: 0x1000,
+                address: 0x1000,
+                target: 0x2010,
+                provenance: DataProvenance::InstructionLocal,
+            }],
+            candidates_examined: 1,
+            ..Default::default()
+        }));
+        app.set_call_index(Some(Arc::new(crate::call_analysis::CallIndex::new(report))));
+        // A Strings row is the X target ahead of any residual code selection.
+        app.tab = Tab::Strings;
+        app.select_string(0x2010);
+        app.show_selection_xrefs();
+        assert_eq!(
+            app.xref_target,
+            Some(XrefTarget {
+                address: 0x2010,
+                kind: TargetKind::StringStart
+            })
+        );
+        assert!(app.tab == Tab::References && app.reference_data);
+        for scale in [1.0, 1.25] {
+            let context = egui::Context::default();
+            theme::install(&context);
+            context.set_pixels_per_point(scale);
+            let frame = |app: &mut DesktopApp| {
+                let mut output =
+                    context.run_ui(egui::RawInput::default(), |ui| app.references_panel(ui));
+                output.textures_delta.clear();
+                rendered_text(&output)
+            };
+            app.reference_access = AccessFilter::All;
+            let text = frame(&mut app);
+            // The write access and the address-taking, each in its own row.
+            assert!(text.iter().any(|t| t == "2 references starting at 0x2010"));
+            assert!(text.iter().any(|t| t == "Address"));
+            assert!(text.iter().any(|t| t == "\u{2014}"));
+            assert!(text.iter().any(|t| t == "0 calls \u{b7} 2 data refs"));
+            app.reference_access = AccessFilter::Address;
+            assert!(
+                frame(&mut app)
+                    .iter()
+                    .any(|t| t == "1 references starting at 0x2010")
+            );
+            app.reference_access = AccessFilter::Read;
+            assert!(
+                frame(&mut app)
+                    .iter()
+                    .any(|t| t == "0 references starting at 0x2010")
+            );
+        }
+        // Listing and Graph restore code-selection scope.
+        app.tab = Tab::Listing;
+        assert_ne!(
+            app.selection_xref_targets().targets[0].kind,
+            TargetKind::StringStart
+        );
+        // Selecting code, or another binary generation, drops the string.
+        app.tab = Tab::Strings;
+        app.select_string(0x2010);
+        app.generation = app.generation.wrapping_add(1);
+        assert!(app.string_target().is_none());
+        app.generation = app.generation.wrapping_sub(1);
+        assert_eq!(app.string_target(), Some(0x2010));
+        app.select_instruction(0x1008);
+        assert!(app.string_target().is_none());
+        // The source column navigates to the exact taking instruction.
+        app.tab = Tab::Strings;
+        app.select_string(0x2010);
+        app.show_selection_xrefs();
+        let context = egui::Context::default();
+        app.navigate_reference(0x1000, 0x1000, &context);
+        assert_eq!(app.selected, Some(0x1000));
+        assert!(app.tab == Tab::Listing && app.string_target().is_none());
     }
 
     #[test]

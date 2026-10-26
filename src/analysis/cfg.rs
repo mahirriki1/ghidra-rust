@@ -384,7 +384,7 @@ impl Walk {
                 continue;
             }
             if let Some(data) = data.as_mut() {
-                data.inspect(entry, &pcode);
+                data.inspect(entry, &pcode, &instruction.mnemonic);
             }
             let call_start = self.calls.len();
             let no_return = &self.no_return;

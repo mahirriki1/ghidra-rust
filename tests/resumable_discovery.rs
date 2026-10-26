@@ -60,6 +60,12 @@ fn all_known_seeds_survive_cancel_restart_and_interactive_requests() {
     for n in 1..300 {
         code.push_str(&format!("int f{n:03}(void) {{ return {n}; }}\n"));
     }
+    // Each returns a string literal's address: address-taking evidence.
+    for n in 0..30 {
+        code.push_str(&format!(
+            "const char *s{n:02}(void) {{ return \"label {n:02}\"; }}\n"
+        ));
+    }
     code.push_str("int main(void) { return f000(); }\n");
     std::fs::write(&source, code).unwrap();
     assert!(
@@ -101,6 +107,7 @@ fn all_known_seeds_survive_cancel_restart_and_interactive_requests() {
     let first_functions = inventory.functions().to_vec();
     assert!(!state.report.references.is_empty());
     let committed = state.report.references.clone();
+    let committed_addresses = state.report.addresses.clone().unwrap();
     let abandoned = state.begin(1, 1, 0).unwrap();
     worker.send(abandoned).unwrap();
     drop(worker); // Actual cancellation of an in-flight contained worker.
@@ -158,6 +165,35 @@ fn all_known_seeds_survive_cancel_restart_and_interactive_requests() {
         committed
             .iter()
             .all(|reference| state.report.references.contains(reference))
+    );
+    // Address evidence accumulates across batches and the worker restart,
+    // once for each string-returning function, and never admits functions.
+    let addresses = state.report.addresses.as_ref().unwrap();
+    assert!(
+        committed_addresses
+            .references
+            .iter()
+            .all(|reference| addresses.references.contains(reference))
+    );
+    assert!(addresses.candidates_examined >= committed_addresses.candidates_examined);
+    let owners: std::collections::BTreeSet<_> = info
+        .functions
+        .iter()
+        .filter(|function| function.name.starts_with('s') && function.name.len() == 3)
+        .map(|function| function.address)
+        .collect();
+    assert_eq!(owners.len(), 30);
+    let taken: std::collections::BTreeSet<_> = addresses
+        .references
+        .iter()
+        .filter(|reference| owners.contains(&reference.function))
+        .map(|reference| (reference.function, reference.target))
+        .collect();
+    assert_eq!(taken.len(), 30);
+    assert!(
+        taken
+            .iter()
+            .all(|&(_, target)| state.status(target).is_none())
     );
     // Real worker evidence passes the checks applied to saved projects.
     let saved = state.save();

@@ -124,8 +124,10 @@ functions.
 
 Cursors retain pointer-run and validation positions across batches and worker
 replacement. Cumulative work and reconstruction are bounded; exhaustion leaves
-partial coverage. Instruction address-taking, PE/AArch64 pointer sources, and
-persistent source witnesses remain unsupported.
+partial coverage. Address-taking evidence from instructions (see
+[address formation](#address-formation)) never seeds or admits functions.
+PE/AArch64 pointer-table sources and persistent source witnesses remain
+unsupported.
 
 ## Function-start patterns
 
@@ -189,12 +191,13 @@ instruction PC, target, width, and kind.
 x86 evidence is instruction-local. AArch64 additionally propagates concrete
 register constants within each basic block, for example `ADRP; ADD; LDR` and
 `MOVZ`/`MOVK` with supported arithmetic, shifts, and extensions. These accesses
-show `Read*` / `Write*` in **Data accesses**; hover the Access cell for
+show `Read*` / `Write*` in **Data references**; hover the Kind cell for
 “* Address from register constants in this block.” Unmarked accesses use
 instruction-local evidence. Block boundaries, calls, unsupported/omitted
 instructions, and overlapping register writes clear knowledge.
 Loaded pointers are never chased: `ADRP; LDR` identifies the slot, not its value.
-Address formation alone and call arguments create no references. Cross-branch
+Address formation is recorded as a separate class (below); call arguments create
+no access references. Cross-branch
 values and switch-recovery table reads are excluded. Internal p-code branches,
 user operations, and unsupported semantics omit the instruction as partial.
 
@@ -205,6 +208,42 @@ addresses. Shared operation, candidate, and state limits mark omissions partial;
 see [limits](#resource-limits-and-trust-boundaries). This is access evidence,
 not data-object or pointer classification.
 
+## Address formation
+
+Discovery also records where an instruction materializes a concrete address
+without accessing it: x86 `LEA reg,[rip+X]`, `MOV reg, imm` and immediate stores or
+pushes, and AArch64 `ADR`, completed `ADRP; ADD` and `MOVZ`/`MOVK` compositions.
+The evidence records source function, instruction PC and target, with no width.
+It is evaluated from p-code during the same bounded walk and shares the data
+analysis' operation charges, but is published, capped and indexed separately; it
+is never a read or write.
+
+Only two sinks count. The first is a final pointer-width general-register value
+that the instruction freshly formed; flags, the program counter, the stack
+pointer, unique temporaries, loaded contents and pure register copies do not.
+The second is a pointer-width value stored by `STORE` or a direct-memory `COPY`,
+even through an unknown destination. Instructions with calls, branches or returns
+form nothing, so return addresses and link registers are excluded. A store can
+yield both a write to its slot and address-taking of the stored value.
+
+x86 evaluates each instruction alone. AArch64 carries values within one displayed
+basic block under the data-access rules. A formed register value is published at
+its defining PC when it is used, overwritten, reaches a call or the block ends,
+unless the next instruction refines it in place: `ADRP; ADD` reports only the
+`ADD`, and `MOVZ; MOVK` only the composition. ADRP page bases are never
+published as register values; the decoded mnemonic only classifies that
+incomplete construction. Rows from carried values show `Address*`.
+
+A target must fit the ABI, be at least `0x1000`, and name a file-backed byte of
+one section. Executable bytes qualify without being functions or instruction
+starts; alignment is not required. Small values, zero fill, gaps and overflow
+are counted as omitted. The `0x1000` floor deliberately drops valid pointers in
+low-address images. A mapped pointer-width constant can still be a coincidental
+scalar: this is concrete address materialization, not proof of a source-language
+pointer or a runtime use. Taken addresses never create functions, CFG edges or
+no-return evidence. Candidates are charged before deduplication; reaching a cap
+marks address coverage partial while seed processing continues.
+
 ## References and progress
 
 **References** shows confirmed incoming/outgoing calls for the selected function.
@@ -213,13 +252,19 @@ limits still selects its exact PC with a notice; **Go to** can inspect it separa
 References cover examined functions in committed batches. Empty does not prove
 that no references exist; absent reports remain **not analyzed**.
 
-**X** uses the decompiler call token's genuine target, selected instructions'
-call/data targets, or otherwise the selected address/function. Multiple targets
-require an explicit choice. Context menus offer **Xrefs to…** on functions,
-instructions, and call tokens. **Data accesses** filters by displayed function
-or exact target start, not overlapping interiors. Source buttons select PCs;
-target buttons send only accessed bytes to Decode, preserving code history and
-selection. Delayed replies cannot override a newer selection or tab. Committed
+**X** uses the string row chosen in **Strings** or the program tree (until a
+code view takes focus), the decompiler call token's genuine target, selected
+instructions' call, data-access and address-taking targets, or otherwise the
+selected address/function. Multiple targets require an explicit choice. Context
+menus offer **Xrefs to…** on functions, instructions, call tokens and string
+rows. **Data references** lists accesses and address-taking with **All / Read /
+Write / Address** filters, by displayed function or exact target start, not
+overlapping interiors; address rows show `—` for width. A string's references are
+exactly those to its first byte; no extent is inferred from its preview. An
+explicit target shows both its call and data-reference counts. Source rows
+select PCs; Decode sends only accessed bytes (64 bytes for a taken address),
+preserving code history and selection. A taken function entry opens normally;
+other taken code bytes are only inspected, never made functions. Delayed replies cannot override a newer selection or tab. Committed
 references stay visible while subsequent batches run.
 
 The status bar remains active through setup, adoption, foreground waits, and
@@ -273,13 +318,25 @@ Direct-memory `COPY`/`LOAD`/`STORE` and AArch64 constant/unknown-output rules ad
 at the same revision. This bounded adaptation tracks concrete values within one
 block, without the Java Program database or analysis framework.
 
+Address formation adapts the `COPY`, `STORE` and `INT_ADD` pointer-value cases,
+`checkPossibleOffsetAddr`, `addStoredReferences` and `makeReference` of
+`ghidra/program/util/SymbolicPropogator.java` in Ghidra 12.2 (revision
+`8ca9077040cc43cd790babcfccf19475622a3e9a`, inspected from the distribution's
+`Ghidra/Features/Base/lib/Base-src.zip`), under Apache License 2.0.
+`ScalarOperandAnalyzer.java` `addReference` and `OperandReferenceAnalyzer.java`
+were consulted only for what not to adopt. The native rules are narrower: a fixed
+`0x1000` floor instead of context-sensitive small-value checks; no speculative
+scalar operands, symbol or existing-reference checks, data definition, or
+disassembly or function creation at targets.
+
 The pinned `ghidra-decompiler` revision is
 `268c3a406d8d964bc00ae2ead4d3e1e1373aaa27`, with recorded Ghidra base `d6192cb3f9`.
 Attribution remains in [NOTICE](../NOTICE). The independent ARM64 PE reader follows
 [Microsoft's exception-handling format](https://learn.microsoft.com/en-us/cpp/build/arm64-exception-handling?view=msvc-170);
 veneer recognition uses public engine APIs. No Java or Python runtime is added.
 
-Remaining work includes cross-block propagation, speculative operand references,
+Remaining work includes cross-block propagation, call-argument and loaded-pointer
+references, speculative operand references,
 exception flow, inferred no-return wrappers, and complete stripped recovery.
 Engine decompilation may expose constructs the independent CFG cannot establish.
 There is no source/class/trait reconstruction or MSVC demangling. Plugins,
@@ -416,6 +473,11 @@ of partial/status/counter data. This checks structure, not instruction truth.
 Unmapped graph exits and call targets save as unresolved.
 Engine or discovery-format fingerprint mismatches discard incompatible caches
 while keeping annotations. A matching binary hash does not authenticate analysis.
+Address-taking evidence is an additive field of saved discovery under a new
+discovery fingerprint, without a project-schema change: discovery saved by an
+earlier release is discarded and recomputed by Discover, and earlier releases
+discard discovery saved by this one. Saved address rows keep **Saved analysis**
+provenance until rediscovered.
 
 Saves publish complete new files atomically after destination checks, retaining
 all protected-input guards through replacement. They never patch the binary,
@@ -430,7 +492,7 @@ for project parsing and residual filesystem limitations.
 | Known functions | 262,144; omitted entries mean a partial inventory |
 | Function walk / graph | 2,048 instruction attempts / 128 displayed blocks |
 | Discovery batch | 128 seeds / 16,384 decode attempts; not cumulative ceilings |
-| References | 16,384 call refs and separately 16,384 data refs |
+| References | 16,384 call refs, 16,384 data-access refs and 16,384 address-taking refs, each per reply and per discovery; 16,384 address candidates per batch |
 | Strings | 64 MiB scanned data / 10,000 results |
 | Bytes / decode | 64 KiB input and XOR keys / 256 KiB output; oversize is rejected |
 | Pseudocode | 2 MiB returned text |

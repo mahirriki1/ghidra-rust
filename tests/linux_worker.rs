@@ -7,7 +7,7 @@ use ghidra_rust::client::{WorkerClient, WorkerEvent};
 use ghidra_rust::model::{CallAnalysis, DataAccess, Request, Response};
 use ghidra_rust::project::ProjectData;
 use ghidra_rust::session::{Annotation, Session};
-use object::{Object, ObjectSymbol};
+use object::{Object, ObjectSection, ObjectSymbol};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -158,6 +158,59 @@ fn compare_fixture_data(binary: &Path, owner: u64, target: u64, analysis: &CallA
     );
 }
 
+/// Address-taking evidence from real worker discovery: `main` passes the
+/// string `base64_message` to `puts`, and `remember_label` stores a string
+/// literal's address to a global. Taken data addresses never become functions.
+fn compare_fixture_addresses(
+    image: &object::File<'_>,
+    functions: &[ghidra_rust::model::FunctionInfo],
+    analysis: &CallAnalysis,
+) {
+    let symbol = |name| {
+        image
+            .symbols()
+            .find(|symbol| symbol.name().ok() == Some(name))
+            .unwrap()
+            .address()
+    };
+    let rodata = image.section_by_name(".rodata").unwrap();
+    let bytes = rodata.data().unwrap();
+    let literal = rodata.address()
+        + bytes
+            .windows(14)
+            .position(|window| window == b"address taken\0")
+            .expect("string literal in .rodata") as u64;
+    let addresses = analysis
+        .addresses
+        .as_ref()
+        .expect("Fresh address-taking analysis");
+    let taken = |owner, target| {
+        addresses
+            .references
+            .iter()
+            .filter(move |r| r.function == owner && r.target == target)
+    };
+    assert!(
+        taken(symbol("main"), symbol("base64_message"))
+            .next()
+            .is_some(),
+        "main takes the address of base64_message"
+    );
+    let store = taken(symbol("remember_label"), literal)
+        .next()
+        .expect("remember_label stores the literal's address");
+    // On x86-64 the same instruction writes the pointer slot.
+    if image.architecture() == object::Architecture::X86_64 {
+        let data = analysis.data.as_ref().unwrap();
+        assert!(data.references.iter().any(|r| r.address == store.address
+            && r.target == symbol("fixture_label")
+            && r.access == DataAccess::Write));
+    }
+    for target in [literal, symbol("base64_message")] {
+        assert!(functions.iter().all(|function| function.address != target));
+    }
+}
+
 #[test]
 fn sandboxed_linux_worker_and_embedded_project_round_trip() {
     let directory = tempfile::Builder::new()
@@ -250,6 +303,7 @@ fn sandboxed_linux_worker_and_embedded_project_round_trip() {
             .iter()
             .any(|reference| reference.target == address)
     );
+    compare_fixture_addresses(&image, &functions, &analysis);
     let protection = worker.protection().bind_snapshot(&info).unwrap();
     let Response::Graph { view } = request(&mut worker, Request::Graph { address }) else {
         panic!("Sandboxed worker did not return CFG");

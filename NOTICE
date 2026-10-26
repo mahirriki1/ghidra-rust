@@ -77,6 +77,26 @@ concrete register constants within one basic block; it omits symbolic values,
 memory modeling, cross-block flow and the Java Program database, and retains the
 upstream Ghidra notices below.
 
+src/data_analysis.rs also records address formation (address-taking references).
+It adapts the COPY, STORE and INT_ADD pointer-value handling, the small-value
+offset check and the stored-value reference rules of SymbolicPropogator.java in
+Ghidra 12.2, revision 8ca9077040cc43cd790babcfccf19475622a3e9a, inspected in
+Ghidra/Features/Base/lib/Base-src.zip of the ghidra_12.2_PUBLIC distribution:
+ghidra/program/util/SymbolicPropogator.java (COPY, STORE and INT_ADD cases,
+checkPossibleOffsetAddr, addStoredReferences, makeReference)
+ghidra/app/plugin/core/analysis/ScalarOperandAnalyzer.java (addReference)
+ghidra/app/plugin/core/analysis/OperandReferenceAnalyzer.java (reference
+iteration; consulted for side effects that are deliberately not imported)
+
+License: Apache License, Version 2.0 (see LICENSE).
+The Rust adaptation evaluates public engine p-code only. It records final
+pointer-width general-register values and concrete stored pointer values that
+name one file-backed byte at or above 0x1000, x86 within one instruction and
+AArch64 within one basic block. ADRP page bases are never published alone.
+Unlike Ghidra it does not speculate on scalar operands, consult symbols or
+existing references, create data definitions, disassemble or create functions at
+targets, or chase loaded pointers. No Ghidra source or Java runtime is included.
+
 ----
 
 The desktop's ARM64 PE runtime-metadata reader is an independent implementation

@@ -419,3 +419,53 @@ fn production_payload_churn_is_bounded_and_save_pins_cannot_force_admission() {
         results.counters().uncached
     );
 }
+
+#[test]
+fn address_evidence_is_charged_once_per_publication_until_save_pins_drop() {
+    use ghidra_rust::call_analysis::CallIndex;
+    let publication = |count: u64| {
+        Arc::new(CallIndex::new(CallAnalysis {
+            addresses: Some(Box::new(AddressAnalysis {
+                references: (0..count)
+                    .map(|n| AddressReference {
+                        function: 0x1000,
+                        address: 0x1000 + n,
+                        target: 0x10_0000 + n,
+                        provenance: DataProvenance::InstructionLocal,
+                    })
+                    .collect(),
+                candidates_examined: count as usize,
+                ..Default::default()
+            })),
+            ..Default::default()
+        }))
+    };
+    let mut results = opened();
+    let baseline = results.usage().charged;
+    let empty = publication(0);
+    assert!(results.retain_discovery(&empty, &[]));
+    let empty_charge = results.usage().charged - baseline;
+    let count = MAX_ADDRESS_REFERENCES as u64;
+    let large = publication(count);
+    assert!(results.retain_discovery(&large, &[]));
+    let large_charge = results.usage().charged - baseline - empty_charge;
+    // Evidence rows plus both target and owner index allocations.
+    let rows = count as usize * std::mem::size_of::<AddressReference>();
+    let index = 2 * count as usize * std::mem::size_of::<usize>();
+    assert!(large_charge >= empty_charge + rows + index);
+    // Retaining the same publication again charges nothing more.
+    assert!(results.retain_discovery(&large, &[]));
+    assert_eq!(
+        results.usage().charged - baseline - empty_charge,
+        large_charge
+    );
+    // A project save keeps the evidence snapshot charged after the index
+    // and publication are replaced, until the save itself drops.
+    let saved = Arc::clone(large.snapshot());
+    drop(large);
+    let held = results.usage().charged;
+    assert!(held > baseline + empty_charge);
+    assert!(held - baseline - empty_charge >= rows);
+    drop(saved);
+    assert_eq!(results.usage().charged, baseline + empty_charge);
+}
