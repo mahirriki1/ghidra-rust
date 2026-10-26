@@ -11,6 +11,14 @@ pub const MAX_STRING_RESULTS: usize = 10_000;
 /// over 260,000 runtime functions. Discovery has its own smaller work budgets.
 pub const MAX_FUNCTIONS: usize = 262_144;
 pub const MAX_FUNCTION_NAME_BYTES: usize = 256;
+/// Limits for the worker-only demangled-name backend. Raw identities are never
+/// truncated to meet a display budget; callers keep the original name separately.
+pub const MAX_SYMBOL_RAW_BYTES: usize = 4096;
+pub const MAX_SYMBOL_DISPLAY_BYTES: usize = 1024;
+pub const MAX_SYMBOL_FORMAT_WRITES: usize = 8192;
+/// Itanium parser and renderer depth. Rust v0 additionally has its own pinned
+/// backend depth limit (500); neither replaces the worker's resource controls.
+pub const SYMBOL_DEMANGLE_RECURSION_LIMIT: u32 = 128;
 /// Total JSON-escaped bytes of all inventory names, excluding quotation marks.
 /// With 43 bytes per entry for structure and 20-digit addresses, a full
 /// inventory serializes to at most 43 * 262_144 + 8 MiB + 1 bytes (19.7 MB).
