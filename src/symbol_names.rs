@@ -148,7 +148,9 @@ impl CappedName {
             DemangleOutcome::Omitted(NameOmission::Invalid)
         } else {
             DemangleOutcome::Display(DemangledName {
-                text: self.text,
+                // Do not retain the sink's 1 KiB scratch capacity for every
+                // short name in the future program-wide table.
+                text: self.text.into_boxed_str().into_string(),
                 backend,
             })
         }
