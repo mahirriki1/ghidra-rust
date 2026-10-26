@@ -38,7 +38,7 @@ fn request(worker: &mut WorkerClient, request: Request) -> Response {
     }
 }
 fn open(worker: &mut WorkerClient, path: &Path) -> BinaryInfo {
-    let Response::Opened { info } = request(
+    let Response::Opened { info, .. } = request(
         worker,
         Request::Open {
             path: path.to_string_lossy().into_owned(),

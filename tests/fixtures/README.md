@@ -80,6 +80,15 @@ Linux. These test the non-UI [demangling backend](../../docs/demangling.md), not
 loader support for relocatable objects. Legacy Rust uses literal regression
 cases; the stable pinned compiler requires unstable options to emit that format.
 
+`demangle_program.cpp` and `demangle_program.rs` are original linked fixtures
+for [display names](../../docs/demangling.md), analyzed and never executed.
+`tests/linux_worker.rs` links the C++ file with G++ and the `no_std` Rust file
+with the pinned rustc (v0 mangling, linking libc) into temporary executables.
+On Windows, `tests/windows_worker.rs` builds the Rust file as a dylib, and
+`scripts/build-windows.ps1` builds the C++ file as an MSVC DLL beneath ignored
+`target/windows-fixture` and sets `GHIDRA_RUST_TEST_PE_CPP`; without that
+variable the MSVC check skips locally.
+
 ## Differential corpus
 
 `differential/corpus.c` and `differential/many_functions.c` are original C for

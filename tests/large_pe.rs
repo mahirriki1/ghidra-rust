@@ -43,7 +43,7 @@ fn large_pe_metadata_analysis_and_project_round_trip() {
         Path::new(env!("CARGO_BIN_EXE_ghidra-rust")),
     )
     .expect("start production contained worker");
-    let Response::Opened { info } = request(
+    let Response::Opened { info, .. } = request(
         &mut worker,
         Request::Open {
             path: binary.to_string_lossy().into_owned(),

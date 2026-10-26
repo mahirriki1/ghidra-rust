@@ -201,7 +201,7 @@ fn profile_contained_analysis_client() {
             )
             .unwrap();
             let spawn_ms = start.elapsed().as_secs_f64() * 1000.;
-            let (Response::Opened { info }, open_ms, loaded_memory) = sampler.request(
+            let (Response::Opened { info, .. }, open_ms, loaded_memory) = sampler.request(
                 &mut worker,
                 Request::Open {
                     path: fixture.path.to_string_lossy().into_owned(),

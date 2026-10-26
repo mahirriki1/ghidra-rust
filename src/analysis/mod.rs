@@ -49,6 +49,8 @@ pub struct LoadedProgram {
     pointers: Option<pointers::PointerRecovery>,
     /// Calls that never return, from the image's own symbols and imports.
     no_return: Arc<crate::no_return::NoReturnIndex>,
+    /// Original symbols and display names derived at open, before any replay.
+    symbol_names: Arc<crate::symbol_names::SymbolTable>,
     signatures: Vec<crate::signatures::FunctionSignature>,
     applied_signatures: BTreeSet<u64>,
     signature_state: Option<String>,
@@ -297,6 +299,7 @@ impl LoadedProgram {
         }
         let mut pe_ranges = Vec::new();
         let mut pe_imports = BTreeMap::new();
+        let mut pe_names = BTreeMap::new();
         if let Some(pe) = pe {
             let _registration = crate::performance::span("open_pe_register");
             crate::pe_symbols::register(&mut program, &pe, target.pointer_bytes)?;
@@ -306,6 +309,7 @@ impl LoadedProgram {
             }
             pe_ranges = pe.function_ranges;
             pe_imports = pe.imports;
+            pe_names = pe.functions;
         }
         let (functions, mut rejected) = select_functions(&program, &info, &BTreeSet::new())?;
         info.functions_truncated |= rejected;
@@ -338,6 +342,8 @@ impl LoadedProgram {
         if info.format == "ELF" && !info.functions_truncated {
             rejected |= recover_elf_main(&mut program, &mut info, &target, &snapshot)?;
         }
+        let symbol_names = Arc::new(symbol_table(&program, &info, &pe_names)?);
+        drop(pe_names);
         let mut no_return = crate::no_return::NoReturnIndex::build(
             &program,
             &info.format,
@@ -385,11 +391,16 @@ impl LoadedProgram {
             coverage: Coverage::default(),
             pointers: None,
             no_return: Arc::new(no_return),
+            symbol_names,
             signatures: Vec::new(),
             applied_signatures: BTreeSet::new(),
             signature_state: None,
             analysis_started: false,
         })
+    }
+
+    pub fn symbol_names(&self) -> &crate::model::SymbolNameSummary {
+        self.symbol_names.summary()
     }
 
     pub fn handle(&mut self, request: Request) -> Result<Response, String> {
@@ -416,13 +427,14 @@ impl LoadedProgram {
             crate::signatures::state_digest(&self.signatures)
         };
         let owned = self.applied_signatures.contains(&address);
-        let (mut text, mut mappings, mut semantics) = crate::decompile::render_with_context(
+        let (mut text, mut mappings, mut semantics) = crate::decompile::render_named(
             &mut self.program,
             address,
             &self.info.sections,
             renames,
             &context,
             owned,
+            Some(Arc::clone(&self.symbol_names)),
         )
         .map_err(engine_error)?;
         if text.len() > MAX_DECOMPILED_BYTES {
@@ -788,6 +800,9 @@ impl LoadedProgram {
             Request::Strings => self.strings(MIN_STRING_LENGTH),
             Request::StringsWithOptions { minimum_length } => self.strings(minimum_length),
             Request::Crypto => self.crypto(),
+            Request::SymbolNames { cursor } => Ok(Response::SymbolNames {
+                page: self.symbol_names.page(cursor)?,
+            }),
             Request::Open { .. } => Err("Open is handled by the worker.".into()),
         }
     }
@@ -1548,6 +1563,41 @@ fn select_functions(
     ))
 }
 
+/// The open-time symbol-name table for the engine's code entries. Raw names
+/// are the loader symbols the engine recorded or exact PE metadata names; the
+/// engine's own (possibly demangled, shortened or suffixed) names never are.
+fn symbol_table(
+    program: &Program,
+    info: &BinaryInfo,
+    pe_names: &BTreeMap<u64, String>,
+) -> Result<crate::symbol_names::SymbolTable, String> {
+    let _building = crate::performance::span("open_symbol_names");
+    let alignment = crate::architecture::instruction_alignment(program.language_id());
+    let format = if info.format == "Mach-O" {
+        crate::symbol_names::SymbolFormat::MachO
+    } else {
+        crate::symbol_names::SymbolFormat::Other
+    };
+    let entries = program.functions().map_err(engine_error)?;
+    Ok(crate::symbol_names::SymbolTable::build(
+        entries
+            .iter()
+            .filter(|f| {
+                f.address.is_multiple_of(alignment)
+                    && executable(&info.sections, f.address, alignment as usize)
+            })
+            .map(|f| crate::symbol_names::SymbolSource {
+                address: f.address,
+                raw: pe_names
+                    .get(&f.address)
+                    .or(f.symbol.as_ref())
+                    .unwrap_or(&f.name),
+                engine: &f.name,
+            }),
+        format,
+    ))
+}
+
 fn bounded_name(name: &str) -> String {
     let mut end = name.len().min(MAX_FUNCTION_NAME_BYTES);
     while !name.is_char_boundary(end) {
@@ -1596,6 +1646,7 @@ fn read_virtual(
 pub(crate) mod tests {
     use super::strings::StringRun;
     use super::*;
+    use crate::semantic::TokenKind;
     use ghidra_decompiler::opcodes::OpCode;
     use ghidra_decompiler::program::InstructionPcode;
 
@@ -1624,6 +1675,7 @@ pub(crate) mod tests {
             coverage: Coverage::default(),
             pointers: None,
             no_return: Arc::default(),
+            symbol_names: Arc::default(),
             signatures: Vec::new(),
             applied_signatures: BTreeSet::new(),
             signature_state: None,
@@ -1650,6 +1702,101 @@ pub(crate) mod tests {
             ..Default::default()
         };
         crate::pe_symbols::register(&mut loaded.program, &metadata, 8).unwrap();
+    }
+
+    #[test]
+    fn demangled_leaf_names_are_display_only_never_no_return_evidence() {
+        let mut loaded = raw_x86(vec![0xc3; 0x40]);
+        bulk_functions(
+            &mut loaded,
+            [
+                (0x1000, "_Z4exitv".into()),
+                (0x1010, "_RNvC4demo4exit".into()),
+                (0x1020, "exit".into()),
+            ]
+            .into_iter(),
+        );
+        let index = crate::no_return::NoReturnIndex::build(
+            &loaded.program,
+            "ELF",
+            8,
+            &BTreeMap::new(),
+            |_| true,
+        );
+        assert_eq!(
+            index.targets().iter().copied().collect::<Vec<_>>(),
+            [0x1020]
+        );
+        let table = symbol_table(&loaded.program, &loaded.info, &BTreeMap::new()).unwrap();
+        let display = |address| {
+            table
+                .display_for(
+                    address,
+                    &loaded
+                        .program
+                        .functions()
+                        .unwrap()
+                        .into_iter()
+                        .find(|f| f.address == address)
+                        .unwrap()
+                        .name,
+                )
+                .map(str::to_owned)
+        };
+        assert_eq!(display(0x1000).as_deref(), Some("exit"));
+        assert_eq!(display(0x1010).as_deref(), Some("demo::exit"));
+        assert_eq!(display(0x1020), None);
+    }
+
+    #[test]
+    fn pseudocode_prints_display_names_only_for_verified_tokens_and_labels_win() {
+        // CALL 0x1020; RET at the caller, RET at the callee.
+        let mut bytes = vec![0xe8, 0x1b, 0, 0, 0, 0xc3];
+        bytes.resize(0x21, 0xc3);
+        let mut loaded = raw_x86(bytes);
+        bulk_functions(
+            &mut loaded,
+            [
+                (0x1000, "caller".into()),
+                (0x1020, "_ZN4demo6calleeEv".into()),
+            ]
+            .into_iter(),
+        );
+        loaded.symbol_names =
+            Arc::new(symbol_table(&loaded.program, &loaded.info, &BTreeMap::new()).unwrap());
+        let decompile = |loaded: &mut LoadedProgram, address| {
+            let Response::Decompiled {
+                text, semantics, ..
+            } = loaded.handle(Request::Decompile { address }).unwrap()
+            else {
+                panic!("decompilation");
+            };
+            (text, semantics)
+        };
+        let (text, semantics) = decompile(&mut loaded, 0x1000);
+        assert!(!text.contains("_ZN4demo6calleeEv"), "{text}");
+        let calls: Vec<_> = semantics
+            .tokens
+            .iter()
+            .filter(|token| matches!(token.kind, TokenKind::Call { target: 0x1020 }))
+            .map(|token| &text[token.start..token.end])
+            .collect();
+        assert_eq!(calls, ["demo::callee"], "{text}");
+        let (text, _) = decompile(&mut loaded, 0x1020);
+        assert!(text.contains("demo::callee("), "{text}");
+        // An analyst rename replaces the engine name, so it is never substituted.
+        loaded
+            .handle(Request::Rename {
+                address: 0x1020,
+                name: "label_name".into(),
+            })
+            .unwrap();
+        let (text, semantics) = decompile(&mut loaded, 0x1000);
+        assert!(!text.contains("demo::callee"), "{text}");
+        assert!(semantics.tokens.iter().any(|token| {
+            matches!(token.kind, TokenKind::Call { target: 0x1020 })
+                && &text[token.start..token.end] == "label_name"
+        }));
     }
 
     #[test]
@@ -2344,6 +2491,7 @@ pub(crate) mod tests {
             coverage: Coverage::default(),
             pointers: None,
             no_return: Arc::default(),
+            symbol_names: Arc::default(),
             signatures: Vec::new(),
             applied_signatures: BTreeSet::new(),
             signature_state: None,

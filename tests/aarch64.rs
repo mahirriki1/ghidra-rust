@@ -77,7 +77,7 @@ fn contained_data_accesses_use_literal_reads_and_block_local_propagation() {
             Path::new(env!("CARGO_BIN_EXE_ghidra-rust")),
         )
         .unwrap();
-        let Response::Opened { info } = request(
+        let Response::Opened { info, .. } = request(
             &mut worker,
             Request::Open {
                 path: binary.to_string_lossy().into_owned(),
@@ -222,7 +222,7 @@ fn contained_aarch64_workers_analyze_elf_pe_macho_and_reopen_projects() {
                 path: binary.to_string_lossy().into_owned(),
             },
         );
-        let Response::Opened { info } = response else {
+        let Response::Opened { info, .. } = response else {
             panic!("Open {format}: {response:?}");
         };
         assert_eq!(info.architecture, "AArch64");
@@ -376,7 +376,7 @@ fn contained_aarch64_workers_analyze_elf_pe_macho_and_reopen_projects() {
         let mut reopened =
             WorkerClient::start_using_executable(context, &extracted, executable).unwrap();
         reopened.retain_source(Arc::new(embedded));
-        let Response::Opened { info: fresh } = request(
+        let Response::Opened { info: fresh, .. } = request(
             &mut reopened,
             Request::Open {
                 path: extracted.to_string_lossy().into_owned(),
@@ -424,7 +424,7 @@ fn stripped_aarch64_discovery_follows_real_calls_in_all_containers() {
                 path: binary.to_string_lossy().into_owned(),
             },
         );
-        let Response::Opened { info } = response else {
+        let Response::Opened { info, .. } = response else {
             panic!("Open stripped image: {response:?}");
         };
         assert_eq!(info.entry, base);
@@ -479,7 +479,7 @@ fn aarch64_rejects_unaligned_entries_and_truncated_instructions() {
             path: binary.to_string_lossy().into_owned(),
         },
     );
-    let Response::Opened { info } = response else {
+    let Response::Opened { info, .. } = response else {
         panic!("Open bounded malformed fixture: {response:?}");
     };
     assert!(
@@ -529,7 +529,7 @@ fn arm64_pe_named_noreturn_veneer_ends_its_callers_block() {
         Path::new(env!("CARGO_BIN_EXE_ghidra-rust")),
     )
     .unwrap();
-    let Response::Opened { info } = request(
+    let Response::Opened { info, .. } = request(
         &mut worker,
         Request::Open {
             path: binary.to_string_lossy().into_owned(),
@@ -577,7 +577,7 @@ fn stripped_arm64_pe_recovers_unwind_entries_and_names_confirmed_import_veneers(
         Path::new(env!("CARGO_BIN_EXE_ghidra-rust")),
     )
     .unwrap();
-    let Response::Opened { info } = request(
+    let Response::Opened { info, .. } = request(
         &mut worker,
         Request::Open {
             path: binary.to_string_lossy().into_owned(),

@@ -179,6 +179,11 @@ impl NoReturnIndex {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn targets(&self) -> &BTreeSet<u64> {
+        &self.targets
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.targets.is_empty() && self.slots.is_empty()
     }

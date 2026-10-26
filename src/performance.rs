@@ -409,6 +409,7 @@ pub fn operation(request: &crate::model::Request) -> &'static str {
         Bytes { .. } => "bytes",
         Strings | StringsWithOptions { .. } => "strings",
         Crypto => "crypto",
+        SymbolNames { .. } => "symbol_names",
     }
 }
 

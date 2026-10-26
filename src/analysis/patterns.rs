@@ -249,6 +249,7 @@ mod tests {
             coverage: Coverage::default(),
             pointers: None,
             no_return: Arc::default(),
+            symbol_names: Arc::default(),
             signatures: Vec::new(),
             applied_signatures: BTreeSet::new(),
             signature_state: None,
