@@ -515,6 +515,8 @@ fn exports(binary: &Path) -> Vec<(String, u64)> {
         .collect()
 }
 
+// Flip this to expect display names once a reviewed MSVC backend is mapped
+// for PE images in `analysis::symbol_format`.
 #[test]
 fn msvc_decorated_exports_stay_raw_without_a_reviewed_backend() {
     let Some(binary) = std::env::var_os("GHIDRA_RUST_TEST_PE_CPP").map(PathBuf::from) else {

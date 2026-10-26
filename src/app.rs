@@ -4966,10 +4966,7 @@ impl DesktopApp {
                                                     )
                                                     .truncate(),
                                                 )
-                                                .on_hover_text(crop(
-                                                    raw.unwrap_or(label),
-                                                    MAX_HOVER_NAME,
-                                                ))
+                                                .on_hover_text(name_hover(label, raw))
                                                 .clicked()
                                             {
                                                 function = Some(item.address);
@@ -5221,7 +5218,7 @@ impl DesktopApp {
                 let response = response.on_hover_text(format!(
                     "{:x}  {}{}",
                     function.address,
-                    crop(raw.unwrap_or(label), MAX_HOVER_NAME),
+                    name_hover(label, raw),
                     detail
                 ));
                 if response.clicked() {
@@ -5636,14 +5633,9 @@ impl DesktopApp {
         if let Some(view) = graph_view(&self.graph) {
             let entry = view.address;
             let (name, raw) = self.function_names(entry).unwrap_or(("function", None));
-            let raw = raw.map(|raw| crop(raw, MAX_HOVER_NAME));
-            let title = format!("{}  {:x}", crop(name, 100), entry);
-            let row =
-                ui.horizontal(|ui| ui.label(RichText::new(title).monospace().color(theme::BLUE)));
-            let response = match raw {
-                Some(raw) => row.inner.on_hover_text(raw),
-                None => row.inner,
-            };
+            let response = ui
+                .horizontal(|ui| function_title(ui, name, raw, entry))
+                .inner;
             response.context_menu(|ui| {
                 if ui.button("Edit signature…").clicked() {
                     self.begin_signature_editor();
@@ -6983,26 +6975,26 @@ impl DesktopApp {
                                             || "Direct call".into(),
                                             |e| e.description(),
                                         );
+                                        let label = format!(
+                                            "{:x} → {:x}{}{}",
+                                            call.address,
+                                            target,
+                                            name.map_or(String::new(), |name| format!(
+                                                "  {}",
+                                                crop(name, 80)
+                                            )),
+                                            if call.no_return.is_some() {
+                                                " [no return]"
+                                            } else {
+                                                ""
+                                            }
+                                        );
                                         if ui
-                                            .button(format!(
-                                                "{:x} → {:x}{}{}",
-                                                call.address,
-                                                target,
-                                                name.map_or(String::new(), |name| format!(
-                                                    "  {}",
-                                                    crop(name, 80)
-                                                )),
-                                                if call.no_return.is_some() {
-                                                    " [no return]"
-                                                } else {
-                                                    ""
+                                            .add(egui::Button::new(label).truncate())
+                                            .on_hover_text(match name {
+                                                Some(name) => {
+                                                    format!("{}\n{evidence}", name_hover(name, raw))
                                                 }
-                                            ))
-                                            .on_hover_text(match raw {
-                                                Some(raw) => format!(
-                                                    "{}\n{evidence}",
-                                                    crop(raw, MAX_HOVER_NAME)
-                                                ),
                                                 None => evidence,
                                             })
                                             .clicked()
@@ -7122,16 +7114,7 @@ impl DesktopApp {
                 let listing = listing_of(&self.graph);
                 let entry = view.address;
                 let (name, raw) = self.function_names(entry).unwrap_or(("function", None));
-                let title = ui.label(
-                    RichText::new(format!("{}  {:x}", crop(name, 120), view.address))
-                        .monospace()
-                        .color(theme::BLUE),
-                );
-                match raw {
-                    Some(raw) => title.on_hover_text(crop(raw, MAX_HOVER_NAME)),
-                    None => title,
-                }
-                .context_menu(|ui| {
+                function_title(ui, name, raw, entry).context_menu(|ui| {
                     if ui.button("Xrefs to this function").clicked() {
                         listing_xrefs = Some(XrefTarget {
                             address: entry,
@@ -8277,6 +8260,37 @@ fn parse_address(text: &str) -> Result<u64, String> {
 
 /// Characters of a raw or displayed name shown in one tooltip.
 const MAX_HOVER_NAME: usize = 512;
+
+/// The shown name, and the raw symbol beneath it when that differs.
+fn name_hover(shown: &str, raw: Option<&str>) -> String {
+    match raw {
+        Some(raw) => format!(
+            "{}\n{}",
+            crop(shown, MAX_HOVER_NAME),
+            crop(raw, MAX_HOVER_NAME)
+        ),
+        None => crop(shown, MAX_HOVER_NAME),
+    }
+}
+
+/// A function header that truncates long names rather than widening its dock.
+fn function_title(
+    ui: &mut egui::Ui,
+    name: &str,
+    raw: Option<&str>,
+    address: u64,
+) -> egui::Response {
+    let title = format!("{}  {address:x}", crop(name, 120));
+    let response = ui.add(
+        egui::Label::new(RichText::new(&title).monospace().color(theme::BLUE))
+            .truncate()
+            .show_tooltip_when_elided(raw.is_none()),
+    );
+    match raw {
+        Some(raw) => response.on_hover_text(name_hover(name, Some(raw))),
+        None => response,
+    }
+}
 /// Characters of a call target's name appended to a Listing row.
 const LISTING_CALL_NAME: usize = 120;
 
