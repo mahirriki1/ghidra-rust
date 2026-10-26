@@ -1563,6 +1563,15 @@ fn select_functions(
     ))
 }
 
+/// The demangler's view of a validated container. PE stays `Other`, so
+/// MSVC-decorated names remain raw until a reviewed backend is selected here.
+fn symbol_format(container: &str) -> crate::symbol_names::SymbolFormat {
+    match container {
+        "Mach-O" => crate::symbol_names::SymbolFormat::MachO,
+        _ => crate::symbol_names::SymbolFormat::Other,
+    }
+}
+
 /// The open-time symbol-name table for the engine's code entries. Raw names
 /// are the loader symbols the engine recorded or exact PE metadata names; the
 /// engine's own (possibly demangled, shortened or suffixed) names never are.
@@ -1573,11 +1582,7 @@ fn symbol_table(
 ) -> Result<crate::symbol_names::SymbolTable, String> {
     let _building = crate::performance::span("open_symbol_names");
     let alignment = crate::architecture::instruction_alignment(program.language_id());
-    let format = if info.format == "Mach-O" {
-        crate::symbol_names::SymbolFormat::MachO
-    } else {
-        crate::symbol_names::SymbolFormat::Other
-    };
+    let format = symbol_format(&info.format);
     let entries = program.functions().map_err(engine_error)?;
     Ok(crate::symbol_names::SymbolTable::build(
         entries
