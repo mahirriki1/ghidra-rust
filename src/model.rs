@@ -16,6 +16,10 @@ pub const MAX_FUNCTION_NAME_BYTES: usize = 256;
 pub const MAX_SYMBOL_RAW_BYTES: usize = 4096;
 pub const MAX_SYMBOL_DISPLAY_BYTES: usize = 1024;
 pub const MAX_SYMBOL_FORMAT_WRITES: usize = 8192;
+/// Cumulative MSVC parser entries, expanded-tree visits and payload bytes.
+/// Includes backreference clones and memorization/equality walks; never resets
+/// when entering a template's local backreference context.
+pub const MAX_SYMBOL_MSVC_PARSE_WORK: usize = 32_768;
 /// Itanium parser and renderer depth. Rust v0 additionally has its own pinned
 /// backend depth limit (500); neither replaces the worker's resource controls.
 pub const SYMBOL_DEMANGLE_RECURSION_LIMIT: u32 = 128;

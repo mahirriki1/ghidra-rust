@@ -1,0 +1,14 @@
+[package]
+name = "ghidra-rust-msvc-demangler"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR NCSA"
+description = "Locally hardened, bounded MSVC display-name demangler"
+publish = false
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+bitflags = "=2.13.2"
+itoa = "=1.0.18"

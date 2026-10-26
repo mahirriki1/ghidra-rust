@@ -515,10 +515,8 @@ fn exports(binary: &Path) -> Vec<(String, u64)> {
         .collect()
 }
 
-// Flip this to expect display names once a reviewed MSVC backend is mapped
-// for PE images in `analysis::symbol_format`.
 #[test]
-fn msvc_decorated_exports_stay_raw_without_a_reviewed_backend() {
+fn msvc_decorated_exports_are_demangled_with_raw_identities() {
     let Some(binary) = std::env::var_os("GHIDRA_RUST_TEST_PE_CPP").map(PathBuf::from) else {
         assert!(
             std::env::var_os("CI").is_none(),
@@ -534,12 +532,30 @@ fn msvc_decorated_exports_stay_raw_without_a_reviewed_backend() {
     assert!(decorated.len() >= 4, "{decorated:?}");
     let (_worker, info, names) = open_names(&binary);
     for (raw, address) in &decorated {
-        assert!(names.get(*address).is_none(), "{raw} gained a display name");
+        let record = names
+            .get(*address)
+            .unwrap_or_else(|| panic!("{raw} has no display name"));
+        assert_eq!(
+            &record.raw, raw,
+            "the raw identity must be the exact export"
+        );
+        assert!(record.display.is_some(), "{raw} has no display name");
         assert!(
             info.functions
                 .iter()
                 .any(|function| function.address == *address && function.name == *raw),
-            "{raw} must keep its exact export name"
+            "{raw} must keep its exact export name as the inventory identity"
+        );
+    }
+    for display in [
+        "demangle_fixture::overloaded",
+        "demangle_fixture::identity<int>",
+        "demangle_fixture::exit",
+    ] {
+        let address = names.find(display).expect(display);
+        assert!(
+            decorated.iter().any(|(_, export)| *export == address),
+            "{display} must belong to a decorated export"
         );
     }
 }
