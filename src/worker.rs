@@ -200,6 +200,12 @@ mod tests {
             access: DataAccess::Write,
             provenance: DataProvenance::InstructionLocal,
         };
+        let address = AddressReference {
+            function: u64::MAX,
+            address: u64::MAX,
+            target: u64::MAX,
+            provenance: DataProvenance::InstructionLocal,
+        };
         let full = |n| usize::MAX - n;
         let analysis = CallAnalysis {
             references: vec![call; MAX_CALL_REFERENCES],
@@ -212,6 +218,13 @@ mod tests {
                 unsupported_instructions: full(4),
                 partial: true,
             }),
+            addresses: Some(Box::new(AddressAnalysis {
+                references: vec![address; MAX_ADDRESS_REFERENCES],
+                candidates_examined: full(10),
+                omitted_candidates: full(11),
+                unsupported_instructions: full(12),
+                partial: true,
+            })),
             functions_examined: full(5),
             decode_attempts: full(6),
             unresolved_calls: full(7),

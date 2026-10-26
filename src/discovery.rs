@@ -10,7 +10,7 @@ use crate::model::*;
 /// Saved discovery format and evidence semantics. A different value discards a
 /// project's saved discovery while keeping its other cached results.
 pub const DISCOVERY_FINGERPRINT: &str =
-    "discovery-v1-calls-v1-data-v1-switch-v1-patterns-v2-noreturn-v1-pointers-v1";
+    "discovery-v1-calls-v1-data-v1-switch-v1-patterns-v2-noreturn-v1-pointers-v1-addresses-v1";
 
 /// Committed discovery results as stored in a project. After loading they are
 /// display-only: Discover starts a fresh queue instead of trusting saved
@@ -94,6 +94,9 @@ impl DiscoverySnapshot {
                 .data
                 .as_ref()
                 .is_some_and(|data| !data.work_within(report.decode_attempts, self.batches))
+            || report.addresses.as_ref().is_some_and(|addresses| {
+                !addresses.work_within(report.decode_attempts, self.batches)
+            })
         {
             return Err("Saved discovery accounting is inconsistent".into());
         }
@@ -108,13 +111,20 @@ impl DiscoverySnapshot {
         if let Some(data) = &report.data {
             data.validate_references(info, examined)?;
         }
+        if let Some(addresses) = &report.addresses {
+            addresses.validate_references(info, examined)?;
+        }
         // Never trust a separate completeness claim; derive what must be partial.
         if (!self.pending.is_empty()
             || !self.limited.is_empty()
             || !self.failed.is_empty()
             || info.functions_truncated
             || self.capped
-            || report.data.as_ref().is_some_and(|data| data.partial))
+            || report.data.as_ref().is_some_and(|data| data.partial)
+            || report
+                .addresses
+                .as_ref()
+                .is_some_and(|addresses| addresses.partial))
             && !report.partial
         {
             return Err("Saved discovery claims complete coverage it does not have".into());
@@ -376,6 +386,11 @@ impl Discovery {
             || self.pointer_recovery.cursor.is_some()
             || self.report.partial
             || self.report.data.as_ref().is_some_and(|data| data.partial)
+            || self
+                .report
+                .addresses
+                .as_ref()
+                .is_some_and(|addresses| addresses.partial)
             || self.remaining() != 0
             || self
                 .patterns
@@ -592,6 +607,12 @@ impl Discovery {
                 .iter()
                 .flat_map(|d| &d.references)
                 .any(|r| !owners.contains(&r.function))
+            || batch
+                .analysis
+                .addresses
+                .iter()
+                .flat_map(|a| &a.references)
+                .any(|r| !owners.contains(&r.function))
         {
             return Err("Discovery evidence belongs to an unexamined function".into());
         }
@@ -647,6 +668,22 @@ impl Discovery {
             data.unsupported_instructions += update.unsupported_instructions;
             data.partial |= update.partial;
         }
+        if let Some(update) = &update.addresses {
+            // Address evidence never admits functions; its cap marks only
+            // address coverage partial.
+            let addresses = report.addresses.get_or_insert_with(Box::default);
+            let mut capped = false;
+            merge(
+                &mut addresses.references,
+                &update.references,
+                MAX_ADDRESS_REFERENCES,
+                &mut capped,
+            );
+            addresses.candidates_examined += update.candidates_examined;
+            addresses.omitted_candidates += update.omitted_candidates;
+            addresses.unsupported_instructions += update.unsupported_instructions;
+            addresses.partial |= update.partial || capped;
+        }
         Ok(())
     }
 
@@ -676,6 +713,7 @@ impl Discovery {
             || analysis.skipped_fallthrough_calls != 0
             || analysis.failed_functions != 0
             || analysis.data.is_some()
+            || analysis.addresses.is_some()
             || scan.next.is_some_and(|next| next < cursor)
             || scan.scanned_bytes > MAX_PATTERN_SCAN_BYTES
             || scan.matches > MAX_PATTERN_MATCHES
@@ -843,7 +881,7 @@ impl Discovery {
             requested,
             batch.binding.epoch,
             change,
-            batch.analysis.data.is_some(),
+            batch.analysis.instruction_evidence(),
         )?;
         adoption.finish(u64::from(changed));
         self.commit_charged(info, batch, &inventory, inventory_validation_rows)?;
@@ -1061,6 +1099,9 @@ impl crate::result_store::Retained for DiscoverySnapshot {
             .slots::<CallReference>(self.report.references.capacity());
         if let Some(data) = &self.report.data {
             bytes = bytes.slots::<DataReference>(data.references.capacity());
+        }
+        if let Some(addresses) = &self.report.addresses {
+            bytes = bytes.slots::<AddressReference>(addresses.references.capacity());
         }
         bytes.total()
     }
@@ -1877,6 +1918,116 @@ mod tests {
         );
         assert!(state.snapshot().partial);
         assert_eq!(state.remaining(), 0);
+    }
+
+    fn taken(function: u64, address: u64, target: u64) -> AddressReference {
+        AddressReference {
+            function,
+            address,
+            target,
+            provenance: DataProvenance::InstructionLocal,
+        }
+    }
+
+    #[test]
+    fn address_evidence_merges_under_its_own_cap_and_never_admits_functions() {
+        let info = info(2);
+        let mut state = Discovery::new(Some(info.entry), [], false);
+        let mut first = batch(state.begin(1, 1, 0).unwrap(), &info);
+        first.outcomes.truncate(1);
+        first.analysis.functions_examined = 1;
+        first.analysis.decode_attempts = MAX_ANALYSIS_INSTRUCTIONS;
+        // Taken code addresses that are not functions stay unadmitted.
+        first.analysis.addresses = Some(Box::new(AddressAnalysis {
+            references: (0..MAX_ADDRESS_REFERENCES as u64)
+                .map(|n| taken(info.entry, info.entry + n % 64, 0x50000 + n))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+            candidates_examined: MAX_ADDRESS_CANDIDATES,
+            ..Default::default()
+        }));
+        commit_replacement(&mut state, &info, &first).unwrap();
+        assert_eq!(state.status(0x50000), None);
+        assert!(!state.capped);
+        let addresses = state.report.addresses.as_ref().unwrap();
+        assert_eq!(addresses.references.len(), MAX_ADDRESS_REFERENCES);
+        assert!(addresses.partial && state.partial());
+
+        // Forged replies leave the publication unchanged: x86 evidence cannot
+        // be propagated, and owners must be this batch's examined seeds.
+        let request = state.begin(1, 1, 0).unwrap();
+        let mut second = batch(request, &info);
+        second.analysis.addresses = Some(Box::new(AddressAnalysis {
+            references: vec![AddressReference {
+                provenance: DataProvenance::Propagated,
+                ..taken(0x1010, 0x1010, 0x60000)
+            }],
+            candidates_examined: 1,
+            ..Default::default()
+        }));
+        assert!(commit_replacement(&mut state, &info, &second).is_err());
+        second.analysis.addresses.as_mut().unwrap().references =
+            vec![taken(info.entry, 0x1010, 0x60000)];
+        assert!(commit_replacement(&mut state, &info, &second).is_err());
+        second.analysis.addresses.as_mut().unwrap().references =
+            vec![taken(0x1010, 0x1010, 0x0fff)];
+        assert!(commit_replacement(&mut state, &info, &second).is_err());
+        assert_eq!(state.batches, 1);
+
+        // The cumulative cap holds while seed coverage continues.
+        second.analysis.addresses.as_mut().unwrap().references =
+            vec![taken(0x1010, 0x1010, 0x60000)];
+        commit_replacement(&mut state, &info, &second).unwrap();
+        let addresses = state.report.addresses.as_ref().unwrap();
+        assert_eq!(addresses.references.len(), MAX_ADDRESS_REFERENCES);
+        assert_eq!(addresses.candidates_examined, MAX_ADDRESS_CANDIDATES + 1);
+        assert_eq!(state.remaining(), 0);
+
+        // The publication round-trips and cannot hide its partial coverage.
+        let saved = state.save();
+        let json = serde_json::to_vec(&saved).unwrap();
+        let parsed: DiscoverySnapshot = serde_json::from_slice(&json).unwrap();
+        parsed.validate(&info).unwrap();
+        let mut forged = parsed.clone();
+        forged.report.partial = false;
+        forged.capped = false;
+        assert!(forged.validate(&info).is_err());
+        let mut forged = parsed;
+        forged
+            .report
+            .addresses
+            .as_mut()
+            .unwrap()
+            .candidates_examined = 0;
+        assert!(forged.validate(&info).is_err());
+    }
+
+    #[test]
+    fn legacy_discovery_without_addresses_decodes_as_unavailable() {
+        let info = info(1);
+        let mut state = Discovery::new(Some(info.entry), [], false);
+        let first = batch(state.begin(1, 1, 0).unwrap(), &info);
+        commit_replacement(&mut state, &info, &first).unwrap();
+        let mut json: serde_json::Value = serde_json::to_value(state.save()).unwrap();
+        // Absent, not an empty examined result.
+        assert!(json["report"].get("addresses").is_none());
+        json["report"]["addresses"] = serde_json::Value::Null;
+        let parsed: DiscoverySnapshot = serde_json::from_value(json).unwrap();
+        assert!(parsed.report.addresses.is_none());
+        parsed.validate(&info).unwrap();
+    }
+
+    #[test]
+    fn pattern_steps_cannot_carry_address_evidence() {
+        let info = info(2);
+        let mut state = pattern_state(&info);
+        let Request::DiscoverBatch { binding, .. } = state.begin(1, 7, 0).unwrap() else {
+            panic!()
+        };
+        let mut reply = pattern_reply(binding, &info, Some(0), vec![info.functions[0].address]);
+        reply.analysis.addresses = Some(Box::default());
+        assert!(commit_replacement(&mut state, &info, &reply).is_err());
     }
 
     #[test]

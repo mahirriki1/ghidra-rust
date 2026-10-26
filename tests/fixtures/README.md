@@ -18,6 +18,9 @@ Open `/tmp/ghidra-rust-sample` in the GUI and verify:
 - Selecting the six bytes at `xor_message` and applying XOR with key `2a`
   yields `secret`.
 - The crypto scan identifies the AES S-box prefix at `aes_sbox_prefix`.
+- After **Discover**, pressing **X** on the `address taken` string lists the
+  address-taking instruction in `remember_label`; on `aGVsbG8gcmV2ZXJzZXI=` it
+  lists `main`.
 - A function rename, comment, and saved decoded result survive a session
   save/reopen, including a portable embedded `.grproj`. The executable's SHA-256
   remains unchanged. Reopening a project displays its saved analysis provenance.

@@ -525,6 +525,12 @@ impl LoadedProgram {
                             .iter()
                             .flat_map(|data| data.references.iter().map(|r| r.function)),
                     )
+                    .chain(
+                        analysis
+                            .addresses
+                            .iter()
+                            .flat_map(|addresses| addresses.references.iter().map(|r| r.function)),
+                    )
                     .collect();
                 self.rebuild_inventory(&owners)?;
                 Ok(Response::Functions {
@@ -909,11 +915,17 @@ impl LoadedProgram {
             return Err("Data references require a byte-addressed memory space".into());
         }
         let space_name = space.get_name().to_owned();
+        let sinks = crate::data_analysis::address_sinks(
+            &mut self.program,
+            self.target.name,
+            self.target.pointer_bytes as u32,
+        )?;
         let mut data = crate::data_analysis::DataCollector::new(
             &self.info.sections,
             &space_name,
             self.target.pointer_bytes as u32,
-        );
+        )
+        .with_addresses(sinks);
         if self.target.name == "AArch64" {
             data = data.with_propagation();
         }
@@ -1110,7 +1122,9 @@ impl LoadedProgram {
             emit(AnalysisStage::Calls, &report, progress)?;
         }
         report.references = references.into_iter().collect();
-        report.data = Some(data.finish());
+        let (data, addresses) = data.finish_all();
+        report.data = Some(data);
+        report.addresses = addresses.map(Box::new);
         if self.target.name == "AArch64" && !self.pe_imports.is_empty() {
             let targets: BTreeSet<_> = report
                 .references

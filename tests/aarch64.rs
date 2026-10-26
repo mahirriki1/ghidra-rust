@@ -119,6 +119,25 @@ fn contained_data_accesses_use_literal_reads_and_block_local_propagation() {
         );
         // The load after the call stays unresolved.
         assert!(data.unresolved_accesses >= 1);
+        // ADR and the completed ADRP/ADD take the literal's address; the
+        // page base alone and the call's link register take none.
+        let taken: Vec<_> = analysis
+            .addresses
+            .as_ref()
+            .expect("Fresh address-taking analysis")
+            .references
+            .iter()
+            .filter(|reference| reference.function == base)
+            .map(|reference| (reference.address, reference.target, reference.provenance))
+            .collect();
+        assert_eq!(
+            taken,
+            [
+                (base + 4, base + 32, DataProvenance::InstructionLocal),
+                (base + 12, base + 32, DataProvenance::Propagated),
+            ],
+            "{format}"
+        );
         assert!(
             !functions
                 .iter()

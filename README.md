@@ -16,8 +16,9 @@ are recorded separately; no general speed advantage over Ghidra is claimed yet.
   in the middle, and a full-height Decompiler on the right.
 - C-like decompilation with linked instruction selection, call navigation,
   and Back / Forward history.
-- Function discovery, confirmed call and data references, and bounded
-  recovery from supported metadata, pointer tables, and function-start patterns.
+- Function discovery, confirmed call, data-access and address-taking
+  references, and bounded recovery from supported metadata, pointer tables,
+  and function-start patterns.
 - Strings, Hex / Memory Map, byte decoding, and FindCrypt-style constant scans.
 - Function labels, comments, supported local renames, and limited function
   signature editing.
@@ -117,7 +118,11 @@ be installed through the updater. See [update setup and recovery](docs/releases.
 ### References and inspection
 
 Use **X** or **Xrefs to…** to inspect confirmed call/data targets. Multiple
-targets require an explicit choice. References cover examined functions;
+targets require an explicit choice. On a **Strings** row, **X** lists the code
+that reads, writes or takes the address of that string's first byte.
+**References → Data references** filters by **All / Read / Write / Address**.
+Address-taking (x86 LEA/immediates, AArch64 ADR/ADRP+ADD) is concrete address
+formation, not proof of pointer use. References cover examined functions;
 an empty result does not prove that no references exist.
 
 **Strings** (**View → Defined Strings**) scans ASCII and printable-ASCII UTF-16LE;

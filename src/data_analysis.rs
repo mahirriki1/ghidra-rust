@@ -1,9 +1,13 @@
 //! Bounded memory-access evidence from public engine p-code: instruction-local
 //! constant pointers, plus AArch64 block-local register-constant propagation.
+//! The same evaluation separately records address formation: concrete
+//! pointer-width values left in general registers or stored to memory.
 //!
 //! Adapts direct-memory reference rules and constant-transfer/unknown-output
 //! rules from Ghidra's SymbolicPropogator.java
-//! (9a723ce99952771b8368329503aa589ae233e916), Apache-2.0. See NOTICE.
+//! (9a723ce99952771b8368329503aa589ae233e916), Apache-2.0, and its COPY,
+//! STORE and INT_ADD pointer-value checks (Ghidra 12.2,
+//! 8ca9077040cc43cd790babcfccf19475622a3e9a), Apache-2.0. See NOTICE.
 use std::collections::{BTreeMap, BTreeSet};
 
 use ghidra_decompiler::opcodes::OpCode;
@@ -22,6 +26,31 @@ pub(crate) struct DataCollector<'a> {
     /// barrier that clears all known values.
     retained: Option<BTreeMap<u64, Retained>>,
     retained_operations: usize,
+    addresses: Option<AddressState>,
+}
+
+/// Address-formation evidence sharing the data collector's p-code charges.
+struct AddressState {
+    /// Offsets of pointer-width general registers, resolved through the
+    /// engine; flags, the program counter and the stack pointer are excluded.
+    sinks: Vec<u64>,
+    /// Keyed by (function, instruction, target); one logical reference keeps
+    /// its most local provenance.
+    references: BTreeMap<(u64, u64, u64), DataProvenance>,
+    report: AddressAnalysis,
+}
+
+/// A register value formed by an earlier instruction of the current block,
+/// published once it is used, overwritten or reaches a barrier, unless a
+/// later instruction refines it first (ADRP then ADD, MOVZ then MOVK).
+#[derive(Clone, Copy)]
+struct Formed {
+    address: u64,
+    target: u64,
+    carried: bool,
+    /// An ADRP page base: an incomplete construction that is never published
+    /// as a register value on its own.
+    page: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -29,6 +58,8 @@ enum Space {
     Const,
     Register,
     Unique,
+    /// The default data space.
+    Data,
     Other,
 }
 
@@ -56,6 +87,8 @@ struct Unresolved {
 struct Retained {
     operations: Vec<Op>,
     unresolved: Vec<Unresolved>,
+    /// Decoded as ADRP, used only to classify an incomplete page base.
+    page: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -63,6 +96,9 @@ struct Known {
     value: u64,
     /// Depends on a value established by an earlier instruction.
     carried: bool,
+    /// Formed by this instruction from a constant or arithmetic, rather than
+    /// only moved or resized from an earlier instruction's register.
+    fresh: bool,
 }
 
 pub(crate) fn mask(size: u32) -> u64 {
@@ -97,6 +133,7 @@ impl Values {
             return Some(Known {
                 value: var.offset & mask(var.size),
                 carried: false,
+                fresh: true,
             });
         }
         let (unique, offset) = Self::key(var)?;
@@ -111,6 +148,7 @@ impl Values {
         (start.checked_add(u64::from(size))? >= end && shift < 8).then(|| Known {
             value: (known.value >> (shift * 8)) & mask(var.size),
             carried: known.carried,
+            fresh: known.fresh,
         })
     }
 
@@ -148,6 +186,7 @@ impl Values {
         self.entries.retain(|&(unique, _), _| !unique);
         for (_, known) in self.entries.values_mut() {
             known.carried = true;
+            known.fresh = false;
         }
     }
 }
@@ -165,10 +204,11 @@ fn evaluate(op: &Op, values: &Values) -> Option<Known> {
         Some((var, values.read(var)?))
     };
     let same = |var: Var| var.size == output.size;
-    let (value, carried) = match (op.opcode, op.inputs.len()) {
+    // Moves and width changes keep freshness; arithmetic forms a new value.
+    let (value, carried, fresh) = match (op.opcode, op.inputs.len()) {
         (Copy, 1) => {
             let (a, x) = input(0)?;
-            same(a).then_some((x.value, x.carried))?
+            same(a).then_some((x.value, x.carried, x.fresh))?
         }
         (IntAdd | IntSub | IntAnd | IntOr | IntXor, 2) => {
             let ((a, x), (b, y)) = (input(0)?, input(1)?);
@@ -182,7 +222,7 @@ fn evaluate(op: &Op, values: &Values) -> Option<Known> {
                 IntOr => x.value | y.value,
                 _ => x.value ^ y.value,
             };
-            (value, x.carried || y.carried)
+            (value, x.carried || y.carried, true)
         }
         (IntLeft | IntRight, 2) => {
             let ((a, x), (_, y)) = (input(0)?, input(1)?);
@@ -198,7 +238,7 @@ fn evaluate(op: &Op, values: &Values) -> Option<Known> {
                 Some(shift) => x.value >> shift,
                 None => 0,
             };
-            (value, x.carried || y.carried)
+            (value, x.carried || y.carried, true)
         }
         (IntZext | IntSext, 1) => {
             let (a, x) = input(0)?;
@@ -211,7 +251,7 @@ fn evaluate(op: &Op, values: &Values) -> Option<Known> {
             } else {
                 x.value
             };
-            (value, x.carried)
+            (value, x.carried, x.fresh)
         }
         (Subpiece, 2) => {
             let ((a, x), (b, y)) = (input(0)?, input(1)?);
@@ -220,20 +260,25 @@ fn evaluate(op: &Op, values: &Values) -> Option<Known> {
             {
                 return None;
             }
-            (x.value >> (y.value * 8), x.carried)
+            (x.value >> (y.value * 8), x.carried, x.fresh)
         }
         (Piece, 2) => {
             let ((a, x), (b, y)) = (input(0)?, input(1)?);
             if a.size + b.size != output.size {
                 return None;
             }
-            ((x.value << (b.size * 8)) | y.value, x.carried || y.carried)
+            (
+                (x.value << (b.size * 8)) | y.value,
+                x.carried || y.carried,
+                true,
+            )
         }
         _ => return None,
     };
     Some(Known {
         value: value & mask(output.size),
         carried,
+        fresh,
     })
 }
 
@@ -247,6 +292,24 @@ impl<'a> DataCollector<'a> {
             report: DataAnalysis::default(),
             retained: None,
             retained_operations: 0,
+            addresses: None,
+        }
+    }
+
+    /// Also records address formation into the pointer-width general
+    /// registers at `sinks` (see [`address_sinks`]) and into stored values.
+    pub fn with_addresses(mut self, sinks: Vec<u64>) -> Self {
+        self.addresses = Some(AddressState {
+            sinks,
+            references: BTreeMap::new(),
+            report: AddressAnalysis::default(),
+        });
+        self
+    }
+
+    fn address_partial(&mut self) {
+        if let Some(state) = &mut self.addresses {
+            state.report.partial = true;
         }
     }
 
@@ -269,6 +332,7 @@ impl<'a> DataCollector<'a> {
             "const" => Space::Const,
             "register" => Space::Register,
             "unique" => Space::Unique,
+            space if space == self.data_space => Space::Data,
             _ => Space::Other,
         };
         Var {
@@ -278,7 +342,9 @@ impl<'a> DataCollector<'a> {
         }
     }
 
-    pub fn inspect(&mut self, function: u64, code: &InstructionPcode) {
+    /// `mnemonic` is the engine's decoded mnemonic. It only classifies an
+    /// AArch64 ADRP page base as incomplete and never supplies a value.
+    pub fn inspect(&mut self, function: u64, code: &InstructionPcode, mnemonic: &str) {
         // Preflight the whole instruction before admitting evidence: internal
         // p-code branches make even preceding operations conditional.
         let charged = code
@@ -294,6 +360,7 @@ impl<'a> DataCollector<'a> {
                 .min(MAX_DATA_OPERATIONS_PER_INSTRUCTION)
         {
             self.report.partial = true;
+            self.address_partial();
             return;
         }
         if code.operations.len() > MAX_DATA_OPERATIONS_PER_INSTRUCTION
@@ -304,6 +371,10 @@ impl<'a> DataCollector<'a> {
         {
             self.report.unsupported_instructions += 1;
             self.report.partial = true;
+            if let Some(state) = &mut self.addresses {
+                state.report.unsupported_instructions += 1;
+                state.report.partial = true;
+            }
             return;
         }
         let mut unresolved = Vec::new();
@@ -359,24 +430,30 @@ impl<'a> DataCollector<'a> {
                 self.value(function, code.address, output, DataAccess::Write);
             }
         }
-        self.retain(code, unresolved);
+        let page = mnemonic.eq_ignore_ascii_case("adrp");
+        if self.retained.is_none() {
+            // Instruction-local address formation; nothing is carried.
+            if self.addresses.is_some() {
+                let local = Retained {
+                    operations: self.ops(code),
+                    unresolved: Vec::new(),
+                    page,
+                };
+                self.propagate_instruction(
+                    function,
+                    code.address,
+                    &local,
+                    &mut Values::default(),
+                    None,
+                );
+            }
+            return;
+        }
+        self.retain(code, unresolved, page);
     }
 
-    fn retain(&mut self, code: &InstructionPcode, unresolved: Vec<Unresolved>) {
-        let Some(retained) = &self.retained else {
-            return;
-        };
-        if retained.contains_key(&code.address) {
-            return;
-        }
-        if code.operations.len() > MAX_DATA_RETAINED_OPERATIONS - self.retained_operations {
-            // The instruction becomes a barrier; later accesses stay unresolved.
-            self.report.partial = true;
-            return;
-        }
-        self.retained_operations += code.operations.len();
-        let operations = code
-            .operations
+    fn ops(&self, code: &InstructionPcode) -> Vec<Op> {
+        code.operations
             .iter()
             .map(|operation| Op {
                 opcode: operation.opcode,
@@ -387,12 +464,30 @@ impl<'a> DataCollector<'a> {
                     .map(|input| self.var(input))
                     .collect(),
             })
-            .collect();
+            .collect()
+    }
+
+    fn retain(&mut self, code: &InstructionPcode, unresolved: Vec<Unresolved>, page: bool) {
+        let Some(retained) = &self.retained else {
+            return;
+        };
+        if retained.contains_key(&code.address) {
+            return;
+        }
+        if code.operations.len() > MAX_DATA_RETAINED_OPERATIONS - self.retained_operations {
+            // The instruction becomes a barrier; later accesses stay unresolved.
+            self.report.partial = true;
+            self.address_partial();
+            return;
+        }
+        self.retained_operations += code.operations.len();
+        let operations = self.ops(code);
         self.retained.as_mut().unwrap().insert(
             code.address,
             Retained {
                 operations,
                 unresolved,
+                page,
             },
         );
     }
@@ -406,30 +501,87 @@ impl<'a> DataCollector<'a> {
         };
         for block in blocks {
             let mut values = Values::default();
+            let mut formed = BTreeMap::new();
             for instruction in &block.instructions {
                 let Some(code) = retained.remove(&instruction.address) else {
                     values = Values::default();
+                    self.publish_formed(function, &mut formed);
                     continue;
                 };
-                self.propagate_instruction(function, instruction.address, &code, &mut values);
+                self.propagate_instruction(
+                    function,
+                    instruction.address,
+                    &code,
+                    &mut values,
+                    Some(&mut formed),
+                );
             }
+            self.publish_formed(function, &mut formed);
         }
         // Accesses outside displayed blocks were not given propagation.
         if retained.values().any(|code| !code.unresolved.is_empty()) {
             self.report.partial = true;
+        }
+        // Nor was their address formation examined at all.
+        if !retained.is_empty() {
+            self.address_partial();
         }
         retained.clear();
         self.retained = Some(retained);
         self.retained_operations = 0;
     }
 
+    /// Evaluates one instruction, resolving its retained accesses and
+    /// recording address formation. `formed` holds the block's unpublished
+    /// register values; `None` evaluates the instruction alone and publishes
+    /// its register values immediately.
     fn propagate_instruction(
         &mut self,
         function: u64,
         address: u64,
         code: &Retained,
         values: &mut Values,
+        mut formed: Option<&mut BTreeMap<u64, Formed>>,
     ) {
+        use OpCode::*;
+        let call = code
+            .operations
+            .iter()
+            .any(|op| matches!(op.opcode, Call | Callind));
+        // Values written around a transfer may be conditional or flow
+        // destinations (return addresses), so they form no addresses.
+        let transfer = code.operations.iter().any(|op| {
+            matches!(
+                op.opcode,
+                Call | Callind | Branch | Cbranch | Branchind | Return
+            )
+        });
+        // Sink registers this instruction reads or writes, including aliases.
+        let (mut read, mut written) = (BTreeSet::new(), BTreeSet::new());
+        if let Some(state) = &self.addresses {
+            let bytes = u64::from(self.pointer_bytes);
+            let overlapping = |var: &Var, into: &mut BTreeSet<u64>| {
+                if var.space != Space::Register {
+                    return;
+                }
+                let end = var.offset.saturating_add(u64::from(var.size));
+                into.extend(
+                    state
+                        .sinks
+                        .iter()
+                        .copied()
+                        .filter(|&sink| var.offset < sink.saturating_add(bytes) && sink < end),
+                );
+            };
+            for op in &code.operations {
+                for input in &op.inputs {
+                    overlapping(input, &mut read);
+                }
+                if let Some(output) = &op.output {
+                    overlapping(output, &mut written);
+                }
+            }
+        }
         let mut pending = code.unresolved.iter().peekable();
         for (index, op) in code.operations.iter().enumerate() {
             if let Some(access) = pending.next_if(|access| access.operation == index) {
@@ -453,6 +605,27 @@ impl<'a> DataCollector<'a> {
                     );
                 }
             }
+            // A stored concrete pointer is address-taking even through an
+            // unknown destination. A call's pushed return address is not.
+            if self.addresses.is_some() && !transfer {
+                let stored = match (op.opcode, op.output) {
+                    (OpCode::Store, _) => op
+                        .inputs
+                        .get(2)
+                        .filter(|value| value.size == self.pointer_bytes)
+                        .and_then(|value| values.read(*value)),
+                    (OpCode::Load, _) => None,
+                    (_, Some(output))
+                        if output.space == Space::Data && output.size == self.pointer_bytes =>
+                    {
+                        evaluate(op, values)
+                    }
+                    _ => None,
+                };
+                if let Some(known) = stored {
+                    self.address_candidate(function, address, known.value, known.carried);
+                }
+            }
             match op.opcode {
                 // Calls may clobber any register under every supported ABI.
                 OpCode::Call | OpCode::Callind => *values = Values::default(),
@@ -463,12 +636,136 @@ impl<'a> DataCollector<'a> {
                             .then(|| evaluate(op, values))
                             .flatten();
                         values.write(output, value);
-                        self.report.partial |= values.exhausted;
+                        if values.exhausted {
+                            self.address_partial();
+                            // Instruction-local evaluation resolves no access.
+                            self.report.partial |= formed.is_some();
+                        }
                     }
                 }
             }
         }
+        if self.addresses.is_some() {
+            self.form_addresses(
+                function,
+                address,
+                (code.page, call, transfer),
+                (&read, &written),
+                values,
+                &mut formed,
+            );
+        }
         values.end_instruction();
+    }
+
+    /// Final pointer-width general-register values of one instruction. Only
+    /// freshly formed values count: a pure register copy repeats existing
+    /// evidence, and a call's link register is a flow destination.
+    fn form_addresses(
+        &mut self,
+        function: u64,
+        address: u64,
+        (page, call, transfer): (bool, bool, bool),
+        (read, written): (&BTreeSet<u64>, &BTreeSet<u64>),
+        values: &Values,
+        formed: &mut Option<&mut BTreeMap<u64, Formed>>,
+    ) {
+        let pointer_bytes = self.pointer_bytes;
+        let final_value = |sink: u64| {
+            values
+                .read(Var {
+                    space: Space::Register,
+                    offset: sink,
+                    size: pointer_bytes,
+                })
+                .filter(|known| known.fresh && !transfer)
+        };
+        if let Some(formed) = formed.as_deref_mut() {
+            // Earlier formations this instruction uses or overwrites are
+            // published, unless it refines them into a new value in place.
+            let touched: Vec<u64> = formed
+                .keys()
+                .copied()
+                .filter(|sink| call || read.contains(sink) || written.contains(sink))
+                .collect();
+            let mut publish = Vec::new();
+            for sink in touched {
+                let earlier = formed.remove(&sink).expect("touched formation");
+                let refined = read.contains(&sink) && final_value(sink).is_some();
+                if !earlier.page && !refined {
+                    publish.push(earlier);
+                }
+            }
+            for earlier in publish {
+                self.address_candidate(function, earlier.address, earlier.target, earlier.carried);
+            }
+        }
+        let sinks: Vec<u64> = written.iter().copied().collect();
+        for sink in sinks {
+            let Some(known) = final_value(sink) else {
+                continue;
+            };
+            match formed.as_deref_mut() {
+                Some(formed) => {
+                    formed.insert(
+                        sink,
+                        Formed {
+                            address,
+                            target: known.value,
+                            carried: known.carried,
+                            page,
+                        },
+                    );
+                }
+                None if !page => {
+                    self.address_candidate(function, address, known.value, known.carried)
+                }
+                None => {}
+            }
+        }
+    }
+
+    /// Publishes a block's remaining formations at a barrier or block end.
+    /// ADRP page bases that nothing completed are dropped.
+    fn publish_formed(&mut self, function: u64, formed: &mut BTreeMap<u64, Formed>) {
+        for earlier in std::mem::take(formed).into_values() {
+            if !earlier.page {
+                self.address_candidate(function, earlier.address, earlier.target, earlier.carried);
+            }
+        }
+    }
+
+    /// Charges one concrete address candidate before validation and
+    /// deduplication, then records it if it names a file-backed byte.
+    fn address_candidate(&mut self, function: u64, address: u64, target: u64, carried: bool) {
+        let sections = self.sections;
+        let pointer_bytes = self.pointer_bytes;
+        let Some(state) = &mut self.addresses else {
+            return;
+        };
+        let report = &mut state.report;
+        if report.candidates_examined == MAX_ADDRESS_CANDIDATES {
+            report.partial = true;
+            return;
+        }
+        report.candidates_examined += 1;
+        if !address_target(sections, target, pointer_bytes) {
+            report.omitted_candidates += 1;
+            return;
+        }
+        let provenance = if carried {
+            DataProvenance::Propagated
+        } else {
+            DataProvenance::InstructionLocal
+        };
+        let key = (function, address, target);
+        if let Some(existing) = state.references.get_mut(&key) {
+            *existing = (*existing).min(provenance);
+        } else if state.references.len() == MAX_ADDRESS_REFERENCES {
+            report.partial = true;
+        } else {
+            state.references.insert(key, provenance);
+        }
     }
 
     fn candidate(&mut self) -> bool {
@@ -528,6 +825,80 @@ impl<'a> DataCollector<'a> {
         self.report.references = self.references.into_iter().collect();
         self.report
     }
+
+    /// Both reports; the address report is `None` unless enabled.
+    pub fn finish_all(self) -> (DataAnalysis, Option<AddressAnalysis>) {
+        let addresses = self.addresses.as_ref().map(|state| {
+            let mut report = state.report.clone();
+            report.references = state
+                .references
+                .iter()
+                .map(
+                    |(&(function, address, target), &provenance)| AddressReference {
+                        function,
+                        address,
+                        target,
+                        provenance,
+                    },
+                )
+                .collect();
+            report
+        });
+        (self.finish(), addresses)
+    }
+}
+
+/// Pointer-width general registers that can hold a formed address, through
+/// public engine register lookup. Flags, the program counter and the stack
+/// pointer are never sinks.
+pub(crate) fn address_sinks(
+    program: &mut ghidra_decompiler::program::Program,
+    architecture: &str,
+    pointer_bytes: u32,
+) -> Result<Vec<u64>, String> {
+    let names: Vec<String> = match architecture {
+        "x86-64" => ["RAX", "RCX", "RDX", "RBX", "RBP", "RSI", "RDI"]
+            .into_iter()
+            .map(str::to_owned)
+            .chain((8..16).map(|n| format!("R{n}")))
+            .collect(),
+        "x86" => ["EAX", "ECX", "EDX", "EBX", "EBP", "ESI", "EDI"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        "AArch64" => (0..31).map(|n| format!("x{n}")).collect(),
+        _ => return Err("Unsupported address analysis architecture".into()),
+    };
+    let translator = program
+        .architecture()
+        .translator()
+        .map_err(|e| format!("Missing register translator: {e}"))?;
+    let mut sinks = Vec::with_capacity(names.len());
+    for name in &names {
+        let storage = translator
+            .get_register(name)
+            .map_err(|e| format!("Missing register {name}: {e}"))?;
+        if storage.size != pointer_bytes
+            || storage
+                .space
+                .as_ref()
+                .is_none_or(|space| space.get_name() != "register")
+        {
+            return Err(format!("Register {name} is not a pointer-width register"));
+        }
+        sinks.push(storage.offset);
+    }
+    sinks.sort_unstable();
+    sinks.dedup();
+    Ok(sinks)
+}
+
+/// A target one file-backed byte can confirm: at least
+/// [`MIN_ADDRESS_REFERENCE_TARGET`], within the ABI width, and inside a
+/// mapped section's file-backed prefix. Executable bytes qualify.
+fn address_target(sections: &[SectionInfo], target: u64, pointer_bytes: u32) -> bool {
+    target >= MIN_ADDRESS_REFERENCE_TARGET
+        && mapped_range(sections, target, 1, pointer_bytes, false)
 }
 
 fn supported(operation: &PcodeOperation) -> bool {
@@ -684,6 +1055,69 @@ impl DataAnalysis {
     }
 }
 
+impl AddressAnalysis {
+    /// Bounds and ownership of this reply's evidence for an inventory already
+    /// accepted by [`validate_inventory`].
+    pub(crate) fn validate_evidence(
+        &self,
+        info: &BinaryInfo,
+        functions: &[FunctionInfo],
+        decode_attempts: usize,
+    ) -> Result<(), String> {
+        if !self.work_within(decode_attempts, 1) || functions.len() > MAX_FUNCTIONS {
+            return Err("Address analysis exceeds its work or result bounds".into());
+        }
+        self.validate_references(info, |owner| {
+            functions
+                .binary_search_by_key(&owner, |function| function.address)
+                .is_ok()
+        })
+    }
+
+    /// Accounting consistent with `batches` committed worker replies. Every
+    /// instruction offers at most one candidate per p-code operation plus
+    /// one per sink register, fewer than two per permitted operation.
+    pub(crate) fn work_within(&self, decode_attempts: usize, batches: usize) -> bool {
+        let counted = self.references.len().checked_add(self.omitted_candidates);
+        let candidate_limit = decode_attempts.checked_mul(2 * MAX_DATA_OPERATIONS_PER_INSTRUCTION);
+        let scaled = |limit: usize| batches.saturating_mul(limit);
+        !(decode_attempts > scaled(MAX_ANALYSIS_INSTRUCTIONS)
+            || self.candidates_examined > scaled(MAX_ADDRESS_CANDIDATES)
+            || self.references.len() > MAX_ADDRESS_REFERENCES
+            || self.unsupported_instructions > decode_attempts
+            || counted.is_none_or(|count| count > self.candidates_examined)
+            || candidate_limit.is_none_or(|limit| self.candidates_examined > limit)
+            || (!self.partial && self.unsupported_instructions != 0))
+    }
+
+    /// Address, owner, ordering, duplicate and provenance checks shared by
+    /// worker replies and saved discovery snapshots.
+    pub(crate) fn validate_references(
+        &self,
+        info: &BinaryInfo,
+        owned: impl Fn(u64) -> bool,
+    ) -> Result<(), String> {
+        let (alignment, pointer_bytes) = layout(info)?;
+        for (index, reference) in self.references.iter().enumerate() {
+            let previous = index.checked_sub(1).map(|index| &self.references[index]);
+            if !valid_pc(info, alignment, pointer_bytes, reference.function)
+                || !valid_pc(info, alignment, pointer_bytes, reference.address)
+                || !owned(reference.function)
+                || !address_target(&info.sections, reference.target, pointer_bytes)
+                || previous.is_some_and(|previous| {
+                    (previous.function, previous.address, previous.target)
+                        >= (reference.function, reference.address, reference.target)
+                })
+                || (reference.provenance == DataProvenance::Propagated
+                    && info.architecture != "AArch64")
+            {
+                return Err("Invalid address evidence addresses, ordering, or duplicates".into());
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Instruction alignment and pointer width after checking section layout.
 /// Inventory entries owning data evidence must be valid instruction starts.
 pub(crate) fn validate_inventory(
@@ -800,7 +1234,7 @@ mod tests {
     fn collect(operations: Vec<PcodeOperation>, pointer_bytes: u32) -> DataAnalysis {
         let sections = sections();
         let mut collector = DataCollector::new(&sections, "ram", pointer_bytes);
-        collector.inspect(0x1000, &instruction(operations));
+        collector.inspect(0x1000, &instruction(operations), "");
         collector.finish()
     }
 
@@ -814,7 +1248,7 @@ mod tests {
         let sections = sections();
         let mut collector = DataCollector::new(&sections, "ram", pointer_bytes);
         for code in program.pcode(0x1000, count).unwrap() {
-            collector.inspect(0x1000, &code);
+            collector.inspect(0x1000, &code, "");
         }
         collector.finish()
     }
@@ -828,7 +1262,7 @@ mod tests {
         let mut collector = DataCollector::new(&sections, "ram", 8).with_propagation();
         collector.begin_function();
         for code in program.pcode(0x1000, words.len()).unwrap() {
-            collector.inspect(0x1000, &code);
+            collector.inspect(0x1000, &code, "");
         }
         let blocks: Vec<_> = blocks
             .iter()
@@ -983,6 +1417,7 @@ mod tests {
                     address,
                     ..nop.clone()
                 },
+                "",
             );
         }
         assert!(!collector.report.partial);
@@ -992,6 +1427,7 @@ mod tests {
                 address: u64::MAX,
                 ..nop
             },
+            "",
         );
         assert!(collector.report.partial);
     }
@@ -1007,7 +1443,7 @@ mod tests {
             operations.push(operation);
         }
         operations.push(load(value("register", 0, 8), 8));
-        collector.inspect(0x1000, &instruction(operations));
+        collector.inspect(0x1000, &instruction(operations), "");
         collector.propagate(
             0x1000,
             [&BasicBlock {
@@ -1039,6 +1475,7 @@ mod tests {
             Some(Known {
                 value,
                 carried: false,
+                fresh: true,
             })
         };
         values.write(register(0x10, 8), known(0x1122_3344_5566_7788));
@@ -1250,8 +1687,8 @@ mod tests {
         for space in ["register", "unique"] {
             let mut establish = copy(value("const", 0x2000, 8));
             establish.output = Some(value(space, 0, 8));
-            collector.inspect(0x1000, &instruction(vec![establish]));
-            collector.inspect(0x1000, &instruction(vec![load(value(space, 0, 8), 8)]));
+            collector.inspect(0x1000, &instruction(vec![establish]), "");
+            collector.inspect(0x1000, &instruction(vec![load(value(space, 0, 8), 8)]), "");
         }
         let report = collector.finish();
         assert!(report.references.is_empty());
@@ -1355,6 +1792,7 @@ mod tests {
         collector.inspect(
             0x1000,
             &instruction(vec![copy(value("ram", 0xffff_fffc, 8))]),
+            "",
         );
         assert_eq!(collector.finish().omitted_accesses, 1);
     }
@@ -1368,7 +1806,7 @@ mod tests {
             MAX_DATA_OPERATIONS_PER_INSTRUCTION
         ]);
         for _ in 0..MAX_DATA_REFERENCES / MAX_DATA_OPERATIONS_PER_INSTRUCTION + 1 {
-            collector.inspect(0x1000, &code);
+            collector.inspect(0x1000, &code, "");
         }
         let report = collector.finish();
         assert_eq!(report.references.len(), 1);
@@ -1385,7 +1823,7 @@ mod tests {
             MAX_DATA_OPERATIONS_PER_INSTRUCTION
         ]);
         for _ in 0..MAX_DATA_OPERATIONS / MAX_DATA_OPERATIONS_PER_INSTRUCTION + 1 {
-            collector.inspect(0x1000, &no_access);
+            collector.inspect(0x1000, &no_access, "");
         }
         let report = collector.finish();
         assert_eq!(report.operations_charged, MAX_DATA_OPERATIONS);
@@ -1513,6 +1951,377 @@ mod tests {
         let mut high = report.clone();
         high.references[0].target = 0x1_0000_2000;
         assert!(high.validate(&invalid, &invalid.functions, 1).is_err());
+    }
+
+    /// Address evidence from real engine bytes at 0x1000: each instruction
+    /// alone (x86) or carried through `blocks` of instruction indices (AArch64).
+    fn addresses(
+        language: &str,
+        bytes: Vec<u8>,
+        count: usize,
+        blocks: &[&[usize]],
+    ) -> AddressAnalysis {
+        let architecture = match language {
+            l if l.starts_with("x86:LE:32:") => "x86",
+            l if l.starts_with("x86:LE:64:") => "x86-64",
+            _ => "AArch64",
+        };
+        let pointer_bytes = if architecture == "x86" { 4 } else { 8 };
+        let mut program = Program::from_raw_bytes(bytes, language, 0x1000).unwrap();
+        let sinks = address_sinks(&mut program, architecture, pointer_bytes).unwrap();
+        let sections = sections();
+        let mut collector =
+            DataCollector::new(&sections, "ram", pointer_bytes).with_addresses(sinks);
+        if architecture == "AArch64" {
+            collector = collector.with_propagation();
+        }
+        collector.begin_function();
+        let decoded = program.disassemble(0x1000, count).unwrap();
+        let codes = program.pcode(0x1000, count).unwrap();
+        for (code, instruction) in codes.iter().zip(&decoded) {
+            collector.inspect(0x1000, code, &instruction.mnemonic);
+        }
+        let blocks: Vec<_> = blocks
+            .iter()
+            .map(|indices| BasicBlock {
+                address: codes[indices[0]].address,
+                instructions: indices
+                    .iter()
+                    .map(|&index| Instruction {
+                        address: codes[index].address,
+                        bytes: Vec::new(),
+                        mnemonic: String::new(),
+                        operands: String::new(),
+                    })
+                    .collect(),
+            })
+            .collect();
+        collector.propagate(0x1000, blocks.iter());
+        let report = collector.finish_all().1.unwrap();
+        assert!(report.references.len() + report.omitted_candidates <= report.candidates_examined);
+        report
+    }
+
+    fn formed(report: &AddressAnalysis) -> Vec<(u64, u64, DataProvenance)> {
+        report
+            .references
+            .iter()
+            .map(|r| (r.address, r.target, r.provenance))
+            .collect()
+    }
+
+    fn words(words: &[u32]) -> Vec<u8> {
+        words.iter().flat_map(|word| word.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn engine_x86_lea_immediates_and_stored_pointers_take_addresses() {
+        use DataProvenance::InstructionLocal as Local;
+        for (language, bytes, expected) in [
+            // lea rax, [rip+0xf9]: an executable target is still an address.
+            (
+                "x86:LE:64:default:gcc",
+                vec![0x48, 0x8d, 0x05, 0xf9, 0, 0, 0],
+                vec![(0x1000, 0x1100, Local)],
+            ),
+            // mov edi, 0x2010 zero-extends into RDI.
+            (
+                "x86:LE:64:default:gcc",
+                vec![0xbf, 0x10, 0x20, 0, 0],
+                vec![(0x1000, 0x2010, Local)],
+            ),
+            // push 0x2010 stores through the unknown stack pointer.
+            (
+                "x86:LE:64:default:gcc",
+                vec![0x68, 0x10, 0x20, 0, 0],
+                vec![(0x1000, 0x2010, Local)],
+            ),
+            // mov qword [rip+0xff5], 0x2010 is a direct-memory store.
+            (
+                "x86:LE:64:default:gcc",
+                vec![0x48, 0xc7, 0x05, 0xf5, 0x0f, 0, 0, 0x10, 0x20, 0, 0],
+                vec![(0x1000, 0x2010, Local)],
+            ),
+            // mov eax, 0x2010; push 0x2010; mov dword [esp], 0x2010
+            (
+                "x86:LE:32:default:gcc",
+                vec![0xb8, 0x10, 0x20, 0, 0],
+                vec![(0x1000, 0x2010, Local)],
+            ),
+            (
+                "x86:LE:32:default:gcc",
+                vec![0x68, 0x10, 0x20, 0, 0],
+                vec![(0x1000, 0x2010, Local)],
+            ),
+            (
+                "x86:LE:32:default:gcc",
+                vec![0xc7, 0x04, 0x24, 0x10, 0x20, 0, 0],
+                vec![(0x1000, 0x2010, Local)],
+            ),
+        ] {
+            let report = addresses(language, bytes.clone(), 1, &[&[0]]);
+            assert_eq!(formed(&report), expected, "{language} {bytes:x?}");
+            assert!(!report.partial, "{language} {bytes:x?}");
+        }
+        // The direct store is also a write access, kept in its own class.
+        let data = real(
+            "x86:LE:64:default:gcc",
+            vec![0x48, 0xc7, 0x05, 0xf5, 0x0f, 0, 0, 0x10, 0x20, 0, 0],
+            1,
+        );
+        assert_eq!(
+            targets(&data),
+            [(0x1000, 0x2000, 8, DataAccess::Write, Local)]
+        );
+    }
+
+    #[test]
+    fn engine_x86_scalars_partial_writes_flags_calls_and_loads_take_no_address() {
+        for (language, bytes, omitted) in [
+            // mov eax, 0x10: below the explicit small-value floor.
+            ("x86:LE:64:default:gcc", vec![0xb8, 0x10, 0, 0, 0], 1),
+            // mov eax, 0x2100 (zero-fill) and 0x3000 (unmapped gap).
+            ("x86:LE:64:default:gcc", vec![0xb8, 0x00, 0x21, 0, 0], 1),
+            ("x86:LE:64:default:gcc", vec![0xb8, 0x00, 0x30, 0, 0], 1),
+            // mov rax, 0x1_0000_2000 does not fit the image's mapping.
+            (
+                "x86:LE:64:default:gcc",
+                vec![0x48, 0xb8, 0, 0x20, 0, 0, 1, 0, 0, 0],
+                1,
+            ),
+            // mov ax, 0x2010 writes only part of an unknown RAX.
+            ("x86:LE:64:default:gcc", vec![0x66, 0xb8, 0x10, 0x20], 0),
+            // mov rsp, 0x2010: stack-pointer bookkeeping is not a sink.
+            (
+                "x86:LE:64:default:gcc",
+                vec![0x48, 0xc7, 0xc4, 0x10, 0x20, 0, 0],
+                0,
+            ),
+            // cmp eax, 0x2010 only sets flags.
+            ("x86:LE:64:default:gcc", vec![0x3d, 0x10, 0x20, 0, 0], 0),
+            // mov rax, [rip+0xf9]: loaded contents are never values.
+            (
+                "x86:LE:64:default:gcc",
+                vec![0x48, 0x8b, 0x05, 0xf9, 0, 0, 0],
+                0,
+            ),
+            // call pushes a return address; it is a flow destination.
+            ("x86:LE:64:default:gcc", vec![0xe8, 0xfb, 0, 0, 0], 0),
+            ("x86:LE:32:default:gcc", vec![0xe8, 0xfb, 0, 0, 0], 0),
+            // rep movsb: values around a conditional exit are not final.
+            ("x86:LE:64:default:gcc", vec![0xf3, 0xa4], 0),
+            // cpuid is an unsupported user operation: rejected whole.
+            ("x86:LE:64:default:gcc", vec![0x0f, 0xa2], 0),
+        ] {
+            let report = addresses(language, bytes.clone(), 1, &[&[0]]);
+            assert!(report.references.is_empty(), "{bytes:x?}: {report:?}");
+            assert_eq!(report.omitted_candidates, omitted, "{bytes:x?}");
+        }
+        let unsupported = addresses("x86:LE:64:default:gcc", vec![0x0f, 0xa2], 1, &[&[0]]);
+        assert_eq!(unsupported.unsupported_instructions, 1);
+        assert!(unsupported.partial);
+        // Instruction-local only: lea then a register copy forms nothing new,
+        // and nothing is carried into the second instruction.
+        let report = addresses(
+            "x86:LE:64:default:gcc",
+            vec![0x48, 0x8d, 0x05, 0xf9, 0, 0, 0, 0x48, 0x89, 0xc7],
+            2,
+            &[&[0, 1]],
+        );
+        assert_eq!(
+            formed(&report),
+            [(0x1000, 0x1100, DataProvenance::InstructionLocal)]
+        );
+    }
+
+    #[test]
+    fn engine_aarch64_adrp_add_publishes_the_completed_address_once() {
+        use DataProvenance::*;
+        const ADD_X1_0: u32 = 0x9100_0021; // add x1, x1, #0
+        const MOV_X2_X1: u32 = 0xaa01_03e2; // mov x2, x1
+        const BL: u32 = 0x9400_0002; // bl +8
+        const STR_X1_SP: u32 = 0xf900_0be1; // str x1, [sp, #0x10]
+        for (program, blocks, expected) in [
+            // adrp; add: one reference, at the ADD.
+            (
+                vec![ADRP_X1_NEXT_PAGE, ADD_X1_0X10],
+                vec![vec![0, 1]],
+                vec![(0x1004, 0x2010, Propagated)],
+            ),
+            // A zero low part still completes the page construction.
+            (
+                vec![ADRP_X1_NEXT_PAGE, ADD_X1_0],
+                vec![vec![0, 1]],
+                vec![(0x1004, 0x2000, Propagated)],
+            ),
+            // A register copy does not repeat the formed value.
+            (
+                vec![ADRP_X1_NEXT_PAGE, ADD_X1_0X10, MOV_X2_X1],
+                vec![vec![0, 1, 2]],
+                vec![(0x1004, 0x2010, Propagated)],
+            ),
+            // An argument reaching a call is attributed to its definition;
+            // the call's link register is not an address.
+            (
+                vec![ADRP_X1_NEXT_PAGE, ADD_X1_0X10, BL],
+                vec![vec![0, 1, 2]],
+                vec![(0x1004, 0x2010, Propagated)],
+            ),
+            // A pointer-valued store is published as well.
+            (
+                vec![ADRP_X1_NEXT_PAGE, ADD_X1_0X10, STR_X1_SP],
+                vec![vec![0, 1, 2]],
+                vec![(0x1004, 0x2010, Propagated), (0x1008, 0x2010, Propagated)],
+            ),
+            // adr x5, +0x100 is complete on its own.
+            (
+                vec![0x1000_0805],
+                vec![vec![0]],
+                vec![(0x1000, 0x1100, InstructionLocal)],
+            ),
+            // movz x3, #0x2000; movk x3, #0, lsl #16: only the composition.
+            (
+                vec![0xd284_0003, 0xf2a0_0003],
+                vec![vec![0, 1]],
+                vec![(0x1004, 0x2000, Propagated)],
+            ),
+        ] {
+            let blocks: Vec<_> = blocks.iter().map(Vec::as_slice).collect();
+            let report = addresses(
+                "AARCH64:LE:64:v8A:default",
+                words(&program),
+                program.len(),
+                &blocks,
+            );
+            assert_eq!(formed(&report), expected, "{program:x?}");
+            assert!(!report.partial, "{program:x?}");
+        }
+    }
+
+    #[test]
+    fn engine_aarch64_page_bases_loads_and_block_starts_take_no_address() {
+        for (program, blocks) in [
+            // A standalone page base is incomplete.
+            (vec![ADRP_X1_NEXT_PAGE], vec![vec![0]]),
+            // adrp; ldr x2, [x1]: an access, never an address-taking.
+            (vec![ADRP_X1_NEXT_PAGE, LDR_X2_X1], vec![vec![0, 1]]),
+            // adrp; bl: a page base reaching a call stays incomplete.
+            (vec![ADRP_X1_NEXT_PAGE, 0x9400_0002], vec![vec![0, 1]]),
+            // The ADD starts another block: no incoming page base.
+            (vec![ADRP_X1_NEXT_PAGE, ADD_X1_0X10], vec![vec![0], vec![1]]),
+            // ldr x1, [x1]: loaded contents replace the page base.
+            (
+                vec![ADRP_X1_NEXT_PAGE, 0xf940_0021, ADD_X1_0X10],
+                vec![vec![0, 1, 2]],
+            ),
+        ] {
+            let blocks: Vec<_> = blocks.iter().map(Vec::as_slice).collect();
+            let report = addresses(
+                "AARCH64:LE:64:v8A:default",
+                words(&program),
+                program.len(),
+                &blocks,
+            );
+            assert!(report.references.is_empty(), "{program:x?}: {report:?}");
+            assert_eq!(report.candidates_examined, 0, "{program:x?}");
+        }
+        // Instructions outside every displayed block were never examined.
+        let report = addresses(
+            "AARCH64:LE:64:v8A:default",
+            words(&[ADRP_X1_NEXT_PAGE, ADD_X1_0X10]),
+            2,
+            &[&[0]],
+        );
+        assert!(report.partial);
+    }
+
+    #[test]
+    fn address_candidates_and_references_are_bounded_and_charged_first() {
+        let sections = sections();
+        let mut collector = DataCollector::new(&sections, "ram", 8).with_addresses(vec![0]);
+        let mut store = copy(value("const", 0x2010, 8));
+        store.output = Some(value("ram", 0x2000, 8));
+        // Repeated identical evidence is charged but deduplicated.
+        let code = instruction(vec![copy(value("const", 0x2010, 8)), store]);
+        for _ in 0..3 {
+            collector.inspect(0x1000, &code, "");
+        }
+        let report = collector.finish_all().1.unwrap();
+        assert_eq!(report.candidates_examined, 6);
+        assert_eq!(report.references.len(), 1);
+        assert!(!report.partial);
+
+        let mut collector = DataCollector::new(&sections, "ram", 8).with_addresses(vec![0]);
+        for target in 0..MAX_ADDRESS_CANDIDATES as u64 + 2 {
+            collector.inspect(
+                0x1000,
+                &InstructionPcode {
+                    address: 0x1000 + 4 * (target % 64),
+                    ..instruction(vec![copy(value("const", 0x2000 + target % 0x100, 8))])
+                },
+                "",
+            );
+        }
+        let report = collector.finish_all().1.unwrap();
+        assert_eq!(report.candidates_examined, MAX_ADDRESS_CANDIDATES);
+        assert!(report.references.len() <= MAX_ADDRESS_REFERENCES);
+        assert!(report.partial);
+    }
+
+    #[test]
+    fn validates_address_evidence_targets_owners_order_and_provenance() {
+        let info = binary();
+        let reference = |function, address, target, provenance| AddressReference {
+            function,
+            address,
+            target,
+            provenance,
+        };
+        let report = AddressAnalysis {
+            references: vec![
+                reference(0x1000, 0x1000, 0x1100, DataProvenance::InstructionLocal),
+                reference(0x1000, 0x1004, 0x2000, DataProvenance::Propagated),
+            ],
+            candidates_examined: 2,
+            ..Default::default()
+        };
+        report.validate_evidence(&info, &info.functions, 1).unwrap();
+        for invalid in [
+            reference(0x1004, 0x1004, 0x2000, DataProvenance::InstructionLocal), // owner
+            reference(0x1000, 0x1006, 0x2000, DataProvenance::InstructionLocal), // unaligned
+            reference(0x1000, 0x1004, 0x0fff, DataProvenance::InstructionLocal), // floor
+            reference(0x1000, 0x1004, 0x2100, DataProvenance::InstructionLocal), // zero-fill
+            reference(0x1000, 0x1004, 0x3000, DataProvenance::InstructionLocal), // gap
+            reference(0x1000, 0x1000, 0x1100, DataProvenance::Propagated),       // duplicate
+        ] {
+            let mut forged = report.clone();
+            forged.references[1] = invalid;
+            assert!(forged.validate_evidence(&info, &info.functions, 1).is_err());
+        }
+        let mut x86 = info.clone();
+        x86.architecture = "x86-64".into();
+        assert!(report.validate_evidence(&x86, &x86.functions, 1).is_err());
+        for forged in [
+            AddressAnalysis {
+                candidates_examined: 1,
+                ..report.clone()
+            },
+            AddressAnalysis {
+                omitted_candidates: usize::MAX,
+                ..report.clone()
+            },
+            AddressAnalysis {
+                unsupported_instructions: 1,
+                ..report.clone()
+            },
+            AddressAnalysis {
+                candidates_examined: 2 * MAX_DATA_OPERATIONS_PER_INSTRUCTION + 1,
+                ..report.clone()
+            },
+        ] {
+            assert!(forged.validate_evidence(&info, &info.functions, 1).is_err());
+        }
+        assert!(report.validate_evidence(&info, &info.functions, 0).is_err());
     }
 
     #[test]
