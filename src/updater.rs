@@ -989,9 +989,15 @@ mod tests {
         assert_eq!(fs::read(destination).unwrap(), b"old executable");
         let replacement = installation.path().join("replacement");
         fs::write(&replacement, b"replaced externally").unwrap();
+        // Windows allows renaming the retained executable, but refuses replacing
+        // it in place while BinaryProtection keeps its handle open.
+        let previous = installation.path().join("previous");
+        fs::rename(destination, &previous).unwrap();
         crate::session::atomic_replace(&replacement, destination).unwrap();
         assert!(install(&prepared, &[]).unwrap_err().contains("changed"));
         assert_eq!(fs::read(destination).unwrap(), b"replaced externally");
+        assert_eq!(fs::read(&previous).unwrap(), b"old executable");
+        assert_eq!(fs::read(&alias).unwrap(), b"old executable");
     }
 
     #[test]
