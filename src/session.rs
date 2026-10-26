@@ -58,6 +58,13 @@ impl BinaryProtection {
         let file = options
             .open(&original_path)
             .map_err(|error| format!("Cannot open input binary: {error}"))?;
+        Self::from_open_file(&original_path, file)
+    }
+
+    /// Pin an already-opened file without a close/reopen gap in its identity.
+    /// Callers supply the resolved intended path, which stays protected even
+    /// if another process renames or replaces the directory entry afterward.
+    pub(crate) fn from_open_file(path: &Path, file: File) -> Result<Self, String> {
         let metadata = file
             .metadata()
             .map_err(|error| format!("Cannot inspect input binary: {error}"))?;
@@ -71,7 +78,7 @@ impl BinaryProtection {
             .ok_or("Input file identity protection is unsupported on this platform")?;
         Ok(Self {
             _file: Arc::new(file),
-            original_path,
+            original_path: path.to_owned(),
             identity,
             snapshot_sha256: None,
         })
@@ -98,6 +105,10 @@ impl BinaryProtection {
 
     pub fn same_source(&self, other: &Self) -> bool {
         self.identity == other.identity
+    }
+
+    pub(crate) fn file_identity(&self) -> FileIdentity {
+        self.identity
     }
 
     #[cfg(not(windows))]
@@ -655,8 +666,14 @@ pub(crate) fn safe_destination(
             if !metadata.is_file() {
                 return Err("Session destination must be a regular file".into());
             }
+            #[cfg(not(windows))]
             let file = open_regular_file(&destination, u64::MAX)?;
-            if FileIdentity::from_file(&file) == Some(protection.identity) {
+            #[cfg(windows)]
+            let file = crate::windows::open_for_identity(&destination)
+                .map_err(|error| format!("Cannot inspect destination identity: {error}"))?;
+            let identity =
+                FileIdentity::from_file(&file).ok_or("Cannot determine destination identity")?;
+            if identity == protection.identity {
                 return Err("Cannot save a session over a hard link to the input binary".into());
             }
         }

@@ -204,8 +204,22 @@ dependency notices are collected from both release packages into a new
 `ghidra-rust-VERSION-notices-*.txt` beside the executable. Keep this file when
 redistributing an updated app.
 
-Recovery copies use `ghidra-rust-previous-VERSION-*` (with `.exe` on Windows).
-Keep them until the new release works, then remove obsolete copies manually.
+Recovery copies use `ghidra-rust-previous-VERSION-XXXXXX` (with `.exe` on Windows),
+where `VERSION` is a valid semantic version and `XXXXXX` is six ASCII letters or
+digits. After successful publication, the updater keeps the just-created recovery
+copy and removes older regular files matching exactly that pattern, only in the
+installation directory. Cleanup runs here because the exact new backup and input
+identity guards are still available; no startup or modification-time heuristic
+is needed. Even if the new app fails to start, that backup is the version that
+was running before the update. Failed or rolled-back installations never prune.
+
+Cleanup skips symlinks, Windows reparse points/junctions, protected inputs and
+hard-link aliases of protected or retained files. It is best effort: errors do
+not fail the update, and running or locked previous executables on Windows are
+kept. Each update scans at most 4,096 directory entries and removes at most 128
+copies, so inaccessible files or a large directory may leave additional copies
+for later updates or manual removal. Similarly named files and nested directories
+are left alone. Dependency-notice files are retained.
 To recover, close the app and copy the desired previous executable back to the
 normal executable path. Older releases may reject projects saved in a newer
 format; retain project backups before upgrading. Failed downloads and
