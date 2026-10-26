@@ -6222,6 +6222,8 @@ impl DesktopApp {
         }
         let report = &index.report;
         ui.horizontal_wrapped(|ui| {
+            // Long coverage summaries wrap within the panel.
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
             if self.saved_references {
                 ui.colored_label(theme::WARNING, "Saved analysis")
                     .on_hover_text("Saved references; run Discover to recompute.");
@@ -6465,7 +6467,7 @@ impl DesktopApp {
     fn references_panel(&mut self, ui: &mut egui::Ui) {
         let context = ui.ctx().clone();
         let mut open = None;
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(
                     self.info.is_some() && self.file_job.is_none(),
@@ -6548,6 +6550,8 @@ impl DesktopApp {
         };
         let report = &index.report;
         ui.horizontal_wrapped(|ui| {
+            // Long coverage summaries wrap within the panel.
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
             if self.saved_references {
                 ui.colored_label(theme::WARNING, "Saved analysis")
                     .on_hover_text("Saved references; run Discover to recompute.");
@@ -10715,6 +10719,62 @@ mod tests {
         app.navigate_reference(0x1000, 0x1000, &context);
         assert_eq!(app.selected, Some(0x1000));
         assert!(app.tab == Tab::Listing && app.string_target().is_none());
+    }
+
+    #[test]
+    fn reference_headers_wrap_within_narrow_panels_at_fractional_scale() {
+        let mut app = xref_app();
+        app.saved_references = true;
+        app.open_xrefs(XrefTarget {
+            address: 0x2010,
+            kind: TargetKind::StringStart,
+        });
+        for (scale, data) in [(1.0, true), (1.25, true), (1.25, false)] {
+            app.reference_data = data;
+            for width in [760.0, 560.0, 420.0] {
+                let context = egui::Context::default();
+                theme::install(&context);
+                context.set_pixels_per_point(scale);
+                let mut output = context.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, 500.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| app.references_panel(ui),
+                );
+                output.textures_delta.clear();
+                // The panel width in points after egui applies the scale.
+                let visible = context.content_rect().width();
+                // Table columns scroll horizontally; header text must not clip.
+                let rows = output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| match &shape.shape {
+                        egui::epaint::Shape::Text(text)
+                            if matches!(text.galley.text(), "Kind" | "Function") =>
+                        {
+                            Some(text.pos.y)
+                        }
+                        _ => None,
+                    })
+                    .reduce(f32::min);
+                for shape in &output.shapes {
+                    if let egui::epaint::Shape::Text(text) = &shape.shape {
+                        let bounds = text.galley.rect.translate(text.pos.to_vec2());
+                        assert!(
+                            bounds.right() <= visible + 0.5
+                                || rows.is_some_and(|row| bounds.top() >= row),
+                            "{scale} {width}: {:?} ends at {}",
+                            text.galley.text(),
+                            bounds.right()
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
