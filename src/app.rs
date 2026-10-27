@@ -517,6 +517,7 @@ fn request_task(request: &Request) -> &'static str {
         Request::Crypto => "Scanning constants",
         Request::SymbolNames { .. } => "Reading symbol names",
         Request::Linkage { .. } => "Reading imports and exports",
+        Request::SearchMemory { .. } => "Searching memory",
     }
 }
 
@@ -636,7 +637,7 @@ pub struct DesktopApp {
     discovery_summary: Option<String>,
     worker_epoch: u64,
     /// Validated symbol names for the binary generation they belong to.
-    symbol_names: Option<(u64, crate::symbol_names::SymbolNames)>,
+    symbol_names: Option<(u64, Arc<crate::symbol_names::SymbolNames>)>,
     symbol_fetch: Option<SymbolFetch>,
     /// A table digest that failed validation for a generation is not retried.
     symbol_failed: Option<(u64, String)>,
@@ -3244,7 +3245,7 @@ impl DesktopApp {
                     .symbol_names
                     .as_ref()
                     .filter(|(generation, _)| *generation == self.generation)
-                    .map(|(_, names)| names);
+                    .map(|(_, names)| names.as_ref());
                 let (label, raw) = function_display(self.session.as_ref(), symbols, function);
                 // A query cannot contain NUL, so it never spans both names.
                 let mut key = label.to_lowercase();
@@ -6358,7 +6359,7 @@ impl DesktopApp {
         self.symbol_names
             .as_ref()
             .filter(|(generation, _)| *generation == self.generation)
-            .map(|(_, names)| names)
+            .map(|(_, names)| names.as_ref())
     }
 
     /// A worker announced its open-time table. A replacement worker for the
@@ -6413,7 +6414,7 @@ impl DesktopApp {
         let fetch = self.symbol_fetch.take().expect("checked symbol fetch");
         if let Some(names) = fetch.pages.finish() {
             crate::performance::event("symbol_names_retained_bytes", names.retained_bytes() as u64);
-            self.symbol_names = Some((fetch.generation, names));
+            self.symbol_names = Some((fetch.generation, Arc::new(names)));
             self.symbol_revision = self.symbol_revision.wrapping_add(1);
             self.rebuild_filter();
         }
@@ -7432,7 +7433,7 @@ impl DesktopApp {
                                 .symbol_names
                                 .as_ref()
                                 .filter(|(generation, _)| *generation == self.generation)
-                                .map(|(_, names)| names);
+                                .map(|(_, names)| names.as_ref());
                             Some(function_display(self.session.as_ref(), symbols, function).0)
                         };
                         canvas.set_comments(

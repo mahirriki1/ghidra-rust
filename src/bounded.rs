@@ -40,6 +40,25 @@ where
     deserializer.deserialize_seq(Bounded::<T, N>(PhantomData))
 }
 
+/// Bound an untrusted string before making its owned copy.
+pub(crate) fn string<'de, D: Deserializer<'de>, const N: usize>(d: D) -> Result<String, D::Error> {
+    struct Bounded<const N: usize>;
+    impl<const N: usize> Visitor<'_> for Bounded<N> {
+        type Value = String;
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "a string of at most {N} bytes")
+        }
+        fn visit_str<E: Error>(self, value: &str) -> Result<String, E> {
+            if value.len() > N {
+                Err(E::custom("string exceeds its size limit"))
+            } else {
+                Ok(value.to_owned())
+            }
+        }
+    }
+    d.deserialize_str(Bounded::<N>)
+}
+
 struct Budget {
     nodes: usize,
     max_string: usize,
@@ -147,6 +166,7 @@ fn reply_nodes(kind: &str) -> Option<usize> {
                 + crate::signatures::MAX_INFERRED_NOTES
         }
         "signatures_synced" => 5 * crate::signatures::MAX_SIGNATURES,
+        "memory_search" => 7 * MAX_SEARCH_PAGE_RESULTS + 96,
         "bytes" => MAX_BYTE_READ,
         "strings" => 7 * MAX_STRING_RESULTS,
         "crypto" => 9 * MAX_CRYPTO_MATCHES,
@@ -212,7 +232,9 @@ pub(crate) fn check_reply(line: &[u8]) -> Result<ReplyShape, String> {
             let nodes = reply_nodes(&kind).ok_or_else(|| A::Error::custom("unknown reply kind"))?;
             let mut budget = Budget {
                 nodes,
-                max_string: if kind == "symbol_names" {
+                max_string: if kind == "memory_search" {
+                    64
+                } else if kind == "symbol_names" {
                     MAX_SYMBOL_RAW_BYTES
                 } else if kind == "linkage" {
                     MAX_SYMBOL_RAW_BYTES + crate::linkage::MAX_LINKAGE_LABEL_BYTES
@@ -259,6 +281,9 @@ pub(crate) fn check_reply(line: &[u8]) -> Result<ReplyShape, String> {
     }
     if shape.kind == "linkage" && line.len() > crate::linkage::MAX_LINKAGE_PAGE_BYTES + 512 {
         return Err("Invalid worker response: linkage page exceeds its size limit".into());
+    }
+    if shape.kind == "memory_search" && line.len() + 1 > MAX_MEMORY_SEARCH_REPLY_BYTES {
+        return Err("Invalid worker response: memory search page exceeds its size limit".into());
     }
     Ok(shape)
 }

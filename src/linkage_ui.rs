@@ -168,6 +168,11 @@ impl PreparedLinkage {
         &self.view.linkage
     }
 
+    #[allow(dead_code)] // Used by the sequential search UI implementation.
+    pub(crate) fn shared_linkage(&self) -> Arc<Linkage> {
+        Arc::clone(&self.view.linkage)
+    }
+
     /// Allocation capacity retained by the table, its view and filter keys.
     pub(crate) fn retained_bytes(&self) -> usize {
         let keys =

@@ -39,6 +39,8 @@ pub mod performance;
 mod pointer_discovery;
 pub mod project;
 pub mod result_store;
+pub mod search;
+pub mod search_text;
 pub mod selection;
 pub mod semantic;
 pub mod session;

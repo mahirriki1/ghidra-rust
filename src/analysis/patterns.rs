@@ -251,6 +251,7 @@ mod tests {
             no_return: Arc::default(),
             symbol_names: Arc::default(),
             linkage: None,
+            search: None,
             signatures: Vec::new(),
             applied_signatures: BTreeSet::new(),
             signature_state: None,

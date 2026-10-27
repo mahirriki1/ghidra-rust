@@ -403,6 +403,10 @@ impl SymbolNames {
         self.records.is_empty()
     }
 
+    pub fn records(&self) -> &[SymbolName] {
+        &self.records
+    }
+
     pub fn get(&self, address: u64) -> Option<&SymbolName> {
         self.records
             .binary_search_by_key(&address, |record| record.address)
