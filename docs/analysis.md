@@ -239,8 +239,10 @@ The Functions dock's **Imports** and **Exports** tabs show the same table as
 flat lists sorted by declared name (ordinal-only entries last, equal names in
 library order). Imports show their open address, name and library; exports show
 their address, name and, when the table has any, ordinal. Entries without a
-destination have no address and a muted name. Each tab has its own filter over
-the same name, label, ordinal, library (imports) and hexadecimal address keys;
+destination have no address and a muted name. Narrow docks hide the library or
+ordinal column to preserve name space; row tooltips retain those details.
+Each tab has its own filter over the same name, label, ordinal, library
+(imports) and hexadecimal address keys;
 the filtered list is rebuilt only when its filter, the labels or the table
 change. The tab header shows the match count or the table's **Loading**,
 **Partial** or **Unavailable** state. Selection, click/double-click, the row

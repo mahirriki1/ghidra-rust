@@ -15484,6 +15484,26 @@ mod tests {
                 let output = frame(&mut app, vec![]);
                 let again = frame(&mut app, vec![]);
                 assert_eq!(bars(&output), bars(&again), "{width}: no scrollbar flicker");
+                let mut headings: Vec<_> = output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| match &shape.shape {
+                        egui::epaint::Shape::Text(text)
+                            if ["Address", "Name", "Library", "Ordinal"]
+                                .contains(&text.galley.text()) =>
+                        {
+                            Some(text.galley.rect.translate(text.pos.to_vec2()))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                headings.sort_by(|a, b| a.left().total_cmp(&b.left()));
+                for pair in headings.windows(2) {
+                    assert!(
+                        pair[0].right() + 2.0 < pair[1].left(),
+                        "{width}: headings overlap: {pair:?}"
+                    );
+                }
                 let rows: Vec<_> = output
                     .shapes
                     .iter()

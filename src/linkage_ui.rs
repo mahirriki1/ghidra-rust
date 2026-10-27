@@ -1108,17 +1108,20 @@ impl LinkageTree {
         };
         let glyph = theme::glyph_width(ui);
         let digits = theme::address_digits(prepared.last_address);
-        let name_x = (digits + 2) as f32 * glyph;
         let width = ui.available_width();
+        // Preserve name room even for wide addresses in a narrow dock.
+        // The full address remains available in the row's hover details.
+        let name_x = ((digits + 2) as f32 * glyph).min(width * 0.45);
         let rest = (width - name_x).max(0.0);
         let tail_x = match table {
             // The library keeps at most 40% and 160 points of the name room.
             Table::Imports => Some(name_x + (rest * 0.6).max(rest - 160.0)),
             Table::Exports => prepared
                 .ordinal_digits
-                .map(|digits| width - (digits.max(5) + 2) as f32 * glyph),
+                .map(|digits| width - (digits.max(7) + 2) as f32 * glyph),
         }
-        .map(|x| x.max(name_x));
+        // Optional columns must leave useful name space and fit their heading.
+        .filter(|&x| x - name_x >= 10.0 * glyph && width - x >= 9.0 * glyph);
         let mut columns = vec![("Address", 0.0), ("Name", name_x)];
         if let Some(x) = tail_x {
             columns.push((

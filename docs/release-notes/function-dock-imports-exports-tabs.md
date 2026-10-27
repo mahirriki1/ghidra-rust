@@ -3,8 +3,9 @@
   docks collapse the tabs into a menu so every tab stays reachable.
 - List every import flat by declared name with its address and library, and
   every export with its address, name and ordinal (when the table has ordinals).
-  Each tab has its own name, label, ordinal, library or hexadecimal address
-  filter; the header shows the match count, or **Loading**, **Partial** (hover
+  Narrow docks hide the library or ordinal column to preserve name space;
+  hover still shows those details. Each tab has its own name, label, ordinal,
+  library or hexadecimal address filter; the header shows the match count, or **Loading**, **Partial** (hover
   lists coverage gaps) or **Unavailable**.
 - Select, open and right-click imports and exports in the tabs exactly as in the
   Symbol Tree: the selection is shared and highlighted in both views, code opens
