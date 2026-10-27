@@ -236,11 +236,17 @@ filter also filters imports and exports by name, label, library and hexadecimal
 address.
 
 Click selects a row; double-click opens it, and Back/Forward record the visit.
+Back/Forward restores slot and data destinations in Hex with the original span;
+code destinations retain their instruction navigation.
 An import opens its verified stub through code navigation, or otherwise its slot
 in Hex at exactly that address, selecting the pointer-width slot clipped to
 file-backed bytes. Further verified stubs and slots appear as child rows and in
 the row's context menu. Code and IFUNC-resolver exports open as code. Data
 exports open in Hex, including mapped zero-fill, and never become functions.
+Saving while viewing a slot or data export retains the previous code location
+(or entry point) for reopening; Hex spans remain session-only. Reopening also
+accepts earlier projects saved at a data address and quietly falls back to the
+saved function or entry point.
 Forwarded and unresolved entries remain selectable but have no destination or
 references. With a row selected, **X** queries its single exact address, or
 offers every stub and slot of an import in the bounded target chooser. It uses

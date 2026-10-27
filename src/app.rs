@@ -665,7 +665,9 @@ pub struct DesktopApp {
     code_chars: usize,
     auto_decompile: bool,
     selected: Option<u64>,
-    history: Vec<u64>,
+    history: Vec<crate::linkage_ui::Place>,
+    data_location: Option<(u64, u64)>,
+    code_selection: Option<u64>,
     history_index: usize,
     function_filter: String,
     filtered_functions: Vec<usize>,
@@ -813,6 +815,8 @@ impl DesktopApp {
             auto_decompile: true,
             selected: None,
             history: Vec::new(),
+            data_location: None,
+            code_selection: None,
             history_index: 0,
             function_filter: String::new(),
             filtered_functions: Vec::new(),
@@ -1041,6 +1045,8 @@ impl DesktopApp {
         self.name_edit.clear();
         self.comment_edit.clear();
         self.history.clear();
+        self.data_location = None;
+        self.code_selection = None;
         self.comment_owners.clear();
         self.annotation_browser = AnnotationBrowser::default();
         self.history_index = 0;
@@ -1624,24 +1630,16 @@ impl DesktopApp {
         self.undisplayed_call = None;
         self.selection_generation = self.selection_generation.wrapping_add(1);
         crate::performance::navigation_begin(self.selection_generation);
+        if record {
+            self.record_location(address, address);
+        }
+        self.data_location = None;
         self.selected = Some(address);
         self.address = format!("{address:x}");
         self.editor_address = None;
         self.clear_decompilation();
         self.pending_listing_scroll = None;
         self.saved_analysis = false;
-        if record {
-            if !self.history.is_empty() {
-                self.history.truncate(self.history_index + 1);
-            }
-            if self.history.last() != Some(&address) {
-                self.history.push(address);
-            }
-            if self.history.len() > 256 {
-                self.history.remove(0);
-            }
-            self.history_index = self.history.len().saturating_sub(1);
-        }
         self.graph = None;
         self.cached_graph = false;
         self.canvas = None;
@@ -1815,16 +1813,9 @@ impl DesktopApp {
     }
 
     fn select_instruction(&mut self, address: u64) {
-        self.string_focus = None;
-        self.linkage_focus = false;
-        self.selected_call = None;
-        self.xref_choices = None;
+        self.data_location = None;
+        self.set_selected_address(address);
         self.pending_comment_scroll = Some(address);
-        self.selected_local = None;
-        self.decompiler_rename_context = false;
-        self.selected = Some(address);
-        self.address = format!("{address:x}");
-        self.editor_address = None;
         self.semantic.select_instruction(address);
         self.pending_code_scroll =
             self.semantic.ranges.first().map(|range| {
@@ -1832,7 +1823,22 @@ impl DesktopApp {
             });
     }
 
+    fn set_selected_address(&mut self, address: u64) {
+        self.string_focus = None;
+        self.linkage_focus = false;
+        self.selected_call = None;
+        self.xref_choices = None;
+        self.pending_comment_scroll = None;
+        self.pending_code_scroll = None;
+        self.selected_local = None;
+        self.decompiler_rename_context = false;
+        self.selected = Some(address);
+        self.address = format!("{address:x}");
+        self.editor_address = None;
+    }
+
     fn select_decompiled_byte(&mut self, byte: usize) {
+        self.data_location = None;
         self.string_focus = None;
         self.linkage_focus = false;
         self.xref_choices = None;
@@ -2271,6 +2277,7 @@ impl DesktopApp {
 
     fn poll_worker(&mut self, context: &egui::Context) {
         if self.results.poll_inputs()
+            && self.data_location.is_none()
             && let Some(address) = self.view().map(|view| view.address)
         {
             // Re-resolving the displayed function keeps a selected tree row.
@@ -3373,6 +3380,17 @@ impl DesktopApp {
             .or_else(|| std::env::current_dir().ok())
     }
 
+    /// The existing project field describes a code selection, never a Hex span.
+    fn project_selection(&self) -> Option<u64> {
+        let info = self.info.as_ref()?;
+        self.selected
+            .filter(|_| self.data_location.is_none())
+            .or(self.code_selection)
+            .filter(|&address| crate::call_analysis::code_address(info, address))
+            .or_else(|| self.view().map(|view| view.address))
+            .or(Some(info.entry))
+    }
+
     fn save_project(&mut self, save_as: bool, context: &egui::Context) {
         let (Some(info), Some(session), Some(protection)) = (
             self.info.clone(),
@@ -3396,7 +3414,7 @@ impl DesktopApp {
             strings_truncated: self.strings_truncated,
             crypto: self.crypto.clone(),
             crypto_truncated: self.crypto_truncated,
-            selected_address: self.selected,
+            selected_address: self.project_selection(),
             discovery: self.discovery_saved.clone(),
         };
         let generation = self.generation;
@@ -3466,6 +3484,11 @@ impl DesktopApp {
         }
         let selected = data
             .selected_address
+            .filter(|&address| {
+                self.info
+                    .as_ref()
+                    .is_some_and(|info| crate::call_analysis::code_address(info, address))
+            })
             .or_else(|| data.view.as_ref().map(|v| v.address))
             .or_else(|| self.info.as_ref().map(|info| info.entry));
         if let Some(view) = data.view.filter(|view| {
@@ -3494,7 +3517,7 @@ impl DesktopApp {
                 Some(address),
             );
             self.adopt_graph(graph, ResultOrigin::Saved);
-            self.history.push(address);
+            self.history.push(crate::linkage_ui::Place::Code(address));
             self.history_index = 0;
             self.selected = selected;
             self.address = format!("{:x}", selected.unwrap_or(address));
@@ -4532,7 +4555,14 @@ impl DesktopApp {
         } else {
             return;
         }
-        self.navigate_annotation(self.history[self.history_index], false, context);
+        match self.history[self.history_index] {
+            crate::linkage_ui::Place::Code(address) => {
+                self.navigate_annotation(address, false, context)
+            }
+            crate::linkage_ui::Place::Data { address, length } => {
+                self.open_data(address, length, context)
+            }
+        }
     }
 
     fn handle_shortcuts(&mut self, context: &egui::Context) {
@@ -5401,7 +5431,7 @@ impl DesktopApp {
             .max()
             .unwrap_or(0);
         self.comment_owners.retain(|pc, _| {
-            self.history.contains(pc)
+            self.history.iter().any(|place| place.address() == *pc)
                 || self
                     .session
                     .as_ref()
@@ -5488,6 +5518,11 @@ impl DesktopApp {
     /// exact departure selection, including an instruction reached by a single
     /// click, for predictable Back/Forward behavior.
     fn record_location(&mut self, address: u64, owner: u64) {
+        self.record_destination(crate::linkage_ui::Place::Code(address), owner);
+    }
+
+    fn record_destination(&mut self, destination: crate::linkage_ui::Place, owner: u64) {
+        let address = destination.address();
         if let Some(selected) = self.selected {
             if let Some(view) = graph_view(&self.graph)
                 && (selected == view.address
@@ -5501,12 +5536,15 @@ impl DesktopApp {
                 self.comment_owners.insert(selected, view.address);
             }
             if let Some(previous) = self.history.get_mut(self.history_index) {
-                *previous = selected;
+                *previous = self.data_location.map_or(
+                    crate::linkage_ui::Place::Code(selected),
+                    |(address, length)| crate::linkage_ui::Place::Data { address, length },
+                );
             }
         }
         self.history.truncate(self.history_index + 1);
-        if self.history.last() != Some(&address) {
-            self.history.push(address);
+        if self.history.last() != Some(&destination) {
+            self.history.push(destination);
         }
         if self.history.len() > 256 {
             self.history.remove(0);
@@ -5516,7 +5554,7 @@ impl DesktopApp {
             self.comment_owners.insert(address, owner);
         }
         self.comment_owners.retain(|pc, _| {
-            self.history.contains(pc)
+            self.history.iter().any(|place| place.address() == *pc)
                 || self
                     .session
                     .as_ref()
@@ -6504,9 +6542,23 @@ impl DesktopApp {
         if address == 0 {
             return;
         }
-        self.record_location(address, address);
+        self.record_destination(crate::linkage_ui::Place::Data { address, length }, address);
+        self.open_data(address, length, context);
+    }
+
+    fn open_data(&mut self, address: u64, length: u64, context: &egui::Context) {
+        if self.data_location.is_none() {
+            self.code_selection = self.selected;
+        }
+        self.selection_generation = self.selection_generation.wrapping_add(1);
+        self.queue.retain(|request| {
+            !matches!(request, Request::Graph { .. } | Request::Decompile { .. })
+        });
         self.reference_focus = None;
-        self.select_instruction(address);
+        self.set_selected_address(address);
+        self.semantic.addresses.clear();
+        self.semantic.ranges.clear();
+        self.data_location = Some((address, length));
         let action = {
             let Some(info) = &self.info else { return };
             self.hex.go_to_span(address, length, &info.sections)
@@ -8813,7 +8865,10 @@ mod tests {
             signature: "bytes".into(),
             length: 4,
         });
-        app.history = vec![0x1000, 0x1040];
+        app.history = vec![0x1000, 0x1040]
+            .into_iter()
+            .map(crate::linkage_ui::Place::Code)
+            .collect();
         app.history_index = 1;
         let selected = app.selected;
         app.comment_owners.insert(0x1001, 0x1000);
@@ -8838,7 +8893,13 @@ mod tests {
                 && app.discovery_saved.is_none()
         );
         assert!(app.strings_scanned && app.strings.len() == 1 && app.crypto.len() == 1);
-        assert_eq!(app.history, [0x1000, 0x1040]);
+        assert_eq!(
+            app.history
+                .iter()
+                .map(|place| place.address())
+                .collect::<Vec<_>>(),
+            [0x1000, 0x1040]
+        );
         assert_eq!((app.history_index, app.selected), (1, selected));
     }
 
@@ -10191,7 +10252,10 @@ mod tests {
     fn history_shortcuts_revisit_functions_without_adding_history_entries() {
         let context = egui::Context::default();
         let mut app = keyboard_app();
-        app.history = vec![0x1000, 0x1040];
+        app.history = vec![0x1000, 0x1040]
+            .into_iter()
+            .map(crate::linkage_ui::Place::Code)
+            .collect();
         app.history_index = 1;
         app.selected = Some(0x1040);
         keyboard_frame(
@@ -10208,11 +10272,23 @@ mod tests {
         );
         assert_eq!(app.selected, Some(0x1040));
         assert_eq!(app.history_index, 1);
-        assert_eq!(app.history, [0x1000, 0x1040]);
+        assert_eq!(
+            app.history
+                .iter()
+                .map(|place| place.address())
+                .collect::<Vec<_>>(),
+            [0x1000, 0x1040]
+        );
         app.navigate(0x1080, true, &context);
         app.history_step(false, &context);
         app.navigate(0x10c0, true, &context);
-        assert_eq!(app.history, [0x1000, 0x1040, 0x10c0]);
+        assert_eq!(
+            app.history
+                .iter()
+                .map(|place| place.address())
+                .collect::<Vec<_>>(),
+            [0x1000, 0x1040, 0x10c0]
+        );
     }
 
     fn edit_view(app: &mut DesktopApp, edit: impl FnOnce(&mut FunctionView)) {
@@ -10292,7 +10368,10 @@ mod tests {
             },
         );
         show_code(&mut app, text, vec![], SemanticInfo::default());
-        app.history = vec![0x1000];
+        app.history = vec![0x1000]
+            .into_iter()
+            .map(crate::linkage_ui::Place::Code)
+            .collect();
         app
     }
 
@@ -10548,7 +10627,13 @@ mod tests {
         output.textures_delta.clear();
         assert_eq!(app.selected, Some(0x1008));
         assert_eq!(app.pending_listing_scroll, Some(2));
-        assert_eq!(app.history, [0x1004, 0x1008]);
+        assert_eq!(
+            app.history
+                .iter()
+                .map(|place| place.address())
+                .collect::<Vec<_>>(),
+            [0x1004, 0x1008]
+        );
         app.history_step(false, &context);
         assert_eq!(app.selected, Some(0x1004));
         assert_eq!(app.pending_listing_scroll, Some(1));
@@ -10637,7 +10722,10 @@ mod tests {
         let context = egui::Context::default();
         let mut app = semantic_app();
         app.tab = Tab::Graph;
-        app.history = vec![0x1000, 0x1004];
+        app.history = vec![0x1000, 0x1004]
+            .into_iter()
+            .map(crate::linkage_ui::Place::Code)
+            .collect();
         app.history_index = 1;
         app.history_step(false, &context);
         assert_eq!(app.selected, Some(0x1000));
@@ -10775,7 +10863,13 @@ mod tests {
         );
         assert_eq!(app.pending_listing_scroll, Some(1));
         assert_eq!(app.selection_generation, generation);
-        assert_eq!(app.history, vec![0x1000]);
+        assert_eq!(
+            app.history
+                .iter()
+                .map(|place| place.address())
+                .collect::<Vec<_>>(),
+            [0x1000]
+        );
         assert!(app.client.is_none());
         assert!(context.memory(|memory| memory.focused()).is_none());
         // Unmapped punctuation does not fabricate a nearby machine address.
@@ -11672,7 +11766,13 @@ mod tests {
             }
         }
         assert_eq!(app.selected, Some(0x1040));
-        assert_eq!(app.history, [0x1000, 0x1040]);
+        assert_eq!(
+            app.history
+                .iter()
+                .map(|place| place.address())
+                .collect::<Vec<_>>(),
+            [0x1000, 0x1040]
+        );
     }
 
     #[test]
@@ -11964,7 +12064,13 @@ mod tests {
         );
         output.textures_delta.clear();
         assert_eq!(app.decompiled(), source);
-        assert_eq!(app.history, [0x1000]);
+        assert_eq!(
+            app.history
+                .iter()
+                .map(|place| place.address())
+                .collect::<Vec<_>>(),
+            [0x1000]
+        );
         assert_eq!(app.strings[0].text, "saved string");
         assert!(app.strings_truncated);
         assert!(extracted.exists());
@@ -13432,7 +13538,13 @@ mod tests {
         app.select_instruction(0x1008);
         // A callsite in another function is recorded as its exact instruction.
         app.navigate_reference(0x1040, 0x1044, &context);
-        assert_eq!(app.history, [0x1008, 0x1044]);
+        assert_eq!(
+            app.history
+                .iter()
+                .map(|place| place.address())
+                .collect::<Vec<_>>(),
+            [0x1008, 0x1044]
+        );
         assert_eq!(app.reference_focus, Some((0x1040, 0x1044)));
         assert_eq!(app.comment_owners.get(&0x1044), Some(&0x1040));
         assert_eq!(app.comment_owners.get(&0x1008), Some(&0x1000));
@@ -13458,7 +13570,13 @@ mod tests {
         // Forward reopens the recorded owner, not a guessed function at the PC.
         app.history_step(true, &context);
         assert_eq!(app.reference_focus, Some((0x1040, 0x1044)));
-        assert_eq!(app.history, [0x1008, 0x1044]);
+        assert_eq!(
+            app.history
+                .iter()
+                .map(|place| place.address())
+                .collect::<Vec<_>>(),
+            [0x1008, 0x1044]
+        );
     }
 
     /// No worker process is needed to exercise delivery order. A pending
@@ -13552,7 +13670,10 @@ mod tests {
         let context = egui::Context::default();
         let mut app = hex_app();
         app.semantic.select_instruction(0x1004);
-        app.history = vec![0x1040, 0x1000];
+        app.history = vec![0x1040, 0x1000]
+            .into_iter()
+            .map(crate::linkage_ui::Place::Code)
+            .collect();
         app.history_index = 1;
         let selected = app.selected;
         let address_field = app.address.clone();
@@ -14622,7 +14743,10 @@ mod tests {
         app.open_linkage(LinkageItem::Export(1), &context);
         assert_eq!(app.tab, Tab::Hex);
         assert_eq!(app.selected, Some(fixture::DATA_EXPORT));
-        assert_eq!(app.history.last(), Some(&fixture::DATA_EXPORT));
+        assert_eq!(
+            app.history.last().map(|place| place.address()),
+            Some(fixture::DATA_EXPORT)
+        );
         assert_eq!(app.linkage.selected(), Some(LinkageItem::Export(1)));
         unchanged(&app);
         // Forwarders and unresolved entries only become selected.
@@ -14641,7 +14765,10 @@ mod tests {
         assert_eq!(app.selected, Some(fixture::STUB));
         assert_eq!(app.tab, Tab::Listing);
         assert_ne!(app.selection_generation, generation);
-        assert_eq!(app.history.last(), Some(&fixture::STUB));
+        assert_eq!(
+            app.history.last().map(|place| place.address()),
+            Some(fixture::STUB)
+        );
         // Its slot-only namesake in another library opens its slot instead.
         app.open_linkage(LinkageItem::Import(1), &context);
         assert_eq!(
@@ -14656,6 +14783,27 @@ mod tests {
         assert_eq!(app.selected, Some(fixture::DATA_EXPORT));
         app.history_step(true, &context);
         assert_eq!(app.selected, Some(fixture::STUB));
+        app.history_step(true, &context);
+        assert_eq!(
+            (app.tab, app.selected),
+            (Tab::Hex, Some(fixture::SLOT_ONLY))
+        );
+        assert_eq!(app.hex.focused_span(), Some((fixture::SLOT_ONLY, 8)));
+        assert!(app.semantic.addresses.is_empty());
+        // Returning to the same VA with a different span retains both steps.
+        app.navigate_data(fixture::SLOT_ONLY, 1, &context);
+        app.history_step(false, &context);
+        assert_eq!(app.hex.focused_span(), Some((fixture::SLOT_ONLY, 8)));
+        app.history_step(true, &context);
+        assert_eq!(app.hex.focused_span(), Some((fixture::SLOT_ONLY, 1)));
+        for offset in 0..300 {
+            app.navigate_data(fixture::SLOT_ONLY, 1 + offset % 8, &context);
+        }
+        assert_eq!(app.history.len(), 256);
+        assert_eq!(app.history_index, 255);
+        app.history_step(false, &context);
+        app.navigate_data(fixture::DATA_EXPORT, 1, &context);
+        assert_eq!(app.history_index + 1, app.history.len());
         assert_eq!(app.info.as_ref().unwrap().functions, functions);
     }
 
@@ -14952,6 +15100,182 @@ mod tests {
         frame(&context, &mut app, 260.0, pointer_events(data));
         assert_eq!(app.tab, Tab::Hex);
         assert_eq!(app.selected, Some(crate::linkage_ui::fixture::DATA_EXPORT));
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn project_saved_at_linkage_data_reopens_and_fetches_tree_without_navigation() {
+        use crate::linkage_ui::{LinkageItem, Status};
+        let directory = tempfile::tempdir().unwrap();
+        #[cfg(target_os = "linux")]
+        let binary = {
+            let binary = directory.path().join("sample");
+            assert!(
+                std::process::Command::new("gcc")
+                    .args(["-O0", "-g", "-rdynamic", "tests/fixtures/sample.c", "-o"])
+                    .arg(&binary)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            binary
+        };
+        #[cfg(windows)]
+        let binary = match std::env::var_os("GHIDRA_RUST_TEST_PE") {
+            Some(path) => PathBuf::from(path),
+            None => return, // scripts/build-windows.ps1 supplies the native fixture.
+        };
+        let executable = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(if cfg!(windows) {
+                "ghidra-rust.exe"
+            } else {
+                "ghidra-rust"
+            });
+        assert!(
+            executable.is_file(),
+            "full cargo test builds the worker executable: {}",
+            executable.display()
+        );
+        let context = egui::Context::default();
+        let mut app = DesktopApp::empty(None);
+        // Use the application's executable rather than Cargo's test harness.
+        let start = |app: &mut DesktopApp, path: PathBuf| {
+            let mut client =
+                WorkerClient::start_using_executable(context.clone(), &path, &executable).unwrap();
+            if let Some(project) = &app.opening_project
+                && let Some(binary) = &project.project.binary
+            {
+                client.retain_source(Arc::new(binary.clone()));
+            }
+            app.client = Some(client);
+            app.worker_epoch += 1;
+            app.opening = Some(Opening {
+                path: path.clone(),
+                preserve: false,
+                follow: None,
+                revision: app.revision,
+                follow_origin: app.request_origin(),
+            });
+            app.send_direct(Request::Open {
+                path: path.to_string_lossy().into_owned(),
+            });
+        };
+        let settle = |app: &mut DesktopApp| {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                app.poll_worker(&context);
+                if app.linkage.status() == Status::Ready
+                    && app.pending.is_none()
+                    && app.queue.is_empty()
+                    && !app.results.preparing()
+                    && app.deferred_restore.is_none()
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "reopen did not settle: {}, tree {:?}",
+                    app.status,
+                    app.linkage.status()
+                );
+                assert!(app.client.is_some(), "worker stopped: {}", app.status);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        start(&mut app, binary);
+        settle(&mut app);
+        app.analyze_prompt = None;
+        let code_pc = app.selected.unwrap();
+        #[cfg(target_os = "linux")]
+        let item = {
+            let linkage = app.linkage.prepared().unwrap().linkage();
+            let import = linkage
+                .imports
+                .iter()
+                .find(|import| import.raw.as_deref() == Some("__libc_start_main"))
+                .unwrap();
+            assert!(import.stub.is_none());
+            LinkageItem::Import(import.id)
+        };
+        #[cfg(windows)]
+        let item = {
+            let linkage = app.linkage.prepared().unwrap().linkage();
+            LinkageItem::Export(
+                linkage
+                    .exports
+                    .iter()
+                    .find(|export| export.raw.as_deref() == Some("base64_message"))
+                    .unwrap()
+                    .id,
+            )
+        };
+        app.open_linkage(item, &context);
+        let data_address = app.selected.unwrap();
+        assert_eq!(app.tab, Tab::Hex);
+        assert_eq!(app.project_selection(), Some(code_pc));
+        let project_path = directory.path().join("data-location.grproj");
+        app.project_path = Some(project_path.clone());
+        app.save_project(false, &context);
+        while app.file_job.is_some() {
+            app.poll_files(&context);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(
+            ProjectData::load(&project_path)
+                .unwrap()
+                .data
+                .selected_address,
+            Some(code_pc)
+        );
+        // Also exercise projects saved by the original feature: they persisted
+        // a data selection alongside the previous displayed code results.
+        let mut old = ProjectData::load(&project_path).unwrap().data;
+        old.selected_address = Some(data_address);
+        old.info.source_identity = app.info.as_ref().unwrap().source_identity;
+        let legacy_path = directory.path().join("legacy-data-location.grproj");
+        old.save(&legacy_path, app.binary_protection.as_ref().unwrap(), true)
+            .unwrap();
+        old.view = None;
+        old.decompiled = None;
+        old.mappings.clear();
+        old.semantics = Default::default();
+        let entry_path = directory.path().join("legacy-no-code-view.grproj");
+        old.save(&entry_path, app.binary_protection.as_ref().unwrap(), true)
+            .unwrap();
+        let entry = app.info.as_ref().unwrap().entry;
+        for (path, expected_pc) in [
+            (project_path, code_pc),
+            (legacy_path, code_pc),
+            (entry_path, entry),
+        ] {
+            app.clear_binary();
+            app.open_project(path, &context);
+            while app.file_job.is_some() {
+                app.poll_files(&context);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let opening = app
+                .opening
+                .as_ref()
+                .expect("project starts worker verification")
+                .path
+                .clone();
+            // Replace only Cargo's harness process; keep the real file-load,
+            // Opened verification, deferred restore and page-adoption paths.
+            start(&mut app, opening);
+            settle(&mut app);
+            assert_eq!(app.selected, Some(expected_pc));
+            assert!(app.view().is_some());
+            assert!(!app.status.contains("outside file-backed"));
+            assert_eq!(app.linkage.status(), Status::Ready);
+            assert!(!app.linkage.prepared().unwrap().linkage().imports.is_empty());
+        }
+        app.clear_binary();
     }
 
     #[test]

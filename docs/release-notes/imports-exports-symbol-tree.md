@@ -11,7 +11,8 @@
   Back/Forward history. Imports open their verified stub as code, or else their
   slot in Hex at that exact address with the pointer-width slot selected. Code
   and resolver exports open as code; data exports open in Hex and never become
-  functions. Forwarded and unresolved entries are selectable but do not navigate.
+  functions. Back/Forward restores each Hex destination and its selected span.
+  Forwarded and unresolved entries are selectable but do not navigate.
   Further verified stubs and slots appear as child rows and in the row's context
   menu.
 - Press **X** on an import or export row to see references to its exact address,
@@ -29,6 +30,8 @@
   unknown. ELF imports link to their classic `.plt` or IBT `.plt.sec` stubs only
   when the stub's jump reads that import's own relocation slot. Mach-O uses nlist declarations, library ordinals and indirect symbols.
 - Imports, exports, group expansion and the filter are not saved in projects;
-  reopening rebuilds them from the verified binary with unchanged project and
-  annotation formats. dyld binding opcodes, chained fixups and export tries remain
+  reopening rebuilds them from the verified binary without requiring navigation.
+  Projects saved while viewing a slot or data export reopen at the previous code
+  location (or entry point), without attempting to analyze data as code. Project
+  and annotation formats are unchanged. dyld binding opcodes, chained fixups and export tries remain
   unsupported and mark the tree **Partial**.

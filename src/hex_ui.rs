@@ -214,7 +214,16 @@ impl HexPanel {
             });
         match result {
             Ok((page, offset)) => {
-                let action = self.navigate(page, Some(offset), address);
+                // Explicit span navigation is a new consumer/selection even
+                // within a pending page. Give it its own token so an old
+                // consumer's late reply cannot cancel or populate this one.
+                let action = if self.target == Some(page) && self.pending.is_some() {
+                    let action = self.start_read(page);
+                    self.set_focus(Some(offset), address);
+                    action
+                } else {
+                    self.navigate(page, Some(offset), address)
+                };
                 let section = &sections[page.section];
                 let backed = section
                     .address
@@ -230,6 +239,15 @@ impl HexPanel {
                 None
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn focused_span(&self) -> Option<(u64, u64)> {
+        let range = self.selection_range()?;
+        Some((
+            self.target?.address + range.start as u64,
+            range.len() as u64,
+        ))
     }
 
     fn turn_page(&mut self, address: u64, sections: &[SectionInfo]) -> Option<HexAction> {
@@ -944,6 +962,20 @@ mod tests {
         assert_eq!(panel.selected_bytes(), Some((0x3007, vec![0])));
         assert!(panel.go_to(0x3008, &sections).is_none());
         assert_eq!(panel.loaded_page().unwrap().0, 0x3003);
+    }
+
+    #[test]
+    fn successive_span_navigation_renews_pending_page_without_losing_the_exact_span() {
+        let sections = [section(0x2000, 0x100, 0x100)];
+        let mut panel = HexPanel::default();
+        let old = read(panel.go_to_span(0x2008, 8, &sections));
+        let latest = read(panel.go_to_span(0x2020, 4, &sections));
+        assert_ne!(old.0, latest.0);
+        assert!(!panel.expects(old.0, old.1, old.2));
+        assert!(panel.expects(latest.0, latest.1, latest.2));
+        assert_eq!(panel.focused_span(), Some((0x2020, 4)));
+        deliver(&mut panel, latest);
+        assert_eq!(panel.selected_bytes(), Some((0x2020, vec![0; 4])));
     }
 
     #[test]

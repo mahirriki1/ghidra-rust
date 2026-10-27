@@ -52,6 +52,14 @@ pub(crate) enum Place {
     Data { address: u64, length: u64 },
 }
 
+impl Place {
+    pub(crate) fn address(self) -> u64 {
+        match self {
+            Self::Code(address) | Self::Data { address, .. } => address,
+        }
+    }
+}
+
 /// What a tree interaction asks the desktop to do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TreeAction {
@@ -1552,6 +1560,103 @@ mod tests {
         tree.begin(3, 1);
         let complete = fixture::fetch(&mut tree, &empty, &info, 3, 1).unwrap();
         assert!(complete.imports.is_empty() && complete.exports.is_empty());
+    }
+
+    #[test]
+    fn expanded_group_rows_fit_fractional_docks_and_remain_virtualized_during_fast_scrolls() {
+        let info = fixture::info(&sha());
+        let mut records = vec![LinkageRecord::Library(crate::linkage::Library {
+            id: 0,
+            name: "library.dll".into(),
+        })];
+        records.extend((0..10_000).map(|id| {
+            LinkageRecord::Import(fixture::import(
+                id,
+                Some(&format!("import_{id:05}_long_declared_name")),
+                Some(0),
+            ))
+        }));
+        let table = LinkageTable::new(records, Vec::new()).with_image(&sha());
+        for width in [173.6, 420.0] {
+            let context = egui::Context::default();
+            theme::install(&context);
+            context.set_pixels_per_point(1.25);
+            let mut tree = LinkageTree::default();
+            tree.begin(1, 1);
+            let linkage = fixture::fetch(&mut tree, &table, &info, 1, 1).unwrap();
+            tree.build(linkage, &context);
+            assert!(matches!(tree.wait(), Polled::Ready(_)));
+            tree.toggle(GroupKey::Library(0), false);
+            tree.refresh_rows(None, 0, "");
+            let mut previous_x = None;
+            let mut seen = BTreeSet::new();
+            for frame in 0..35 {
+                let delta = match frame {
+                    0..=4 => 0.0,
+                    5..=14 => -1800.0,
+                    15..=24 => 1800.0,
+                    _ => 0.0,
+                };
+                let mut output = context.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, 240.0),
+                        )),
+                        time: Some(frame as f64 / 30.0),
+                        events: vec![
+                            egui::Event::PointerMoved(egui::pos2(80.0, 70.0)),
+                            egui::Event::MouseWheel {
+                                unit: egui::MouseWheelUnit::Point,
+                                phase: egui::TouchPhase::Move,
+                                source: egui::MouseWheelSource::Unknown,
+                                delta: egui::vec2(0.0, delta),
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                    |ui| {
+                        tree.import_list(ui, None, 8, &mut None, &mut None);
+                    },
+                );
+                let mut rows = Vec::new();
+                for shape in &output.shapes {
+                    if let egui::Shape::Text(text) = &shape.shape
+                        && text.galley.text().starts_with("import_")
+                    {
+                        let bounds = text.galley.rect.translate(text.pos.to_vec2());
+                        assert!(
+                            bounds.right() <= shape.clip_rect.right() + 0.8,
+                            "row must fit dock: {bounds:?}"
+                        );
+                        if let Some(x) = previous_x {
+                            assert_eq!(bounds.left(), x, "no horizontal gutter flicker");
+                        }
+                        previous_x = Some(bounds.left());
+                        seen.insert(text.galley.text()[7..12].parse::<u32>().unwrap());
+                        rows.push(bounds);
+                    }
+                }
+                assert!(
+                    (6..=11).contains(&rows.len()),
+                    "virtualized viewport has no blanks: {} rows",
+                    rows.len()
+                );
+                for pair in rows.windows(2) {
+                    assert!(
+                        (pair[1].center().y - pair[0].center().y - theme::ROW_HEIGHT).abs() < 0.81,
+                        "fixed-height alignment"
+                    );
+                }
+                output.textures_delta.clear();
+            }
+            assert!(
+                seen.iter().next_back().unwrap() > &500,
+                "rapid scroll reaches distant rows"
+            );
+            assert!(seen.len() < 400, "only visible rows are painted");
+        }
     }
 
     #[test]
