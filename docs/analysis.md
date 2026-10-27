@@ -265,7 +265,9 @@ demanglers and remain separate from exact raw identities.
   `DT_NEEDED` alone cannot assign an import owner. Weak declarations and symbol
   versions are retained. Existing engine import stubs also require an
   unambiguous raw identity and a conventional encoded jump to that symbol's
-  verified relocation slot. Other PLT/veneer forms stay unresolved. IFUNC exports
+  verified relocation slot: classic `.plt` entries and IBT `.plt.sec` entries
+  (an `ENDBR` landing pad, optionally followed by a `BND` jump) are recognized.
+  Other PLT/veneer forms, including 32-bit PIC `jmp *slot(%ebx)`, stay unresolved. IFUNC exports
   are tagged as resolvers; TLS and absolute declarations have no code destination.
 - Thin Mach-O reads external nlist declarations, checked two-level library
   ordinals and indirect-symbol pointer/stub locations. Self, main-executable,

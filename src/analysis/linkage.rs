@@ -420,27 +420,28 @@ pub(crate) struct EngineStub<'a> {
 /// Exact slot encoded by a conventional stub in the immutable snapshot.
 /// Name equality alone never establishes a relationship to an import.
 fn stub_slot(bytes: &[u8], info: &BinaryInfo, address: u64) -> Option<u64> {
-    let width = if info.architecture == "AArch64" {
-        12
-    } else {
-        6
-    };
     let index = info
         .sections
         .partition_point(|section| section.address <= address)
         .checked_sub(1)?;
     let section = &info.sections[index];
-    if !section.executable || !section.backs(address, width) {
+    if !section.executable {
         return None;
     }
-    let at = usize::try_from(
-        section
-            .file_offset
-            .checked_add(address.checked_sub(section.address)?)?,
-    )
-    .ok()?;
-    let code = bytes.get(at..at.checked_add(width as usize)?)?;
+    let read = |width: u64| {
+        if !section.backs(address, width) {
+            return None;
+        }
+        let at = usize::try_from(
+            section
+                .file_offset
+                .checked_add(address.checked_sub(section.address)?)?,
+        )
+        .ok()?;
+        bytes.get(at..at.checked_add(usize::try_from(width).ok()?)?)
+    };
     if info.architecture == "AArch64" {
+        let code = read(12)?;
         crate::pe_symbols::aarch64_veneer_slot(
             address,
             [
@@ -450,9 +451,19 @@ fn stub_slot(bytes: &[u8], info: &BinaryInfo, address: u64) -> Option<u64> {
             ],
         )
     } else {
+        // IBT PLT entries (`.plt.sec`) begin with an ENDBR landing pad, and
+        // MPX-era entries put a BND prefix on the indirect jump.
+        let mut skip = 0;
+        if read(4).is_some_and(|pad| matches!(pad, [0xf3, 0x0f, 0x1e, 0xfa | 0xfb])) {
+            skip = 4;
+        }
+        if read(skip + 1).is_some_and(|code| code[skip as usize] == 0xf2) {
+            skip += 1;
+        }
+        let code = read(skip + 6)?;
         crate::pe_symbols::x86_thunk_slot(
-            address,
-            code,
+            address.checked_add(skip)?,
+            &code[skip as usize..],
             crate::architecture::properties(&info.architecture)?.0 as u32,
         )
     }

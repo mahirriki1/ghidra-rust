@@ -26,7 +26,8 @@
 - Preserve PE aliases, ordinal-only and data exports, forwarders, and conventional
   RVA-form delay imports without adding delay imports to analysis registration.
   ELF ownership uses symbol-version requirements; unowned declarations remain
-  unknown. Mach-O uses nlist declarations, library ordinals and indirect symbols.
+  unknown. ELF imports link to their classic `.plt` or IBT `.plt.sec` stubs only
+  when the stub's jump reads that import's own relocation slot. Mach-O uses nlist declarations, library ordinals and indirect symbols.
 - Imports, exports, group expansion and the filter are not saved in projects;
   reopening rebuilds them from the verified binary with unchanged project and
   annotation formats. dyld binding opcodes, chained fixups and export tries remain

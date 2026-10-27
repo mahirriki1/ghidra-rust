@@ -816,11 +816,13 @@ impl LoadedProgram {
                             entry.source == ghidra_decompiler::program::FunctionSource::ImportStub
                         })
                         .take(crate::linkage::MAX_LINKAGE_LOCATIONS)
-                        .filter_map(|entry| {
-                            entry.symbol.as_deref().map(|raw| linkage::EngineStub {
-                                address: entry.address,
-                                raw,
-                            })
+                        // The engine records `symbol` only when it differs
+                        // from the loaded name, so plain C stubs carry their
+                        // raw name in `name`. A name only selects a candidate;
+                        // the stub's encoded slot must still match it.
+                        .map(|entry| linkage::EngineStub {
+                            address: entry.address,
+                            raw: entry.symbol.as_deref().unwrap_or(&entry.name),
                         })
                         .collect();
                     self.linkage = Some(linkage::table(&self.snapshot, &self.info, pe, &stubs));
