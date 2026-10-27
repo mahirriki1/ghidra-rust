@@ -3453,6 +3453,9 @@ impl DesktopApp {
             cache_compatible,
             ..
         } = project;
+        // Projects persist a code location, so reveal it even if the previous
+        // binary was closed while Hex or another analysis tab was active.
+        self.tab = Tab::Listing;
         self.embed_binary = binary.is_some();
         self.project_binary = binary;
         self.project_path = Some(project_path);
@@ -15270,6 +15273,7 @@ mod tests {
             start(&mut app, opening);
             settle(&mut app);
             assert_eq!(app.selected, Some(expected_pc));
+            assert_eq!(app.tab, Tab::Listing);
             assert!(app.view().is_some());
             assert!(!app.status.contains("outside file-backed"));
             assert_eq!(app.linkage.status(), Status::Ready);
