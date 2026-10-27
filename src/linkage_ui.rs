@@ -910,7 +910,10 @@ impl LinkageTree {
                             theme::cell_text(
                                 ui,
                                 rect.with_min_x(rect.left() + INDENT),
-                                format!("{} ({})", group.label, rows.group_counts[index as usize]),
+                                body(format!(
+                                    "{} ({})",
+                                    group.label, rows.group_counts[index as usize]
+                                )),
                                 theme::TEXT,
                             );
                             if response.clicked() {
@@ -936,7 +939,7 @@ impl LinkageTree {
                             theme::cell_text(
                                 ui,
                                 rect.with_min_x(rect.left() + INDENT),
-                                name.as_ref(),
+                                body(name),
                                 theme::TEXT,
                             );
                             if let Some(chosen) = click_action(&response, item) {
@@ -1024,7 +1027,7 @@ impl LinkageTree {
                     } else {
                         theme::MUTED
                     };
-                    theme::cell_text(ui, rect, name.as_ref(), color);
+                    theme::cell_text(ui, rect, body(name), color);
                     if let Some(chosen) = click_action(&response, item) {
                         *action = Some(chosen);
                     }
@@ -1038,6 +1041,12 @@ impl LinkageTree {
 }
 
 /// The collapsing-header triangle, painted font-independently.
+/// Names use the body font of the neighbouring tree rows; addresses stay
+/// monospace.
+fn body(text: impl Into<String>) -> RichText {
+    RichText::new(text).text_style(egui::TextStyle::Body)
+}
+
 fn paint_disclosure(ui: &egui::Ui, rect: egui::Rect, open: bool) {
     if !ui.is_rect_visible(rect) {
         return;
