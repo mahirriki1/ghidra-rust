@@ -20,8 +20,9 @@ are recorded separately; no general speed advantage over Ghidra is claimed yet.
   references, and bounded recovery from supported metadata, pointer tables,
   and function-start patterns.
 - Strings, Hex / Memory Map, byte decoding, and FindCrypt-style constant scans.
-- Declared imports grouped by library and exports in the Symbol Tree, with
-  exact navigation and references.
+- Declared imports grouped by library and exports in the Symbol Tree, plus
+  flat, filterable Imports and Exports tabs in the Functions dock, with exact
+  navigation and references.
 - Compact C++, Rust and MSVC display names with the raw symbol on hover.
   See [demangling](docs/demangling.md).
 - Function labels, comments, supported local renames, and limited function
@@ -95,6 +96,11 @@ and data exports open in Hex; neither creates a function. Forwarded and
 unresolved exports have no destination. Right-click for every known location.
 Names prefer your label at the row's address, then the demangled name; hover
 shows the raw name, library, ordinal and other declared facts.
+
+The Functions dock below has **Functions**, **Imports** and **Exports** tabs.
+The Imports and Exports tabs list every entry by name, with its address and
+library (or export ordinal), and each has its own filter. They share the Symbol
+Tree's selection, opening behaviour and context menu.
 
 Visited functions reuse compatible session results. **Analysis → Refresh
 function** recomputes the selected function. This session cache does not mean

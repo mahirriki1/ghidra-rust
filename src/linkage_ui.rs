@@ -31,6 +31,15 @@ use crate::theme;
 const LIST_HEIGHT: f32 = 180.0;
 /// Row indentation per tree level inside a category list.
 const INDENT: f32 = 14.0;
+/// Maximum declarations examined by one flat-filter step.
+const FLAT_FILTER_BUDGET: usize = 512;
+
+/// Which declared table a flat list shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Table {
+    Imports,
+    Exports,
+}
 
 /// Stable identity of a selectable row: dense per-kind record indices of the
 /// adopted table, never names.
@@ -84,6 +93,10 @@ pub(crate) struct PreparedLinkage {
     import_keys: Box<[Box<str>]>,
     export_keys: Box<[Box<str>]>,
     group_keys: Box<[Box<str>]>,
+    /// Highest declared address, for address column width.
+    last_address: u64,
+    /// Decimal digits of the largest export ordinal, when any export has one.
+    ordinal_digits: Option<usize>,
 }
 
 fn declared_key(raw: &Option<String>, display: &Option<String>, ordinal: Option<u32>) -> Box<str> {
@@ -93,12 +106,11 @@ fn declared_key(raw: &Option<String>, display: &Option<String>, ordinal: Option<
         // A query cannot contain NUL, so it never spans both names.
         key.push('\0');
     }
-    match (raw, ordinal) {
-        (Some(raw), _) => key.push_str(&raw.to_lowercase()),
-        (None, Some(ordinal)) => {
-            let _ = write!(key, "ordinal {ordinal}");
-        }
-        (None, None) => {}
+    if let Some(raw) = raw {
+        key.push_str(&raw.to_lowercase());
+    }
+    if let Some(ordinal) = ordinal {
+        let _ = write!(key, "\0ordinal {ordinal}");
     }
     key.into_boxed_str()
 }
@@ -122,11 +134,33 @@ impl PreparedLinkage {
             .iter()
             .map(|group| group.label.to_lowercase().into_boxed_str())
             .collect();
+        let last_address = linkage
+            .imports
+            .iter()
+            .flat_map(|import| [import.stub, import.slot])
+            .chain(linkage.exports.iter().map(|export| export.target.address()))
+            .chain(
+                linkage
+                    .locations
+                    .iter()
+                    .map(|location| Some(location.address)),
+            )
+            .flatten()
+            .max()
+            .unwrap_or(0);
+        let ordinal_digits = linkage
+            .exports
+            .iter()
+            .filter_map(|export| export.ordinal)
+            .max()
+            .map(|ordinal| ordinal.to_string().len());
         Self {
             view,
             import_keys,
             export_keys,
             group_keys,
+            last_address,
+            ordinal_digits,
         }
     }
 
@@ -276,6 +310,17 @@ enum State {
     Unavailable,
 }
 
+/// One flat list's filtered record identities in presentation order.
+struct FlatRows {
+    /// The filter text as typed; lowercased only when rebuilding.
+    filter: String,
+    revision: u64,
+    ids: Vec<u32>,
+    query: String,
+    cursor: usize,
+    complete: bool,
+}
+
 struct RowsKey {
     query: String,
     revision: u64,
@@ -303,6 +348,10 @@ pub(crate) struct LinkageTree {
     collapsed_query: String,
     expansion: u64,
     rows: Option<Rows>,
+    /// Flat Imports/Exports lists, indexed by [`Table`].
+    flat: [Option<FlatRows>; 2],
+    /// The selection each flat list last scrolled to.
+    flat_revealed: [Option<LinkageItem>; 2],
 }
 
 impl Default for LinkageTree {
@@ -316,6 +365,8 @@ impl Default for LinkageTree {
             collapsed_query: String::new(),
             expansion: 0,
             rows: None,
+            flat: [None, None],
+            flat_revealed: [None, None],
         }
     }
 }
@@ -349,6 +400,7 @@ impl LinkageTree {
     pub(crate) fn fail(&mut self) {
         self.state = State::Unavailable;
         self.rows = None;
+        self.flat = [None, None];
     }
 
     pub(crate) fn status(&self) -> Status {
@@ -488,6 +540,7 @@ impl LinkageTree {
                 let bytes = prepared.retained_bytes();
                 self.state = State::Ready(Box::new(prepared));
                 self.rows = None;
+                self.flat = [None, None];
                 Polled::Ready(bytes)
             }
             Err(TryRecvError::Empty) => Polled::Idle,
@@ -586,6 +639,66 @@ impl Matcher<'_> {
     }
 }
 
+impl<'a> Matcher<'a> {
+    fn new(query: &'a str) -> Self {
+        Self {
+            query,
+            hex: !query.is_empty() && query.bytes().all(|b| b.is_ascii_hexdigit()),
+            buffer: String::with_capacity(16),
+        }
+    }
+}
+
+fn export_matches(
+    prepared: &PreparedLinkage,
+    session: Option<&Session>,
+    matcher: &mut Matcher,
+    id: u32,
+) -> bool {
+    let address = prepared.linkage().exports[id as usize].target.address();
+    matcher.matches(
+        &prepared.export_keys[id as usize],
+        label_at(session, address),
+        address,
+    )
+}
+
+/// One flat list's matches for the lowercased `query`: name, label, ordinal
+/// or address, and for imports also the library.
+fn flat_ids(
+    prepared: &PreparedLinkage,
+    session: Option<&Session>,
+    table: Table,
+    query: &str,
+    range: std::ops::Range<usize>,
+) -> Vec<u32> {
+    let mut matcher = Matcher::new(query);
+    match table {
+        Table::Imports => {
+            let linkage = prepared.linkage();
+            prepared.view.imports[range]
+                .iter()
+                .copied()
+                .filter(|&id| {
+                    let group = prepared.view.import_groups[id as usize] as usize;
+                    let address = import_address(&linkage.imports[id as usize]);
+                    !query.is_empty() && prepared.group_keys[group].contains(query)
+                        || matcher.matches(
+                            &prepared.import_keys[id as usize],
+                            label_at(session, address),
+                            address,
+                        )
+                })
+                .collect()
+        }
+        Table::Exports => prepared.view.exports[range]
+            .iter()
+            .copied()
+            .filter(|&id| export_matches(prepared, session, &mut matcher, id))
+            .collect(),
+    }
+}
+
 fn flatten(
     prepared: &PreparedLinkage,
     session: Option<&Session>,
@@ -596,11 +709,7 @@ fn flatten(
     let linkage = prepared.linkage();
     let query = key.query.as_str();
     let filtering = !query.is_empty();
-    let mut matcher = Matcher {
-        query,
-        hex: filtering && query.bytes().all(|b| b.is_ascii_hexdigit()),
-        buffer: String::with_capacity(16),
-    };
+    let mut matcher = Matcher::new(query);
     let mut imports = Vec::new();
     let mut group_counts = Vec::with_capacity(prepared.view.groups.len());
     let mut import_matches = 0usize;
@@ -652,15 +761,7 @@ fn flatten(
         .exports
         .iter()
         .copied()
-        .filter(|&id| {
-            let export = &linkage.exports[id as usize];
-            let address = export.target.address();
-            matcher.matches(
-                &prepared.export_keys[id as usize],
-                label_at(session, address),
-                address,
-            )
-        })
+        .filter(|&id| export_matches(prepared, session, &mut matcher, id))
         .collect();
     Rows {
         key,
@@ -819,19 +920,7 @@ impl LinkageTree {
         pointer: u64,
     ) -> Option<TreeAction> {
         self.refresh_rows(session, revision, query);
-        let loading = match &self.state {
-            State::Fetching { .. } => worker,
-            State::Building(_) => true,
-            _ => false,
-        };
-        let state = match self.status() {
-            Status::Loading if loading => Some(("Loading", theme::MUTED)),
-            Status::Unavailable => Some(("Unavailable", theme::MUTED)),
-            Status::Ready if self.prepared().is_some_and(|p| p.linkage().partial()) => {
-                Some(("Partial", theme::WARNING))
-            }
-            _ => None,
-        };
+        let state = self.state_label(worker);
         let partial = state.is_some_and(|(text, _)| text == "Partial");
         let (import_count, export_count) = match (self.prepared(), &self.rows) {
             (Some(prepared), Some(rows)) => (
@@ -848,25 +937,300 @@ impl LinkageTree {
             .show(ui, |ui| {
                 self.import_list(ui, session, pointer, &mut action, &mut toggle)
             });
-        if partial && let Some(prepared) = self.prepared() {
-            header.header_response.on_hover_ui(|ui| {
-                for gap in &prepared.linkage().gaps {
-                    ui.label(gap.label());
-                }
-            });
+        if partial {
+            self.gaps_hover(header.header_response);
         }
         let header = egui::CollapsingHeader::new(header_text(ui, "Exports", export_count, state))
             .id_salt("tree-exports")
             .show(ui, |ui| self.export_list(ui, session, pointer, &mut action));
-        if partial && let Some(prepared) = self.prepared() {
-            header.header_response.on_hover_ui(|ui| {
+        if partial {
+            self.gaps_hover(header.header_response);
+        }
+        if let Some(key) = toggle {
+            self.toggle(key, filtering);
+        }
+        action
+    }
+
+    /// The terse table state the tree and flat lists show.
+    fn state_label(&self, worker: bool) -> Option<(&'static str, egui::Color32)> {
+        let loading = match &self.state {
+            State::Fetching { .. } => worker,
+            State::Building(_) => true,
+            _ => false,
+        };
+        match self.status() {
+            Status::Loading if loading => Some(("Loading", theme::MUTED)),
+            Status::Unavailable => Some(("Unavailable", theme::MUTED)),
+            Status::Ready if self.prepared().is_some_and(|p| p.linkage().partial()) => {
+                Some(("Partial", theme::WARNING))
+            }
+            _ => None,
+        }
+    }
+
+    fn gaps_hover(&self, response: egui::Response) {
+        if let Some(prepared) = self.prepared() {
+            response.on_hover_ui(|ui| {
                 for gap in &prepared.linkage().gaps {
                     ui.label(gap.label());
                 }
             });
         }
-        if let Some(key) = toggle {
-            self.toggle(key, filtering);
+    }
+
+    /// Rebuilds a flat list only when its filter, labels or table change.
+    pub(crate) fn refresh_flat(
+        &mut self,
+        table: Table,
+        session: Option<&Session>,
+        revision: u64,
+        filter: &str,
+    ) {
+        let slot = &mut self.flat[table as usize];
+        let State::Ready(prepared) = &self.state else {
+            *slot = None;
+            return;
+        };
+        if !slot
+            .as_ref()
+            .is_some_and(|rows| rows.filter == filter && rows.revision == revision)
+        {
+            *slot = Some(FlatRows {
+                filter: filter.to_owned(),
+                revision,
+                query: filter.to_lowercase(),
+                ids: Vec::new(),
+                cursor: 0,
+                complete: false,
+            });
+        }
+        let rows = slot.as_mut().unwrap();
+        if rows.complete {
+            return;
+        }
+        let order = match table {
+            Table::Imports => &prepared.view.imports,
+            Table::Exports => &prepared.view.exports,
+        };
+        if rows.query.is_empty() {
+            // Already sorted in the background; no matching or formatting work.
+            rows.ids = order.to_vec();
+            rows.cursor = order.len();
+        } else {
+            let end = (rows.cursor + FLAT_FILTER_BUDGET).min(order.len());
+            rows.ids.extend(flat_ids(
+                prepared,
+                session,
+                table,
+                &rows.query,
+                rows.cursor..end,
+            ));
+            rows.cursor = end;
+        }
+        rows.complete = rows.cursor == order.len();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn flat_items(&self, table: Table) -> Option<Vec<LinkageItem>> {
+        let item = match table {
+            Table::Imports => LinkageItem::Import,
+            Table::Exports => LinkageItem::Export,
+        };
+        self.flat[table as usize]
+            .as_ref()
+            .map(|rows| rows.ids.iter().copied().map(item).collect())
+    }
+
+    /// A flat list's dock-header count, or its loading/failed state, and
+    /// the Partial chip.
+    pub(crate) fn flat_header(&self, ui: &mut egui::Ui, table: Table, worker: bool) {
+        let state = self.state_label(worker);
+        if let (Some(_), Some(rows)) = (self.prepared(), &self.flat[table as usize]) {
+            if rows.complete {
+                ui.weak(rows.ids.len().to_string());
+            } else {
+                ui.spinner().on_hover_text("Filtering");
+            }
+        }
+        match state {
+            Some(("Partial", color)) => {
+                self.gaps_hover(ui.colored_label(color, "Partial"));
+            }
+            Some((text, color)) => {
+                ui.colored_label(color, text);
+            }
+            None => {}
+        }
+    }
+
+    /// A filterable flat Imports or Exports list sharing the tree's
+    /// selection, open behaviour and row menu.
+    pub(crate) fn show_flat(
+        &mut self,
+        ui: &mut egui::Ui,
+        table: Table,
+        session: Option<&Session>,
+        revision: u64,
+        filter: &mut String,
+        pointer: u64,
+    ) -> Option<TreeAction> {
+        if ui
+            .add(
+                egui::TextEdit::singleline(filter)
+                    .id(egui::Id::unique(("linkage-filter", table as u8)))
+                    .hint_text("Filter name or address")
+                    .desired_width(f32::INFINITY)
+                    .char_limit(256),
+            )
+            .changed()
+        {
+            // The dock header above counted the previous filter.
+            ui.ctx().request_repaint();
+        }
+        self.refresh_flat(table, session, revision, filter);
+        let (Some(prepared), Some(rows)) = (self.prepared(), &self.flat[table as usize]) else {
+            return None;
+        };
+        if !rows.complete {
+            ui.ctx().request_repaint();
+        }
+        let linkage = prepared.linkage();
+        let item = |id: u32| match table {
+            Table::Imports => LinkageItem::Import(id),
+            Table::Exports => LinkageItem::Export(id),
+        };
+        let selected = self.selected;
+        let reveal = if self.flat_revealed[table as usize] == selected {
+            None
+        } else {
+            selected.and_then(|selected| rows.ids.iter().position(|&id| item(id) == selected))
+        };
+        let glyph = theme::glyph_width(ui);
+        let digits = theme::address_digits(prepared.last_address);
+        let width = ui.available_width();
+        // Preserve name room even for wide addresses in a narrow dock.
+        // The full address remains available in the row's hover details.
+        let name_x = ((digits + 2) as f32 * glyph).min(width * 0.45);
+        let rest = (width - name_x).max(0.0);
+        let tail_x = match table {
+            // The library keeps at most 40% and 160 points of the name room.
+            Table::Imports => Some(name_x + (rest * 0.6).max(rest - 160.0)),
+            Table::Exports => prepared
+                .ordinal_digits
+                .map(|digits| width - (digits.max(7) + 2) as f32 * glyph),
+        }
+        // Optional columns must leave useful name space and fit their heading.
+        .filter(|&x| x - name_x >= 10.0 * glyph && width - x >= 9.0 * glyph);
+        let mut columns = vec![("Address", 0.0), ("Name", name_x)];
+        if let Some(x) = tail_x {
+            columns.push((
+                match table {
+                    Table::Imports => "Library",
+                    Table::Exports => "Ordinal",
+                },
+                x,
+            ));
+        }
+        theme::column_header(ui, &columns, 0.0);
+        let mut action = None;
+        theme::rows::<()>(
+            ui,
+            match table {
+                Table::Imports => "flat-import-rows",
+                Table::Exports => "flat-export-rows",
+            },
+            rows.ids.len(),
+            theme::ROW_HEIGHT,
+            0.0,
+            reveal,
+            |ui, row, rect| {
+                let id = rows.ids[row];
+                let item = item(id);
+                let response = theme::row_response(
+                    ui,
+                    ui.scope_id().with(("flat-linkage", table as u8, id)),
+                    rect,
+                    selected == Some(item),
+                    false,
+                );
+                let cell = |left: f32, right: Option<f32>| {
+                    egui::Rect::from_x_y_ranges(
+                        rect.left() + left..=right.map_or(rect.right(), |x| rect.left() + x),
+                        rect.y_range(),
+                    )
+                };
+                let address = destination(linkage, item, pointer).map(Place::address);
+                if let Some(address) = address {
+                    theme::cell_text(
+                        ui,
+                        cell(0.0, Some(name_x)),
+                        RichText::new(format!("{address:0digits$x}")).monospace(),
+                        theme::MUTED,
+                    );
+                }
+                let color = if address.is_some() {
+                    theme::TEXT
+                } else {
+                    theme::MUTED
+                };
+                let name = cell(name_x, tail_x);
+                let response = match table {
+                    Table::Imports => {
+                        let import = &linkage.imports[id as usize];
+                        let shown = shown_name(
+                            label_at(session, import_address(import)),
+                            &import.raw,
+                            &import.display,
+                            import.ordinal,
+                        );
+                        theme::cell_text(ui, name, body(shown), color);
+                        if let Some(x) = tail_x {
+                            let group = prepared.view.import_groups[id as usize];
+                            theme::cell_text(
+                                ui,
+                                cell(x, None),
+                                body(prepared.view.groups[group as usize].label.as_str()),
+                                theme::MUTED,
+                            );
+                        }
+                        response.on_hover_ui(|ui| import_hover(ui, linkage, import))
+                    }
+                    Table::Exports => {
+                        let export = &linkage.exports[id as usize];
+                        let shown = shown_name(
+                            label_at(session, export.target.address()),
+                            &export.raw,
+                            &export.display,
+                            export.ordinal,
+                        );
+                        theme::cell_text(ui, name, body(shown), color);
+                        if let (Some(x), Some(ordinal)) = (tail_x, export.ordinal) {
+                            theme::cell_text(
+                                ui,
+                                cell(x, None),
+                                RichText::new(ordinal.to_string()).monospace(),
+                                theme::MUTED,
+                            );
+                        }
+                        response.on_hover_ui(|ui| export_hover(ui, export))
+                    }
+                };
+                if let Some(chosen) = click_action(&response, item) {
+                    action = Some(chosen);
+                }
+                row_menu(
+                    &response,
+                    item,
+                    || places(linkage, item, pointer),
+                    &mut action,
+                );
+                None
+            },
+        );
+        // One-shot: a selection outside this filter is not searched again.
+        if rows.complete || reveal.is_some() {
+            self.flat_revealed[table as usize] = selected;
         }
         action
     }
@@ -1657,6 +2021,123 @@ mod tests {
             );
             assert!(seen.len() < 400, "only visible rows are painted");
         }
+    }
+
+    #[test]
+    fn flat_filter_restarts_mid_scan_and_discards_old_generations() {
+        let info = fixture::info(&sha());
+        let records = (0..2_000)
+            .map(|id| {
+                LinkageRecord::Import(fixture::import(id, Some(&format!("named_{id:05}")), None))
+            })
+            .collect();
+        let table = LinkageTable::new(records, Vec::new()).with_image(&sha());
+        let mut tree = LinkageTree::default();
+        tree.begin(1, 1);
+        let linkage = fixture::fetch(&mut tree, &table, &info, 1, 1).unwrap();
+        tree.build(linkage, &egui::Context::default());
+        assert!(matches!(tree.wait(), Polled::Ready(_)));
+        tree.refresh_flat(Table::Imports, None, 0, "named_01999");
+        assert!(!tree.flat[0].as_ref().unwrap().complete);
+        assert!(tree.flat_items(Table::Imports).unwrap().is_empty());
+        // A new query supersedes an unfinished search.
+        for _ in 0..4 {
+            tree.refresh_flat(Table::Imports, None, 0, "named_00042");
+        }
+        assert!(tree.flat[0].as_ref().unwrap().complete);
+        assert_eq!(
+            tree.flat_items(Table::Imports).unwrap(),
+            [LinkageItem::Import(42)]
+        );
+        tree.begin(2, 1);
+        assert!(tree.flat_items(Table::Imports).is_none());
+        // Named declarations are searchable by their ordinal too.
+        let key = declared_key(&Some("named".into()), &None, Some(17));
+        assert!(Matcher::new("ordinal 17").matches(&key, None, None));
+    }
+
+    #[test]
+    fn flat_lists_reveal_a_new_selection_once_and_paint_only_visible_rows() {
+        let info = fixture::info(&sha());
+        let mut records = vec![LinkageRecord::Library(crate::linkage::Library {
+            id: 0,
+            name: "library.dll".into(),
+        })];
+        records.extend((0..10_000).map(|id| {
+            LinkageRecord::Import(fixture::import(
+                id,
+                Some(&format!("import_{id:05}")),
+                Some(0),
+            ))
+        }));
+        let table = LinkageTable::new(records, Vec::new()).with_image(&sha());
+        let context = egui::Context::default();
+        theme::install(&context);
+        context.set_pixels_per_point(1.25);
+        context.all_styles_mut(|style| style.animation_time = 0.0);
+        let mut tree = LinkageTree::default();
+        tree.begin(1, 1);
+        let linkage = fixture::fetch(&mut tree, &table, &info, 1, 1).unwrap();
+        tree.build(linkage, &context);
+        assert!(matches!(tree.wait(), Polled::Ready(_)));
+        tree.select(LinkageItem::Import(9_000));
+        let mut filter = String::new();
+        let mut frame = |tree: &mut LinkageTree, time: f64, wheel: f32| {
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(260.0, 240.0),
+                    )),
+                    time: Some(time),
+                    events: vec![
+                        egui::Event::PointerMoved(egui::pos2(80.0, 120.0)),
+                        egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point,
+                            phase: egui::TouchPhase::Move,
+                            source: egui::MouseWheelSource::Unknown,
+                            delta: egui::vec2(0.0, wheel),
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ui| {
+                    ui.allocate_ui(egui::vec2(260.0, 240.0), |ui| {
+                        tree.show_flat(ui, Table::Imports, None, 0, &mut filter, 8);
+                    });
+                },
+            );
+            output.textures_delta.clear();
+            output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text().starts_with("import_") => {
+                        text.galley.text()[7..].parse::<u32>().ok()
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let shown = frame(&mut tree, 0.0, 0.0);
+        assert!(shown.contains(&9_000), "revealed: {shown:?}");
+        assert!(shown.len() < 15, "virtualized: {}", shown.len());
+        // Scrolling away is not undone by the same selection.
+        for step in 1..10 {
+            frame(&mut tree, step as f64 / 30.0, 1800.0);
+        }
+        // Let smoothed wheel scrolling settle.
+        for step in 0..30 {
+            frame(&mut tree, 0.5 + step as f64 / 30.0, 0.0);
+        }
+        let shown = frame(&mut tree, 1.5, 0.0);
+        assert!(!shown.contains(&9_000), "kept scroll: {shown:?}");
+        // A different selection, such as one made in the tree, is revealed.
+        tree.select(LinkageItem::Import(42));
+        frame(&mut tree, 2.0, 0.0);
+        let shown = frame(&mut tree, 2.1, 0.0);
+        assert!(shown.contains(&42), "revealed: {shown:?}");
     }
 
     #[test]
