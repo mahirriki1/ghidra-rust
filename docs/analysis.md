@@ -208,6 +208,96 @@ addresses. Shared operation, candidate, and state limits mark omissions partial;
 see [limits](#resource-limits-and-trust-boundaries). This is access evidence,
 not data-object or pointer classification.
 
+## Imports and exports
+
+The Symbol Tree shows **Imports (n)**, with one group per declaring library,
+lookup scope or **Unknown library**, and **Exports (n)**. After a binary or a
+verified project opens, the desktop requests the worker's import/export table
+page by page whenever the worker is otherwise idle. Queued navigation and other
+user requests, replays and result adoption run first; pages are interleaved
+between discovery batches and scans like symbol-name pages, and a user action
+issued during a page waits only for that page. Each page is bound to the binary
+generation, worker epoch, expected cursor and table digest. Replies for another
+binary, a stopped worker or an earlier table are dropped, a defective page
+discards the whole table, and only a complete table is shown. A table whose
+request fails, times out or stops its worker stays **Unavailable** for that
+binary. Grouping, sorting and filter keys are prepared on a background thread.
+The table and its presentation are charged to the session's shared 64 MiB result
+budget beside other metadata; a table that does not fit is shown as
+**Unavailable**. Headers show **Loading**, **Partial** (hover lists the coverage
+gaps) or **Unavailable**.
+
+Rows show the analyst label at the row's exact address, then the worker's
+demangled name, then the raw declaration, then `ordinal N`. Order always uses
+declared text, so renaming never reorders the tree. Hover shows the raw name,
+library or scope, version, ordinal and delay/weak facts, the stub and slot, or an
+export's code/resolver/data address or forwarding destination. The function
+filter also filters imports and exports by name, label, library and hexadecimal
+address.
+
+Click selects a row; double-click opens it, and Back/Forward record the visit.
+Back/Forward restores slot and data destinations in Hex with the original span;
+code destinations retain their instruction navigation.
+An import opens its verified stub through code navigation, or otherwise its slot
+in Hex at exactly that address, selecting the pointer-width slot clipped to
+file-backed bytes. Further verified stubs and slots appear as child rows and in
+the row's context menu. Code and IFUNC-resolver exports open as code. Data
+exports open in Hex, including mapped zero-fill, and never become functions.
+Saving while viewing a slot or data export retains the previous code location
+(or entry point) for reopening; Hex spans remain session-only. Reopening also
+accepts earlier projects saved at a data address and quietly falls back to the
+saved function or entry point.
+Forwarded and unresolved entries remain selectable but have no destination or
+references. With a row selected, **X** queries its single exact address, or
+offers every stub and slot of an import in the bounded target chooser. It uses
+the existing call, data-access and address-formation evidence; no direct call
+from an import slot to its external symbol is invented.
+
+The worker reads the immutable image snapshot once, on demand, and caches the
+table; opening a binary and ordinary function replies do not carry this table.
+Metadata never loads another library, resolves a runtime address, infers a
+prototype or creates a function. Demangled names use the existing bounded worker
+demanglers and remain separate from exact raw identities.
+
+- PE retains library names, named and ordinal imports, export aliases and
+  ordinal-only exports, mapped data, and directory-bounded forwarders. Conventional
+  RVA-based delay-import descriptors share the normal import limit. Old VA-form
+  and unknown delay variants remain partial; delay declarations do not seed the
+  engine, no-return recognition or prototypes. Exact conventional x86 and ARM64
+  thunks are associated only among the first 2,048 established functions; later
+  discovery does not revise an already-published metadata snapshot.
+- ELF reads dynamic symbols, version requirements/definitions and supported
+  JUMP_SLOT/GLOB_DAT relocations. A version requirement can identify a library;
+  `DT_NEEDED` alone cannot assign an import owner. Weak declarations and symbol
+  versions are retained. Existing engine import stubs also require an
+  unambiguous raw identity and a conventional encoded jump to that symbol's
+  verified relocation slot: classic `.plt` entries and IBT `.plt.sec` entries
+  (an `ENDBR` landing pad, optionally followed by a `BND` jump) are recognized.
+  Other PLT/veneer forms, including 32-bit PIC `jmp *slot(%ebx)`, stay unresolved. IFUNC exports
+  are tagged as resolvers; TLS and absolute declarations have no code destination.
+- Thin Mach-O reads external nlist declarations, checked two-level library
+  ordinals and indirect-symbol pointer/stub locations. Self, main-executable,
+  dynamic-lookup and flat-namespace scopes remain distinct from dependencies.
+  Private externs are excluded. dyld binding opcode programs, chained fixups and
+  export-trie-only definitions are unsupported and explicitly mark partial
+  coverage. No native macOS execution is established by these parser tests.
+
+Each table permits at most 10,000 imports, 16,384 exports, 1,024 libraries and
+16,384 additional locations, with 4 MiB total JSON-escaped text. A cumulative
+500,000-entry/8 MiB work budget bounds format scans, including duplicate records
+and names. Pages have at most 1,024 records and 64 KiB encoded data. Pages bind to
+the image SHA-256, metadata policy and an ordered table digest; accumulation
+checks exact cursors, IDs, library references, names, counts, address membership
+and duplicate/conflicting locations before adoption. Slots must be fully
+file-backed at the ABI pointer width. Mapped zero-filled exports retain their
+data address but provide no file bytes beyond the existing Hex/Decode limits.
+
+The table, group expansion and the filter are transient. Projects do not store
+them: reopening a verified project rebuilds the tree from the image without
+changing SQLite or annotation JSON schemas or the engine cache fingerprint.
+Analyst labels at import and export addresses are ordinary annotations and are
+saved as before.
+
 ## Address formation
 
 Discovery also records where an instruction materializes a concrete address

@@ -17,8 +17,8 @@ use sha2::{Digest, Sha256};
 use crate::function_presentation::{PreparedDecompilation, PreparedGraph};
 use crate::model::{FunctionInfo, Request};
 use crate::result_store::{
-    Admission, DecompileKey, FunctionKey, ProgramContext, RESULT_STORE_BUDGET, ResultOrigin,
-    ResultStore, Retained, Shared, StoreCounters, StoreUsage,
+    Admission, DecompileKey, FunctionKey, MetadataOwner, ProgramContext, RESULT_STORE_BUDGET,
+    ResultOrigin, ResultStore, Retained, Shared, StoreCounters, StoreUsage,
 };
 use crate::semantic::LocalRename;
 use crate::signatures::FunctionSignature;
@@ -273,7 +273,7 @@ impl FunctionResults {
                 // bookkeeping. Payloads charge their own allocations separately.
                 if !self
                     .store
-                    .set_metadata_bytes(4096 + state.locals.len() * 2048)
+                    .set_metadata_bytes(MetadataOwner::LocalNames, 4096 + state.locals.len() * 2048)
                 {
                     self.input_failed = true;
                     return false;
@@ -449,6 +449,12 @@ impl FunctionResults {
 
     fn bump_refresh(&mut self, _address: u64) {
         self.refresh = self.refresh.wrapping_add(1);
+    }
+
+    /// Charges the adopted import/export table and its presentation beside,
+    /// not instead of, the local-name metadata. Returns whether it fits.
+    pub fn set_linkage_bytes(&mut self, bytes: usize) -> bool {
+        self.store.set_metadata_bytes(MetadataOwner::Linkage, bytes)
     }
 
     pub fn usage(&self) -> StoreUsage {

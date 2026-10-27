@@ -155,3 +155,12 @@ and source/validation batch boundaries. Builds with `NO_UNWIND` check precision
 without requiring equal recall. `pointer_recovery.rs` also uses the original
 300-function differential corpus; unstripped symbols score the stripped worker
 results and never seed discovery.
+
+`linkage.c` is an original declaration-only ELF fixture, built with
+`gcc -O0 -fPIC -shared` into a temporary shared library. It declares a versioned
+libc import, an unversioned weak import, a decorated C++ export, and a data
+export. The real-worker test replaces its private on-disk copy after opening to
+check that metadata comes from the retained immutable snapshot. It never runs
+the shared library. PE normal/delay/ordinal imports, aliases and forwarded/data
+exports, and Mach-O library ordinals and indirect locations use original
+synthetic format bytes in module tests.

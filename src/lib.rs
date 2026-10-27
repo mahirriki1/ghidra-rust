@@ -27,6 +27,8 @@ mod hex_ui;
 pub mod highlight;
 mod inventory;
 pub mod limits;
+pub mod linkage;
+mod linkage_ui;
 mod local_symbols;
 pub mod model;
 mod no_return;

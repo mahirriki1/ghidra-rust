@@ -15,6 +15,7 @@ use crate::model::*;
 
 mod cfg;
 mod function_candidates;
+pub(crate) mod linkage;
 mod patterns;
 mod pointers;
 mod strings;
@@ -51,6 +52,7 @@ pub struct LoadedProgram {
     no_return: Arc<crate::no_return::NoReturnIndex>,
     /// Original symbols and display names derived at open, before any replay.
     symbol_names: Arc<crate::symbol_names::SymbolTable>,
+    linkage: Option<crate::linkage::LinkageTable>,
     signatures: Vec<crate::signatures::FunctionSignature>,
     applied_signatures: BTreeSet<u64>,
     signature_state: Option<String>,
@@ -392,6 +394,7 @@ impl LoadedProgram {
             pointers: None,
             no_return: Arc::new(no_return),
             symbol_names,
+            linkage: None,
             signatures: Vec::new(),
             applied_signatures: BTreeSet::new(),
             signature_state: None,
@@ -803,6 +806,40 @@ impl LoadedProgram {
             Request::SymbolNames { cursor } => Ok(Response::SymbolNames {
                 page: self.symbol_names.page(cursor)?,
             }),
+            Request::Linkage { cursor, digest } => {
+                if self.linkage.is_none() {
+                    let pe = crate::pe::linkage(&self.snapshot, &self.info.sections)?;
+                    let entries = self.program.functions().map_err(engine_error)?;
+                    let stubs: Vec<_> = entries
+                        .iter()
+                        .filter(|entry| {
+                            entry.source == ghidra_decompiler::program::FunctionSource::ImportStub
+                        })
+                        .take(crate::linkage::MAX_LINKAGE_LOCATIONS)
+                        // The engine records `symbol` only when it differs
+                        // from the loaded name, so plain C stubs carry their
+                        // raw name in `name`. A name only selects a candidate;
+                        // the stub's encoded slot must still match it.
+                        .map(|entry| linkage::EngineStub {
+                            address: entry.address,
+                            raw: entry.symbol.as_deref().unwrap_or(&entry.name),
+                        })
+                        .collect();
+                    self.linkage = Some(linkage::table(&self.snapshot, &self.info, pe, &stubs));
+                }
+                let table = self.linkage.as_ref().expect("table prepared");
+                if (cursor != 0 && digest.is_none())
+                    || digest
+                        .as_ref()
+                        .is_some_and(|digest| digest != &table.summary().digest)
+                {
+                    return Err("Linkage request does not match the current table".into());
+                }
+                Ok(Response::Linkage {
+                    summary: table.summary().clone(),
+                    page: table.page(cursor)?,
+                })
+            }
             Request::Open { .. } => Err("Open is handled by the worker.".into()),
         }
     }
@@ -1682,6 +1719,7 @@ pub(crate) mod tests {
             pointers: None,
             no_return: Arc::default(),
             symbol_names: Arc::default(),
+            linkage: None,
             signatures: Vec::new(),
             applied_signatures: BTreeSet::new(),
             signature_state: None,
@@ -2498,6 +2536,7 @@ pub(crate) mod tests {
             pointers: None,
             no_return: Arc::default(),
             symbol_names: Arc::default(),
+            linkage: None,
             signatures: Vec::new(),
             applied_signatures: BTreeSet::new(),
             signature_state: None,

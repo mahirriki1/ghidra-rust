@@ -410,6 +410,7 @@ pub fn operation(request: &crate::model::Request) -> &'static str {
         Strings | StringsWithOptions { .. } => "strings",
         Crypto => "crypto",
         SymbolNames { .. } => "symbol_names",
+        Linkage { .. } => "linkage",
     }
 }
 

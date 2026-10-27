@@ -2,6 +2,7 @@
 #![cfg(target_os = "linux")]
 
 mod inventory;
+mod linkage;
 
 use ghidra_rust::client::{WorkerClient, WorkerEvent};
 use ghidra_rust::model::{CallAnalysis, DataAccess, Request, Response};
@@ -254,6 +255,13 @@ fn sandboxed_linux_worker_and_embedded_project_round_trip() {
     ) else {
         panic!("Sandboxed worker did not open ELF fixture");
     };
+    let declarations = linkage::read(|query| request(&mut worker, query), &info);
+    assert!(
+        declarations
+            .imports
+            .iter()
+            .any(|import| import.raw.as_deref() == Some("puts"))
+    );
     assert_eq!(info.format, "ELF");
     assert_eq!(Path::new(&info.path), binary.canonicalize().unwrap());
     assert_eq!(
@@ -386,6 +394,10 @@ fn sandboxed_linux_worker_and_embedded_project_round_trip() {
     ) else {
         panic!("Sandboxed worker did not reopen the embedded input");
     };
+    assert_eq!(
+        declarations.digest,
+        linkage::read(|query| request(&mut reopened, query), &fresh).digest
+    );
     loaded.data.validate_against(&fresh).unwrap();
     assert_ne!(fresh.source_identity, project.info.source_identity);
     drop(loaded);
@@ -1325,5 +1337,52 @@ fn rust_v0_executable_names_are_demangled_without_hashes() {
         assert_eq!(names.find(raw), Some(address));
         assert_eq!(symbol(&binary, raw), address);
         assert!(calls.contains(&(address, display.into())), "{calls:?}");
+    }
+}
+
+#[test]
+fn plt_stubs_link_to_their_imports_in_classic_and_ibt_layouts() {
+    use object::{ObjectSymbolTable, RelocationTarget};
+    let directory = tempfile::tempdir().unwrap();
+    let source = Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/sample.c"
+    ));
+    for (name, args, plt) in [
+        ("classic", &["-O0", "-fcf-protection=none"][..], ".plt"),
+        (
+            "ibt",
+            &["-O0", "-fcf-protection=full", "-Wl,-z,ibtplt"][..],
+            ".plt.sec",
+        ),
+    ] {
+        let binary = compile(directory.path(), name, source, args, false);
+        let bytes = std::fs::read(&binary).unwrap();
+        let image = object::File::parse(bytes.as_slice()).unwrap();
+        let symbols = image.dynamic_symbol_table().unwrap();
+        let slot = image
+            .dynamic_relocations()
+            .unwrap()
+            .find_map(|(offset, relocation)| match relocation.target() {
+                RelocationTarget::Symbol(index) => {
+                    (symbols.symbol_by_index(index).ok()?.name().ok()? == "puts").then_some(offset)
+                }
+                _ => None,
+            })
+            .expect("puts relocation");
+        let (mut worker, info) = open(&binary);
+        let declarations = linkage::read(|query| request(&mut worker, query), &info);
+        let puts = declarations
+            .imports
+            .iter()
+            .find(|import| import.raw.as_deref() == Some("puts"))
+            .unwrap();
+        assert_eq!(puts.slot, Some(slot), "{name}");
+        let stub = puts.stub.unwrap_or_else(|| panic!("{name}: puts stub"));
+        let section = image
+            .sections()
+            .find(|section| (section.address()..section.address() + section.size()).contains(&stub))
+            .unwrap();
+        assert_eq!(section.name().unwrap(), plt, "{name}");
     }
 }

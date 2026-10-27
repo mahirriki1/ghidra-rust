@@ -75,6 +75,16 @@ impl TargetSet {
         }
     }
 
+    /// Explicit exact targets, deduplicated by address and bounded like any
+    /// other choice list.
+    pub fn from_targets(targets: impl IntoIterator<Item = XrefTarget>) -> Self {
+        let mut set = Self::default();
+        for target in targets {
+            set.push(target);
+        }
+        set
+    }
+
     /// Distinct targets not offered because the choice list is full.
     pub fn omitted(&self) -> usize {
         self.omitted.len()

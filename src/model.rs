@@ -921,6 +921,13 @@ pub enum Request {
     SymbolNames {
         cursor: usize,
     },
+    /// One page of the import/export table derived from the immutable snapshot.
+    Linkage {
+        cursor: usize,
+        /// Required after the first page, binding the request to one table.
+        #[serde(default)]
+        digest: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -993,6 +1000,10 @@ pub enum Response {
     },
     SymbolNames {
         page: SymbolNamePage,
+    },
+    Linkage {
+        summary: crate::linkage::LinkageSummary,
+        page: crate::linkage::LinkagePage,
     },
     Error {
         message: String,

@@ -43,7 +43,7 @@ const UNDO_BYTES: usize = 4 * 1024 * 1024;
 /// Per-frame work for the function filter, keeping typing responsive.
 const FILTER_FRAME_BUDGET: Duration = Duration::from_millis(4);
 
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Tab {
     Graph,
     #[default]
@@ -479,6 +479,7 @@ fn request_task(request: &Request) -> &'static str {
         Request::Strings | Request::StringsWithOptions { .. } => "Finding strings",
         Request::Crypto => "Scanning constants",
         Request::SymbolNames { .. } => "Reading symbol names",
+        Request::Linkage { .. } => "Reading imports and exports",
     }
 }
 
@@ -604,6 +605,10 @@ pub struct DesktopApp {
     symbol_failed: Option<(u64, String)>,
     /// Advances when displayed function names change without an annotation edit.
     symbol_revision: u64,
+    /// Imports and exports of the displayed binary generation.
+    linkage: crate::linkage_ui::LinkageTree,
+    /// The selected linkage row is the X target until the selection moves.
+    linkage_focus: bool,
     /// The inventory last adopted from the current worker. Batch requests name
     /// its revision while `inventory_synced` records that `info.functions` is
     /// still that inventory; every other inventory write clears it.
@@ -660,7 +665,9 @@ pub struct DesktopApp {
     code_chars: usize,
     auto_decompile: bool,
     selected: Option<u64>,
-    history: Vec<u64>,
+    history: Vec<crate::linkage_ui::Place>,
+    data_location: Option<(u64, u64)>,
+    code_selection: Option<u64>,
     history_index: usize,
     function_filter: String,
     filtered_functions: Vec<usize>,
@@ -763,6 +770,8 @@ impl DesktopApp {
             symbol_fetch: None,
             symbol_failed: None,
             symbol_revision: 0,
+            linkage: crate::linkage_ui::LinkageTree::default(),
+            linkage_focus: false,
             worker_inventory: None,
             inventory_synced: false,
             discovery_sync: None,
@@ -806,6 +815,8 @@ impl DesktopApp {
             auto_decompile: true,
             selected: None,
             history: Vec::new(),
+            data_location: None,
+            code_selection: None,
             history_index: 0,
             function_filter: String::new(),
             filtered_functions: Vec::new(),
@@ -999,6 +1010,9 @@ impl DesktopApp {
         self.string_focus = None;
         self.reference_focus = None;
         self.undisplayed_call = None;
+        self.linkage.reset();
+        self.linkage_focus = false;
+        self.results.set_linkage_bytes(0);
         self.browser_dialog = None;
         self.focus_comment = false;
         self.reset_names.clear();
@@ -1031,6 +1045,8 @@ impl DesktopApp {
         self.name_edit.clear();
         self.comment_edit.clear();
         self.history.clear();
+        self.data_location = None;
+        self.code_selection = None;
         self.comment_owners.clear();
         self.annotation_browser = AnnotationBrowser::default();
         self.history_index = 0;
@@ -1102,6 +1118,8 @@ impl DesktopApp {
         self.discovery_bytes = None;
         self.worker_inventory = None;
         self.inventory_synced = false;
+        // Pages of an unfinished table never outlive the worker they came from.
+        self.linkage.interrupt();
         if let Some(state) = &mut self.discovery {
             state.interrupt();
         }
@@ -1345,6 +1363,7 @@ impl DesktopApp {
                     Request::DiscoverBatch { .. }
                         | Request::SyncFunctions { .. }
                         | Request::SymbolNames { .. }
+                        | Request::Linkage { .. }
                 )
             })
         {
@@ -1606,28 +1625,21 @@ impl DesktopApp {
         self.result_scope = Some(address);
         self.reference_focus = None;
         self.string_focus = None;
+        self.linkage_focus = false;
         self.selected_call = None;
         self.undisplayed_call = None;
         self.selection_generation = self.selection_generation.wrapping_add(1);
         crate::performance::navigation_begin(self.selection_generation);
+        if record {
+            self.record_location(address, address);
+        }
+        self.data_location = None;
         self.selected = Some(address);
         self.address = format!("{address:x}");
         self.editor_address = None;
         self.clear_decompilation();
         self.pending_listing_scroll = None;
         self.saved_analysis = false;
-        if record {
-            if !self.history.is_empty() {
-                self.history.truncate(self.history_index + 1);
-            }
-            if self.history.last() != Some(&address) {
-                self.history.push(address);
-            }
-            if self.history.len() > 256 {
-                self.history.remove(0);
-            }
-            self.history_index = self.history.len().saturating_sub(1);
-        }
         self.graph = None;
         self.cached_graph = false;
         self.canvas = None;
@@ -1801,15 +1813,9 @@ impl DesktopApp {
     }
 
     fn select_instruction(&mut self, address: u64) {
-        self.string_focus = None;
-        self.selected_call = None;
-        self.xref_choices = None;
+        self.data_location = None;
+        self.set_selected_address(address);
         self.pending_comment_scroll = Some(address);
-        self.selected_local = None;
-        self.decompiler_rename_context = false;
-        self.selected = Some(address);
-        self.address = format!("{address:x}");
-        self.editor_address = None;
         self.semantic.select_instruction(address);
         self.pending_code_scroll =
             self.semantic.ranges.first().map(|range| {
@@ -1817,8 +1823,24 @@ impl DesktopApp {
             });
     }
 
-    fn select_decompiled_byte(&mut self, byte: usize) {
+    fn set_selected_address(&mut self, address: u64) {
         self.string_focus = None;
+        self.linkage_focus = false;
+        self.selected_call = None;
+        self.xref_choices = None;
+        self.pending_comment_scroll = None;
+        self.pending_code_scroll = None;
+        self.selected_local = None;
+        self.decompiler_rename_context = false;
+        self.selected = Some(address);
+        self.address = format!("{address:x}");
+        self.editor_address = None;
+    }
+
+    fn select_decompiled_byte(&mut self, byte: usize) {
+        self.data_location = None;
+        self.string_focus = None;
+        self.linkage_focus = false;
         self.xref_choices = None;
         self.pending_comment_scroll = None;
         self.decompiler_rename_context = true;
@@ -2255,9 +2277,13 @@ impl DesktopApp {
 
     fn poll_worker(&mut self, context: &egui::Context) {
         if self.results.poll_inputs()
+            && self.data_location.is_none()
             && let Some(address) = self.view().map(|view| view.address)
         {
+            // Re-resolving the displayed function keeps a selected tree row.
+            let linkage_focus = self.linkage_focus;
             self.navigate_to(address, self.selected, false, context);
+            self.linkage_focus = linkage_focus;
         }
         if !self.results.preparing()
             && let Some(project) = self.deferred_restore.take()
@@ -2265,6 +2291,7 @@ impl DesktopApp {
             self.restore_project(*project, context);
         }
         self.poll_discovery(context);
+        self.poll_linkage();
         if self.results.preparing() {
             context.request_repaint_after(Duration::from_millis(10));
         }
@@ -2290,6 +2317,7 @@ impl DesktopApp {
                 .pending
                 .as_ref()
                 .is_some_and(|pending| resumes_discovery(&pending.request));
+            self.fail_pending_linkage();
             self.stop_after_failure(resumable, context);
             self.status =
                 "Analysis exceeded 30 seconds and was stopped. Choose an action to restart.".into();
@@ -2307,6 +2335,7 @@ impl DesktopApp {
                         .pending
                         .as_ref()
                         .is_some_and(|pending| resumes_discovery(&pending.request));
+                    self.fail_pending_linkage();
                     self.stop_after_failure(resumable, context);
                     if signature_failure {
                         self.signature_error = Some(format!("Signature change failed: {error}"));
@@ -2319,6 +2348,7 @@ impl DesktopApp {
         }
         self.dispatch_queued(context);
         self.pump_symbol_names();
+        self.pump_linkage();
         self.pump_discovery(context);
         self.pump_analysis(context);
         if self.pending.is_some()
@@ -2391,6 +2421,13 @@ impl DesktopApp {
                     bytes: pending.bytes,
                 };
                 self.fail_byte_request(&pending.request, origin, &message);
+                self.dispatch_queued(context);
+                return;
+            }
+            if matches!(pending.request, Request::Linkage { .. }) {
+                // The worker answered in protocol; only this table is lost.
+                self.fail_linkage();
+                self.status = crop(&message, 4096);
                 self.dispatch_queued(context);
                 return;
             }
@@ -2633,6 +2670,7 @@ impl DesktopApp {
                     });
                 }
                 self.begin_symbol_names(symbols);
+                self.linkage.begin(self.generation, self.worker_epoch);
                 self.rebuild_filter();
                 self.status = "Binary loaded".into();
                 if let Some(project) = project {
@@ -3012,6 +3050,9 @@ impl DesktopApp {
             (Request::SymbolNames { cursor }, Response::SymbolNames { page }) => {
                 self.receive_symbol_names(cursor, page, context);
             }
+            (Request::Linkage { cursor, digest }, Response::Linkage { summary, page }) => {
+                self.receive_linkage(cursor, digest, summary, page, context);
+            }
             (Request::Crypto, Response::Crypto { matches, truncated }) => {
                 self.result_revision = self.result_revision.wrapping_add(1);
                 self.cached_crypto = false;
@@ -3339,6 +3380,17 @@ impl DesktopApp {
             .or_else(|| std::env::current_dir().ok())
     }
 
+    /// The existing project field describes a code selection, never a Hex span.
+    fn project_selection(&self) -> Option<u64> {
+        let info = self.info.as_ref()?;
+        self.selected
+            .filter(|_| self.data_location.is_none())
+            .or(self.code_selection)
+            .filter(|&address| crate::call_analysis::code_address(info, address))
+            .or_else(|| self.view().map(|view| view.address))
+            .or(Some(info.entry))
+    }
+
     fn save_project(&mut self, save_as: bool, context: &egui::Context) {
         let (Some(info), Some(session), Some(protection)) = (
             self.info.clone(),
@@ -3362,7 +3414,7 @@ impl DesktopApp {
             strings_truncated: self.strings_truncated,
             crypto: self.crypto.clone(),
             crypto_truncated: self.crypto_truncated,
-            selected_address: self.selected,
+            selected_address: self.project_selection(),
             discovery: self.discovery_saved.clone(),
         };
         let generation = self.generation;
@@ -3401,6 +3453,9 @@ impl DesktopApp {
             cache_compatible,
             ..
         } = project;
+        // Projects persist a code location, so reveal it even if the previous
+        // binary was closed while Hex or another analysis tab was active.
+        self.tab = Tab::Listing;
         self.embed_binary = binary.is_some();
         self.project_binary = binary;
         self.project_path = Some(project_path);
@@ -3432,6 +3487,11 @@ impl DesktopApp {
         }
         let selected = data
             .selected_address
+            .filter(|&address| {
+                self.info
+                    .as_ref()
+                    .is_some_and(|info| crate::call_analysis::code_address(info, address))
+            })
             .or_else(|| data.view.as_ref().map(|v| v.address))
             .or_else(|| self.info.as_ref().map(|info| info.entry));
         if let Some(view) = data.view.filter(|view| {
@@ -3460,7 +3520,7 @@ impl DesktopApp {
                 Some(address),
             );
             self.adopt_graph(graph, ResultOrigin::Saved);
-            self.history.push(address);
+            self.history.push(crate::linkage_ui::Place::Code(address));
             self.history_index = 0;
             self.selected = selected;
             self.address = format!("{:x}", selected.unwrap_or(address));
@@ -4498,7 +4558,14 @@ impl DesktopApp {
         } else {
             return;
         }
-        self.navigate_annotation(self.history[self.history_index], false, context);
+        match self.history[self.history_index] {
+            crate::linkage_ui::Place::Code(address) => {
+                self.navigate_annotation(address, false, context)
+            }
+            crate::linkage_ui::Place::Data { address, length } => {
+                self.open_data(address, length, context)
+            }
+        }
     }
 
     fn handle_shortcuts(&mut self, context: &egui::Context) {
@@ -4921,6 +4988,10 @@ impl DesktopApp {
         let mut string_xrefs = None;
         let mut section_index = None;
         let mut scan_strings = false;
+        let mut linkage_action = None;
+        // Rendered beside borrowed program state, then returned unchanged.
+        let mut linkage = std::mem::take(&mut self.linkage);
+        let pointer = self.pointer_width();
         ScrollArea::both()
             .id_salt("symbol-tree-scroll")
             // Fill the resized dock rather than anchoring nested scrollbars to
@@ -5057,6 +5128,14 @@ impl DesktopApp {
                                         });
                                 }
                             });
+                            linkage_action = linkage.show(
+                                ui,
+                                self.session.as_ref(),
+                                self.revision,
+                                &self.filter_query,
+                                self.client.is_some(),
+                                pointer,
+                            );
                         }
                         egui::CollapsingHeader::new(format!("Sections ({})", info.sections.len()))
                             .default_open(self.program_tree)
@@ -5088,9 +5167,22 @@ impl DesktopApp {
                             });
                     });
             });
+        self.linkage = linkage;
         let context = ui.ctx().clone();
         if let Some(address) = function {
             self.navigate(address, true, &context);
+        }
+        match linkage_action {
+            Some(crate::linkage_ui::TreeAction::Select(item)) => self.select_linkage(item),
+            Some(crate::linkage_ui::TreeAction::Open(item)) => self.open_linkage(item, &context),
+            Some(crate::linkage_ui::TreeAction::OpenPlace(item, place)) => {
+                self.open_linkage_place(item, place, &context);
+            }
+            Some(crate::linkage_ui::TreeAction::Xrefs(item)) => {
+                self.select_linkage(item);
+                self.show_selection_xrefs();
+            }
+            None => {}
         }
         if let Some((address, length)) = read {
             if string_read {
@@ -5342,7 +5434,7 @@ impl DesktopApp {
             .max()
             .unwrap_or(0);
         self.comment_owners.retain(|pc, _| {
-            self.history.contains(pc)
+            self.history.iter().any(|place| place.address() == *pc)
                 || self
                     .session
                     .as_ref()
@@ -5384,42 +5476,7 @@ impl DesktopApp {
             .or_else(|| self.comment_owners.get(&address).copied())
             .unwrap_or(address);
         if record {
-            // Capture the exact departure selection, including an instruction
-            // reached by a single click, for predictable Back/Forward behavior.
-            if let Some(selected) = self.selected {
-                if let Some(view) = graph_view(&self.graph)
-                    && (selected == view.address
-                        || listing_of(&self.graph).contains(selected)
-                        || self
-                            .semantic
-                            .mappings
-                            .iter()
-                            .any(|m| m.addresses.contains(&selected)))
-                {
-                    self.comment_owners.insert(selected, view.address);
-                }
-                if let Some(previous) = self.history.get_mut(self.history_index) {
-                    *previous = selected;
-                }
-            }
-            self.history.truncate(self.history_index + 1);
-            if self.history.last() != Some(&address) {
-                self.history.push(address);
-            }
-            if self.history.len() > 256 {
-                self.history.remove(0);
-            }
-            self.history_index = self.history.len().saturating_sub(1);
-            if owner != address {
-                self.comment_owners.insert(address, owner);
-            }
-            self.comment_owners.retain(|pc, _| {
-                self.history.contains(pc)
-                    || self
-                        .session
-                        .as_ref()
-                        .is_some_and(|s| s.annotations.contains_key(pc))
-            });
+            self.record_location(address, owner);
         }
         if self
             .info
@@ -5458,6 +5515,54 @@ impl DesktopApp {
             // result selects it as precisely as a delayed reply would.
             self.navigate_to(owner, Some(address), false, context);
         }
+    }
+
+    /// Records a Back/Forward step to `address` within `owner`, capturing the
+    /// exact departure selection, including an instruction reached by a single
+    /// click, for predictable Back/Forward behavior.
+    fn record_location(&mut self, address: u64, owner: u64) {
+        self.record_destination(crate::linkage_ui::Place::Code(address), owner);
+    }
+
+    fn record_destination(&mut self, destination: crate::linkage_ui::Place, owner: u64) {
+        let address = destination.address();
+        if let Some(selected) = self.selected {
+            if let Some(view) = graph_view(&self.graph)
+                && (selected == view.address
+                    || listing_of(&self.graph).contains(selected)
+                    || self
+                        .semantic
+                        .mappings
+                        .iter()
+                        .any(|m| m.addresses.contains(&selected)))
+            {
+                self.comment_owners.insert(selected, view.address);
+            }
+            if let Some(previous) = self.history.get_mut(self.history_index) {
+                *previous = self.data_location.map_or(
+                    crate::linkage_ui::Place::Code(selected),
+                    |(address, length)| crate::linkage_ui::Place::Data { address, length },
+                );
+            }
+        }
+        self.history.truncate(self.history_index + 1);
+        if self.history.last() != Some(&destination) {
+            self.history.push(destination);
+        }
+        if self.history.len() > 256 {
+            self.history.remove(0);
+        }
+        self.history_index = self.history.len().saturating_sub(1);
+        if owner != address {
+            self.comment_owners.insert(address, owner);
+        }
+        self.comment_owners.retain(|pc, _| {
+            self.history.iter().any(|place| place.address() == *pc)
+                || self
+                    .session
+                    .as_ref()
+                    .is_some_and(|s| s.annotations.contains_key(pc))
+        });
     }
 
     fn open_comment(&mut self, address: u64) {
@@ -6050,6 +6155,9 @@ impl DesktopApp {
     /// call and data evidence of every selected instruction in the displayed
     /// function, else the selected address itself.
     fn selection_xref_targets(&self) -> TargetSet {
+        if let Some(item) = self.linkage_target() {
+            return self.linkage_xref_targets(item);
+        }
         if let Some(address) = self.string_target() {
             return TargetSet::single(XrefTarget {
                 address,
@@ -6124,8 +6232,18 @@ impl DesktopApp {
         self.string_focus = Some((self.generation, address));
     }
 
+    /// The linkage row last selected in the Symbol Tree, while it is still
+    /// the selection.
+    fn linkage_target(&self) -> Option<crate::linkage_ui::LinkageItem> {
+        self.linkage.selected().filter(|_| self.linkage_focus)
+    }
+
     fn show_selection_xrefs(&mut self) {
         let set = self.selection_xref_targets();
+        if set.targets.is_empty() && self.linkage_target().is_some() {
+            // Forwarders and unresolved entries have no address to query.
+            return;
+        }
         match set.targets.as_slice() {
             [] => self.status = "Select an instruction, function or address first".into(),
             [target] if set.omitted() == 0 => self.open_xrefs(*target),
@@ -6275,6 +6393,210 @@ impl DesktopApp {
         }
         self.adopt_symbol_names();
         context.request_repaint();
+    }
+
+    /// Requests the next import/export page while the worker is otherwise
+    /// idle, after symbol names; user actions, replays and adoption go first.
+    fn pump_linkage(&mut self) {
+        if self.client.is_none()
+            || self.pending.is_some()
+            || self.opening.is_some()
+            || !self.queue.is_empty()
+            || self.signature_replay.is_some()
+            || self.discovery_job.is_some()
+            || self.deferred_discovery.is_some()
+            || self.discovery_bytes.is_some()
+            || self.results.preparing()
+        {
+            return;
+        }
+        if let Some(request) = self.linkage.request(self.generation, self.worker_epoch) {
+            self.send_direct(request);
+        }
+    }
+
+    fn receive_linkage(
+        &mut self,
+        cursor: usize,
+        digest: Option<String>,
+        summary: crate::linkage::LinkageSummary,
+        page: crate::linkage::LinkagePage,
+        context: &egui::Context,
+    ) {
+        let Some(info) = &self.info else {
+            return;
+        };
+        let received = self.linkage.receive(
+            self.generation,
+            self.worker_epoch,
+            cursor,
+            digest.as_deref(),
+            summary,
+            page,
+            info,
+        );
+        match received {
+            Ok(crate::linkage_ui::Received::Stale | crate::linkage_ui::Received::Pending) => {}
+            Ok(crate::linkage_ui::Received::Complete(linkage)) => {
+                // Charged while the presentation is prepared from it.
+                if self.results.set_linkage_bytes(linkage.retained_bytes()) {
+                    self.linkage.build(linkage, context);
+                } else {
+                    self.fail_linkage();
+                }
+            }
+            Err(error) => {
+                self.fail_linkage();
+                self.stop_worker();
+                self.status = format!("Invalid worker response: linkage: {error}; worker stopped");
+                return;
+            }
+        }
+        context.request_repaint();
+    }
+
+    /// Adopts a finished background presentation within the session budget.
+    fn poll_linkage(&mut self) {
+        match self.linkage.poll() {
+            crate::linkage_ui::Polled::Idle => {}
+            crate::linkage_ui::Polled::Ready(bytes) => {
+                crate::performance::event("linkage_retained_bytes", bytes as u64);
+                if !self.results.set_linkage_bytes(bytes) {
+                    self.fail_linkage();
+                }
+            }
+            crate::linkage_ui::Polled::Failed => self.fail_linkage(),
+        }
+    }
+
+    /// A worker that timed out or died serving the table is not asked again
+    /// for this binary, so the table cannot keep restarting workers.
+    fn fail_pending_linkage(&mut self) {
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| matches!(pending.request, Request::Linkage { .. }))
+        {
+            self.fail_linkage();
+        }
+    }
+
+    fn fail_linkage(&mut self) {
+        self.linkage.fail();
+        self.linkage_focus = false;
+        self.results.set_linkage_bytes(0);
+    }
+
+    fn pointer_width(&self) -> u64 {
+        self.info
+            .as_ref()
+            .and_then(|info| crate::architecture::properties(&info.architecture))
+            .map_or(1, |(pointer, _)| pointer)
+    }
+
+    /// Single click on a linkage row: it becomes the X target. The code
+    /// selection, and so the Back/Forward departure point, stays where it was;
+    /// tokens chosen in code views no longer apply.
+    fn select_linkage(&mut self, item: crate::linkage_ui::LinkageItem) {
+        self.string_focus = None;
+        self.selected_call = None;
+        self.xref_choices = None;
+        self.selected_local = None;
+        self.decompiler_rename_context = false;
+        self.linkage.select(item);
+        self.linkage_focus = true;
+    }
+
+    /// Double click: code through function navigation, slots and data in Hex.
+    /// Entries without an address only become selected.
+    fn open_linkage(&mut self, item: crate::linkage_ui::LinkageItem, context: &egui::Context) {
+        let place = self.linkage.prepared().and_then(|prepared| {
+            crate::linkage_ui::destination(prepared.linkage(), item, self.pointer_width())
+        });
+        match place {
+            Some(place) => self.open_linkage_place(item, place, context),
+            None => self.select_linkage(item),
+        }
+    }
+
+    fn open_linkage_place(
+        &mut self,
+        item: crate::linkage_ui::LinkageItem,
+        place: crate::linkage_ui::Place,
+        context: &egui::Context,
+    ) {
+        self.linkage.select(item);
+        match place {
+            crate::linkage_ui::Place::Code(address) => {
+                self.navigate_location(address, None, true, context);
+            }
+            crate::linkage_ui::Place::Data { address, length } => {
+                self.navigate_data(address, length, context);
+            }
+        }
+        // X now follows the destination's selection.
+        self.linkage_focus = false;
+    }
+
+    /// Opens a slot or data object in Hex at exactly `address`, selecting up
+    /// to `length` file-backed bytes. It is recorded for Back/Forward and is
+    /// never treated as a function entry.
+    fn navigate_data(&mut self, address: u64, length: u64, context: &egui::Context) {
+        if address == 0 {
+            return;
+        }
+        self.record_destination(crate::linkage_ui::Place::Data { address, length }, address);
+        self.open_data(address, length, context);
+    }
+
+    fn open_data(&mut self, address: u64, length: u64, context: &egui::Context) {
+        if self.data_location.is_none() {
+            self.code_selection = self.selected;
+        }
+        self.selection_generation = self.selection_generation.wrapping_add(1);
+        self.queue.retain(|request| {
+            !matches!(request, Request::Graph { .. } | Request::Decompile { .. })
+        });
+        self.reference_focus = None;
+        self.set_selected_address(address);
+        self.semantic.addresses.clear();
+        self.semantic.ranges.clear();
+        self.data_location = Some((address, length));
+        let action = {
+            let Some(info) = &self.info else { return };
+            self.hex.go_to_span(address, length, &info.sections)
+        };
+        self.tab = Tab::Hex;
+        if let Some(action) = action {
+            self.handle_hex_action(action, context);
+        }
+    }
+
+    /// Exact X targets of the selected linkage row: one address opens
+    /// References directly, several use the bounded chooser.
+    fn linkage_xref_targets(&self, item: crate::linkage_ui::LinkageItem) -> TargetSet {
+        let Some(prepared) = self.linkage.prepared() else {
+            return TargetSet::default();
+        };
+        let functions = self.info.as_ref().map(|info| info.functions.as_slice());
+        TargetSet::from_targets(
+            crate::linkage_ui::places(prepared.linkage(), item, self.pointer_width())
+                .into_iter()
+                .map(|place| match place {
+                    crate::linkage_ui::Place::Code(address) => XrefTarget {
+                        address,
+                        kind: if functions.is_some_and(|f| function_at(f, address).is_some()) {
+                            TargetKind::Function
+                        } else {
+                            TargetKind::Address
+                        },
+                    },
+                    crate::linkage_ui::Place::Data { address, .. } => XrefTarget {
+                        address,
+                        kind: TargetKind::DataAccess,
+                    },
+                }),
+        )
     }
 
     fn read_data_reference(&mut self, target: u64, size: u32, context: &egui::Context) {
@@ -8546,7 +8868,10 @@ mod tests {
             signature: "bytes".into(),
             length: 4,
         });
-        app.history = vec![0x1000, 0x1040];
+        app.history = vec![0x1000, 0x1040]
+            .into_iter()
+            .map(crate::linkage_ui::Place::Code)
+            .collect();
         app.history_index = 1;
         let selected = app.selected;
         app.comment_owners.insert(0x1001, 0x1000);
@@ -8571,7 +8896,13 @@ mod tests {
                 && app.discovery_saved.is_none()
         );
         assert!(app.strings_scanned && app.strings.len() == 1 && app.crypto.len() == 1);
-        assert_eq!(app.history, [0x1000, 0x1040]);
+        assert_eq!(
+            app.history
+                .iter()
+                .map(|place| place.address())
+                .collect::<Vec<_>>(),
+            [0x1000, 0x1040]
+        );
         assert_eq!((app.history_index, app.selected), (1, selected));
     }
 
@@ -9924,7 +10255,10 @@ mod tests {
     fn history_shortcuts_revisit_functions_without_adding_history_entries() {
         let context = egui::Context::default();
         let mut app = keyboard_app();
-        app.history = vec![0x1000, 0x1040];
+        app.history = vec![0x1000, 0x1040]
+            .into_iter()
+            .map(crate::linkage_ui::Place::Code)
+            .collect();
         app.history_index = 1;
         app.selected = Some(0x1040);
         keyboard_frame(
@@ -9941,11 +10275,23 @@ mod tests {
         );
         assert_eq!(app.selected, Some(0x1040));
         assert_eq!(app.history_index, 1);
-        assert_eq!(app.history, [0x1000, 0x1040]);
+        assert_eq!(
+            app.history
+                .iter()
+                .map(|place| place.address())
+                .collect::<Vec<_>>(),
+            [0x1000, 0x1040]
+        );
         app.navigate(0x1080, true, &context);
         app.history_step(false, &context);
         app.navigate(0x10c0, true, &context);
-        assert_eq!(app.history, [0x1000, 0x1040, 0x10c0]);
+        assert_eq!(
+            app.history
+                .iter()
+                .map(|place| place.address())
+                .collect::<Vec<_>>(),
+            [0x1000, 0x1040, 0x10c0]
+        );
     }
 
     fn edit_view(app: &mut DesktopApp, edit: impl FnOnce(&mut FunctionView)) {
@@ -10025,7 +10371,10 @@ mod tests {
             },
         );
         show_code(&mut app, text, vec![], SemanticInfo::default());
-        app.history = vec![0x1000];
+        app.history = vec![0x1000]
+            .into_iter()
+            .map(crate::linkage_ui::Place::Code)
+            .collect();
         app
     }
 
@@ -10281,7 +10630,13 @@ mod tests {
         output.textures_delta.clear();
         assert_eq!(app.selected, Some(0x1008));
         assert_eq!(app.pending_listing_scroll, Some(2));
-        assert_eq!(app.history, [0x1004, 0x1008]);
+        assert_eq!(
+            app.history
+                .iter()
+                .map(|place| place.address())
+                .collect::<Vec<_>>(),
+            [0x1004, 0x1008]
+        );
         app.history_step(false, &context);
         assert_eq!(app.selected, Some(0x1004));
         assert_eq!(app.pending_listing_scroll, Some(1));
@@ -10370,7 +10725,10 @@ mod tests {
         let context = egui::Context::default();
         let mut app = semantic_app();
         app.tab = Tab::Graph;
-        app.history = vec![0x1000, 0x1004];
+        app.history = vec![0x1000, 0x1004]
+            .into_iter()
+            .map(crate::linkage_ui::Place::Code)
+            .collect();
         app.history_index = 1;
         app.history_step(false, &context);
         assert_eq!(app.selected, Some(0x1000));
@@ -10508,7 +10866,13 @@ mod tests {
         );
         assert_eq!(app.pending_listing_scroll, Some(1));
         assert_eq!(app.selection_generation, generation);
-        assert_eq!(app.history, vec![0x1000]);
+        assert_eq!(
+            app.history
+                .iter()
+                .map(|place| place.address())
+                .collect::<Vec<_>>(),
+            [0x1000]
+        );
         assert!(app.client.is_none());
         assert!(context.memory(|memory| memory.focused()).is_none());
         // Unmapped punctuation does not fabricate a nearby machine address.
@@ -11405,7 +11769,13 @@ mod tests {
             }
         }
         assert_eq!(app.selected, Some(0x1040));
-        assert_eq!(app.history, [0x1000, 0x1040]);
+        assert_eq!(
+            app.history
+                .iter()
+                .map(|place| place.address())
+                .collect::<Vec<_>>(),
+            [0x1000, 0x1040]
+        );
     }
 
     #[test]
@@ -11697,7 +12067,13 @@ mod tests {
         );
         output.textures_delta.clear();
         assert_eq!(app.decompiled(), source);
-        assert_eq!(app.history, [0x1000]);
+        assert_eq!(
+            app.history
+                .iter()
+                .map(|place| place.address())
+                .collect::<Vec<_>>(),
+            [0x1000]
+        );
         assert_eq!(app.strings[0].text, "saved string");
         assert!(app.strings_truncated);
         assert!(extracted.exists());
@@ -13165,7 +13541,13 @@ mod tests {
         app.select_instruction(0x1008);
         // A callsite in another function is recorded as its exact instruction.
         app.navigate_reference(0x1040, 0x1044, &context);
-        assert_eq!(app.history, [0x1008, 0x1044]);
+        assert_eq!(
+            app.history
+                .iter()
+                .map(|place| place.address())
+                .collect::<Vec<_>>(),
+            [0x1008, 0x1044]
+        );
         assert_eq!(app.reference_focus, Some((0x1040, 0x1044)));
         assert_eq!(app.comment_owners.get(&0x1044), Some(&0x1040));
         assert_eq!(app.comment_owners.get(&0x1008), Some(&0x1000));
@@ -13191,7 +13573,13 @@ mod tests {
         // Forward reopens the recorded owner, not a guessed function at the PC.
         app.history_step(true, &context);
         assert_eq!(app.reference_focus, Some((0x1040, 0x1044)));
-        assert_eq!(app.history, [0x1008, 0x1044]);
+        assert_eq!(
+            app.history
+                .iter()
+                .map(|place| place.address())
+                .collect::<Vec<_>>(),
+            [0x1008, 0x1044]
+        );
     }
 
     /// No worker process is needed to exercise delivery order. A pending
@@ -13285,7 +13673,10 @@ mod tests {
         let context = egui::Context::default();
         let mut app = hex_app();
         app.semantic.select_instruction(0x1004);
-        app.history = vec![0x1040, 0x1000];
+        app.history = vec![0x1040, 0x1000]
+            .into_iter()
+            .map(crate::linkage_ui::Place::Code)
+            .collect();
         app.history_index = 1;
         let selected = app.selected;
         let address_field = app.address.clone();
@@ -14274,5 +14665,711 @@ mod tests {
         );
         assert!(app.dirty());
         assert_eq!(app.revision, app.saved_revision);
+    }
+
+    fn linkage_app(sha256: &str) -> (DesktopApp, crate::linkage::LinkageTable) {
+        let mut app = DesktopApp::empty(None);
+        app.info = Some(crate::linkage_ui::fixture::info(sha256));
+        app.session = Some(Session::new(sha256.into()));
+        app.selected = Some(0x1000);
+        app.address = "1000".into();
+        app.rebuild_filter();
+        app.linkage.begin(app.generation, app.worker_epoch);
+        let table = crate::linkage_ui::fixture::table(
+            sha256,
+            vec![crate::linkage::LinkageGap::DelayVariant],
+        );
+        (app, table)
+    }
+
+    fn linkage_reply(
+        app: &DesktopApp,
+        request: Request,
+        table: &crate::linkage::LinkageTable,
+    ) -> (Pending, Response) {
+        let Request::Linkage { cursor, .. } = &request else {
+            panic!("expected a linkage request");
+        };
+        let page = table.page(*cursor).unwrap();
+        (
+            Pending {
+                id: 1,
+                request,
+                started: Instant::now(),
+                selection: app.selection_generation,
+                revision: app.revision,
+                byte_origin: (app.selected, app.tab),
+                bytes: None,
+                result: None,
+            },
+            Response::Linkage {
+                summary: table.summary().clone(),
+                page,
+            },
+        )
+    }
+
+    fn adopt_linkage(app: &mut DesktopApp, table: &crate::linkage::LinkageTable) {
+        let context = egui::Context::default();
+        while let Some(request) = app.linkage.request(app.generation, app.worker_epoch) {
+            let (pending, reply) = linkage_reply(app, request, table);
+            app.receive(pending, reply, &context);
+        }
+        for _ in 0..5000 {
+            app.poll_linkage();
+            if app.linkage.status() != crate::linkage_ui::Status::Loading {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(app.linkage.status(), crate::linkage_ui::Status::Ready);
+    }
+
+    #[test]
+    fn linkage_rows_navigate_exactly_and_never_create_functions() {
+        use crate::linkage_ui::{LinkageItem, fixture};
+        let context = egui::Context::default();
+        let (mut app, table) = linkage_app(&"a".repeat(64));
+        adopt_linkage(&mut app, &table);
+        assert!(app.results.usage().charged > 0, "linkage is charged");
+        let functions = app.info.as_ref().unwrap().functions.clone();
+        let unchanged = |app: &DesktopApp| {
+            assert_eq!(app.info.as_ref().unwrap().functions, functions);
+            assert!(app.pending.is_none() && app.opening.is_none());
+            assert!(
+                !app.queue
+                    .iter()
+                    .any(|request| matches!(request, Request::Graph { .. }))
+            );
+        };
+        // A data export opens Hex at its exact address.
+        app.open_linkage(LinkageItem::Export(1), &context);
+        assert_eq!(app.tab, Tab::Hex);
+        assert_eq!(app.selected, Some(fixture::DATA_EXPORT));
+        assert_eq!(
+            app.history.last().map(|place| place.address()),
+            Some(fixture::DATA_EXPORT)
+        );
+        assert_eq!(app.linkage.selected(), Some(LinkageItem::Export(1)));
+        unchanged(&app);
+        // Forwarders and unresolved entries only become selected.
+        let history = app.history.clone();
+        for id in [2, 3] {
+            app.open_linkage(LinkageItem::Export(id), &context);
+            assert_eq!(app.linkage.selected(), Some(LinkageItem::Export(id)));
+            assert_eq!(
+                (app.tab, &app.history, app.selected),
+                (Tab::Hex, &history, Some(fixture::DATA_EXPORT))
+            );
+        }
+        // An import goes to its verified stub through code navigation.
+        let generation = app.selection_generation;
+        app.open_linkage(LinkageItem::Import(0), &context);
+        assert_eq!(app.selected, Some(fixture::STUB));
+        assert_eq!(app.tab, Tab::Listing);
+        assert_ne!(app.selection_generation, generation);
+        assert_eq!(
+            app.history.last().map(|place| place.address()),
+            Some(fixture::STUB)
+        );
+        // Its slot-only namesake in another library opens its slot instead.
+        app.open_linkage(LinkageItem::Import(1), &context);
+        assert_eq!(
+            (app.tab, app.selected),
+            (Tab::Hex, Some(fixture::SLOT_ONLY))
+        );
+        unchanged(&app);
+        // Back/Forward revisit the exact addresses.
+        app.history_step(false, &context);
+        assert_eq!(app.selected, Some(fixture::STUB));
+        app.history_step(false, &context);
+        assert_eq!(app.selected, Some(fixture::DATA_EXPORT));
+        app.history_step(true, &context);
+        assert_eq!(app.selected, Some(fixture::STUB));
+        app.history_step(true, &context);
+        assert_eq!(
+            (app.tab, app.selected),
+            (Tab::Hex, Some(fixture::SLOT_ONLY))
+        );
+        assert_eq!(app.hex.focused_span(), Some((fixture::SLOT_ONLY, 8)));
+        assert!(app.semantic.addresses.is_empty());
+        // Returning to the same VA with a different span retains both steps.
+        app.navigate_data(fixture::SLOT_ONLY, 1, &context);
+        app.history_step(false, &context);
+        assert_eq!(app.hex.focused_span(), Some((fixture::SLOT_ONLY, 8)));
+        app.history_step(true, &context);
+        assert_eq!(app.hex.focused_span(), Some((fixture::SLOT_ONLY, 1)));
+        for offset in 0..300 {
+            app.navigate_data(fixture::SLOT_ONLY, 1 + offset % 8, &context);
+        }
+        assert_eq!(app.history.len(), 256);
+        assert_eq!(app.history_index, 255);
+        app.history_step(false, &context);
+        app.navigate_data(fixture::DATA_EXPORT, 1, &context);
+        assert_eq!(app.history_index + 1, app.history.len());
+        assert_eq!(app.info.as_ref().unwrap().functions, functions);
+    }
+
+    #[test]
+    fn linkage_x_uses_exact_addresses_or_the_bounded_chooser() {
+        use crate::linkage_ui::{LinkageItem, fixture};
+        let context = egui::Context::default();
+        theme::install(&context);
+        let (mut app, table) = linkage_app(&"a".repeat(64));
+        adopt_linkage(&mut app, &table);
+        // Several verified locations become explicit choices.
+        app.selected_call = Some(0x1000);
+        app.select_linkage(LinkageItem::Import(0));
+        assert!(app.selected_call.is_none(), "stale call token cleared");
+        app.show_selection_xrefs();
+        let choices = app.xref_choices.as_ref().expect("target chooser");
+        assert_eq!(
+            choices
+                .set
+                .targets
+                .iter()
+                .map(|target| (target.address, target.kind))
+                .collect::<Vec<_>>(),
+            [
+                (fixture::STUB, TargetKind::Function),
+                (0x1030, TargetKind::Address),
+                (fixture::SLOT, TargetKind::DataAccess),
+                (0x2020, TargetKind::DataAccess),
+            ]
+        );
+        assert_eq!(app.tab, Tab::References);
+        // One exact address opens References directly, through the X key.
+        app.select_linkage(LinkageItem::Import(1));
+        keyboard_frame(
+            &context,
+            &mut app,
+            vec![key_event(egui::Key::X, egui::Modifiers::NONE)],
+        );
+        assert!(app.xref_choices.is_none());
+        assert_eq!(
+            app.xref_target,
+            Some(XrefTarget {
+                address: fixture::SLOT_ONLY,
+                kind: TargetKind::DataAccess
+            })
+        );
+        // A forwarder has no address, so X does nothing.
+        let status = app.status.clone();
+        app.select_linkage(LinkageItem::Export(2));
+        app.show_selection_xrefs();
+        assert_eq!(app.xref_target.unwrap().address, fixture::SLOT_ONLY);
+        assert!(app.xref_choices.is_none());
+        assert_eq!(app.status, status);
+        // Once the selection moves, X follows it rather than the row.
+        app.select_linkage(LinkageItem::Export(1));
+        app.select_instruction(0x1000);
+        assert_eq!(
+            app.selection_xref_targets().targets,
+            [XrefTarget {
+                address: 0x1000,
+                kind: TargetKind::Function
+            }]
+        );
+    }
+
+    fn paged_linkage_table(sha256: &str) -> crate::linkage::LinkageTable {
+        let records = std::iter::once(crate::linkage::LinkageRecord::Library(
+            crate::linkage::Library {
+                id: 0,
+                name: "paged.dll".into(),
+            },
+        ))
+        .chain((0..1500).map(|id| {
+            crate::linkage::LinkageRecord::Import(crate::linkage_ui::fixture::import(
+                id,
+                Some(&format!("paged_{id}")),
+                Some(0),
+            ))
+        }))
+        .collect();
+        crate::linkage::LinkageTable::new(records, Vec::new()).with_image(sha256)
+    }
+
+    #[test]
+    fn late_linkage_pages_after_a_new_binary_or_cancel_are_dropped() {
+        let context = egui::Context::default();
+        let (mut app, _) = linkage_app(&"a".repeat(64));
+        let table = paged_linkage_table(&"a".repeat(64));
+        let first = app
+            .linkage
+            .request(app.generation, app.worker_epoch)
+            .unwrap();
+        let (pending, reply) = linkage_reply(&app, first, &table);
+        app.receive(pending, reply, &context);
+        let second = app
+            .linkage
+            .request(app.generation, app.worker_epoch)
+            .unwrap();
+        assert!(matches!(second, Request::Linkage { cursor, digest: Some(_) } if cursor > 0));
+        // Cancel discards received pages; the late reply changes nothing.
+        let (pending, reply) = linkage_reply(&app, second.clone(), &table);
+        app.stop_worker();
+        app.receive(pending, reply, &context);
+        assert_eq!(app.linkage.status(), crate::linkage_ui::Status::Loading);
+        assert!(matches!(
+            app.linkage.request(app.generation, app.worker_epoch),
+            Some(Request::Linkage {
+                cursor: 0,
+                digest: None
+            })
+        ));
+        // A replacement worker for the same image starts from the first page.
+        app.worker_epoch += 1;
+        app.linkage.begin(app.generation, app.worker_epoch);
+        assert!(matches!(
+            app.linkage.request(app.generation, app.worker_epoch),
+            Some(Request::Linkage {
+                cursor: 0,
+                digest: None
+            })
+        ));
+        // A page answering the previous binary is dropped after a new open.
+        let first = app
+            .linkage
+            .request(app.generation, app.worker_epoch)
+            .unwrap();
+        let (pending, reply) = linkage_reply(&app, first, &table);
+        app.receive(pending, reply, &context);
+        let (pending, reply) = linkage_reply(&app, second, &table);
+        app.clear_views();
+        app.generation += 1;
+        app.linkage.begin(app.generation, app.worker_epoch);
+        app.receive(pending, reply, &context);
+        assert_eq!(app.linkage.status(), crate::linkage_ui::Status::Loading);
+        assert!(app.status.is_empty() || !app.status.contains("linkage"));
+        adopt_linkage(&mut app, &table);
+        assert_eq!(
+            app.linkage.prepared().unwrap().linkage().imports.len(),
+            1500
+        );
+        // A tampered current page fails closed; a worker error only loses the table.
+        app.clear_views();
+        app.generation += 1;
+        app.linkage.begin(app.generation, app.worker_epoch);
+        let request = app
+            .linkage
+            .request(app.generation, app.worker_epoch)
+            .unwrap();
+        let (pending, mut reply) = linkage_reply(&app, request.clone(), &table);
+        if let Response::Linkage { page, .. } = &mut reply {
+            page.entries.swap(0, 1);
+        }
+        app.receive(pending, reply, &context);
+        assert_eq!(app.linkage.status(), crate::linkage_ui::Status::Unavailable);
+        assert!(app.status.contains("linkage"), "{}", app.status);
+        assert!(
+            app.linkage
+                .request(app.generation, app.worker_epoch)
+                .is_none()
+        );
+        app.clear_views();
+        app.generation += 1;
+        app.linkage.begin(app.generation, app.worker_epoch);
+        let (pending, _) = linkage_reply(&app, request, &table);
+        app.receive(
+            pending,
+            Response::Error {
+                message: "linkage failed".into(),
+            },
+            &context,
+        );
+        assert_eq!(app.linkage.status(), crate::linkage_ui::Status::Unavailable);
+        assert_eq!(app.status, "linkage failed");
+    }
+
+    #[test]
+    fn linkage_tree_fits_narrow_and_wide_docks_at_fractional_scale() {
+        fn frame(
+            context: &egui::Context,
+            app: &mut DesktopApp,
+            width: f32,
+            events: Vec<egui::Event>,
+        ) -> egui::FullOutput {
+            let time = context.input(|input| input.time) + 0.05;
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1000.0, 800.0),
+                    )),
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |root| {
+                    egui::Panel::left("linkage-tree-test")
+                        .exact_size(width)
+                        .frame(egui::Frame::NONE)
+                        .show(root, |ui| app.symbol_tree(ui));
+                },
+            );
+            output.textures_delta.clear();
+            output
+        }
+        fn bars(output: &egui::FullOutput) -> Vec<egui::Rect> {
+            output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Rect(rect)
+                        if rect.rect.width().min(rect.rect.height()) < 20.0
+                            && rect.rect.width().max(rect.rect.height()) > 60.0 =>
+                    {
+                        Some(rect.rect)
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+
+        let context = egui::Context::default();
+        theme::install(&context);
+        context.set_pixels_per_point(1.25);
+        context.all_styles_mut(|style| {
+            style.animation_time = 0.0;
+            style.spacing.scroll = egui::style::ScrollStyle::solid();
+        });
+        let (mut app, table) = linkage_app(&"a".repeat(64));
+        app.client = None;
+        frame(&context, &mut app, 260.0, vec![]);
+        let output = frame(&context, &mut app, 260.0, vec![]);
+        assert!(!rendered_text(&output).iter().any(|t| t.contains("Loading")));
+        adopt_linkage(&mut app, &table);
+        frame(&context, &mut app, 260.0, vec![]);
+        let output = frame(&context, &mut app, 260.0, vec![]);
+        let text = rendered_text(&output);
+        assert!(
+            text.iter()
+                .any(|t| t.starts_with("Imports (4)") && t.ends_with("Partial"))
+        );
+        let imports = text_position(&output, "Imports (4)", 0);
+        frame(&context, &mut app, 260.0, pointer_events(imports));
+        let output = frame(&context, &mut app, 260.0, vec![]);
+        let group = text_position(&output, "KERNEL32.dll (2)", 0);
+        frame(&context, &mut app, 260.0, pointer_events(group));
+        let output = frame(&context, &mut app, 260.0, vec![]);
+        let exports = text_position(&output, "Exports (5)", 0);
+        frame(&context, &mut app, 260.0, pointer_events(exports));
+        for width in [150.0, 260.0, 431.0, 260.0] {
+            frame(&context, &mut app, width, vec![]);
+            let output = frame(&context, &mut app, width, vec![]);
+            let again = frame(&context, &mut app, width, vec![]);
+            assert_eq!(
+                bars(&output),
+                bars(&again),
+                "no scrollbar flicker at {width}"
+            );
+            let rows: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Text(text)
+                        if ["fn", "Shared", "code_export", "data_export", "ordinal 9"]
+                            .contains(&text.galley.text()) =>
+                    {
+                        Some((shape.clip_rect, text.galley.rows.len()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert!(rows.len() >= 5, "{width}: {rows:?}");
+            for (clip, lines) in rows {
+                assert_eq!(lines, 1);
+                assert!(clip.right() <= width + 0.5, "{width}: {clip:?}");
+            }
+            // Expanded lists stay within their content height: no scrollbars.
+            assert!(
+                bars(&output)
+                    .iter()
+                    .all(|bar| bar.height() < bar.width() || bar.height() > 300.0),
+                "{width}: {:?}",
+                bars(&output)
+            );
+        }
+        // Clicking selects; double-clicking a data row opens Hex.
+        let output = frame(&context, &mut app, 260.0, vec![]);
+        let data = text_position(&output, "data_export", 0);
+        frame(&context, &mut app, 260.0, pointer_events(data));
+        assert_eq!(
+            app.linkage.selected(),
+            Some(crate::linkage_ui::LinkageItem::Export(1))
+        );
+        assert_ne!(app.tab, Tab::Hex);
+        frame(&context, &mut app, 260.0, pointer_events(data));
+        assert_eq!(app.tab, Tab::Hex);
+        assert_eq!(app.selected, Some(crate::linkage_ui::fixture::DATA_EXPORT));
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn project_saved_at_linkage_data_reopens_and_fetches_tree_without_navigation() {
+        use crate::linkage_ui::{LinkageItem, Status};
+        let directory = tempfile::tempdir().unwrap();
+        #[cfg(target_os = "linux")]
+        let binary = {
+            let binary = directory.path().join("sample");
+            assert!(
+                std::process::Command::new("gcc")
+                    .args(["-O0", "-g", "-rdynamic", "tests/fixtures/sample.c", "-o"])
+                    .arg(&binary)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            binary
+        };
+        #[cfg(windows)]
+        let binary = match std::env::var_os("GHIDRA_RUST_TEST_PE") {
+            Some(path) => PathBuf::from(path),
+            None => return, // scripts/build-windows.ps1 supplies the native fixture.
+        };
+        let executable = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(if cfg!(windows) {
+                "ghidra-rust.exe"
+            } else {
+                "ghidra-rust"
+            });
+        assert!(
+            executable.is_file(),
+            "full cargo test builds the worker executable: {}",
+            executable.display()
+        );
+        let context = egui::Context::default();
+        let mut app = DesktopApp::empty(None);
+        // Use the application's executable rather than Cargo's test harness.
+        let start = |app: &mut DesktopApp, path: PathBuf| {
+            let mut client =
+                WorkerClient::start_using_executable(context.clone(), &path, &executable).unwrap();
+            if let Some(project) = &app.opening_project
+                && let Some(binary) = &project.project.binary
+            {
+                client.retain_source(Arc::new(binary.clone()));
+            }
+            app.client = Some(client);
+            app.worker_epoch += 1;
+            app.opening = Some(Opening {
+                path: path.clone(),
+                preserve: false,
+                follow: None,
+                revision: app.revision,
+                follow_origin: app.request_origin(),
+            });
+            app.send_direct(Request::Open {
+                path: path.to_string_lossy().into_owned(),
+            });
+        };
+        let settle = |app: &mut DesktopApp| {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                app.poll_worker(&context);
+                if app.linkage.status() == Status::Ready
+                    && app.pending.is_none()
+                    && app.queue.is_empty()
+                    && !app.results.preparing()
+                    && app.deferred_restore.is_none()
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "reopen did not settle: {}, tree {:?}",
+                    app.status,
+                    app.linkage.status()
+                );
+                assert!(app.client.is_some(), "worker stopped: {}", app.status);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        start(&mut app, binary);
+        settle(&mut app);
+        app.analyze_prompt = None;
+        let code_pc = app.selected.unwrap();
+        #[cfg(target_os = "linux")]
+        let item = {
+            let linkage = app.linkage.prepared().unwrap().linkage();
+            let import = linkage
+                .imports
+                .iter()
+                .find(|import| import.raw.as_deref() == Some("__libc_start_main"))
+                .unwrap();
+            assert!(import.stub.is_none());
+            LinkageItem::Import(import.id)
+        };
+        #[cfg(windows)]
+        let item = {
+            let linkage = app.linkage.prepared().unwrap().linkage();
+            LinkageItem::Export(
+                linkage
+                    .exports
+                    .iter()
+                    .find(|export| export.raw.as_deref() == Some("base64_message"))
+                    .unwrap()
+                    .id,
+            )
+        };
+        app.open_linkage(item, &context);
+        let data_address = app.selected.unwrap();
+        assert_eq!(app.tab, Tab::Hex);
+        assert_eq!(app.project_selection(), Some(code_pc));
+        let project_path = directory.path().join("data-location.grproj");
+        app.project_path = Some(project_path.clone());
+        app.save_project(false, &context);
+        while app.file_job.is_some() {
+            app.poll_files(&context);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(
+            ProjectData::load(&project_path)
+                .unwrap()
+                .data
+                .selected_address,
+            Some(code_pc)
+        );
+        // Also exercise projects saved by the original feature: they persisted
+        // a data selection alongside the previous displayed code results.
+        let mut old = ProjectData::load(&project_path).unwrap().data;
+        old.selected_address = Some(data_address);
+        old.info.source_identity = app.info.as_ref().unwrap().source_identity;
+        let legacy_path = directory.path().join("legacy-data-location.grproj");
+        old.save(&legacy_path, app.binary_protection.as_ref().unwrap(), true)
+            .unwrap();
+        old.view = None;
+        old.decompiled = None;
+        old.mappings.clear();
+        old.semantics = Default::default();
+        let entry_path = directory.path().join("legacy-no-code-view.grproj");
+        old.save(&entry_path, app.binary_protection.as_ref().unwrap(), true)
+            .unwrap();
+        let entry = app.info.as_ref().unwrap().entry;
+        for (path, expected_pc) in [
+            (project_path, code_pc),
+            (legacy_path, code_pc),
+            (entry_path, entry),
+        ] {
+            app.clear_binary();
+            app.open_project(path, &context);
+            while app.file_job.is_some() {
+                app.poll_files(&context);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let opening = app
+                .opening
+                .as_ref()
+                .expect("project starts worker verification")
+                .path
+                .clone();
+            // Replace only Cargo's harness process; keep the real file-load,
+            // Opened verification, deferred restore and page-adoption paths.
+            start(&mut app, opening);
+            settle(&mut app);
+            assert_eq!(app.selected, Some(expected_pc));
+            assert_eq!(app.tab, Tab::Listing);
+            assert!(app.view().is_some());
+            assert!(!app.status.contains("outside file-backed"));
+            assert_eq!(app.linkage.status(), Status::Ready);
+            assert!(!app.linkage.prepared().unwrap().linkage().imports.is_empty());
+        }
+        app.clear_binary();
+    }
+
+    #[test]
+    fn saved_projects_omit_linkage_and_reopen_rebuilds_it_from_the_image() {
+        use crate::linkage_ui::{LinkageItem, Status, fixture};
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("fixture.bin");
+        std::fs::write(&binary, [0_u8; 0x400]).unwrap();
+        let sha256 = crate::session::fingerprint(&binary).unwrap();
+        let (mut app, table) = linkage_app(&sha256);
+        let info = app.info.as_mut().unwrap();
+        info.path = binary.to_string_lossy().into_owned();
+        info.source_identity = FileIdentity::from_file(&std::fs::File::open(&binary).unwrap());
+        let protection = BinaryProtection::open(&binary)
+            .unwrap()
+            .bind_snapshot(info)
+            .unwrap();
+        adopt_linkage(&mut app, &table);
+        app.edit_annotation(
+            fixture::STUB,
+            Annotation {
+                label: "analyst_shared".into(),
+                ..Annotation::default()
+            },
+        );
+        app.select_linkage(LinkageItem::Import(2));
+        app.function_filter = "shared".into();
+        app.restart_filter();
+        let data = ProjectData {
+            info: app.info.clone().unwrap(),
+            session: app.session.clone().unwrap(),
+            view: None,
+            decompiled: None,
+            mappings: Vec::new(),
+            semantics: Default::default(),
+            strings: Vec::new(),
+            strings_truncated: false,
+            crypto: Vec::new(),
+            crypto_truncated: false,
+            selected_address: app.selected,
+            discovery: None,
+        };
+        let project_path = directory.path().join("linkage.grproj");
+        data.save(&project_path, &protection, true).unwrap();
+        let bytes = std::fs::read(&project_path).unwrap();
+        for declared in ["USER32.dll", "data_export", "OTHER.Func", "?fn@@YAXXZ"] {
+            assert!(
+                !bytes
+                    .windows(declared.len())
+                    .any(|window| window == declared.as_bytes()),
+                "{declared} is not persisted"
+            );
+        }
+        // Reopen: a new generation starts empty and fetches from the image.
+        let project = ProjectData::load(&project_path).unwrap();
+        let extracted = project.binary.as_ref().unwrap().path().to_owned();
+        app.clear_views();
+        app.generation += 1;
+        app.function_filter.clear();
+        app.restart_filter();
+        app.session = Some(project.data.session.clone());
+        app.restore_project(
+            ProjectOpen {
+                project,
+                project_path,
+                binary_path: extracted,
+                discovery_index: None,
+            },
+            &egui::Context::default(),
+        );
+        app.linkage.begin(app.generation, app.worker_epoch);
+        assert_eq!(app.linkage.status(), Status::Loading);
+        assert!(app.linkage.selected().is_none() && app.linkage.prepared().is_none());
+        adopt_linkage(&mut app, &fixture::table(&sha256, Vec::new()));
+        let linkage = app.linkage.prepared().unwrap().linkage();
+        assert_eq!(linkage.digest, table.summary().digest);
+        // The saved label still names the import at its exact stub.
+        let import = &linkage.imports[0];
+        assert_eq!(
+            crate::linkage_ui::shown_name(
+                Some(
+                    app.session.as_ref().unwrap().annotations[&fixture::STUB]
+                        .label
+                        .as_str()
+                ),
+                &import.raw,
+                &import.display,
+                import.ordinal
+            ),
+            "analyst_shared"
+        );
     }
 }

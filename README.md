@@ -20,6 +20,8 @@ are recorded separately; no general speed advantage over Ghidra is claimed yet.
   references, and bounded recovery from supported metadata, pointer tables,
   and function-start patterns.
 - Strings, Hex / Memory Map, byte decoding, and FindCrypt-style constant scans.
+- Declared imports grouped by library and exports in the Symbol Tree, with
+  exact navigation and references.
 - Compact C++, Rust and MSVC display names with the raw symbol on hover.
   See [demangling](docs/demangling.md).
 - Function labels, comments, supported local renames, and limited function
@@ -85,6 +87,15 @@ pseudocode selects the corresponding instructions. Links use genuine engine
 addresses. Several instructions can share an expression, and optimized-away
 instructions may have no visible counterpart.
 
+The Symbol Tree lists **Imports**, grouped by declaring library (or **Unknown
+library**), and **Exports**. The function filter applies to them too. Click a
+row to select it; double-click to open it. An import opens its verified stub as
+code, or else its slot in Hex at that exact address. Code exports open as code
+and data exports open in Hex; neither creates a function. Forwarded and
+unresolved exports have no destination. Right-click for every known location.
+Names prefer your label at the row's address, then the demangled name; hover
+shows the raw name, library, ordinal and other declared facts.
+
 Visited functions reuse compatible session results. **Analysis → Refresh
 function** recomputes the selected function. This session cache does not mean
 every visited function is saved in a project.
@@ -121,7 +132,9 @@ be installed through the updater. See [update setup and recovery](docs/releases.
 
 Use **X** or **Xrefs to…** to inspect confirmed call/data targets. Multiple
 targets require an explicit choice. On a **Strings** row, **X** lists the code
-that reads, writes or takes the address of that string's first byte.
+that reads, writes or takes the address of that string's first byte. On an
+**Imports** or **Exports** row, **X** uses its exact address, or offers its stub
+and slot locations as choices.
 **References → Data references** filters by **All / Read / Write / Address**.
 Address-taking (x86 LEA/immediates, AArch64 ADR/ADRP+ADD) is concrete address
 formation, not proof of pointer use. References cover examined functions;
@@ -158,6 +171,7 @@ completion percentage. Use **Analysis → Cancel analysis** to stop a run.
 It stores annotations, the known function list, the displayed function's
 listing/graph and pseudocode, scan results, and committed discovery results.
 It does not save every visited function or the engine's complete database.
+Imports and exports are not saved; reopening rebuilds them from the verified binary.
 
 **File → Include binary in project** is enabled initially. Embedded projects
 include the analyzed binary. Without it, reopening asks you to select the
