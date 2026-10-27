@@ -133,6 +133,26 @@ fn shortcut(event: &egui::Event) -> Option<Shortcut> {
     None
 }
 
+/// Where a binary opens: `main`, else its entry point, else its lowest known
+/// function, each only when it is file-backed executable code. A shared
+/// library's zero entry is not a location, so it may have none.
+fn start_address(info: &BinaryInfo) -> Option<u64> {
+    let code = |address: &u64| crate::call_analysis::code_address(info, *address);
+    info.functions
+        .iter()
+        .find(|function| function.name == "main")
+        .map(|function| function.address)
+        .filter(code)
+        .or(Some(info.entry).filter(code))
+        .or_else(|| {
+            info.functions
+                .iter()
+                .map(|function| function.address)
+                .filter(code)
+                .min()
+        })
+}
+
 fn info_without_functions(info: &BinaryInfo) -> BinaryInfo {
     BinaryInfo {
         path: String::new(),
@@ -2618,12 +2638,7 @@ impl DesktopApp {
                 }
                 self.discovery_sync =
                     replay.then(|| replay_addresses(&worker_functions, &info.functions));
-                let first = info
-                    .functions
-                    .iter()
-                    .find(|function| function.name == "main")
-                    .map(|function| function.address)
-                    .unwrap_or(info.entry);
+                let first = start_address(&info);
                 self.binary_path = Some(opening.path);
                 if !opening.preserve {
                     self.binary_protection = Some(protection);
@@ -2691,7 +2706,9 @@ impl DesktopApp {
                         generation: self.generation,
                         first_open: true,
                     });
-                    self.navigate(first, true, context);
+                    if let Some(first) = first {
+                        self.navigate(first, true, context);
+                    }
                 }
             }
             (Request::Graph { address }, Response::Graph { view }) if view.address == address => {
@@ -3388,7 +3405,7 @@ impl DesktopApp {
             .or(self.code_selection)
             .filter(|&address| crate::call_analysis::code_address(info, address))
             .or_else(|| self.view().map(|view| view.address))
-            .or(Some(info.entry))
+            .or_else(|| start_address(info))
     }
 
     fn save_project(&mut self, save_as: bool, context: &egui::Context) {
@@ -3493,7 +3510,7 @@ impl DesktopApp {
                     .is_some_and(|info| crate::call_analysis::code_address(info, address))
             })
             .or_else(|| data.view.as_ref().map(|v| v.address))
-            .or_else(|| self.info.as_ref().map(|info| info.entry));
+            .or_else(|| self.info.as_ref().and_then(start_address));
         if let Some(view) = data.view.filter(|view| {
             selected.is_some_and(|address| {
                 address == view.address
@@ -15250,11 +15267,12 @@ mod tests {
         let entry_path = directory.path().join("legacy-no-code-view.grproj");
         old.save(&entry_path, app.binary_protection.as_ref().unwrap(), true)
             .unwrap();
-        let entry = app.info.as_ref().unwrap().entry;
+        // Without a saved view, reopening lands where a fresh open would.
+        let opening_pc = start_address(app.info.as_ref().unwrap()).unwrap();
         for (path, expected_pc) in [
             (project_path, code_pc),
             (legacy_path, code_pc),
-            (entry_path, entry),
+            (entry_path, opening_pc),
         ] {
             app.clear_binary();
             app.open_project(path, &context);
@@ -15279,6 +15297,82 @@ mod tests {
             assert_eq!(app.linkage.status(), Status::Ready);
             assert!(!app.linkage.prepared().unwrap().linkage().imports.is_empty());
         }
+        app.clear_binary();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shared_library_without_main_or_entry_opens_at_a_known_function() {
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("liblinkage.so");
+        assert!(
+            std::process::Command::new("gcc")
+                .args(["-O0", "-fPIC", "-shared", "tests/fixtures/linkage.c", "-o"])
+                .arg(&binary)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let executable = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("ghidra-rust");
+        assert!(
+            executable.is_file(),
+            "full cargo test builds the worker executable: {}",
+            executable.display()
+        );
+        let context = egui::Context::default();
+        let mut app = DesktopApp::empty(None);
+        app.client = Some(
+            WorkerClient::start_using_executable(context.clone(), &binary, &executable).unwrap(),
+        );
+        app.worker_epoch += 1;
+        app.opening = Some(Opening {
+            path: binary.clone(),
+            preserve: false,
+            follow: None,
+            revision: app.revision,
+            follow_origin: app.request_origin(),
+        });
+        app.send_direct(Request::Open {
+            path: binary.to_string_lossy().into_owned(),
+        });
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while app.info.is_none() || app.pending.is_some() || !app.queue.is_empty() {
+            app.poll_worker(&context);
+            assert!(
+                Instant::now() < deadline,
+                "open did not settle: {}",
+                app.status
+            );
+            assert!(app.client.is_some(), "worker stopped: {}", app.status);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let info = app.info.as_ref().unwrap();
+        // A shared library declares no entry point and has no `main`.
+        assert_eq!(info.entry, 0);
+        assert!(
+            info.functions
+                .iter()
+                .all(|function| function.name != "main")
+        );
+        assert!(
+            !app.status.contains("outside file-backed"),
+            "{}",
+            app.status
+        );
+        let selected = app.selected.expect("opens at a known function");
+        assert!(
+            info.functions
+                .iter()
+                .any(|function| function.address == selected)
+        );
+        assert!(crate::call_analysis::code_address(info, selected));
+        assert!(app.view().is_some());
         app.clear_binary();
     }
 

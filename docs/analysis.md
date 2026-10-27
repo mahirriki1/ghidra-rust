@@ -244,9 +244,12 @@ file-backed bytes. Further verified stubs and slots appear as child rows and in
 the row's context menu. Code and IFUNC-resolver exports open as code. Data
 exports open in Hex, including mapped zero-fill, and never become functions.
 Saving while viewing a slot or data export retains the previous code location
-(or entry point) for reopening; Hex spans remain session-only. Reopening also
-accepts earlier projects saved at a data address and quietly falls back to the
-saved function or entry point.
+(or the opening location) for reopening; Hex spans remain session-only. Reopening
+also accepts earlier projects saved at a data address and quietly falls back to
+the saved function or the opening location. A binary opens at `main`, else its
+entry point, else its lowest known function, each only when it is file-backed
+executable code; a shared library with no entry point opens at a known function
+instead of address zero.
 Forwarded and unresolved entries remain selectable but have no destination or
 references. With a row selected, **X** queries its single exact address, or
 offers every stub and slot of an import in the bounded target chooser. It uses
