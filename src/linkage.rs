@@ -807,6 +807,10 @@ pub struct ImportGroup {
 pub struct LinkageView {
     pub linkage: Arc<Linkage>,
     pub groups: Box<[ImportGroup]>,
+    /// Every import by declared name across libraries, then in group order.
+    pub imports: Box<[u32]>,
+    /// Group index of each import, by import identity.
+    pub import_groups: Box<[u32]>,
     pub exports: Box<[u32]>,
 }
 
@@ -873,6 +877,28 @@ impl LinkageView {
                 });
             }
         }
+        let mut import_groups = vec![0u32; linkage.imports.len()];
+        for (index, group) in groups.iter().enumerate() {
+            for &id in &group.members {
+                import_groups[id as usize] = index as u32;
+            }
+        }
+        // `keyed` is already in group order; a stable sort keeps it for ties.
+        let mut imports: Vec<u32> = keyed.iter().map(|(_, id)| *id).collect();
+        imports.sort_by(|left, right| {
+            let (a, b) = (
+                &linkage.imports[*left as usize],
+                &linkage.imports[*right as usize],
+            );
+            // Ordinal-only imports follow named ones.
+            let unnamed = |import: &Import| import.raw.is_none() && import.display.is_none();
+            unnamed(a)
+                .cmp(&unnamed(b))
+                .then_with(|| {
+                    compare_text(sort_name(&a.raw, &a.display), sort_name(&b.raw, &b.display))
+                })
+                .then_with(|| a.ordinal.cmp(&b.ordinal))
+        });
         let mut exports: Vec<u32> = linkage.exports.iter().map(|export| export.id).collect();
         exports.sort_by(|left, right| {
             let (a, b) = (
@@ -892,6 +918,8 @@ impl LinkageView {
         Self {
             linkage,
             groups: groups.into_boxed_slice(),
+            imports: imports.into_boxed_slice(),
+            import_groups: import_groups.into_boxed_slice(),
             exports: exports.into_boxed_slice(),
         }
     }
@@ -906,6 +934,8 @@ impl LinkageView {
                 .iter()
                 .map(|group| group.label.capacity() + size_of_val(&*group.members))
                 .sum::<usize>()
+            + size_of_val(&*self.imports)
+            + size_of_val(&*self.import_groups)
             + size_of_val(&*self.exports)
     }
 }

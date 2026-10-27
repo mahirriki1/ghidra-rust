@@ -55,6 +55,21 @@ enum Tab {
     References,
 }
 
+/// The list shown in the left Functions dock; session-only.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum FunctionDock {
+    #[default]
+    Functions,
+    Imports,
+    Exports,
+}
+
+const FUNCTION_DOCK_TABS: [(FunctionDock, &str); 3] = [
+    (FunctionDock::Functions, "Functions"),
+    (FunctionDock::Imports, "Imports"),
+    (FunctionDock::Exports, "Exports"),
+];
+
 #[derive(Clone)]
 enum BrowserDialogKind {
     Rename { address: u64, function: bool },
@@ -690,6 +705,9 @@ pub struct DesktopApp {
     code_selection: Option<u64>,
     history_index: usize,
     function_filter: String,
+    function_dock: FunctionDock,
+    /// Flat Imports and Exports filters, indexed by `linkage_ui::Table`.
+    linkage_filters: [String; 2],
     filtered_functions: Vec<usize>,
     /// Lowercased effective labels, aligned with `info.functions` and valid for
     /// `filter_keys_revision`.
@@ -839,6 +857,8 @@ impl DesktopApp {
             code_selection: None,
             history_index: 0,
             function_filter: String::new(),
+            function_dock: FunctionDock::Functions,
+            linkage_filters: [String::new(), String::new()],
             filtered_functions: Vec::new(),
             filter_keys: Vec::new(),
             filter_keys_revision: (0, 0),
@@ -5189,18 +5209,7 @@ impl DesktopApp {
         if let Some(address) = function {
             self.navigate(address, true, &context);
         }
-        match linkage_action {
-            Some(crate::linkage_ui::TreeAction::Select(item)) => self.select_linkage(item),
-            Some(crate::linkage_ui::TreeAction::Open(item)) => self.open_linkage(item, &context),
-            Some(crate::linkage_ui::TreeAction::OpenPlace(item, place)) => {
-                self.open_linkage_place(item, place, &context);
-            }
-            Some(crate::linkage_ui::TreeAction::Xrefs(item)) => {
-                self.select_linkage(item);
-                self.show_selection_xrefs();
-            }
-            None => {}
-        }
+        self.linkage_action(linkage_action, &context);
         if let Some((address, length)) = read {
             if string_read {
                 self.select_string(address);
@@ -5225,36 +5234,98 @@ impl DesktopApp {
         }
     }
 
+    /// Applies a Symbol Tree or flat Imports/Exports interaction.
+    fn linkage_action(
+        &mut self,
+        action: Option<crate::linkage_ui::TreeAction>,
+        context: &egui::Context,
+    ) {
+        match action {
+            Some(crate::linkage_ui::TreeAction::Select(item)) => self.select_linkage(item),
+            Some(crate::linkage_ui::TreeAction::Open(item)) => self.open_linkage(item, context),
+            Some(crate::linkage_ui::TreeAction::OpenPlace(item, place)) => {
+                self.open_linkage_place(item, place, context);
+            }
+            Some(crate::linkage_ui::TreeAction::Xrefs(item)) => {
+                self.select_linkage(item);
+                self.show_selection_xrefs();
+            }
+            None => {}
+        }
+    }
+
+    /// The Functions dock: Functions, Imports and Exports tabs.
     fn function_panel(&mut self, ui: &mut egui::Ui) {
         let filtered = self.step_filter(FILTER_FRAME_BUDGET);
         if !filtered {
             ui.ctx().request_repaint();
         }
-        theme::dock_header(
+        let table = match self.function_dock {
+            FunctionDock::Functions => None,
+            FunctionDock::Imports => Some(crate::linkage_ui::Table::Imports),
+            FunctionDock::Exports => Some(crate::linkage_ui::Table::Exports),
+        };
+        if let Some(table) = table {
+            self.linkage.refresh_flat(
+                table,
+                self.session.as_ref(),
+                self.revision,
+                &self.linkage_filters[table as usize],
+            );
+        }
+        let mut dock = self.function_dock;
+        let worker = self.client.is_some();
+        let changed = theme::dock_tabs(
             ui,
-            "Functions",
-            false,
-            self.cached_functions.then_some((
+            &mut dock,
+            &FUNCTION_DOCK_TABS,
+            (table.is_none() && self.cached_functions).then_some((
                 "Saved analysis",
                 "Saved functions; run Discover to recompute.",
             )),
-            |ui| {
-                ui.weak(if filtered {
-                    self.filtered_functions.len().to_string()
-                } else {
-                    format!("Filtering… {}", self.filtered_functions.len())
-                });
-                if self
-                    .info
-                    .as_ref()
-                    .is_some_and(|info| info.functions_truncated)
-                {
-                    ui.colored_label(theme::WARNING, "Partial").on_hover_text(
-                        "Incomplete function inventory; see References and status warnings.",
-                    );
+            |ui| match table {
+                Some(table) => self.linkage.flat_header(ui, table, worker),
+                None => {
+                    ui.weak(if filtered {
+                        self.filtered_functions.len().to_string()
+                    } else {
+                        format!("Filtering… {}", self.filtered_functions.len())
+                    });
+                    if self
+                        .info
+                        .as_ref()
+                        .is_some_and(|info| info.functions_truncated)
+                    {
+                        ui.colored_label(theme::WARNING, "Partial").on_hover_text(
+                            "Incomplete function inventory; see References and status warnings.",
+                        );
+                    }
                 }
             },
         );
+        if changed {
+            // This frame keeps the header it counted; the new tab follows.
+            self.function_dock = dock;
+            ui.ctx().request_repaint();
+        }
+        match table {
+            None => self.function_list(ui),
+            Some(table) => {
+                let pointer = self.pointer_width();
+                let action = self.linkage.show_flat(
+                    ui,
+                    table,
+                    self.session.as_ref(),
+                    self.revision,
+                    &mut self.linkage_filters[table as usize],
+                    pointer,
+                );
+                self.linkage_action(action, ui.ctx());
+            }
+        }
+    }
+
+    fn function_list(&mut self, ui: &mut egui::Ui) {
         if ui
             .add(
                 TextEdit::singleline(&mut self.function_filter)
@@ -15120,6 +15191,330 @@ mod tests {
         frame(&context, &mut app, 260.0, pointer_events(data));
         assert_eq!(app.tab, Tab::Hex);
         assert_eq!(app.selected, Some(crate::linkage_ui::fixture::DATA_EXPORT));
+    }
+
+    fn function_dock_frame(
+        context: &egui::Context,
+        app: &mut DesktopApp,
+        width: f32,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let time = context.input(|input| input.time) + 0.05;
+        let mut output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1000.0, 800.0),
+                )),
+                time: Some(time),
+                events,
+                ..Default::default()
+            },
+            |root| {
+                egui::Panel::left("function-dock-test")
+                    .exact_size(width)
+                    .frame(egui::Frame::NONE)
+                    .show(root, |ui| app.navigation_panel(ui));
+            },
+        );
+        output.textures_delta.clear();
+        output
+    }
+
+    /// Centers of every galley whose whole text is `text`, top to bottom.
+    fn exact_text(output: &egui::FullOutput, text: &str) -> Vec<egui::Pos2> {
+        let mut found: Vec<egui::Pos2> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(shown) if shown.galley.text() == text => {
+                    Some(shown.galley.rect.translate(shown.pos.to_vec2()).center())
+                }
+                _ => None,
+            })
+            .collect();
+        found.sort_by(|a, b| a.y.total_cmp(&b.y));
+        found
+    }
+
+    fn selection_fill_at(output: &egui::FullOutput, point: egui::Pos2) -> bool {
+        output.shapes.iter().any(|shape| {
+            matches!(&shape.shape, egui::epaint::Shape::Rect(rect)
+                if rect.fill == theme::SELECTION && rect.rect.contains(point))
+        })
+    }
+
+    #[test]
+    fn function_dock_tabs_share_linkage_selection_navigation_and_filters() {
+        use crate::linkage_ui::{LinkageItem, Table, TreeAction, fixture};
+        let context = egui::Context::default();
+        theme::install(&context);
+        context.set_pixels_per_point(1.25);
+        context.all_styles_mut(|style| style.animation_time = 0.0);
+        let (mut app, table) = linkage_app(&"a".repeat(64));
+        app.client = None;
+        adopt_linkage(&mut app, &table);
+        let width = 340.0;
+        let frame =
+            |app: &mut DesktopApp, events| function_dock_frame(&context, app, width, events);
+        frame(&mut app, vec![]);
+        let output = frame(&mut app, vec![]);
+        let [tab] = exact_text(&output, "Imports")[..] else {
+            panic!("one Imports tab")
+        };
+        frame(&mut app, pointer_events(tab));
+        assert_eq!(app.function_dock, FunctionDock::Imports);
+        frame(&mut app, vec![]);
+        let output = frame(&mut app, vec![]);
+        // Flat: declared names across libraries; ordinal-only last.
+        assert_eq!(
+            app.linkage.flat_items(Table::Imports).unwrap(),
+            [2, 0, 1, 3].map(LinkageItem::Import)
+        );
+        let text = rendered_text(&output);
+        for shown in ["Library", "KERNEL32.dll", "USER32.dll", "Unknown library"] {
+            assert!(text.iter().any(|t| t == shown), "{shown}: {text:?}");
+        }
+        assert!(
+            text.iter()
+                .any(|t| t.ends_with("1010") && t.starts_with('0'))
+        );
+        let row =
+            |output: &egui::FullOutput, name: &str, index: usize| exact_text(output, name)[index];
+        // A click selects the same item the Symbol Tree highlights.
+        let history = app.history.clone();
+        frame(&mut app, pointer_events(row(&output, "fn", 0)));
+        assert_eq!(app.linkage.selected(), Some(LinkageItem::Import(2)));
+        assert_eq!(app.linkage_target(), Some(LinkageItem::Import(2)));
+        assert_eq!(app.history, history);
+        let output = frame(&mut app, vec![]);
+        assert!(selection_fill_at(&output, row(&output, "fn", 0)));
+        let tree_imports = text_position(&output, "Imports (4)", 0);
+        frame(&mut app, pointer_events(tree_imports));
+        let output = frame(&mut app, vec![]);
+        let group = text_position(&output, "KERNEL32.dll (2)", 0);
+        frame(&mut app, pointer_events(group));
+        let output = frame(&mut app, vec![]);
+        let names = exact_text(&output, "fn");
+        assert_eq!(names.len(), 2, "tree and flat rows");
+        assert!(names.iter().all(|&name| selection_fill_at(&output, name)));
+        // A tree selection is highlighted in the flat Exports.
+        app.linkage_action(Some(TreeAction::Select(LinkageItem::Export(1))), &context);
+        app.function_dock = FunctionDock::Exports;
+        frame(&mut app, vec![]);
+        let output = frame(&mut app, vec![]);
+        assert!(selection_fill_at(&output, row(&output, "data_export", 0)));
+        assert!(rendered_text(&output).iter().any(|t| t == "Ordinal"));
+        // Double-click opens code through navigation and data in Hex.
+        app.function_dock = FunctionDock::Imports;
+        frame(&mut app, vec![]);
+        let output = frame(&mut app, vec![]);
+        let flat =
+            |output: &egui::FullOutput, name: &str| *exact_text(output, name).last().unwrap();
+        let shared = flat(&output, "Shared");
+        let kernel = exact_text(&output, "Shared")
+            .into_iter()
+            .rev()
+            .nth(1)
+            .unwrap();
+        assert!(kernel.y < shared.y);
+        frame(&mut app, pointer_events(kernel));
+        frame(&mut app, pointer_events(kernel));
+        assert_eq!((app.tab, app.selected), (Tab::Listing, Some(fixture::STUB)));
+        assert_eq!(
+            app.history.last().map(|place| place.address()),
+            Some(fixture::STUB)
+        );
+        assert_eq!(app.linkage.selected(), Some(LinkageItem::Import(0)));
+        // Past the multi-click window, so the next pair is a new double-click.
+        for _ in 0..10 {
+            frame(&mut app, vec![]);
+        }
+        let output = frame(&mut app, vec![]);
+        let shared = flat(&output, "Shared");
+        frame(&mut app, pointer_events(shared));
+        frame(&mut app, pointer_events(shared));
+        assert_eq!(
+            (app.tab, app.selected),
+            (Tab::Hex, Some(fixture::SLOT_ONLY))
+        );
+        // The row menu offers the tree's explicit places.
+        let output = frame(&mut app, vec![]);
+        frame(&mut app, secondary_events(flat(&output, "fn")));
+        let output = frame(&mut app, vec![]);
+        let go = text_position(&output, "Go to slot 2010", 0);
+        assert!(rendered_text(&output).iter().any(|t| t == "Xrefs to…"));
+        frame(&mut app, pointer_events(go));
+        assert_eq!((app.tab, app.selected), (Tab::Hex, Some(0x2010)));
+        // Typing filters by library, raw name, ordinal, address and label.
+        let output = frame(&mut app, vec![]);
+        let hint = text_position(&output, "Filter name or address", 0);
+        frame(&mut app, pointer_events(hint));
+        frame(&mut app, vec![egui::Event::Text("kernel32".into())]);
+        frame(&mut app, vec![]);
+        assert_eq!(app.linkage_filters[Table::Imports as usize], "kernel32");
+        assert_eq!(
+            app.linkage.flat_items(Table::Imports).unwrap(),
+            [2, 0].map(LinkageItem::Import)
+        );
+        context.memory_mut(|memory| memory.stop_text_input());
+        app.edit_annotation(
+            fixture::STUB,
+            Annotation {
+                label: "analyst_shared".into(),
+                ..Annotation::default()
+            },
+        );
+        for (query, expected) in [
+            ("YAXXZ", vec![2]),
+            ("ordinal 42", vec![3]),
+            ("2018", vec![3]),
+            ("analyst", vec![0]),
+        ] {
+            app.linkage_filters[Table::Imports as usize] = query.into();
+            frame(&mut app, vec![]);
+            assert_eq!(
+                app.linkage.flat_items(Table::Imports).unwrap(),
+                expected
+                    .into_iter()
+                    .map(LinkageItem::Import)
+                    .collect::<Vec<_>>(),
+                "{query}"
+            );
+        }
+        app.function_dock = FunctionDock::Exports;
+        for (query, expected) in [("ordinal 9", 3), ("2040", 1)] {
+            app.linkage_filters[Table::Exports as usize] = query.into();
+            frame(&mut app, vec![]);
+            assert_eq!(
+                app.linkage.flat_items(Table::Exports).unwrap(),
+                [LinkageItem::Export(expected)],
+                "{query}"
+            );
+        }
+        // Functions keeps its own filter across tab switches.
+        let click_tab = |app: &mut DesktopApp, label: &str| {
+            let output = frame(app, vec![]);
+            let [tab] = exact_text(&output, label)[..] else {
+                panic!("one {label} tab")
+            };
+            frame(app, pointer_events(tab));
+            frame(app, vec![]);
+            frame(app, vec![])
+        };
+        click_tab(&mut app, "Functions");
+        app.function_filter = "entry".into();
+        app.restart_filter();
+        let functions = app.filtered_functions.clone();
+        assert_eq!(functions, [0]);
+        click_tab(&mut app, "Imports");
+        assert_eq!(app.function_dock, FunctionDock::Imports);
+        assert_eq!(app.linkage_filters[Table::Imports as usize], "analyst");
+        let output = click_tab(&mut app, "Functions");
+        assert_eq!(app.function_dock, FunctionDock::Functions);
+        assert_eq!(
+            (app.function_filter.as_str(), &app.filtered_functions),
+            ("entry", &functions)
+        );
+        assert!(rendered_text(&output).iter().any(|t| t == "entry"));
+        // Another binary generation drops the flat list with the table.
+        app.function_dock = FunctionDock::Imports;
+        app.linkage_filters[Table::Imports as usize].clear();
+        frame(&mut app, vec![]);
+        assert!(app.linkage.flat_items(Table::Imports).is_some());
+        app.generation += 1;
+        app.linkage.begin(app.generation, app.worker_epoch);
+        let output = frame(&mut app, vec![]);
+        assert!(app.linkage.flat_items(Table::Imports).is_none());
+        assert!(exact_text(&output, "Shared").is_empty());
+    }
+
+    #[test]
+    fn function_dock_tabs_stay_reachable_and_fit_narrow_docks_at_fractional_scale() {
+        use crate::linkage_ui::{LinkageItem, Table};
+        fn bars(output: &egui::FullOutput) -> Vec<egui::Rect> {
+            output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Rect(rect)
+                        if rect.rect.width().min(rect.rect.height()) < 20.0
+                            && rect.rect.width().max(rect.rect.height()) > 60.0 =>
+                    {
+                        Some(rect.rect)
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+        let labels = ["Functions", "Imports", "Exports"];
+        for width in [150.0, 200.0, 260.0, 431.0] {
+            let context = egui::Context::default();
+            theme::install(&context);
+            context.set_pixels_per_point(1.25);
+            context.all_styles_mut(|style| style.animation_time = 0.0);
+            let (mut app, table) = linkage_app(&"a".repeat(64));
+            app.client = None;
+            adopt_linkage(&mut app, &table);
+            let frame =
+                |app: &mut DesktopApp, events| function_dock_frame(&context, app, width, events);
+            frame(&mut app, vec![]);
+            let output = frame(&mut app, vec![]);
+            let shown: Vec<_> = labels
+                .iter()
+                .map(|label| exact_text(&output, label).first().copied())
+                .collect();
+            let exports = if shown.iter().all(Option::is_some) {
+                shown[2].unwrap()
+            } else {
+                // Collapsed to a view menu: every tab is one of its entries.
+                let face = shown[0].expect("selected tab face");
+                frame(&mut app, pointer_events(face));
+                let output = frame(&mut app, vec![]);
+                for label in labels {
+                    assert!(!exact_text(&output, label).is_empty(), "{width}: {label}");
+                }
+                *exact_text(&output, "Exports").last().unwrap()
+            };
+            frame(&mut app, pointer_events(exports));
+            assert_eq!(app.function_dock, FunctionDock::Exports, "{width}");
+            for dock in [FunctionDock::Exports, FunctionDock::Imports] {
+                app.function_dock = dock;
+                frame(&mut app, vec![]);
+                let output = frame(&mut app, vec![]);
+                let again = frame(&mut app, vec![]);
+                assert_eq!(bars(&output), bars(&again), "{width}: no scrollbar flicker");
+                let rows: Vec<_> = output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| match &shape.shape {
+                        egui::epaint::Shape::Text(text)
+                            if ["fn", "Shared", "code_export", "data_export", "KERNEL32.dll"]
+                                .contains(&text.galley.text()) =>
+                        {
+                            Some((shape.clip_rect, text.galley.rows.len()))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                assert!(rows.len() >= 2, "{width}: {rows:?}");
+                for (clip, lines) in rows {
+                    assert_eq!(lines, 1);
+                    assert!(clip.right() <= width + 0.5, "{width}: {clip:?}");
+                }
+            }
+            assert_eq!(
+                app.linkage.flat_items(Table::Exports).unwrap().len(),
+                5,
+                "{width}"
+            );
+            assert!(
+                app.linkage
+                    .flat_items(Table::Imports)
+                    .unwrap()
+                    .contains(&LinkageItem::Import(0))
+            );
+        }
     }
 
     #[cfg(any(target_os = "linux", windows))]
