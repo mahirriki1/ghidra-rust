@@ -208,11 +208,46 @@ addresses. Shared operation, candidate, and state limits mark omissions partial;
 see [limits](#resource-limits-and-trust-boundaries). This is access evidence,
 not data-object or pointer classification.
 
-## Import/export declaration metadata
+## Imports and exports
 
-The worker provides a separate paged import/export metadata request. Desktop
-Symbol Tree browsing and navigation are pending integration. The request reads
-the worker's immutable image snapshot once, on demand, and caches the resulting
+The Symbol Tree shows **Imports (n)**, with one group per declaring library,
+lookup scope or **Unknown library**, and **Exports (n)**. After a binary or a
+verified project opens, the desktop requests the worker's import/export table
+page by page whenever the worker is otherwise idle. Queued navigation and other
+user requests, replays and result adoption run first; pages are interleaved
+between discovery batches and scans like symbol-name pages, and a user action
+issued during a page waits only for that page. Each page is bound to the binary
+generation, worker epoch, expected cursor and table digest. Replies for another
+binary, a stopped worker or an earlier table are dropped, a defective page
+discards the whole table, and only a complete table is shown. A table whose
+request fails, times out or stops its worker stays **Unavailable** for that
+binary. Grouping, sorting and filter keys are prepared on a background thread.
+The table and its presentation are charged to the session's shared 64 MiB result
+budget beside other metadata; a table that does not fit is shown as
+**Unavailable**. Headers show **Loading**, **Partial** (hover lists the coverage
+gaps) or **Unavailable**.
+
+Rows show the analyst label at the row's exact address, then the worker's
+demangled name, then the raw declaration, then `ordinal N`. Order always uses
+declared text, so renaming never reorders the tree. Hover shows the raw name,
+library or scope, version, ordinal and delay/weak facts, the stub and slot, or an
+export's code/resolver/data address or forwarding destination. The function
+filter also filters imports and exports by name, label, library and hexadecimal
+address.
+
+Click selects a row; double-click opens it, and Back/Forward record the visit.
+An import opens its verified stub through code navigation, or otherwise its slot
+in Hex at exactly that address, selecting the pointer-width slot clipped to
+file-backed bytes. Further verified stubs and slots appear as child rows and in
+the row's context menu. Code and IFUNC-resolver exports open as code. Data
+exports open in Hex, including mapped zero-fill, and never become functions.
+Forwarded and unresolved entries remain selectable but have no destination or
+references. With a row selected, **X** queries its single exact address, or
+offers every stub and slot of an import in the bounded target chooser. It uses
+the existing call, data-access and address-formation evidence; no direct call
+from an import slot to its external symbol is invented.
+
+The worker reads the immutable image snapshot once, on demand, and caches the
 table; opening a binary and ordinary function replies do not carry this table.
 Metadata never loads another library, resolves a runtime address, infers a
 prototype or creates a function. Demangled names use the existing bounded worker
@@ -249,10 +284,11 @@ and duplicate/conflicting locations before adoption. Slots must be fully
 file-backed at the ABI pointer width. Mapped zero-filled exports retain their
 data address but provide no file bytes beyond the existing Hex/Decode limits.
 
-The table is transient. Reopening a verified project reconstructs it from the
-image without changing SQLite or annotation JSON schemas or the engine cache
-fingerprint. Table and grouping APIs expose retained-allocation accounting for
-the pending desktop integration with its shared result-store budget.
+The table, group expansion and the filter are transient. Projects do not store
+them: reopening a verified project rebuilds the tree from the image without
+changing SQLite or annotation JSON schemas or the engine cache fingerprint.
+Analyst labels at import and export addresses are ordinary annotations and are
+saved as before.
 
 ## Address formation
 

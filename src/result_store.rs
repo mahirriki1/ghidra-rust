@@ -261,11 +261,26 @@ struct ExternalLease {
     identity: usize,
 }
 
+/// Independent holders of session metadata within the shared budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MetadataOwner {
+    /// Local-name override states and context bookkeeping.
+    LocalNames,
+    /// The adopted import/export table and its Symbol Tree presentation.
+    Linkage,
+}
+
+impl MetadataOwner {
+    const COUNT: usize = 2;
+}
+
 pub struct ResultStore<G, D> {
     context: Option<Arc<ProgramContext>>,
     records: BTreeMap<u64, Record<G, D>>,
     external: RefCell<Vec<ExternalLease>>,
-    metadata: usize,
+    /// Session metadata bytes, charged per owner so owners never overwrite
+    /// each other's share of the budget.
+    metadata: [usize; MetadataOwner::COUNT],
     ledger: Arc<Ledger>,
     uncached: Arc<Ledger>,
     budget: usize,
@@ -279,7 +294,7 @@ impl<G: Retained, D: Retained> ResultStore<G, D> {
             context: None,
             records: BTreeMap::new(),
             external: RefCell::new(Vec::new()),
-            metadata: 0,
+            metadata: [0; MetadataOwner::COUNT],
             ledger: Arc::default(),
             uncached: Arc::default(),
             budget,
@@ -307,7 +322,7 @@ impl<G: Retained, D: Retained> ResultStore<G, D> {
     pub fn clear(&mut self) {
         self.invalidate_all();
         self.context = None;
-        self.metadata = 0;
+        self.metadata = [0; MetadataOwner::COUNT];
     }
 
     fn invalidate_all(&mut self) {
@@ -514,7 +529,7 @@ impl<G: Retained, D: Retained> ResultStore<G, D> {
         }
         self.ledger
             .charged()
-            .saturating_add(self.metadata)
+            .saturating_add(self.metadata())
             .saturating_sub(released)
             .checked_add(needed)
             .is_some_and(|total| total <= self.budget)
@@ -531,12 +546,21 @@ impl<G: Retained, D: Retained> ResultStore<G, D> {
         });
     }
 
-    pub fn set_metadata_bytes(&mut self, bytes: usize) -> bool {
-        let extra = bytes.saturating_sub(self.metadata);
+    fn metadata(&self) -> usize {
+        self.metadata
+            .iter()
+            .fold(0usize, |total, bytes| total.saturating_add(*bytes))
+    }
+
+    /// Replaces one owner's metadata charge, evicting results to make room.
+    /// A refused charge leaves the owner's previous charge in place.
+    pub fn set_metadata_bytes(&mut self, owner: MetadataOwner, bytes: usize) -> bool {
+        let slot = owner as usize;
+        let extra = bytes.saturating_sub(self.metadata[slot]);
         if !self.make_room(extra, &[]) {
             return false;
         }
-        self.metadata = bytes;
+        self.metadata[slot] = bytes;
         true
     }
 
@@ -572,7 +596,7 @@ impl<G: Retained, D: Retained> ResultStore<G, D> {
                     let (bytes, held) = record.indexed();
                     (total.saturating_add(bytes), pinned.saturating_add(held))
                 });
-        let charged = self.ledger.charged().saturating_add(self.metadata);
+        let charged = self.ledger.charged().saturating_add(self.metadata());
         StoreUsage {
             budget: self.budget,
             charged,
@@ -607,7 +631,7 @@ impl<G: Retained, D: Retained> ResultStore<G, D> {
     fn make_room(&mut self, bytes: usize, protect: &[u64]) -> bool {
         self.reap_external();
         loop {
-            let charged = self.ledger.charged().saturating_add(self.metadata);
+            let charged = self.ledger.charged().saturating_add(self.metadata());
             if charged
                 .checked_add(bytes)
                 .is_some_and(|total| total <= self.budget)

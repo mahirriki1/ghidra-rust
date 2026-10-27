@@ -181,6 +181,18 @@ impl HexPanel {
     }
 
     pub(crate) fn go_to(&mut self, address: u64, sections: &[SectionInfo]) -> Option<HexAction> {
+        self.go_to_span(address, 1, sections)
+    }
+
+    /// Exact navigation that also selects up to `length` bytes from `address`,
+    /// clipped to its page and to the section's file-backed bytes. Zero-fill
+    /// or unbacked destinations keep the single-byte focus.
+    pub(crate) fn go_to_span(
+        &mut self,
+        address: u64,
+        length: u64,
+        sections: &[SectionInfo],
+    ) -> Option<HexAction> {
         self.initialized = true;
         // Preserve the selected mapping when virtual ranges overlap.
         let preferred = self.section.filter(|&index| {
@@ -201,7 +213,17 @@ impl HexPanel {
                 Ok((page, offset))
             });
         match result {
-            Ok((page, offset)) => self.navigate(page, Some(offset), address),
+            Ok((page, offset)) => {
+                let action = self.navigate(page, Some(offset), address);
+                let section = &sections[page.section];
+                let backed = section
+                    .address
+                    .saturating_add(section.file_size.min(section.size))
+                    .saturating_sub(address);
+                let span = length.min(backed).min((page.length - offset) as u64).max(1) as usize;
+                self.selection = Some((offset, offset + span - 1));
+                action
+            }
             Err(message) => {
                 // Invalid navigation cannot discard a valid page or pending read.
                 self.navigation_error = Some(message);
@@ -922,6 +944,24 @@ mod tests {
         assert_eq!(panel.selected_bytes(), Some((0x3007, vec![0])));
         assert!(panel.go_to(0x3008, &sections).is_none());
         assert_eq!(panel.loaded_page().unwrap().0, 0x3003);
+    }
+
+    #[test]
+    fn exact_spans_select_only_file_backed_bytes_of_their_page() {
+        // 0x40 file-backed bytes followed by zero-fill.
+        let sections = [section(0x2000, 0x100, 0x40)];
+        let mut panel = HexPanel::default();
+        let request = read(panel.go_to_span(0x2008, 8, &sections));
+        deliver(&mut panel, request);
+        assert_eq!(panel.selected_bytes(), Some((0x2008, vec![0; 8])));
+        // Clipped where file backing ends; within the loaded page.
+        assert!(panel.go_to_span(0x203c, 8, &sections).is_none());
+        assert_eq!(panel.selected_bytes(), Some((0x203c, vec![0; 4])));
+        // Unbacked bytes keep only the exact focus; a span never grows past it.
+        assert!(panel.go_to_span(0x20f0, 8, &sections).is_none());
+        assert_eq!(panel.selected_bytes(), Some((0x20f0, vec![0])));
+        assert!(panel.go_to_span(0x2100, 8, &sections).is_none());
+        assert_eq!(panel.selected_bytes(), Some((0x20f0, vec![0])));
     }
 
     #[test]
