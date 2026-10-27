@@ -945,6 +945,63 @@ mod tests {
     }
 
     #[test]
+    fn maximum_utf16_literal_survives_chunk_and_step_lookahead() {
+        let text = format!("{}Z", "a".repeat(127));
+        let spec = utf16(&text, false);
+        let mut bytes = vec![0xff; MAX_SEARCH_STEP_BYTES as usize + 512];
+        for start in [MAX_BYTE_READ - 1, MAX_SEARCH_STEP_BYTES as usize - 1] {
+            for index in 0..128 {
+                bytes[start + 2 * index] = if index == 127 { b'z' } else { b'A' };
+                bytes[start + 2 * index + 1] = 0;
+            }
+        }
+        let result = collect(&bytes, spec);
+        assert_eq!(result.state(), SearchState::Complete);
+        assert_eq!(
+            result
+                .hits()
+                .iter()
+                .map(|h| h.address - 0x1000)
+                .collect::<Vec<_>>(),
+            [65535, 1048575]
+        );
+        assert_eq!(result.attempts(), 2);
+    }
+
+    #[test]
+    fn clipped_domain_rejects_hits_past_its_boundary() {
+        let cap = crate::analysis::MAX_IMAGE_BYTES;
+        let domain = SearchDomain::new(&[section(0, 0, cap + 4)], cap + 4).unwrap();
+        let context = domain
+            .request_context(&request(
+                ascii("AB", true),
+                domain.cursor(cap - 2).unwrap(),
+                10,
+            ))
+            .unwrap();
+        let valid = MemorySearchPage {
+            binding: context.binding.clone(),
+            spec_digest: context.digest.clone(),
+            start_cursor: context.cursor,
+            next_cursor: None,
+            hits: vec![MemoryHit {
+                address: cap - 2,
+                length: 2,
+                section_index: 0,
+            }],
+            scanned: 2,
+            stop: SearchStop::ScanLimit,
+        };
+        domain.validate_page(&context, &valid).unwrap();
+        let mut crossing = valid.clone();
+        crossing.hits[0].address = cap - 1;
+        assert!(domain.validate_page(&context, &crossing).is_err());
+        let mut wrong_reason = valid;
+        wrong_reason.stop = SearchStop::Complete;
+        assert!(domain.validate_page(&context, &wrong_reason).is_err());
+    }
+
+    #[test]
     fn domains_exclude_zero_fill_and_section_splits_but_keep_file_aliases() {
         let mut sections = vec![section(1, 0, 1), section(2, 1, 1), section(50, 0, 2)];
         sections[1].size = 20;
