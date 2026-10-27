@@ -1339,6 +1339,123 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn windows_cleanup_does_not_fall_back_to_case_colliding_names_after_enumeration() {
+        use backup_cleanup::Boundary;
+        use std::io::Write;
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            DELETE, FILE_CASE_SENSITIVE_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+            FILE_FLAG_POSIX_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            FILE_WRITE_ATTRIBUTES, FileCaseSensitiveInfo, SYNCHRONIZE, SetFileInformationByHandle,
+        };
+
+        let installation = tempfile::tempdir().unwrap();
+        let directory = fs::OpenOptions::new()
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(installation.path())
+            .unwrap();
+        // FILE_CS_FLAG_CASE_SENSITIVE_DIR; change only this private empty fixture.
+        let info = FILE_CASE_SENSITIVE_INFO { Flags: 1 };
+        // SAFETY: directory is a live owned handle with write-attributes access;
+        // info is initialized input storage of the supplied size for this call.
+        if unsafe {
+            SetFileInformationByHandle(
+                directory.as_raw_handle(),
+                FileCaseSensitiveInfo,
+                (&info as *const FILE_CASE_SENSITIVE_INFO).cast(),
+                std::mem::size_of_val(&info) as u32,
+            )
+        } == 0
+        {
+            let error = std::io::Error::last_os_error();
+            assert!(
+                matches!(error.raw_os_error(), Some(5 | 50 | 1314)),
+                "{error}"
+            );
+            eprintln!("Windows case-sensitive-directory fixture unavailable: {error}");
+            return;
+        }
+        drop(directory);
+        let executable = installation.path().join("app.exe");
+        fs::write(&executable, b"running executable").unwrap();
+        let guard = BinaryProtection::open(&executable).unwrap();
+        let cleanup = BackupCleanup::prepare(installation.path(), &guard);
+        assert!(cleanup.available());
+        let candidate = backup_path(installation.path(), "0.0.1-Abc123");
+        let sibling = installation.path().join(
+            candidate
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .replacen("ghidra", "GHIDRA", 1),
+        );
+        assert!(is_backup_name(candidate.file_name().unwrap()));
+        assert!(!is_backup_name(sibling.file_name().unwrap()));
+        for (path, bytes) in [
+            (&candidate, b"eligible backup".as_slice()),
+            (&sibling, b"unrelated case-colliding file".as_slice()),
+        ] {
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .custom_flags(FILE_FLAG_POSIX_SEMANTICS)
+                .open(path)
+                .unwrap()
+                .write_all(bytes)
+                .unwrap();
+        }
+        let sibling_identity = crate::model::FileIdentity::from_file(
+            &crate::windows::open_for_identity(&sibling).unwrap(),
+        )
+        .unwrap();
+        // The actor already has a DELETE handle before cleanup seals the
+        // directory. Remove the enumerated entry synchronously before lookup;
+        // the differently cased sibling must never become the cleanup victim.
+        let mut actor = Some(
+            fs::OpenOptions::new()
+                .access_mode(DELETE | SYNCHRONIZE)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .custom_flags(FILE_FLAG_POSIX_SEMANTICS)
+                .open(&candidate)
+                .unwrap(),
+        );
+        let mut removed = false;
+        cleanup.prune_with(std::slice::from_ref(&guard), |boundary, name| {
+            if matches!(boundary, Boundary::Open) && name == candidate.file_name().unwrap() {
+                let file = actor.take().unwrap();
+                crate::windows::delete_open_file(&file).unwrap();
+                drop(file);
+                removed = true;
+            }
+        });
+        assert!(
+            removed,
+            "the mutation must complete after enumeration and before lookup"
+        );
+        assert!(
+            !fs::read_dir(installation.path())
+                .unwrap()
+                .any(|entry| { entry.unwrap().file_name() == candidate.file_name().unwrap() })
+        );
+        assert_eq!(
+            fs::read(&sibling).unwrap(),
+            b"unrelated case-colliding file"
+        );
+        assert_eq!(
+            crate::model::FileIdentity::from_file(
+                &crate::windows::open_for_identity(&sibling).unwrap()
+            ),
+            Some(sibling_identity)
+        );
+        assert_eq!(fs::read(&executable).unwrap(), b"running executable");
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn windows_cleanup_rejects_protected_substitutions_and_prevents_postcheck_swaps() {
         use backup_cleanup::Boundary;
         for phase in 0..3 {

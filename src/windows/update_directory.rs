@@ -82,7 +82,11 @@ fn open_relative(
         Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
         RootDirectory: parent.as_raw_handle(),
         ObjectName: &text,
-        Attributes: OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
+        // Enumeration supplied the exact candidate spelling. In a case-sensitive
+        // directory, an insensitive lookup could select a non-eligible sibling
+        // after that entry disappears. Bootstrap/identity opens remain guarded
+        // by retained file identities; deletion opens must use the exact name.
+        Attributes: OBJ_DONT_REPARSE | if deletion { 0 } else { OBJ_CASE_INSENSITIVE },
         SecurityDescriptor: ptr::null(),
         SecurityQualityOfService: ptr::null(),
     };
