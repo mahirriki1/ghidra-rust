@@ -3,6 +3,9 @@
 //! Job objects limit resource use and lifetime. They do not isolate the worker
 //! from the user's files, registry, credentials, or network.
 
+mod update_directory;
+pub(crate) use update_directory::PinnedUpdateDirectory;
+
 use crate::model::FileIdentity;
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -165,6 +168,41 @@ pub fn file_identity(file: &File) -> io::Result<FileIdentity> {
         inode: u64::from_le_bytes(id[..8].try_into().expect("Eight-byte file ID half")),
         inode_high: u64::from_le_bytes(id[8..].try_into().expect("Eight-byte file ID half")),
     })
+}
+
+/// Inspect an output's identity without conflicting with its existing writer
+/// (for example, an updater-owned tempfile). This handle never reads its bytes.
+pub fn open_for_identity(path: &Path) -> io::Result<File> {
+    validate_local_path(path)?;
+    let file = OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    verify_regular_file(&file)?;
+    Ok(file)
+}
+
+/// Delete the exact regular file that was inspected, rather than resolving its
+/// name again. Sharing violations (including running executables) are errors.
+pub fn delete_open_file(file: &File) -> io::Result<()> {
+    verify_regular_file(file)?;
+    let info = FILE_DISPOSITION_INFO { DeleteFile: true };
+    // SAFETY: file owns a live handle opened with DELETE access. info is an
+    // initialized FILE_DISPOSITION_INFO of the supplied size, live for the call.
+    // The kernel marks this handle's file for deletion when its last handle closes.
+    if unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileDispositionInfo,
+            (&info as *const FILE_DISPOSITION_INFO).cast(),
+            std::mem::size_of_val(&info) as u32,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Same-volume replacement supports existing destinations on Windows, unlike
