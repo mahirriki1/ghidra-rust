@@ -17241,6 +17241,183 @@ mod tests {
         assert!(app.search_target(view, index, true).is_none());
     }
 
+    fn desktop_frame(
+        context: &egui::Context,
+        app: &mut DesktopApp,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let time = context.input(|input| input.time) + 0.05;
+        let mut output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 800.0),
+                )),
+                time: Some(time),
+                focused: true,
+                events,
+                ..Default::default()
+            },
+            |ui| app.draw(ui),
+        );
+        output.textures_delta.clear();
+        output
+    }
+
+    /// Each pointer or key event in its own frame, as a desktop delivers them.
+    fn desktop_events(
+        context: &egui::Context,
+        app: &mut DesktopApp,
+        events: impl IntoIterator<Item = egui::Event>,
+    ) {
+        for event in events {
+            desktop_frame(context, app, vec![event]);
+        }
+        desktop_frame(context, app, vec![]);
+    }
+
+    #[test]
+    fn opened_search_hits_leave_listing_clicks_keys_and_shortcuts_working_after_back() {
+        let context = egui::Context::default();
+        theme::install(&context);
+        context.set_pixels_per_point(1.25);
+        context.all_styles_mut(|style| style.animation_time = 0.0);
+        let mut app = hex_app();
+        app.pending = None;
+        app.client = None;
+        app.tab = Tab::Listing;
+        app.select_instruction(0x1000);
+        desktop_frame(&context, &mut app, vec![]);
+
+        // S, choose ASCII, type into the field, then Return.
+        desktop_events(&context, &mut app, tap(egui::Key::S, egui::Modifiers::NONE));
+        assert!(app.search_dialog.is_some());
+        let output = desktop_frame(&context, &mut app, vec![]);
+        let ascii = text_position(&output, "ASCII", 1);
+        let hex = text_position(&output, "Hex", 1);
+        let click = |app: &mut DesktopApp, point| {
+            desktop_events(&context, app, pointer_events(point));
+        };
+        click(&mut app, ascii);
+        assert_eq!(app.search_form.memory_mode, MemoryMode::Ascii);
+        click(&mut app, egui::pos2(hex.x + 40.0, hex.y + 28.0));
+        for ch in "srch".chars() {
+            let key = egui::Key::from_name(&ch.to_string()).unwrap();
+            let mut events = tap(key, egui::Modifiers::NONE);
+            events.insert(1, egui::Event::Text(ch.into()));
+            desktop_events(&context, &mut app, events);
+        }
+        assert_eq!(app.search_form.memory_query, "srch");
+        desktop_events(
+            &context,
+            &mut app,
+            tap(egui::Key::Enter, egui::Modifiers::NONE),
+        );
+        assert!(app.search_dialog.is_none());
+        deliver_memory_pages(&mut app, &marked_image(), &context);
+        assert_eq!(app.tab, Tab::Search);
+
+        let no_focus = |context: &egui::Context| context.memory(|memory| memory.focused());
+        let listing_click_and_keys = |app: &mut DesktopApp| {
+            assert_eq!((app.tab, app.selected), (Tab::Listing, Some(0x1000)));
+            assert_eq!(no_focus(&context), None);
+            assert!(!app.navigation_shortcuts_blocked(&context));
+            desktop_events(&context, app, tap(egui::Key::Space, egui::Modifiers::NONE));
+            assert_eq!(app.tab, Tab::Graph);
+            desktop_events(&context, app, tap(egui::Key::Space, egui::Modifiers::NONE));
+            assert_eq!(app.tab, Tab::Listing);
+            let output = desktop_frame(&context, app, vec![]);
+            let row = text_position(&output, "00001004", 3);
+            click(app, row);
+            assert_eq!(app.selected, Some(0x1004));
+            desktop_events(
+                &context,
+                app,
+                tap(egui::Key::ArrowDown, egui::Modifiers::NONE),
+            );
+            assert_eq!(app.selected, Some(0x1008));
+            app.select_instruction(0x1000);
+        };
+
+        // Double-click, then Enter on the selected row, then the context menu.
+        let output = desktop_frame(&context, &mut app, vec![]);
+        let row = text_position(&output, "00001011", 3);
+        let [moved, press, release] = <[egui::Event; 3]>::try_from(pointer_events(row)).unwrap();
+        for open in 0..3 {
+            app.tab = Tab::Search;
+            desktop_frame(&context, &mut app, vec![]);
+            match open {
+                0 => desktop_events(
+                    &context,
+                    &mut app,
+                    [
+                        moved.clone(),
+                        press.clone(),
+                        release.clone(),
+                        press.clone(),
+                        release.clone(),
+                    ],
+                ),
+                1 => {
+                    assert_eq!(app.searches.table.selected, Some(1));
+                    desktop_events(
+                        &context,
+                        &mut app,
+                        tap(egui::Key::Enter, egui::Modifiers::NONE),
+                    );
+                }
+                _ => {
+                    desktop_events(&context, &mut app, secondary_events(row));
+                    let output = desktop_frame(&context, &mut app, vec![]);
+                    // The menu item, not the toolbar's "Open…".
+                    let open = output
+                        .shapes
+                        .iter()
+                        .rev()
+                        .find_map(|shape| match &shape.shape {
+                            egui::epaint::Shape::Text(text) if text.galley.text() == "Open" => {
+                                Some(text.pos + text.galley.rect.center().to_vec2())
+                            }
+                            _ => None,
+                        })
+                        .expect("context menu Open");
+                    click(&mut app, open);
+                }
+            }
+            assert_eq!(
+                (app.tab, app.data_location),
+                (Tab::Hex, Some((0x1011, 4))),
+                "open {open}"
+            );
+            desktop_events(
+                &context,
+                &mut app,
+                tap(egui::Key::ArrowLeft, egui::Modifiers::ALT),
+            );
+            listing_click_and_keys(&mut app);
+            // Forward returns to the exact span, and Back again restores input.
+            desktop_events(
+                &context,
+                &mut app,
+                tap(egui::Key::ArrowRight, egui::Modifiers::ALT),
+            );
+            assert_eq!((app.tab, app.data_location), (Tab::Hex, Some((0x1011, 4))));
+            desktop_events(
+                &context,
+                &mut app,
+                tap(egui::Key::ArrowLeft, egui::Modifiers::ALT),
+            );
+            listing_click_and_keys(&mut app);
+        }
+        // Search shortcuts still open their dialogs.
+        desktop_events(
+            &context,
+            &mut app,
+            tap(egui::Key::F, egui::Modifiers::COMMAND),
+        );
+        assert!(app.search_dialog.is_some());
+    }
+
     fn search_frame(
         context: &egui::Context,
         app: &mut DesktopApp,
