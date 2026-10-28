@@ -1,10 +1,10 @@
 //! Directory-relative cleanup capability. No original-path lookup authorizes
 //! a destructive operation after this directory has been opened.
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::windows::{
-    ffi::{OsStrExt, OsStringExt},
+    ffi::OsStrExt,
     fs::OpenOptionsExt,
     io::{AsRawHandle, FromRawHandle},
 };
@@ -17,8 +17,7 @@ use windows_sys::Wdk::Storage::FileSystem::{
     FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
 };
 use windows_sys::Win32::Foundation::{
-    ERROR_NO_MORE_FILES, OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE, RtlNtStatusToDosError,
-    UNICODE_STRING,
+    OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE, RtlNtStatusToDosError, UNICODE_STRING,
 };
 use windows_sys::Win32::Storage::FileSystem::*;
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
@@ -93,7 +92,7 @@ fn open_relative(
     let mut handle = ptr::null_mut();
     let mut status_block = IO_STATUS_BLOCK::default();
     let access = if directory {
-        FILE_GENERIC_READ | FILE_TRAVERSE
+        FILE_GENERIC_READ | FILE_TRAVERSE | if deletion { DELETE } else { 0 }
     } else {
         FILE_READ_ATTRIBUTES | SYNCHRONIZE | if deletion { DELETE } else { 0 }
     };
@@ -284,109 +283,52 @@ impl PinnedUpdateDirectory {
 }
 
 impl CleanupDirectory {
+    /// Obtain DELETE access to the same directory object; disposition will only
+    /// remove it once empty. No ambient pathname or recursive removal is used.
+    pub(crate) fn empty_deletion(&self) -> io::Result<File> {
+        let expected = directory_id(&self.directory)?;
+        let mut error = invalid();
+        for name in [Vec::new(), vec![46]] {
+            match open_relative(
+                &self.directory,
+                name,
+                true,
+                true,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            ) {
+                Ok(file) if directory_id(&file)? == expected => return Ok(file),
+                Ok(_) => return Err(invalid()),
+                Err(failure) => error = failure,
+            }
+        }
+        Err(error)
+    }
+
     pub(crate) fn deletion(&self, name: &OsStr) -> io::Result<File> {
         relative(&self.directory, name, false, true)
     }
 
-    /// Enumerate the retained object, charging every record before filtering.
-    /// A false visitor return stops immediately without another directory query.
-    pub(crate) fn visit(
-        &self,
-        maximum: usize,
-        mut visitor: impl FnMut(&OsStr) -> bool,
-    ) -> io::Result<usize> {
-        let mut storage = [0u64; 8192]; // Fixed 64 KiB, aligned for Windows output.
-        let mut scanned = 0;
-        let mut restart = true;
-        while scanned < maximum {
-            storage.fill(0);
-            let class = if restart {
-                FileIdBothDirectoryRestartInfo
-            } else {
-                FileIdBothDirectoryInfo
-            };
-            restart = false;
-            // SAFETY: directory owns a synchronous directory handle opened with
-            // FILE_LIST_DIRECTORY. storage is live, writable and 8-byte aligned;
-            // its exact byte size is passed and no pointer survives this call.
-            let success = unsafe {
-                GetFileInformationByHandleEx(
-                    self.directory.as_raw_handle(),
-                    class,
-                    storage.as_mut_ptr().cast(),
-                    size_of_val(&storage) as u32,
-                )
-            };
-            if success == 0 {
-                let error = io::Error::last_os_error();
-                if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
-                    return Ok(scanned);
-                }
-                return Err(error);
-            }
-            // SAFETY: every u64 is initialized; viewing its full allocation as
-            // bytes preserves alignment/lifetime and cannot read outside storage.
-            let data = unsafe {
-                std::slice::from_raw_parts(storage.as_ptr().cast::<u8>(), size_of_val(&storage))
-            };
-            let mut offset = 0usize;
-            loop {
-                let (name, next) = entry(data, offset)?;
-                scanned += 1;
-                if !visitor(&name) || scanned == maximum {
-                    return Ok(scanned);
-                }
-                let Some(next) = next else {
-                    break;
-                };
-                offset = next;
-            }
+    /// Remove this verified directory only if it is empty. Never resolve its
+    /// original pathname after releasing the directory capability.
+    pub(crate) fn remove_empty(&self) -> io::Result<()> {
+        let file = self.empty_deletion()?;
+        let info = FILE_DISPOSITION_INFO { DeleteFile: true };
+        // SAFETY: empty_deletion returns a live DELETE handle to this exact
+        // verified directory. info is initialized and live for its exact size;
+        // the kernel refuses a nonempty directory and never recursively deletes.
+        if unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle(),
+                FileDispositionInfo,
+                (&info as *const FILE_DISPOSITION_INFO).cast(),
+                size_of_val(&info) as u32,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
         }
-        Ok(scanned)
+        Ok(())
     }
-}
-
-/// Parse bounded directory records without dereferencing variable-length C
-/// structs. File IDs/attributes are hints; opened handles are authoritative.
-fn entry(data: &[u8], at: usize) -> io::Result<(OsString, Option<usize>)> {
-    let header = std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileName);
-    let read32 = |offset: usize| -> io::Result<u32> {
-        let start = at.checked_add(offset).ok_or_else(invalid)?;
-        let bytes = data
-            .get(start..start.checked_add(4).ok_or_else(invalid)?)
-            .ok_or_else(invalid)?;
-        Ok(u32::from_le_bytes(bytes.try_into().map_err(|_| invalid())?))
-    };
-    let next = read32(std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, NextEntryOffset))? as usize;
-    let length = read32(std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileNameLength))? as usize;
-    if length == 0 || length > 510 || !length.is_multiple_of(2) {
-        return Err(invalid());
-    }
-    let start = at.checked_add(header).ok_or_else(invalid)?;
-    let end = start.checked_add(length).ok_or_else(invalid)?;
-    let bytes = data.get(start..end).ok_or_else(invalid)?;
-    let name: Vec<_> = bytes
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-        .collect();
-    if name.contains(&0) {
-        return Err(invalid());
-    }
-    let next = if next == 0 {
-        None
-    } else {
-        if next < header + length || !next.is_multiple_of(8) {
-            return Err(invalid());
-        }
-        let offset = at
-            .checked_add(next)
-            .filter(|next| *next < data.len())
-            .ok_or_else(invalid)?;
-        Some(offset)
-    };
-    Ok((OsString::from_wide(&name), next))
 }
 
 #[cfg(test)]
@@ -394,60 +336,73 @@ mod tests {
     use super::*;
 
     #[test]
-    fn directory_iteration_charges_nonmatching_entries_and_stops_at_the_budget() {
+    fn child_names_cannot_escape_the_directory() {
         let directory = tempfile::tempdir().unwrap();
-        for index in 0..12 {
-            std::fs::write(directory.path().join(format!("unrelated-{index}")), []).unwrap();
-        }
-        let prepared = PinnedUpdateDirectory::open(directory.path()).unwrap();
-        let pinned = prepared.sealed().unwrap();
-        let mut visited = 0;
-        assert_eq!(
-            pinned
-                .visit(7, |_| {
-                    visited += 1;
-                    true
-                })
-                .unwrap(),
-            7
-        );
-        assert_eq!(visited, 7);
-        let mut visited = 0;
-        assert_eq!(
-            pinned
-                .visit(4096, |_| {
-                    visited += 1;
-                    false
-                })
-                .unwrap(),
-            1
-        );
-        assert_eq!(visited, 1);
+        let pinned = PinnedUpdateDirectory::open(directory.path()).unwrap();
         for name in ["", ".", "..", "x\\y", "x/y", "x:y", "x\0y"] {
-            assert!(prepared.identity(OsStr::new(name)).is_err());
+            assert!(pinned.identity(OsStr::new(name)).is_err());
         }
     }
 
     #[test]
-    fn directory_record_parser_rejects_truncated_overlapping_and_overlong_names() {
-        let header = std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileName);
-        let length_at = std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileNameLength);
-        let mut record = vec![0u8; header + 8];
-        record[length_at..length_at + 4].copy_from_slice(&2u32.to_le_bytes());
-        record[header..header + 2].copy_from_slice(&u16::from(b'x').to_le_bytes());
-        assert_eq!(entry(&record, 0).unwrap(), (OsString::from("x"), None));
-        for length in [0u32, 1, 512, u32::MAX] {
-            let mut broken = record.clone();
-            broken[length_at..length_at + 4].copy_from_slice(&length.to_le_bytes());
-            assert!(entry(&broken, 0).is_err());
+    fn empty_directory_cleanup_preserves_path_replacements_and_nonempty_contents() {
+        for junction in [false, true] {
+            let outer = tempfile::tempdir().unwrap();
+            let original = outer.path().join("original");
+            let moved = outer.path().join("moved");
+            let outside = outer.path().join("outside");
+            std::fs::create_dir(&original).unwrap();
+            std::fs::create_dir(&outside).unwrap();
+            let pinned = PinnedUpdateDirectory::open(&original).unwrap();
+            let cleanup = pinned.sealed().unwrap();
+            drop(pinned);
+            let swapped = match std::fs::rename(&original, &moved) {
+                Ok(()) => true,
+                Err(error) => {
+                    assert!(matches!(error.raw_os_error(), Some(5 | 32)), "{error}");
+                    false // Open-directory sharing can itself block the attack.
+                }
+            };
+            eprintln!("directory replacement: junction={junction}, swapped={swapped}");
+            if swapped {
+                if junction {
+                    let result = std::process::Command::new("cmd.exe")
+                        .args(["/d", "/c", "mklink", "/J"])
+                        .arg(&original)
+                        .arg(&outside)
+                        .output()
+                        .unwrap();
+                    assert!(result.status.success());
+                } else {
+                    std::fs::create_dir(&original).unwrap();
+                }
+            }
+            let actual = if swapped { &moved } else { &original };
+            // Refuse to remove a directory that still contains any data.
+            std::fs::write(actual.join("keep"), b"keep this data").unwrap();
+            assert!(cleanup.remove_empty().is_err());
+            assert_eq!(
+                std::fs::read(actual.join("keep")).unwrap(),
+                b"keep this data"
+            );
+            std::fs::remove_file(actual.join("keep")).unwrap();
+            cleanup.remove_empty().unwrap();
+            drop(cleanup);
+            assert!(!actual.exists());
+            if swapped {
+                assert!(
+                    std::fs::symlink_metadata(&original).is_ok(),
+                    "replacement was removed"
+                );
+                // Make replacement preservation observable even when it was empty
+                // at the cleanup boundary (the vulnerable pathname case).
+                std::fs::write(original.join("replacement-survived"), b"safe").unwrap();
+                if junction {
+                    std::fs::remove_dir(&original).unwrap();
+                }
+            }
+            assert!(outside.exists());
         }
-        for next in [1u32, header as u32, u32::MAX] {
-            let mut broken = record.clone();
-            broken[..4].copy_from_slice(&next.to_le_bytes());
-            assert!(entry(&broken, 0).is_err());
-        }
-        assert!(entry(&record[..header], 0).is_err());
-        assert!(entry(&record, usize::MAX).is_err());
     }
 
     #[test]

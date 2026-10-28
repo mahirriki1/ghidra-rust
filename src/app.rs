@@ -8240,13 +8240,9 @@ impl DesktopApp {
             self.poll_worker(&context);
         }
         if let Some(installed) = self.updater.poll(&context) {
-            self.status = format!(
-                "Updated. Previous executable: {}; notices: {}",
-                installed.backup.display(),
-                installed.notices.display()
-            );
+            self.status = "Update ready. Restarting…".into();
             self.restart.set(crate::updater::Restart {
-                executable: installed.executable,
+                installed,
                 project: self.project_path.clone(),
             });
             self.quit_confirmed = true;

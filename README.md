@@ -130,8 +130,9 @@ and during file operations.
 releases while running a `0.x` version. Download a verified update, then choose
 **Install and restart**. Unsaved work uses the normal save/discard/cancel prompt;
 a saved project reopens after restart. Linux x64 and Windows x64 portable builds
-require a writable installation folder. Updates retain the previous executable
-and current dependency notices beside the app. Older or unsigned releases cannot
+require a writable installation folder. Review and accept the license and dependency
+notices before installation. Updates replace the executable at its existing path;
+notices remain available in **Help → About Ghidra Rust**. Older or unsigned releases cannot
 be installed through the updater. See [update setup and recovery](docs/releases.md#in-app-updates).
 
 ### References and inspection

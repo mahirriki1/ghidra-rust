@@ -39,6 +39,9 @@ if ! rustc -vV | grep -x 'host: x86_64-unknown-linux-gnu' >/dev/null; then
     exit 1
 fi
 
+export GHIDRA_RUST_EMBEDDED_NOTICES
+GHIDRA_RUST_EMBEDDED_NOTICES=$(python3 scripts/embed-notices.py --target x86_64-unknown-linux-gnu)
+
 cargo fmt --all --check
 if ((run_tests)); then
     python3 -m unittest discover -s scripts -p 'test_*.py'

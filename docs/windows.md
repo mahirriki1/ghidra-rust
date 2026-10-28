@@ -76,6 +76,9 @@ job runs the same script with `-SkipTests`:
 rustup run 1.98.1-x86_64-pc-windows-msvc powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-windows.ps1
 ```
 
+Python 3.11+ must be on PATH as `python` for build-time dependency notice collection.
+The desktop does not require Python.
+
 The script checks formatting, tests, strict Clippy, and the release build,
 including worker/project integration against the release GUI-subsystem EXE.
 Products stay under `target` (or `CARGO_TARGET_DIR`); it installs no toolchain.
@@ -94,6 +97,27 @@ the **ghidra-rust-windows-x64** workflow artifact. The hosted job builds and
 packages but runs no tests, so it does not establish a passing native run. The
 local tests also do not exercise an actual OpenGL window; use the desktop check
 below on the intended machine.
+
+## Native updater process checks
+
+`scripts/build-windows.ps1` builds the disposable `updater-test-driver` fixture and
+sets `GHIDRA_RUST_TEST_UPDATER_DRIVER` before running `tests/windows_updater.rs`.
+These tests execute the production helper and cleanup entry points with native
+Windows processes: replacement of a running app, saved-project handoff,
+cancellation, parent-exit timeout, blocked publication, failed relaunch, and
+protected-file aliases. They do not open the OpenGL desktop. The build script
+repeats these checks with the release fixture's GUI subsystem to exercise inherited
+pipes without a console. To run just the debug process checks:
+
+```powershell
+cargo build --locked --target x86_64-pc-windows-msvc --example updater-test-driver
+$env:GHIDRA_RUST_TEST_UPDATER_DRIVER = (Resolve-Path target/x86_64-pc-windows-msvc/debug/examples/updater-test-driver.exe).Path
+cargo test --locked --target x86_64-pc-windows-msvc --test windows_updater
+```
+
+Use the matching path beneath `CARGO_TARGET_DIR` if that variable is set.
+The optional failure janitor uses Windows' built-in PowerShell; if it is unavailable
+or restricted, the error identifies the temporary folder for manual cleanup.
 
 ## Desktop check
 

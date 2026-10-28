@@ -22,6 +22,7 @@ enum State {
 pub(crate) struct UpdatePanel {
     pub open: bool,
     state: State,
+    accepted: bool,
 }
 
 impl UpdatePanel {
@@ -30,7 +31,9 @@ impl UpdatePanel {
     }
 
     pub fn ready(&self) -> Option<Arc<Prepared>> {
-        if let State::Ready(prepared) = &self.state {
+        if let State::Ready(prepared) = &self.state
+            && self.accepted
+        {
             Some(Arc::clone(prepared))
         } else {
             None
@@ -88,6 +91,7 @@ impl UpdatePanel {
         let mut download = None;
         let mut install = false;
         let mut close = false;
+        let mut decline = false;
         let modal = egui::Modal::new(egui::Id::unique("updates")).show(context, |ui| {
             ui.set_width(500.0);
             ui.heading("Ghidra Rust updates");
@@ -119,12 +123,21 @@ impl UpdatePanel {
                 }
                 State::Ready(prepared) => {
                     ui.label(format!("Version {} is downloaded and verified.", prepared.release.version));
-                    ui.label("Installation restarts the app. You’ll be prompted to save unsaved work. The previous executable is retained beside the app for recovery.");
-                    if ui.button("Install and restart").clicked() { install = true; }
+                    ui.label("Review the license and dependency notices before installing.");
+                    let height = ui.text_style_height(&egui::TextStyle::Monospace);
+                    ScrollArea::both().id_salt("update-license").max_height(240.0)
+                        .show_rows(ui, height, prepared.notice_lines.len(), |ui, range| {
+                            for line in &prepared.notice_lines[range] {
+                                ui.monospace(prepared.notices_text[line.clone()].trim_end_matches(['\n', '\r']));
+                            }
+                        });
+                    ui.checkbox(&mut self.accepted, "I accept the license terms and acknowledge the dependency notices.");
+                    ui.label("You’ll be prompted to save unsaved work. The update replaces the app at its existing location and restarts it.");
+                    if ui.add_enabled(self.accepted, egui::Button::new("Install and restart")).clicked() { install = true; }
                 }
                 State::Installing(_) => {
                     ui.spinner();
-                    ui.label("Stopping analysis, retaining the previous version, and installing…");
+                    ui.label("Stopping analysis and preparing to replace the app…");
                 }
                 State::Failed(error) => {
                     ui.label("The update could not be completed.");
@@ -138,15 +151,24 @@ impl UpdatePanel {
                     && ui.add_enabled(updater::supported(), egui::Button::new("Check for updates")).clicked()
                 { check = true; }
                 if !updater::supported() { ui.label("In-app updates require Linux x64 or Windows x64."); }
-                if !self.installing() && ui.button(if matches!(self.state, State::Checking(_) | State::Downloading(_)) { "Cancel" } else { "Close" }).clicked() {
+                if !self.installing() && ui.button(if matches!(self.state, State::Ready(_)) { "Decline" } else if matches!(self.state, State::Checking(_) | State::Downloading(_)) { "Cancel" } else { "Close" }).clicked() {
+                    decline = matches!(self.state, State::Ready(_));
                     close = true;
                 }
             });
         });
+        if decline {
+            self.accepted = false;
+            let discarded = std::mem::take(&mut self.state);
+            // Removing downloaded files can block; keep it off the GUI thread.
+            std::thread::spawn(move || drop(discarded));
+        }
         if check {
+            self.accepted = false;
             self.state = State::Checking(updater::check(context));
         }
         if let Some(release) = download {
+            self.accepted = false;
             self.state = State::Downloading(updater::download(context, release));
         }
         if !self.installing() && (close || modal.should_close() || install) {
@@ -156,5 +178,33 @@ impl UpdatePanel {
             }
         }
         install
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn installation_requires_accepting_the_downloaded_releases_notices() {
+        let (_installation, prepared) = updater::tests::prepared();
+        let prepared = Arc::new(prepared);
+        let mut panel = UpdatePanel {
+            state: State::Ready(prepared.clone()),
+            ..Default::default()
+        };
+        let context = egui::Context::default();
+        panel.open = true;
+        let mut requested = false;
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| {
+            requested |= panel.show(ui.ctx());
+        });
+        output.textures_delta.clear();
+        assert!(!requested);
+        assert!(panel.ready().is_none());
+        panel.accepted = true;
+        assert!(Arc::ptr_eq(&panel.ready().unwrap(), &prepared));
+        panel.accepted = false;
+        assert!(panel.ready().is_none());
     }
 }
