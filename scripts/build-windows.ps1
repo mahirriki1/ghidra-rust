@@ -11,6 +11,8 @@ if ([Environment]::OSVersion.Platform -ne 'Win32NT') {
 }
 
 $root = Split-Path $PSScriptRoot -Parent
+$previousUpdaterDriver = $env:GHIDRA_RUST_TEST_UPDATER_DRIVER
+$previousNotices = $env:GHIDRA_RUST_EMBEDDED_NOTICES
 $previousFixture = $env:GHIDRA_RUST_TEST_PE
 $previousCppFixture = $env:GHIDRA_RUST_TEST_PE_CPP
 Push-Location $root
@@ -49,9 +51,15 @@ try {
         $env:GHIDRA_RUST_TEST_PE_CPP = $cppFixture
     }
 
+    $env:GHIDRA_RUST_EMBEDDED_NOTICES = & python "$PSScriptRoot/embed-notices.py" --target $target
+    if ($LASTEXITCODE -ne 0) { throw 'Collecting embedded dependency notices failed (Python 3 is required).' }
+
     & cargo fmt --all --check
     if ($LASTEXITCODE -ne 0) { throw 'Formatting check failed.' }
     if (!$SkipTests) {
+        & cargo build --locked --target $target --example updater-test-driver
+        if ($LASTEXITCODE -ne 0) { throw 'Building the updater process fixture failed.' }
+        $env:GHIDRA_RUST_TEST_UPDATER_DRIVER = Join-Path $targetDir "$target/debug/examples/updater-test-driver.exe"
         & cargo test --locked --target $target
         if ($LASTEXITCODE -ne 0) { throw 'Windows tests failed.' }
     }
@@ -60,6 +68,11 @@ try {
     & cargo build --release --locked --target $target
     if ($LASTEXITCODE -ne 0) { throw 'Windows release build failed.' }
     if (!$SkipTests) {
+        & cargo build --release --locked --target $target --example updater-test-driver
+        if ($LASTEXITCODE -ne 0) { throw 'Building the release updater fixture failed.' }
+        $env:GHIDRA_RUST_TEST_UPDATER_DRIVER = Join-Path $targetDir "$target/release/examples/updater-test-driver.exe"
+        & cargo test --release --locked --target $target --test windows_updater
+        if ($LASTEXITCODE -ne 0) { throw 'Windows release updater lifecycle tests failed.' }
         # The release EXE uses the Windows GUI subsystem. Test its inherited worker
         # pipes explicitly; the debug/console-subsystem test cannot establish this.
         & cargo test --release --locked --target $target --test windows_worker
@@ -69,6 +82,8 @@ try {
     }
     & "$PSScriptRoot\package-windows.ps1"
 } finally {
+    $env:GHIDRA_RUST_TEST_UPDATER_DRIVER = $previousUpdaterDriver
+    $env:GHIDRA_RUST_EMBEDDED_NOTICES = $previousNotices
     $env:GHIDRA_RUST_TEST_PE = $previousFixture
     $env:GHIDRA_RUST_TEST_PE_CPP = $previousCppFixture
     Pop-Location

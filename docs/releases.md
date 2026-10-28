@@ -184,65 +184,61 @@ assets are accepted. Responses, downloads, release counts, and timeouts are
 bounded. Downloads stream to a private staging directory rather than retaining
 the executable in memory. Files are hashed again during installation.
 
-**Download update** stages the executable and notices. **Install and restart**
-uses the normal save/discard/cancel flow, stops and reaps the current analysis
-worker, stages files beside the installed executable, and retains the previous
-version. The executable is replaced only after validation. Linux uses atomic
-replacement; Windows first renames the running executable to its recovery path,
-then publishes the new file without overwriting a file that appeared meanwhile.
-A failed Windows publication attempts to restore the previous path; if that is
-not possible, the error identifies the retained executable for manual recovery.
-An unexpected interruption between those Windows renames can also require manual
-recovery. Input-file identity guards remain in force, including hard links: an
-app analyzing its own executable must close that binary before updating.
+**Download update** stages the executable and notices in a private temporary
+folder. The update window displays the verified license and dependency notices;
+**Install and restart** stays disabled until you explicitly accept them. Declining
+or closing the window leaves the installed executable alone. Starting a new
+check/download clears acceptance. The normal save/discard/cancel prompt still
+protects unsaved work, and the analysis worker is stopped and reaped first.
 
-The desktop exits before launching the new version. A saved project reopens;
-unsaved binary-only sessions are not automatically restored. The installation
-folder must be writable. The updater does not request elevation or manage system
-packages. Installed documentation is not replaced; updated application and
-dependency notices are collected from both release packages into a new
-`ghidra-rust-VERSION-notices-*.txt` beside the executable. Keep this file when
-redistributing an updated app.
+Linux stages the verified executable beside the installed file and atomically
+replaces it at the same path without creating a recovery executable. Windows
+prepares a temporary copy of the current updater in a private temporary folder.
+The helper retains the installed-file identity and protected input handles before
+reporting ready. After the desktop closes, a pipe commit authorizes the helper;
+it waits up to 30 seconds on a retained process handle for the old app to exit,
+then revalidates the destination and hashes the staged bytes before replacement.
+Windows requires the helper to close its own installed-file identity handle after
+the final destination check; analyzed-input guards remain pinned throughout.
+It does not rename the running app to a recovery path. Failed publication leaves
+the original executable in place. Publication still uses paths and is not a
+general guarantee against concurrent namespace changes during installation.
 
-Recovery copies use `ghidra-rust-previous-VERSION-XXXXXX` (with `.exe` on Windows),
-where `VERSION` is a valid semantic version and `XXXXXX` is six ASCII letters or
-digits. On Windows, after successful publication, the updater keeps the
-just-created recovery copy and removes older regular files matching exactly that
-pattern, only in the installation directory. Cleanup runs here because the exact
-new backup and input identity guards are still available; no startup or modification-time heuristic
-is needed. Even if the new app fails to start, that backup is the version that
-was running before the update. Failed or rolled-back installations never prune.
+The updated Windows app acknowledges a cleanup handoff before the helper exits,
+then removes the exact temporary artifacts using directory-relative,
+identity-checked file handles. If the helper fails before restart, a failure-only
+janitor uses Windows' built-in PowerShell and handles duplicated into that process
+to remove the exact artifacts after the helper exits. It also removes the staging
+directory only if empty. Incoming file paths are never used as deletion commands.
+Cleanup remains best effort: locked files, interrupted updates, unavailable or
+restricted PowerShell, or unsupported containment can leave temporary files in
+the system's temporary folder. The failure dialog identifies that folder if the
+janitor could not be started. The janitor waits at most five minutes for the
+helper/error dialog to close. There is no recursive cleanup and no startup scan of the
+installation folder. Recovery executables and versioned notice files left by
+older updaters are not removed automatically; remove them manually if unwanted.
+Updates initiated by an older installed version still use that version’s updater;
+this workflow takes effect once the updated app is running.
 
-Linux retains all recovery copies; remove obsolete copies manually after
-confirming that the new version works. Linux pathname deletion cannot guarantee
-that a concurrently replaced name still identifies the file that was checked.
-The updater therefore performs no Linux cleanup moves or deletions.
+A saved project reopens after restart; unsaved binary-only sessions do not. The
+installation folder must be writable. The updater does not request elevation or
+manage system packages. Installed documentation is not replaced. The native build
+scripts collect dependency licenses before compilation and embed them in the
+executable, available under **Help → About Ghidra Rust → License and dependency
+notices**. No new notice sidecar is installed. Direct Cargo source builds show
+application notices and identify the dependency source packages as their license
+source; use the native build scripts for distributable binaries with full notices.
+Windows release builds now also require Python 3.11+ for notice collection;
+the desktop and updater have no Python runtime dependency.
 
-Windows cleanup prepares a directory capability before publication, validates
-membership of the running and staged files, then verifies published outputs in
-that same directory. Enumeration and candidate opens remain relative to the
-retained directory handle if an ancestor is renamed. Deletion uses the validated
-candidate handle. Unsupported containment, identity or filename comparisons
-(including non-ASCII protected basenames) disable pruning for that update.
-These safeguards govern cleanup; the existing publication and rollback operations
-still use paths and are not a general guarantee against concurrent namespace
-changes during installation.
-
-Cleanup skips symlinks, Windows reparse points/junctions, protected inputs and
-hard-link aliases of protected or retained files. It is best effort: errors do
-not fail the update, and running or locked previous executables on Windows are
-kept. Each Windows update scans at most 4,096 directory entries and removes at most 128
-copies, so inaccessible files or a large directory may leave additional copies
-for later updates or manual removal. Similarly named files and nested directories
-are left alone. Dependency-notice files are retained.
-To recover, close the app and copy the desired previous executable back to the
-normal executable path. Older releases may reject projects saved in a newer
-format; retain project backups before upgrading. Failed downloads and
-verification never replace the installed executable. A failed relaunch leaves
-the verified new executable installed. Windows shows the manual launch path in
-a native error dialog; Linux reports it through stderr, which may not be visible
-when launched from a desktop menu. Linux directory entries are not explicitly
-fsynced, so atomic replacement is not a power-loss durability guarantee.
+Download or verification failures never replace the installed executable. Without
+a retained old executable, reverting requires downloading an older release.
+Older releases may reject projects saved in a newer format; retain project
+backups before upgrading. Failed relaunch leaves the verified new executable
+installed. Windows reports failures in a native dialog; Linux reports them to
+stderr, which may not be visible when launched from a desktop menu. Linux
+directory entries are not explicitly fsynced, so atomic replacement is not a
+power-loss durability guarantee.
 
 ### Configure release signing once
 
@@ -282,6 +278,8 @@ python3 scripts/sign-updates.py --sign target/release-assets --key-file /secure/
 python3 -m unittest discover -s scripts -p 'test_updates.py'
 ```
 
-The first updater-enabled version requires a manual download. Installation and
-restart still need native Windows validation before being described as tested
-there; Linux checks do not establish Windows runtime support.
+The first updater-enabled version requires a manual download. Native Windows
+process tests cover replacement, relaunch/project handoff, and failure cleanup,
+including a release fixture with the GUI subsystem. They do not open the OpenGL
+desktop or exercise the interactive update prompt against a published release;
+use the Windows desktop check for that validation.

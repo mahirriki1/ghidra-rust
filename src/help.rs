@@ -66,6 +66,22 @@ impl HelpDialog {
                 Self::About => {
                     ui.label(concat!("Version ", env!("CARGO_PKG_VERSION")));
                     ui.label(ABOUT_SCOPE);
+                    ui.collapsing("License and dependency notices", |ui| {
+                        ui.set_max_width(680.0);
+                        let text = include_str!(concat!(env!("OUT_DIR"), "/notices.txt"));
+                        let lines = embedded_lines(text);
+                        let height = ui.text_style_height(&egui::TextStyle::Monospace);
+                        egui::ScrollArea::both().max_height(320.0).show_rows(
+                            ui,
+                            height,
+                            lines.len(),
+                            |ui, range| {
+                                for line in &lines[range] {
+                                    ui.monospace(*line);
+                                }
+                            },
+                        );
+                    });
                     ui.horizontal(|ui| {
                         ui.hyperlink_to(
                             "LICENSE",
@@ -142,4 +158,9 @@ fn shortcut_table(ui: &mut egui::Ui, key_width: f32) {
             theme::TEXT,
         );
     }
+}
+
+fn embedded_lines(text: &'static str) -> &'static Vec<&'static str> {
+    static LINES: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    LINES.get_or_init(|| text.lines().collect())
 }

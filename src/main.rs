@@ -5,6 +5,35 @@ use std::path::PathBuf;
 
 fn main() -> std::process::ExitCode {
     let argument = std::env::args_os().nth(1);
+    #[cfg(windows)]
+    if argument.as_deref() == Some(std::ffi::OsStr::new("--update-helper")) {
+        return ghidra_rust::updater::run_helper().map_or_else(
+            |error| {
+                use std::io::Write;
+                if let Ok(message) = serde_json::to_string(&error) {
+                    let _ = writeln!(std::io::stdout(), "{message}");
+                    let _ = std::io::stdout().flush();
+                }
+                report_update_error(&error);
+                std::process::ExitCode::FAILURE
+            },
+            |_| std::process::ExitCode::SUCCESS,
+        );
+    }
+    #[cfg(windows)]
+    let initial_path = if argument.as_deref() == Some(std::ffi::OsStr::new("--update-cleanup")) {
+        match ghidra_rust::updater::run_cleanup() {
+            Ok(project) => project,
+            Err(error) => {
+                eprintln!("Update cleanup skipped: {error}");
+                None
+            }
+        }
+    } else {
+        argument.clone().map(PathBuf::from)
+    };
+    #[cfg(not(windows))]
+    let initial_path = argument.clone().map(PathBuf::from);
     let worker = argument.as_deref() == Some(std::ffi::OsStr::new("--analysis-worker"));
     if let Err(error) = ghidra_rust::performance::init() {
         if worker {
@@ -18,8 +47,7 @@ fn main() -> std::process::ExitCode {
     let mut success = if worker {
         ghidra_rust::worker::run_worker().map_err(|error| eprintln!("{error}"))
     } else {
-        run_desktop(argument.map(PathBuf::from))
-            .map_err(|error| report_startup_error(&error.to_string()))
+        run_desktop(initial_path).map_err(|error| report_startup_error(&error.to_string()))
     }
     .is_ok();
     lifetime.finish(0);
@@ -66,16 +94,10 @@ fn run_desktop(initial_path: Option<PathBuf>) -> eframe::Result<()> {
         }),
     )?;
     if let Some(restart) = restart.take() {
-        let mut command = std::process::Command::new(&restart.executable);
-        if let Some(project) = restart.project {
-            command.arg(project);
-        }
-        command.spawn().map_err(|error| {
-            eframe::Error::AppCreation(Box::new(std::io::Error::other(format!(
-                "The update was installed, but restart failed: {error}. Relaunch {} manually.",
-                restart.executable.display()
-            ))))
-        })?;
+        restart
+            .installed
+            .restart(restart.project)
+            .map_err(|error| eframe::Error::AppCreation(Box::new(std::io::Error::other(error))))?;
     }
     Ok(())
 }
@@ -104,5 +126,21 @@ fn report_startup_error(error: &str) {
                 MB_OK | MB_ICONERROR,
             )
         };
+    }
+}
+
+#[cfg(windows)]
+fn report_update_error(error: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
+    let message: Vec<u16> = error.encode_utf16().chain(Some(0)).collect();
+    let title: Vec<u16> = "Ghidra Rust — update\0".encode_utf16().collect();
+    // SAFETY: both strings are live NUL-terminated UTF-16 buffers for this call.
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            message.as_ptr(),
+            title.as_ptr(),
+            MB_OK | MB_ICONERROR,
+        );
     }
 }

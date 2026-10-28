@@ -112,11 +112,6 @@ impl BinaryProtection {
         self.identity
     }
 
-    #[cfg(not(windows))]
-    pub(crate) fn matches_file(&self, file: &File) -> bool {
-        FileIdentity::from_file(file) == Some(self.identity)
-    }
-
     /// Read the retained file, rather than following a pathname that may have changed.
     /// Reject concurrent changes if the bytes no longer match the analyzed image.
     pub fn verified_snapshot(&self) -> Result<Vec<u8>, String> {

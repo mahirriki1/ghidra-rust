@@ -4,7 +4,7 @@
 //! from the user's files, registry, credentials, or network.
 
 mod update_directory;
-pub(crate) use update_directory::PinnedUpdateDirectory;
+pub(crate) use update_directory::{CleanupDirectory, PinnedUpdateDirectory};
 
 use crate::model::FileIdentity;
 use std::fs::{File, OpenOptions};
