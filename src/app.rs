@@ -16641,4 +16641,794 @@ mod tests {
             "analyst_shared"
         );
     }
+
+    fn tap(key: egui::Key, modifiers: egui::Modifiers) -> Vec<egui::Event> {
+        let press = key_event(key, modifiers);
+        let mut release = press.clone();
+        if let egui::Event::Key { pressed, .. } = &mut release {
+            *pressed = false;
+        }
+        vec![press, release]
+    }
+
+    fn find_modifiers() -> egui::Modifiers {
+        egui::Modifiers {
+            ctrl: !cfg!(target_os = "macos"),
+            mac_cmd: cfg!(target_os = "macos"),
+            command: true,
+            ..Default::default()
+        }
+    }
+
+    fn dialog_kind(app: &DesktopApp) -> Option<DialogKind> {
+        app.search_dialog.as_ref().map(|dialog| dialog.kind)
+    }
+
+    #[test]
+    fn search_shortcuts_respect_guards_escape_and_leave_other_bindings_intact() {
+        let context = egui::Context::default();
+        let mut app = keyboard_app();
+        keyboard_frame(&context, &mut app, vec![]);
+        keyboard_frame(&context, &mut app, tap(egui::Key::S, egui::Modifiers::NONE));
+        assert_eq!(dialog_kind(&app), Some(DialogKind::Memory));
+        // The open search modal blocks every other shortcut.
+        keyboard_frame(&context, &mut app, vec![]);
+        for key in [egui::Key::F1, egui::Key::G, egui::Key::L, egui::Key::X] {
+            keyboard_frame(&context, &mut app, tap(key, egui::Modifiers::NONE));
+        }
+        assert!(app.help_dialog.is_none() && app.browser_dialog.is_none());
+        assert_eq!(app.tab, Tab::Listing);
+        // Escape closes only the search modal.
+        keyboard_frame(
+            &context,
+            &mut app,
+            tap(egui::Key::Escape, egui::Modifiers::NONE),
+        );
+        assert_eq!(dialog_kind(&app), None);
+        assert_eq!((app.tab, app.selected), (Tab::Listing, Some(0x1000)));
+        assert!(app.searches.current.is_none());
+        keyboard_frame(&context, &mut app, vec![]);
+        keyboard_frame(&context, &mut app, vec![]);
+
+        keyboard_frame(&context, &mut app, tap(egui::Key::F, find_modifiers()));
+        assert_eq!(dialog_kind(&app), Some(DialogKind::Text));
+        keyboard_frame(&context, &mut app, vec![]);
+        keyboard_frame(
+            &context,
+            &mut app,
+            tap(egui::Key::Escape, egui::Modifiers::NONE),
+        );
+        assert_eq!(dialog_kind(&app), None);
+        keyboard_frame(&context, &mut app, vec![]);
+        keyboard_frame(&context, &mut app, vec![]);
+
+        // Text focus, file jobs, repeats and extra modifiers never open search.
+        let filter = egui::Id::unique("function-filter");
+        context.memory_mut(|memory| memory.request_focus(filter));
+        keyboard_frame(&context, &mut app, vec![]);
+        keyboard_frame(&context, &mut app, tap(egui::Key::S, egui::Modifiers::NONE));
+        context.memory_mut(|memory| memory.surrender_focus(filter));
+        let (_sender, receiver) = mpsc::sync_channel(1);
+        app.file_job = Some(receiver);
+        keyboard_frame(&context, &mut app, tap(egui::Key::F, find_modifiers()));
+        // Hold S across the end of the file job: its repeat must not open.
+        keyboard_frame(
+            &context,
+            &mut app,
+            vec![key_event(egui::Key::S, egui::Modifiers::NONE)],
+        );
+        app.file_job = None;
+        let mut repeat = key_event(egui::Key::S, egui::Modifiers::NONE);
+        if let egui::Event::Key { repeat, .. } = &mut repeat {
+            *repeat = true;
+        }
+        keyboard_frame(&context, &mut app, vec![repeat]);
+        let release = tap(egui::Key::S, egui::Modifiers::NONE).pop().unwrap();
+        keyboard_frame(&context, &mut app, vec![release]);
+        keyboard_frame(
+            &context,
+            &mut app,
+            tap(egui::Key::S, egui::Modifiers::SHIFT),
+        );
+        keyboard_frame(&context, &mut app, tap(egui::Key::F, egui::Modifiers::NONE));
+        assert_eq!(dialog_kind(&app), None);
+
+        // X still belongs to the selection, and Help lists both search keys.
+        keyboard_frame(&context, &mut app, tap(egui::Key::X, egui::Modifiers::NONE));
+        assert_eq!(app.tab, Tab::References);
+        assert!(crate::help::SHORTCUTS.contains(&("S", "Search memory")));
+        assert!(crate::help::SHORTCUTS.contains(&(crate::help::FIND_KEYS, "Search program text")));
+    }
+
+    #[test]
+    fn search_dialog_submits_only_valid_queries_and_opens_the_search_tab() {
+        let context = egui::Context::default();
+        let mut app = keyboard_app();
+        keyboard_frame(&context, &mut app, vec![]);
+        keyboard_frame(&context, &mut app, tap(egui::Key::S, egui::Modifiers::NONE));
+        keyboard_frame(&context, &mut app, vec![]);
+        // A nibble wildcard is invalid hex: Enter keeps the dialog open.
+        keyboard_frame(&context, &mut app, vec![egui::Event::Text("4?".into())]);
+        keyboard_frame(
+            &context,
+            &mut app,
+            tap(egui::Key::Enter, egui::Modifiers::NONE),
+        );
+        assert_eq!(dialog_kind(&app), Some(DialogKind::Memory));
+        assert!(app.searches.current.is_none());
+        app.search_form.memory_query = "D9 6E A5 ?? B7 C8".into();
+        keyboard_frame(
+            &context,
+            &mut app,
+            tap(egui::Key::Enter, egui::Modifiers::NONE),
+        );
+        assert_eq!(dialog_kind(&app), None);
+        assert_eq!(app.tab, Tab::Search);
+        let Some(SearchView {
+            kind: SearchKind::Memory(memory),
+            ..
+        }) = &app.searches.current
+        else {
+            panic!("memory search");
+        };
+        assert_eq!(memory.pattern, "D9 6E A5 ?? B7 C8");
+        assert_eq!(memory.state(), SearchState::Searching);
+    }
+
+    /// Answers each page the displayed memory search asks for by scanning
+    /// `image` with the production scanner, as the worker would.
+    fn deliver_memory_pages(app: &mut DesktopApp, image: &[u8], context: &egui::Context) {
+        let info = app.info.clone().unwrap();
+        let domain = crate::search::SearchDomain::new(&info.sections, info.file_len).unwrap();
+        loop {
+            let epoch = app.worker_epoch;
+            let Some((_, memory)) = app.searches.memory_page() else {
+                break;
+            };
+            let Some(request) = memory
+                .session
+                .as_mut()
+                .unwrap()
+                .next_request(epoch)
+                .unwrap()
+            else {
+                break;
+            };
+            let page = memory_page(&domain, &request, image);
+            let pending = search_pending(app, request);
+            app.receive(pending, Response::MemorySearch(page), context);
+        }
+    }
+
+    fn memory_page(
+        domain: &crate::search::SearchDomain,
+        request: &Request,
+        image: &[u8],
+    ) -> crate::search::MemorySearchPage {
+        let Request::SearchMemory { spec, .. } = request else {
+            panic!("memory search request");
+        };
+        domain
+            .scan(
+                image,
+                &spec.compile().unwrap(),
+                &domain.request_context(request).unwrap(),
+            )
+            .unwrap()
+    }
+
+    fn search_pending(app: &DesktopApp, request: Request) -> Pending {
+        Pending {
+            id: 7,
+            request,
+            started: Instant::now(),
+            selection: app.selection_generation,
+            revision: app.revision,
+            byte_origin: (app.selected, app.tab),
+            bytes: None,
+            result: None,
+        }
+    }
+
+    fn ascii(text: &str) -> crate::search::MemorySearchSpec {
+        crate::search::MemorySearchSpec {
+            pattern: crate::search::MemoryPattern::Ascii { text: text.into() },
+            match_case: false,
+        }
+    }
+
+    fn memory_addresses(app: &DesktopApp) -> Vec<u64> {
+        match &app.searches.current {
+            Some(SearchView {
+                kind: SearchKind::Memory(memory),
+                ..
+            }) => memory.hits().iter().map(|hit| hit.address).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn search_state(app: &DesktopApp) -> Option<SearchState> {
+        app.searches.current.as_ref().map(SearchView::state)
+    }
+
+    /// hex_app's image: `.text` file bytes 0..0x2200, `.data` 0x2200..0x2220.
+    fn marked_image() -> Vec<u8> {
+        let mut image = vec![0; 0x2220];
+        for (va, text) in [
+            (0x1004u64, b"SRCH"),
+            (0x1011, b"srch"),
+            (0x1ffe, b"sRcH"),
+            (0x8004, b"SRCH"),
+        ] {
+            let offset = if va >= 0x8000 {
+                va - 0x8000 + 0x2200
+            } else {
+                va - 0x1000
+            } as usize;
+            image[offset..offset + 4].copy_from_slice(text);
+        }
+        image
+    }
+
+    #[test]
+    fn memory_hits_open_code_only_with_an_owner_and_exact_hex_spans_across_pages() {
+        let context = egui::Context::default();
+        let mut app = hex_app();
+        let (selected, history) = (app.selected, app.history.clone());
+        app.start_memory_search(ascii("srch"), MemoryMode::Ascii, &context);
+        assert_eq!(app.tab, Tab::Search);
+        // The analyst moves on; completion never switches tabs or selection,
+        // and annotation edits do not stale raw byte matches.
+        app.tab = Tab::Strings;
+        app.edit_annotation(
+            0x1040,
+            Annotation {
+                label: "renamed".into(),
+                ..Default::default()
+            },
+        );
+        deliver_memory_pages(&mut app, &marked_image(), &context);
+        assert_eq!(search_state(&app), Some(SearchState::Complete));
+        assert_eq!(memory_addresses(&app), [0x1004, 0x1011, 0x1ffe, 0x8004]);
+        assert_eq!((app.tab, app.selected), (Tab::Strings, selected));
+        assert_eq!(app.history, history);
+
+        // An exact PC of the displayed CFG opens through code navigation.
+        app.open_search_result(0, &context);
+        assert_eq!((app.tab, app.selected), (Tab::Listing, Some(0x1004)));
+        assert_eq!(app.view().map(|view| view.address), Some(0x1000));
+        assert_eq!(
+            app.history.last(),
+            Some(&crate::linkage_ui::Place::Code(0x1004))
+        );
+        // Inside the function's bytes but not an observed instruction: Hex.
+        app.open_search_result(1, &context);
+        assert_eq!(app.tab, Tab::Hex);
+        assert_eq!(app.data_location, Some((0x1011, 4)));
+        assert_eq!(app.view().map(|view| view.address), Some(0x1000));
+        let pending = deferred_bytes(&mut app);
+        let response = byte_payload(&pending, 0x11);
+        app.receive(pending, response, &context);
+        assert_eq!(app.hex.focused_span(), Some((0x1011, 4)));
+
+        // A span crossing the 0x2000 page keeps its whole exact selection.
+        app.open_search_result(2, &context);
+        let pending = deferred_bytes(&mut app);
+        assert!(matches!(
+            pending.request,
+            Request::Bytes {
+                address: 0x1ffe,
+                ..
+            }
+        ));
+        let response = byte_payload(&pending, 0x22);
+        app.receive(pending, response, &context);
+        assert_eq!(app.hex.selected_bytes(), Some((0x1ffe, vec![0x22; 4])));
+
+        // Back and Forward revisit exact data places.
+        app.history_step(false, &context);
+        assert_eq!(app.data_location, Some((0x1011, 4)));
+        let pending = deferred_bytes(&mut app);
+        let response = byte_payload(&pending, 0x11);
+        app.receive(pending, response, &context);
+        app.history_step(true, &context);
+        assert_eq!(app.data_location, Some((0x1ffe, 4)));
+        let pending = deferred_bytes(&mut app);
+        assert!(matches!(
+            pending.request,
+            Request::Bytes {
+                address: 0x1ffe,
+                ..
+            }
+        ));
+        let response = byte_payload(&pending, 0x33);
+        app.receive(pending, response, &context);
+        assert_eq!(app.hex.selected_bytes(), Some((0x1ffe, vec![0x33; 4])));
+        app.history_step(false, &context);
+        app.history_step(false, &context);
+        assert_eq!(
+            app.history[app.history_index],
+            crate::linkage_ui::Place::Code(0x1004)
+        );
+        assert_eq!(app.selected, Some(0x1004));
+
+        // Data outside code also opens in Hex; it never becomes a function.
+        let functions = app.info.as_ref().unwrap().functions.clone();
+        app.open_search_result(3, &context);
+        assert_eq!(app.data_location, Some((0x8004, 4)));
+        assert_eq!(app.info.as_ref().unwrap().functions, functions);
+    }
+
+    #[test]
+    fn memory_pages_bind_to_search_epoch_and_cancel_requery_or_close_clear_them() {
+        let context = egui::Context::default();
+        let mut app = hex_app();
+        app.pending = None;
+        let image = marked_image();
+        let info = app.info.clone().unwrap();
+        let domain = crate::search::SearchDomain::new(&info.sections, info.file_len).unwrap();
+        let next = |app: &mut DesktopApp| {
+            let epoch = app.worker_epoch;
+            let (_, memory) = app.searches.memory_page().unwrap();
+            memory
+                .session
+                .as_mut()
+                .unwrap()
+                .next_request(epoch)
+                .unwrap()
+                .unwrap()
+        };
+
+        // Cancel invalidates at once; its late page is dropped.
+        app.start_memory_search(ascii("srch"), MemoryMode::Ascii, &context);
+        let request = next(&mut app);
+        app.pending = Some(search_pending(&app, request.clone()));
+        app.cancel_search(&context);
+        assert_eq!(search_state(&app), Some(SearchState::Canceled));
+        assert!(app.pending.is_none());
+        let late = memory_page(&domain, &request, &image);
+        let pending = search_pending(&app, request);
+        app.receive(pending, Response::MemorySearch(late), &context);
+        assert_eq!(search_state(&app), Some(SearchState::Canceled));
+        assert!(memory_addresses(&app).is_empty());
+
+        // A requery's identity differs: the previous query's page is dropped,
+        // as is a page from an earlier worker epoch.
+        app.start_memory_search(ascii("srch"), MemoryMode::Ascii, &context);
+        let old = next(&mut app);
+        app.start_memory_search(ascii("srch"), MemoryMode::Ascii, &context);
+        let page = memory_page(&domain, &old, &image);
+        app.receive(
+            search_pending(&app, old),
+            Response::MemorySearch(page),
+            &context,
+        );
+        assert_eq!(search_state(&app), Some(SearchState::Searching));
+        assert!(memory_addresses(&app).is_empty());
+        let request = next(&mut app);
+        let page = memory_page(&domain, &request, &image);
+        app.worker_epoch += 1;
+        app.receive(
+            search_pending(&app, request),
+            Response::MemorySearch(page),
+            &context,
+        );
+        assert!(memory_addresses(&app).is_empty());
+
+        // A worker replaced with a page in flight resumes from the committed
+        // cursor only after the replacement verified the same image.
+        app.start_memory_search(ascii("srch"), MemoryMode::Ascii, &context);
+        let lost = next(&mut app);
+        app.pending = Some(search_pending(&app, lost));
+        app.stop_worker_inner();
+        assert!(
+            app.searches.memory_page().is_none(),
+            "waits for verification"
+        );
+        let Some(SearchView {
+            kind: SearchKind::Memory(memory),
+            ..
+        }) = &mut app.searches.current
+        else {
+            panic!("memory search");
+        };
+        assert!(memory.interrupted);
+        memory.session.as_mut().unwrap().abandon_page();
+        memory.interrupted = false;
+        app.worker_epoch += 1;
+        deliver_memory_pages(&mut app, &image, &context);
+        assert_eq!(memory_addresses(&app), [0x1004, 0x1011, 0x1ffe, 0x8004]);
+
+        // A malformed current page stops the worker and keeps committed hits.
+        app.start_memory_search(ascii("srch"), MemoryMode::Ascii, &context);
+        let request = next(&mut app);
+        let mut page = memory_page(&domain, &request, &image);
+        page.hits[0].length += 1;
+        app.receive(
+            search_pending(&app, request),
+            Response::MemorySearch(page),
+            &context,
+        );
+        assert_eq!(search_state(&app), Some(SearchState::Unavailable));
+        assert!(app.status.contains("memory search"), "{}", app.status);
+
+        // A protocol error ends only this search, without retrying.
+        app.start_memory_search(ascii("srch"), MemoryMode::Ascii, &context);
+        let request = next(&mut app);
+        app.receive(
+            search_pending(&app, request),
+            Response::Error {
+                message: "no".into(),
+            },
+            &context,
+        );
+        assert_eq!(search_state(&app), Some(SearchState::Unavailable));
+        assert!(app.searches.memory_page().is_none());
+
+        // Close/new binary/project reopen drop results, dialog and the tab.
+        app.tab = Tab::Search;
+        app.search_dialog = Some(SearchDialog::new(DialogKind::Text, app.generation));
+        app.search_form.text_query = "srch".into();
+        app.clear_binary();
+        assert!(app.searches.current.is_none() && app.search_dialog.is_none());
+        assert!(app.search_form.text_query.is_empty());
+        assert_ne!(app.tab, Tab::Search);
+    }
+
+    fn wait_for_text(app: &mut DesktopApp, context: &egui::Context) {
+        for _ in 0..5000 {
+            app.pump_text_search(context);
+            if search_state(app) != Some(SearchState::Searching) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("text search did not finish");
+    }
+
+    fn text_hits(app: &DesktopApp) -> Vec<(crate::search_text::TextSourceKey, Option<u64>)> {
+        match &app.searches.current {
+            Some(SearchView {
+                kind: SearchKind::Text(text),
+                ..
+            }) => text
+                .hits()
+                .iter()
+                .map(|hit| (hit.key, hit.address))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn text_app() -> DesktopApp {
+        let mut app = keyboard_app();
+        app.info.as_mut().unwrap().functions[1].name = "srch_fn".into();
+        let session = app.session.as_mut().unwrap();
+        session.annotations.insert(
+            0x1000,
+            Annotation {
+                label: String::new(),
+                comment: "see SRCH4ABA".into(),
+                ..Default::default()
+            },
+        );
+        session.annotations.insert(
+            0x1010,
+            Annotation {
+                label: "srch_label".into(),
+                ..Default::default()
+            },
+        );
+        app.strings = vec![StringEntry {
+            address: 0x1080,
+            text: "a srch string".into(),
+            encoding: "ascii".into(),
+        }];
+        app.strings_scanned = true;
+        app.rebuild_filter();
+        app
+    }
+
+    #[test]
+    fn text_search_finds_loaded_sources_and_goes_stale_only_when_they_change() {
+        use crate::search_text::{TextSearchSpec, TextSourceKey, TextSources};
+        let context = egui::Context::default();
+        let mut app = text_app();
+        let spec = |sources| TextSearchSpec {
+            query: "SRCH".into(),
+            match_case: false,
+            sources,
+        };
+        app.start_text_search(spec(TextSources::ALL));
+        app.tab = Tab::Listing;
+        wait_for_text(&mut app, &context);
+        assert_eq!(
+            text_hits(&app),
+            [
+                (TextSourceKey::Comment(0x1000), Some(0x1000)),
+                (TextSourceKey::Label(0x1010), Some(0x1010)),
+                (TextSourceKey::Name(0x1040), Some(0x1040)),
+                (TextSourceKey::String(0), Some(0x1080)),
+            ]
+        );
+        // The import/export table was never adopted: Partial, not Complete.
+        assert_eq!(search_state(&app), Some(SearchState::Partial));
+        assert_eq!((app.tab, app.selected), (Tab::Listing, Some(0x1000)));
+
+        // Selection alone never stales text results.
+        app.select_instruction(0x1040);
+        app.pump_text_search(&context);
+        assert_eq!(search_state(&app), Some(SearchState::Partial));
+
+        // Labels and comments alone are complete loaded sources.
+        app.start_text_search(spec(TextSources(
+            TextSources::LABELS.0 | TextSources::COMMENTS.0,
+        )));
+        wait_for_text(&mut app, &context);
+        assert_eq!(search_state(&app), Some(SearchState::Complete));
+        assert_eq!(text_hits(&app).len(), 2);
+
+        // Exact destinations: a label at a non-entry code byte opens Hex, a
+        // known entry opens code, a string preview start opens Hex.
+        app.start_text_search(spec(TextSources::ALL));
+        wait_for_text(&mut app, &context);
+        app.open_search_result(1, &context);
+        assert_eq!((app.tab, app.data_location), (Tab::Hex, Some((0x1010, 1))));
+        app.open_search_result(2, &context);
+        assert_eq!(app.selected, Some(0x1040));
+        assert_eq!(app.data_location, None);
+        app.open_search_result(3, &context);
+        assert_eq!(app.data_location, Some((0x1080, 1)));
+        app.pump_text_search(&context);
+        assert_eq!(search_state(&app), Some(SearchState::Partial));
+
+        // Source edits make results stale; they are never silently refreshed.
+        app.edit_annotation(
+            0x1020,
+            Annotation {
+                comment: "srch".into(),
+                ..Default::default()
+            },
+        );
+        app.pump_text_search(&context);
+        assert_eq!(search_state(&app), Some(SearchState::Stale));
+        assert_eq!(text_hits(&app).len(), 4);
+        app.undo(&context);
+        app.pump_text_search(&context);
+        assert_eq!(search_state(&app), Some(SearchState::Stale));
+        for change in 0..3 {
+            app.start_text_search(spec(TextSources::ALL));
+            wait_for_text(&mut app, &context);
+            match change {
+                0 => app.rebuild_filter(),
+                1 => {
+                    app.source_epochs.bump_strings();
+                }
+                _ => app.fail_linkage(),
+            }
+            app.pump_text_search(&context);
+            assert_eq!(search_state(&app), Some(SearchState::Stale), "{change}");
+        }
+
+        // A change during capture or matching stops it as Stale; Cancel keeps
+        // whatever was committed and a newer query replaces an older job.
+        app.start_text_search(spec(TextSources::ALL));
+        app.pump_text_search(&context);
+        app.symbol_revision += 1;
+        app.pump_text_search(&context);
+        assert_eq!(search_state(&app), Some(SearchState::Stale));
+        app.start_text_search(spec(TextSources::ALL));
+        app.pump_text_search(&context);
+        app.cancel_search(&context);
+        assert_eq!(search_state(&app), Some(SearchState::Canceled));
+        app.start_text_search(spec(TextSources::STRINGS));
+        wait_for_text(&mut app, &context);
+        assert_eq!(text_hits(&app), [(TextSourceKey::String(0), Some(0x1080))]);
+    }
+
+    #[test]
+    fn text_search_shares_adopted_linkage_and_opens_declared_places() {
+        use crate::search_text::{TextSearchSpec, TextSourceKey, TextSources};
+        let context = egui::Context::default();
+        let (mut app, table) = linkage_app(&"a".repeat(64));
+        app.client = None;
+        adopt_linkage(&mut app, &table);
+        let linkage = app.linkage.prepared().unwrap().shared_linkage();
+        let export = linkage
+            .exports
+            .iter()
+            .find(|export| export.target.code() && export.raw.is_some())
+            .expect("fixture code export");
+        let (id, name) = (export.id, export.raw.clone().unwrap());
+        app.start_text_search(TextSearchSpec {
+            query: name.clone(),
+            match_case: true,
+            sources: TextSources::EXPORTS,
+        });
+        wait_for_text(&mut app, &context);
+        // The fixture table records a gap, so its names are a partial source.
+        assert_eq!(search_state(&app), Some(SearchState::Partial));
+        let index = text_hits(&app)
+            .iter()
+            .position(|(key, _)| *key == TextSourceKey::Export(id))
+            .expect("export hit");
+        let place =
+            crate::linkage_ui::destination(&linkage, crate::linkage_ui::LinkageItem::Export(id), 8)
+                .unwrap();
+        app.open_search_result(index, &context);
+        assert_eq!(app.history.last(), Some(&place));
+        // A replaced table no longer resolves captured linkage identities.
+        app.fail_linkage();
+        app.pump_text_search(&context);
+        assert_eq!(search_state(&app), Some(SearchState::Stale));
+        let view = app.searches.current.as_ref().unwrap();
+        assert!(app.search_target(view, index).is_none());
+    }
+
+    fn search_frame(
+        context: &egui::Context,
+        app: &mut DesktopApp,
+        width: f32,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let time = context.input(|input| input.time) + 0.05;
+        let mut output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1000.0, 600.0),
+                )),
+                time: Some(time),
+                events,
+                ..Default::default()
+            },
+            |root| {
+                egui::Panel::left("search-test")
+                    .exact_size(width)
+                    .frame(egui::Frame::NONE)
+                    .show(root, |ui| app.search_panel(ui));
+            },
+        );
+        output.textures_delta.clear();
+        output
+    }
+
+    fn texts(output: &egui::FullOutput) -> Vec<(&egui::epaint::TextShape, egui::Rect)> {
+        output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) => Some((text, shape.clip_rect)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn scrollbars(output: &egui::FullOutput) -> Vec<egui::Rect> {
+        output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Rect(rect)
+                    if rect.rect.width().min(rect.rect.height()) < 20.0
+                        && rect.rect.width().max(rect.rect.height()) > 60.0 =>
+                {
+                    Some(rect.rect)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn search_results_fit_narrow_and_wide_panes_at_fractional_scale() {
+        use crate::search_text::{TextSearchSpec, TextSources};
+        for (memory, rows) in [(true, 3usize), (true, 4000), (false, 4)] {
+            for width in [150.0, 230.0, 431.0, 760.0] {
+                let context = egui::Context::default();
+                theme::install(&context);
+                context.set_pixels_per_point(1.25);
+                context.all_styles_mut(|style| style.animation_time = 0.0);
+                let mut app = if memory { hex_app() } else { text_app() };
+                if memory {
+                    app.pending = None;
+                    let mut image = marked_image();
+                    if rows > 4 {
+                        image[..rows].fill(b'A');
+                    } else {
+                        image[4..8].fill(0);
+                    }
+                    let query = if rows > 4 { "A" } else { "srch" };
+                    app.start_memory_search(ascii(query), MemoryMode::Ascii, &context);
+                    deliver_memory_pages(&mut app, &image, &context);
+                } else {
+                    app.start_text_search(TextSearchSpec {
+                        query: "srch".into(),
+                        match_case: false,
+                        sources: TextSources::ALL,
+                    });
+                    wait_for_text(&mut app, &context);
+                }
+                assert_eq!(app.searches.current.as_ref().unwrap().count(), rows);
+                search_frame(&context, &mut app, width, vec![]);
+                let output = search_frame(&context, &mut app, width, vec![]);
+                let again = search_frame(&context, &mut app, width, vec![]);
+                assert_eq!(
+                    scrollbars(&output),
+                    scrollbars(&again),
+                    "{width}: no scrollbar flicker"
+                );
+                let shapes = texts(&output);
+                let mut headings: Vec<_> = shapes
+                    .iter()
+                    .filter(|(text, _)| {
+                        ["Address", "Section", "Match", "Kind", "Text"]
+                            .contains(&text.galley.text())
+                    })
+                    .map(|(text, _)| text.galley.rect.translate(text.pos.to_vec2()))
+                    // The column strip lies below the query/state header.
+                    .filter(|rect| rect.top() > theme::ROW_HEIGHT + 4.0)
+                    .collect();
+                headings.sort_by(|a, b| a.left().total_cmp(&b.left()));
+                assert!(headings.len() >= 2, "{width}: {headings:?}");
+                for pair in headings.windows(2) {
+                    assert!(pair[0].right() + 2.0 < pair[1].left(), "{width}: {pair:?}");
+                }
+                // Every cell is one clipped line; addresses are monospace and
+                // names, kinds, sections and text use the body font.
+                let mut proportional = 0;
+                for (text, clip) in &shapes {
+                    let galley_text = text.galley.text();
+                    if galley_text.is_empty() {
+                        continue;
+                    }
+                    assert_eq!(text.galley.rows.len(), 1, "{width}: {galley_text}");
+                    assert!(
+                        clip.right() <= width + 0.5,
+                        "{width}: {galley_text} {clip:?}"
+                    );
+                    let family = &text.galley.job.sections[0].format.font_id.family;
+                    if galley_text.chars().all(|c| c.is_ascii_hexdigit()) && galley_text.len() == 8
+                    {
+                        assert_eq!(*family, egui::FontFamily::Monospace, "{galley_text}");
+                    }
+                    if ["String", "Label", ".text", "Name", "Comment"].contains(&galley_text)
+                        || galley_text.to_lowercase().contains("srch")
+                        || (rows > 4 && galley_text == "A")
+                    {
+                        assert_eq!(*family, egui::FontFamily::Proportional, "{galley_text}");
+                        proportional += 1;
+                    }
+                }
+                assert!(proportional > 0, "{width}");
+                // Rows keep the shared fixed pitch and stable hit targets.
+                let rows_y: Vec<f32> = shapes
+                    .iter()
+                    .filter(|(text, _)| {
+                        text.galley.text().chars().all(|c| c.is_ascii_hexdigit())
+                            && text.galley.text().len() == 8
+                    })
+                    .map(|(text, _)| text.galley.rect.translate(text.pos.to_vec2()).center().y)
+                    .collect();
+                assert!(!rows_y.is_empty(), "{width}");
+                for pair in rows_y.windows(2) {
+                    assert!(
+                        ((pair[1] - pair[0]) - theme::ROW_HEIGHT).abs() < 0.5,
+                        "{width}: {rows_y:?}"
+                    );
+                }
+                // A single click selects locally; it never navigates.
+                if let Some(first) = rows_y.first() {
+                    let (tab, selected) = (app.tab, app.selected);
+                    let point = egui::pos2(width * 0.5, *first);
+                    search_frame(&context, &mut app, width, pointer_events(point));
+                    search_frame(&context, &mut app, width, vec![]);
+                    assert_eq!(app.searches.table.selected, Some(0), "{width}");
+                    assert_eq!((app.tab, app.selected), (tab, selected));
+                    let output = search_frame(&context, &mut app, width, vec![]);
+                    assert!(selection_fill_at(&output, point), "{width}");
+                }
+            }
+        }
+    }
 }
