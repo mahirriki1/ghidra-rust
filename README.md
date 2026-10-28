@@ -80,6 +80,11 @@ graph, and pseudocode. Pan and zoom the graph; **Fit** shows an overview and
 **Entry** returns to readable entry code.
 **Legend** and graph warnings are in the graph toolbar.
 
+Narrow dock headers keep the active tab visible and put additional tabs in **»**.
+Decompiler controls that do not fit move into **⋯**. The Listing keeps code
+columns in view by reducing the bytes column first; hover shortened fields to
+inspect the full instruction.
+
 Double-click a resolved call instruction or decompiler call-name token to
 open its target. Back / Forward returns to previous instruction selections.
 
