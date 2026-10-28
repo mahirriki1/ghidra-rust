@@ -183,11 +183,12 @@ pub(crate) fn show_dialog(
             DialogKind::Text => form.text_query.is_empty(),
         };
         if let (Err(error), false) = (&validity, empty) {
+            // Over the field's own (focus) border, so it reads as invalid.
             ui.painter().rect_stroke(
                 field.response.rect,
                 2,
-                egui::Stroke::new(1.0, theme::ERROR),
-                egui::StrokeKind::Outside,
+                egui::Stroke::new(1.5, theme::ERROR),
+                egui::StrokeKind::Inside,
             );
             egui::Response::clone(&field.response).on_hover_text(error);
         }
