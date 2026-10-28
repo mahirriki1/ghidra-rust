@@ -271,6 +271,7 @@ impl super::DesktopApp {
         }
         if unfocused {
             cursor.held = 0;
+            return;
         }
         // A focused widget owns the keys; its Enter can arrive in the frame
         // it surrenders focus, so the Listing needs a new click afterwards.
@@ -1002,6 +1003,19 @@ mod tests {
         h.focused = true;
         h.frame(vec![key(egui::Key::ArrowDown, true)]);
         assert_eq!(h.app.selected, Some(0x1008));
+
+        // Key events delivered with focus loss must not move an inactive
+        // application, even if the backend includes a fresh press in the batch.
+        let mut h = Harness::new(rows_app(10), 1.0, egui::vec2(700.0, 400.0));
+        h.click(0x1000);
+        h.focused = false;
+        h.frame(vec![
+            egui::Event::WindowFocused(false),
+            key(egui::Key::End, false),
+        ]);
+        assert_eq!(h.app.selected, Some(0x1000));
+        assert!(h.left_over(egui::Key::End));
+        assert_eq!(h.app.listing_cursor.held, 0);
 
         // A global command in the same batch wins over movement.
         let mut h = Harness::desktop(fixture::semantic_app());
