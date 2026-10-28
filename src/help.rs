@@ -9,6 +9,8 @@ pub(crate) const SHORTCUTS: &[(&str, &str)] = &[
     ("G", "Go to address or name"),
     (";", "Edit comment"),
     ("X", "Xrefs to selection"),
+    ("S", "Search memory"),
+    (FIND_KEYS, "Search program text"),
     ("Space", "Toggle Listing / Graph"),
     ("Alt+Left / Right", "Back / forward"),
     (SAVE_KEYS, "Save project"),
@@ -23,6 +25,10 @@ pub(crate) const SHORTCUTS: &[(&str, &str)] = &[
 const SAVE_KEYS: &str = "Cmd+S";
 #[cfg(not(target_os = "macos"))]
 const SAVE_KEYS: &str = "Ctrl+S";
+#[cfg(target_os = "macos")]
+pub(crate) const FIND_KEYS: &str = "Cmd+F";
+#[cfg(not(target_os = "macos"))]
+pub(crate) const FIND_KEYS: &str = "Ctrl+F";
 #[cfg(target_os = "macos")]
 const UNDO_KEYS: &str = "Cmd+Z";
 #[cfg(not(target_os = "macos"))]

@@ -23,6 +23,12 @@ use crate::hex_ui::{HexAction, HexPanel};
 use crate::model::*;
 use crate::project::{EmbeddedBinary, LoadedProject, ProjectData};
 use crate::result_store::{ResultOrigin, Shared};
+use crate::search::SearchState;
+use crate::search_jobs::{
+    Capture, CaptureInput, Destination, MemoryMode, MemorySearch, SearchKind, SearchView, Searches,
+    SourceEpochs, TextPhase, TextSearch,
+};
+use crate::search_ui::{DialogKind, DialogResult, ResultAction, SearchDialog, SearchForm, Submit};
 use crate::selection::SemanticSelection;
 use crate::semantic::{LocalIdentity, LocalRename, SemanticInfo, TokenKind};
 use crate::session::{Annotation, BinaryProtection, Session};
@@ -55,6 +61,8 @@ enum Tab {
     Decode,
     Hex,
     References,
+    /// Results of the current memory or program-text search.
+    Search,
 }
 
 /// The list shown in the left Functions dock; session-only.
@@ -99,6 +107,8 @@ enum Shortcut {
     Save,
     Undo,
     Xrefs,
+    SearchMemory,
+    SearchText,
 }
 
 fn shortcut(event: &egui::Event) -> Option<Shortcut> {
@@ -125,6 +135,7 @@ fn shortcut(event: &egui::Event) -> Option<Shortcut> {
             egui::Key::Semicolon => Some(Shortcut::Comment),
             egui::Key::Space => Some(Shortcut::ToggleGraph),
             egui::Key::X => Some(Shortcut::Xrefs),
+            egui::Key::S => Some(Shortcut::SearchMemory),
             _ => None,
         };
     }
@@ -144,6 +155,7 @@ fn shortcut(event: &egui::Event) -> Option<Shortcut> {
         return match key {
             egui::Key::S => Some(Shortcut::Save),
             egui::Key::Z => Some(Shortcut::Undo),
+            egui::Key::F => Some(Shortcut::SearchText),
             _ => None,
         };
     }
@@ -762,6 +774,12 @@ pub struct DesktopApp {
     signature_error: Option<String>,
     signature_restore_pc: Option<(u64, u64)>,
     signature_recovery: Option<u64>,
+    /// Transient memory/program-text search; never saved in projects.
+    searches: Searches,
+    search_form: SearchForm,
+    search_dialog: Option<SearchDialog>,
+    /// Revisions of the mutable text sources a program-text search captures.
+    source_epochs: SourceEpochs,
 }
 
 impl DesktopApp {
@@ -910,6 +928,10 @@ impl DesktopApp {
             signature_error: None,
             signature_restore_pc: None,
             signature_recovery: None,
+            searches: Searches::default(),
+            search_form: SearchForm::default(),
+            search_dialog: None,
+            source_epochs: SourceEpochs::default(),
         }
     }
 
@@ -1101,6 +1123,15 @@ impl DesktopApp {
         self.filter_cursor = None;
         self.decoder = DecoderPanel::default();
         self.hex = HexPanel::default();
+        self.searches.clear();
+        self.search_form = SearchForm::default();
+        self.search_dialog = None;
+        self.source_epochs.bump_inventory();
+        self.source_epochs.bump_linkage();
+        self.source_epochs.bump_strings();
+        if self.tab == Tab::Search {
+            self.tab = Tab::Listing;
+        }
         self.advance_byte_intent();
     }
 
@@ -1128,6 +1159,9 @@ impl DesktopApp {
         self.discovery_activity = None;
         self.analysis_plan = None;
         self.stop_worker_transport();
+        // Without a worker, an unfinished memory search cannot continue. Its
+        // committed hits remain; an explicit Cancel marks it Canceled first.
+        self.end_memory_search(SearchState::Unavailable);
     }
 
     /// Recovery preserves the logical run, but keeps the existing byte-intent
@@ -1164,6 +1198,16 @@ impl DesktopApp {
         self.discovery_bytes = None;
         self.worker_inventory = None;
         self.inventory_synced = false;
+        // A memory page lost with this worker resumes from the committed
+        // cursor only after a replacement verifies the same image.
+        if let Some(Pending {
+            request: Request::SearchMemory { binding, .. },
+            ..
+        }) = &self.pending
+            && let Some(memory) = self.searches.memory(binding.search_id)
+        {
+            memory.interrupted = true;
+        }
         // Pages of an unfinished table never outlive the worker they came from.
         self.linkage.interrupt();
         if let Some(state) = &mut self.discovery {
@@ -1410,6 +1454,7 @@ impl DesktopApp {
                         | Request::SyncFunctions { .. }
                         | Request::SymbolNames { .. }
                         | Request::Linkage { .. }
+                        | Request::SearchMemory { .. }
                 )
             })
         {
@@ -2152,6 +2197,9 @@ impl DesktopApp {
                     if let Some(functions) = publication.functions {
                         info.functions = functions;
                     }
+                    if info.functions_truncated != publication.truncated {
+                        self.source_epochs.bump_inventory();
+                    }
                     info.functions_truncated = publication.truncated;
                 }
                 // A batch committed after its worker stopped is not a base for
@@ -2364,6 +2412,7 @@ impl DesktopApp {
                 .as_ref()
                 .is_some_and(|pending| resumes_discovery(&pending.request));
             self.fail_pending_linkage();
+            self.fail_pending_search();
             self.stop_after_failure(resumable, context);
             self.status =
                 "Analysis exceeded 30 seconds and was stopped. Choose an action to restart.".into();
@@ -2382,6 +2431,7 @@ impl DesktopApp {
                         .as_ref()
                         .is_some_and(|pending| resumes_discovery(&pending.request));
                     self.fail_pending_linkage();
+                    self.fail_pending_search();
                     self.stop_after_failure(resumable, context);
                     if signature_failure {
                         self.signature_error = Some(format!("Signature change failed: {error}"));
@@ -2393,14 +2443,16 @@ impl DesktopApp {
             }
         }
         self.dispatch_queued(context);
-        self.pump_symbol_names();
-        self.pump_linkage();
-        self.pump_discovery(context);
-        self.pump_analysis(context);
+        self.pump_worker_turns(context);
+        // Whole-image automatic scans wait until a memory search ends.
+        if !self.searches.memory_searching() {
+            self.pump_analysis(context);
+        }
         if self.pending.is_some()
             || self.discovery_job.is_some()
             || self.discovery_activity.is_some()
             || self.analysis_plan.is_some()
+            || self.searches.memory_searching()
         {
             context.request_repaint_after(Duration::from_millis(100));
         }
@@ -2467,6 +2519,19 @@ impl DesktopApp {
                     bytes: pending.bytes,
                 };
                 self.fail_byte_request(&pending.request, origin, &message);
+                self.dispatch_queued(context);
+                return;
+            }
+            if let Request::SearchMemory { binding, .. } = &pending.request {
+                // The worker answered in protocol; only this search stops.
+                // Failed pages are never retried automatically.
+                if let Some(memory) = self.searches.memory(binding.search_id)
+                    && let Some(session) = &mut memory.session
+                    && session.state() == SearchState::Searching
+                {
+                    session.unavailable();
+                }
+                self.status = crop(&message, 4096);
                 self.dispatch_queued(context);
                 return;
             }
@@ -2712,6 +2777,19 @@ impl DesktopApp {
                 }
                 self.begin_symbol_names(symbols);
                 self.linkage.begin(self.generation, self.worker_epoch);
+                // Same source and SHA are verified above: an interrupted page
+                // restarts at the committed cursor on this worker's epoch.
+                if let Some(SearchView {
+                    kind: SearchKind::Memory(memory),
+                    ..
+                }) = &mut self.searches.current
+                    && memory.interrupted
+                {
+                    if let Some(session) = &mut memory.session {
+                        session.abandon_page();
+                    }
+                    memory.interrupted = false;
+                }
                 self.rebuild_filter();
                 self.status = "Binary loaded".into();
                 if let Some(project) = project {
@@ -3073,6 +3151,7 @@ impl DesktopApp {
                 });
                 self.result_revision = self.result_revision.wrapping_add(1);
                 self.cached_strings = false;
+                self.source_epochs.bump_strings();
                 self.strings = strings;
                 self.strings_truncated = truncated;
                 self.strings_scanned = true;
@@ -3095,6 +3174,9 @@ impl DesktopApp {
             }
             (Request::Linkage { cursor, digest }, Response::Linkage { summary, page }) => {
                 self.receive_linkage(cursor, digest, summary, page, context);
+            }
+            (Request::SearchMemory { binding, .. }, Response::MemorySearch(page)) => {
+                self.receive_memory_page(binding, page);
             }
             (Request::Crypto, Response::Crypto { matches, truncated }) => {
                 self.result_revision = self.result_revision.wrapping_add(1);
@@ -3194,6 +3276,7 @@ impl DesktopApp {
 
     /// Names or labels changed: drop cached search keys and refilter.
     fn rebuild_filter(&mut self) {
+        self.source_epochs.bump_inventory();
         self.filter_keys.clear();
         self.restart_filter();
     }
@@ -3504,6 +3587,7 @@ impl DesktopApp {
         self.project_path = Some(project_path);
         self.cached_strings = cache_compatible && !data.strings.is_empty();
         self.cached_crypto = cache_compatible && !data.crypto.is_empty();
+        self.source_epochs.bump_strings();
         self.strings = data.strings;
         self.strings_truncated = data.strings_truncated;
         self.strings_scanned = self.cached_strings || data.strings_truncated;
@@ -4643,6 +4727,8 @@ impl DesktopApp {
             Some(Shortcut::Save) => self.save_project(false, context),
             Some(Shortcut::Undo) => self.undo(context),
             Some(Shortcut::Xrefs) => self.show_selection_xrefs(),
+            Some(Shortcut::SearchMemory) => self.open_search_dialog(DialogKind::Memory),
+            Some(Shortcut::SearchText) => self.open_search_dialog(DialogKind::Text),
             _ => {}
         }
         if action.is_some() {
@@ -4838,6 +4924,26 @@ impl DesktopApp {
                     ui.close();
                 }
             });
+            ui.menu_button("Search", |ui| {
+                let enabled = self.search_available();
+                if ui
+                    .add_enabled(enabled, egui::Button::new("Memory…").shortcut_text("S"))
+                    .clicked()
+                {
+                    self.open_search_dialog(DialogKind::Memory);
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        enabled,
+                        egui::Button::new("Program text…").shortcut_text(crate::help::FIND_KEYS),
+                    )
+                    .clicked()
+                {
+                    self.open_search_dialog(DialogKind::Text);
+                    ui.close();
+                }
+            });
             ui.menu_button("View", |ui| {
                 for (tab, label) in [
                     (Tab::Listing, "Listing"),
@@ -4847,7 +4953,11 @@ impl DesktopApp {
                     (Tab::Decode, "String Decoder"),
                     (Tab::Hex, "Hex / Memory Map"),
                     (Tab::References, "References"),
+                    (Tab::Search, "Search"),
                 ] {
+                    if tab == Tab::Search && self.searches.current.is_none() {
+                        continue;
+                    }
                     if ui.selectable_value(&mut self.tab, tab, label).clicked() {
                         ui.close();
                     }
@@ -4905,6 +5015,8 @@ impl DesktopApp {
                     )
                     .clicked()
                 {
+                    // Stopping the worker also cancels a memory search.
+                    self.end_memory_search(SearchState::Canceled);
                     self.stop_worker();
                     self.analysis_plan = None;
                     self.status = "Analysis cancelled".into();
@@ -6542,6 +6654,7 @@ impl DesktopApp {
         match self.linkage.poll() {
             crate::linkage_ui::Polled::Idle => {}
             crate::linkage_ui::Polled::Ready(bytes) => {
+                self.source_epochs.bump_linkage();
                 crate::performance::event("linkage_retained_bytes", bytes as u64);
                 if !self.results.set_linkage_bytes(bytes) {
                     self.fail_linkage();
@@ -6564,6 +6677,7 @@ impl DesktopApp {
     }
 
     fn fail_linkage(&mut self) {
+        self.source_epochs.bump_linkage();
         self.linkage.fail();
         self.linkage_focus = false;
         self.results.set_linkage_bytes(0);
@@ -7333,32 +7447,45 @@ impl DesktopApp {
 
     fn main_panel(&mut self, ui: &mut egui::Ui) {
         self.update_comment_rows();
+        let saved_search = self.tab == Tab::Search
+            && matches!(
+                &self.searches.current,
+                Some(SearchView { kind: SearchKind::Text(text), .. }) if text.saved()
+            );
         let saved = (matches!(self.tab, Tab::Graph | Tab::Listing) && self.cached_graph)
             || (self.tab == Tab::Strings && self.cached_strings)
-            || (self.tab == Tab::Crypto && self.cached_crypto);
+            || (self.tab == Tab::Crypto && self.cached_crypto)
+            || saved_search;
         let saved_tooltip = if matches!(self.tab, Tab::Graph | Tab::Listing) {
             "Saved graph/listing; Refresh to recompute."
+        } else if saved_search {
+            "Includes saved names or strings."
         } else {
             "Saved scan results; rescan to recompute."
         };
+        let mut tabs = vec![
+            (Tab::Listing, "Listing"),
+            (Tab::Graph, "Function Graph"),
+            (Tab::Strings, "Strings"),
+            (Tab::Crypto, "FindCrypt"),
+            (Tab::Decode, "Decode"),
+            (Tab::Hex, "Hex / Memory Map"),
+            (Tab::References, "References"),
+        ];
+        if self.searches.current.is_some() {
+            tabs.push((Tab::Search, "Search"));
+        }
         theme::dock_tabs(
             ui,
             &mut self.tab,
-            &[
-                (Tab::Listing, "Listing"),
-                (Tab::Graph, "Function Graph"),
-                (Tab::Strings, "Strings"),
-                (Tab::Crypto, "FindCrypt"),
-                (Tab::Decode, "Decode"),
-                (Tab::Hex, "Hex / Memory Map"),
-                (Tab::References, "References"),
-            ],
+            &tabs,
             saved.then_some(("Saved analysis", saved_tooltip)),
             |_| {},
         );
         let context = ui.ctx().clone();
         match self.tab {
             Tab::References => self.references_panel(ui),
+            Tab::Search => self.search_panel(ui),
             Tab::Graph => {
                 let mut navigate = None;
                 let mut xrefs = None;
@@ -8237,6 +8364,7 @@ impl DesktopApp {
         if !self.updater.installing() {
             self.poll_worker(&context);
         }
+        self.pump_text_search(&context);
         if let Some(installed) = self.updater.poll(&context) {
             self.status = "Update ready. Restarting…".into();
             self.restart.set(crate::updater::Restart {
@@ -8306,6 +8434,7 @@ impl DesktopApp {
         self.analyze_window(&context);
         self.file_dialogs.show(&context);
         self.browser_dialog(&context);
+        self.search_dialog_window(&context);
         self.signature_window(&context);
         if self.intent.is_none()
             && self.after_save.is_none()
@@ -8537,6 +8666,639 @@ impl DesktopApp {
 }
 
 // Freeze the exact historical messages: similarly worded real warnings stay visible.
+/// Search orchestration: dialogs, memory pages between maintenance turns,
+/// paced text capture, staleness, cancellation and exact activation.
+impl DesktopApp {
+    /// Search needs a verified binary and the same guards as keyboard actions.
+    fn search_available(&self) -> bool {
+        self.info.is_some()
+            && self.opening.is_none()
+            && self.file_job.is_none()
+            && self.signature_change.is_none()
+    }
+
+    fn open_search_dialog(&mut self, kind: DialogKind) {
+        if self.search_available() {
+            self.search_dialog = Some(SearchDialog::new(kind, self.generation));
+        }
+    }
+
+    fn search_dialog_window(&mut self, context: &egui::Context) {
+        let Some(mut dialog) = self.search_dialog.take() else {
+            return;
+        };
+        if dialog.generation != self.generation || self.info.is_none() {
+            return;
+        }
+        match crate::search_ui::show_dialog(context, &mut dialog, &mut self.search_form) {
+            DialogResult::Open => self.search_dialog = Some(dialog),
+            DialogResult::Close => {}
+            DialogResult::Submit(Submit::Memory(spec, mode)) => {
+                self.start_memory_search(spec, mode, context);
+            }
+            DialogResult::Submit(Submit::Text(spec)) => self.start_text_search(spec),
+        }
+    }
+
+    /// Results already displayed stay in the store; search never evicts them.
+    fn search_protect(&self) -> Vec<u64> {
+        self.view().map(|view| view.address).into_iter().collect()
+    }
+
+    fn start_memory_search(
+        &mut self,
+        spec: crate::search::MemorySearchSpec,
+        mode: MemoryMode,
+        context: &egui::Context,
+    ) {
+        let protect = self.search_protect();
+        let Some(info) = &self.info else {
+            return;
+        };
+        let id = self.searches.next_id();
+        let pattern = spec.canonical().unwrap_or_default();
+        let session = self
+            .results
+            .reserve_transient(crate::search::MEMORY_SEARCH_RESERVATION_BYTES, &protect)
+            .and_then(|reservation| {
+                crate::search::MemorySearchSession::new(
+                    info,
+                    self.generation,
+                    id,
+                    spec,
+                    reservation,
+                )
+                .ok()
+            });
+        self.searches.replace(Some(SearchView {
+            id,
+            kind: SearchKind::Memory(MemorySearch {
+                session,
+                mode,
+                pattern,
+                interrupted: false,
+            }),
+        }));
+        self.tab = Tab::Search;
+        // A stopped worker is replaced for an explicit search; the new one
+        // must verify the same source and image before any page is sent.
+        if self.client.is_none()
+            && self.opening.is_none()
+            && self.searches.memory_searching()
+            && let Some(path) = self.binary_path.clone()
+        {
+            let continue_discovery = self.discovery_running;
+            self.start_open(path, true, None, context);
+            self.discovery_running = continue_discovery && self.client.is_some();
+            self.update_discovery_summary();
+        }
+    }
+
+    fn text_binding(&self, search_id: u64) -> Option<crate::search_text::TextBinding> {
+        let info = self.info.as_ref()?;
+        Some(crate::search_text::TextBinding {
+            binary_sha256: info.sha256.clone(),
+            generation: self.generation,
+            search_id,
+            annotation_revision: self.revision,
+            inventory_revision: self.source_epochs.inventory,
+            symbol_revision: self.symbol_revision,
+            linkage_revision: self.source_epochs.linkage,
+            strings_revision: self.source_epochs.strings,
+            symbol_digest: None,
+            linkage_digest: None,
+        })
+    }
+
+    /// Whether every source revision a text search captured is unchanged.
+    /// Selection is deliberately absent.
+    fn text_sources_current(&self, binding: &crate::search_text::TextBinding) -> bool {
+        self.info
+            .as_ref()
+            .is_some_and(|info| info.sha256 == binding.binary_sha256)
+            && binding.generation == self.generation
+            && binding.annotation_revision == self.revision
+            && binding.inventory_revision == self.source_epochs.inventory
+            && binding.symbol_revision == self.symbol_revision
+            && binding.linkage_revision == self.source_epochs.linkage
+            && binding.strings_revision == self.source_epochs.strings
+    }
+
+    fn start_text_search(&mut self, spec: crate::search_text::TextSearchSpec) {
+        let id = self.searches.next_id();
+        let Some(binding) = self.text_binding(id) else {
+            return;
+        };
+        self.searches.replace(Some(SearchView {
+            id,
+            kind: SearchKind::Text(TextSearch::new(spec, binding)),
+        }));
+        self.tab = Tab::Search;
+    }
+
+    fn text_search_mut(&mut self) -> Option<&mut TextSearch> {
+        match &mut self.searches.current {
+            Some(SearchView {
+                kind: SearchKind::Text(text),
+                ..
+            }) => Some(text),
+            _ => None,
+        }
+    }
+
+    /// One frame of program-text work: reap a retired job, notice source
+    /// changes, then capture a bounded slice or poll the background matcher.
+    fn pump_text_search(&mut self, context: &egui::Context) {
+        let idle = self.searches.reap();
+        let Some(SearchView {
+            kind: SearchKind::Text(text),
+            ..
+        }) = &self.searches.current
+        else {
+            return;
+        };
+        let current = self.text_sources_current(&text.binding);
+        if !current {
+            self.searches.stale_text();
+            return;
+        }
+        if text.state != SearchState::Searching {
+            return;
+        }
+        let (spec, mut binding) = (text.spec.clone(), text.binding.clone());
+        let phase = self
+            .text_search_mut()
+            .map(|text| std::mem::replace(&mut text.phase, TextPhase::Done))
+            .expect("checked text search");
+        enum Step {
+            Phase(TextPhase),
+            Finished(crate::search_text::TextSearchResult),
+            Failed(SearchState),
+        }
+        let protect = self.search_protect();
+        let step = match phase {
+            TextPhase::Queued if !idle => Step::Phase(TextPhase::Queued),
+            TextPhase::Queued => match self
+                .results
+                .reserve_transient(crate::search_text::TEXT_CORPUS_BASE_BYTES, &protect)
+                .map(|lease| Capture::new(lease, spec.sources))
+            {
+                Some(Ok(capture)) => {
+                    context.request_repaint();
+                    Step::Phase(TextPhase::Capturing(Box::new(capture)))
+                }
+                _ => Step::Failed(SearchState::Unavailable),
+            },
+            TextPhase::Capturing(mut capture) => {
+                let input = CaptureInput {
+                    functions: self.info.as_ref().map_or(&[], |info| &info.functions),
+                    names: if self.cached_functions {
+                        crate::search_text::TextProvenance::Saved
+                    } else {
+                        crate::search_text::TextProvenance::Live
+                    },
+                    annotations: self.session.as_ref().map(|session| &session.annotations),
+                    strings: &self.strings,
+                    strings_provenance: if self.cached_strings {
+                        crate::search_text::TextProvenance::Saved
+                    } else {
+                        crate::search_text::TextProvenance::Live
+                    },
+                };
+                let results = &mut self.results;
+                let mut admit = |reservation: &crate::result_store::TransientReservation, bytes| {
+                    results.grow_transient(reservation, bytes, &protect)
+                };
+                if capture.step(&input, FILTER_FRAME_BUDGET, &mut admit) {
+                    self.start_text_job(*capture, &spec, &mut binding, &protect)
+                        .map_or_else(Step::Failed, |job| Step::Phase(TextPhase::Running(job)))
+                } else {
+                    context.request_repaint();
+                    Step::Phase(TextPhase::Capturing(capture))
+                }
+            }
+            TextPhase::Running(mut job) => match job.try_finish() {
+                Ok(Some(result)) if result.binding == binding && result.spec == spec => {
+                    Step::Finished(result)
+                }
+                Ok(Some(_)) => Step::Failed(SearchState::Stale),
+                Ok(None) => {
+                    context.request_repaint_after(Duration::from_millis(16));
+                    Step::Phase(TextPhase::Running(job))
+                }
+                Err(_) => Step::Failed(SearchState::Unavailable),
+            },
+            TextPhase::Done => Step::Phase(TextPhase::Done),
+        };
+        let Some(text) = self.text_search_mut() else {
+            return;
+        };
+        text.binding = binding;
+        match step {
+            Step::Phase(phase) => text.phase = phase,
+            Step::Finished(result) => {
+                text.state = result.state;
+                text.result = Some(result);
+            }
+            Step::Failed(state) => text.state = state,
+        }
+    }
+
+    /// Finishes a capture with the adopted immutable tables shared by Arc
+    /// (never copied) and starts the background matcher.
+    fn start_text_job(
+        &mut self,
+        capture: Capture,
+        spec: &crate::search_text::TextSearchSpec,
+        binding: &mut crate::search_text::TextBinding,
+        protect: &[u64],
+    ) -> Result<crate::search_text::TextJob, SearchState> {
+        use crate::search_text::{SourceStatus, TextSources};
+        let symbols = self
+            .symbol_names
+            .as_ref()
+            .filter(|(generation, _)| *generation == self.generation)
+            .map(|(_, names)| Arc::clone(names))
+            .filter(|_| spec.sources.contains(TextSources::NAMES));
+        let wants_linkage = spec.sources.contains(TextSources::IMPORTS)
+            || spec.sources.contains(TextSources::EXPORTS);
+        let linkage = self
+            .linkage
+            .prepared()
+            .filter(|_| wants_linkage)
+            .map(|prepared| prepared.shared_linkage())
+            .filter(|linkage| self.results.share_linkage_charge(linkage));
+        let names_missing = self.symbol_fetch.is_some()
+            || self
+                .symbol_failed
+                .as_ref()
+                .is_some_and(|(generation, _)| *generation == self.generation);
+        let names = if names_missing
+            || self
+                .info
+                .as_ref()
+                .is_some_and(|info| info.functions_truncated)
+        {
+            SourceStatus::Partial
+        } else {
+            SourceStatus::Available
+        };
+        let declared = if linkage.is_some() {
+            SourceStatus::Available
+        } else {
+            SourceStatus::Unavailable
+        };
+        let notes = if self.session.is_some() {
+            SourceStatus::Available
+        } else {
+            SourceStatus::Unavailable
+        };
+        let strings = if !self.strings_scanned {
+            SourceStatus::Unavailable
+        } else if self.strings_truncated {
+            SourceStatus::Partial
+        } else {
+            SourceStatus::Available
+        };
+        binding.symbol_digest = symbols.as_ref().map(|names| names.digest().to_owned());
+        binding.linkage_digest = linkage.as_ref().map(|linkage| linkage.digest.clone());
+        let corpus = capture.into_builder().finish(
+            symbols,
+            linkage,
+            [names, declared, declared, notes, notes, strings],
+        );
+        let reservation = self
+            .results
+            .reserve_transient(crate::search_text::TEXT_JOB_RESERVATION_BYTES, protect)
+            .ok_or(SearchState::Unavailable)?;
+        crate::search_text::TextJob::start(corpus, spec.clone(), binding.clone(), reservation)
+            .map_err(|_| SearchState::Unavailable)
+    }
+
+    /// The worker can take a memory page: no foreground work, replay,
+    /// adoption or byte intent is waiting.
+    fn worker_idle(&self) -> bool {
+        self.client.is_some()
+            && self.pending.is_none()
+            && self.opening.is_none()
+            && self.queue.is_empty()
+            && self.signature_replay.is_none()
+            && self.discovery_job.is_none()
+            && self.deferred_discovery.is_none()
+            && self.discovery_bytes.is_none()
+            && !self.results.preparing()
+    }
+
+    /// Dispatches the next bounded memory page; attempts are charged here.
+    fn pump_search(&mut self) -> bool {
+        if !self.worker_idle() {
+            return false;
+        }
+        let epoch = self.worker_epoch;
+        let Some((_, memory)) = self.searches.memory_page() else {
+            return false;
+        };
+        let Some(session) = &mut memory.session else {
+            return false;
+        };
+        match session.next_request(epoch) {
+            Ok(Some(request)) => {
+                self.send_direct(request);
+                self.pending.is_some()
+            }
+            Ok(None) => false,
+            Err(error) => {
+                session.unavailable();
+                self.status = error;
+                false
+            }
+        }
+    }
+
+    /// After foreground work, memory pages alternate with maintenance
+    /// (symbol names, linkage, discovery) so neither starves the other. The
+    /// first turn after a search starts is the search's; with no
+    /// maintenance waiting, pages run back to back. Without a memory
+    /// search the maintenance order is unchanged.
+    fn pump_worker_turns(&mut self, context: &egui::Context) {
+        if self.pending.is_some() || self.opening.is_some() {
+            return;
+        }
+        let searching = self.searches.memory_page().is_some();
+        if searching && self.searches.search_turn && self.pump_search() {
+            self.searches.search_turn = false;
+            return;
+        }
+        let start = if searching {
+            self.searches.maintenance_turn
+        } else {
+            0
+        };
+        for offset in 0..3 {
+            let which = (start + offset) % 3;
+            match which {
+                0 => self.pump_symbol_names(),
+                1 => self.pump_linkage(),
+                _ => self.pump_discovery(context),
+            }
+            if self.pending.is_some() || self.opening.is_some() {
+                if searching {
+                    self.searches.search_turn = true;
+                    self.searches.maintenance_turn = (which + 1) % 3;
+                }
+                return;
+            }
+        }
+        if searching && self.pump_search() {
+            self.searches.search_turn = false;
+        }
+    }
+
+    /// Adopts a page only for the displayed search, binary and worker epoch;
+    /// a known stale page is dropped, a malformed current one stops the worker.
+    fn receive_memory_page(
+        &mut self,
+        binding: crate::search::SearchBinding,
+        page: crate::search::MemorySearchPage,
+    ) {
+        if binding.generation != self.generation || binding.worker_epoch != self.worker_epoch {
+            return;
+        }
+        let Some(memory) = self.searches.memory(binding.search_id) else {
+            return;
+        };
+        let Some(session) = &mut memory.session else {
+            return;
+        };
+        if session.state() != SearchState::Searching {
+            return;
+        }
+        if let Err(error) = session.accept(page) {
+            session.unavailable();
+            self.stop_worker();
+            self.status =
+                format!("Invalid worker response: memory search: {error}; worker stopped");
+        }
+    }
+
+    /// The pending page timed out or its worker died: no automatic retry.
+    fn fail_pending_search(&mut self) {
+        if let Some(Pending {
+            request: Request::SearchMemory { binding, .. },
+            ..
+        }) = &self.pending
+        {
+            let id = binding.search_id;
+            if let Some(memory) = self.searches.memory(id)
+                && let Some(session) = &mut memory.session
+                && session.state() == SearchState::Searching
+            {
+                session.unavailable();
+            }
+        }
+    }
+
+    /// Ends an unfinished memory search, keeping its committed hits.
+    fn end_memory_search(&mut self, state: SearchState) {
+        if let Some(SearchView {
+            kind: SearchKind::Memory(memory),
+            ..
+        }) = &mut self.searches.current
+            && let Some(session) = &mut memory.session
+            && session.state() == SearchState::Searching
+        {
+            match state {
+                SearchState::Canceled => session.cancel(),
+                _ => session.unavailable(),
+            }
+        }
+    }
+
+    /// Cancel invalidates the search at once. An active memory page stops its
+    /// worker through the asynchronous drop/reap path and a replacement opens
+    /// for unrelated work; a queued page is simply never sent.
+    fn cancel_search(&mut self, context: &egui::Context) {
+        let Some(view) = &self.searches.current else {
+            return;
+        };
+        let id = view.id;
+        match view.kind {
+            SearchKind::Memory(_) => {
+                let active = matches!(
+                    &self.pending,
+                    Some(Pending { request: Request::SearchMemory { binding, .. }, .. })
+                        if binding.search_id == id
+                );
+                self.end_memory_search(SearchState::Canceled);
+                if active {
+                    let continue_discovery = self.discovery_running;
+                    self.stop_worker_transport();
+                    if let Some(path) = self.binary_path.clone() {
+                        self.start_open(path, true, None, context);
+                        self.discovery_running = continue_discovery && self.client.is_some();
+                        self.update_discovery_summary();
+                    }
+                }
+            }
+            SearchKind::Text(_) => self.searches.cancel_text(),
+        }
+    }
+
+    /// The function whose recovered CFG, genuine semantic mapping or recorded
+    /// history observed exactly `pc` as an instruction.
+    fn observed_owner(&self, pc: u64) -> Option<u64> {
+        self.view()
+            .filter(|view| {
+                pc == view.address
+                    || self.listing().contains(pc)
+                    || self
+                        .semantic
+                        .mappings
+                        .iter()
+                        .any(|mapping| mapping.addresses.contains(&pc))
+            })
+            .map(|view| view.address)
+            .or_else(|| self.comment_owners.get(&pc).copied())
+    }
+
+    /// The adopted linkage table when it is still the one `text` searched.
+    fn search_linkage(&self, text: &TextSearch) -> Option<&crate::linkage::Linkage> {
+        let linkage = self.linkage.prepared()?.linkage();
+        (text.binding.linkage_digest.as_deref() == Some(linkage.digest.as_str())).then_some(linkage)
+    }
+
+    /// Where activating row `index` of `view` goes, decided from current
+    /// evidence and the captured record's own facts, never snippet text.
+    fn search_target(&self, view: &SearchView, index: usize) -> Option<SearchTarget> {
+        let info = self.info.as_ref()?;
+        let observed = |pc| self.observed_owner(pc);
+        match &view.kind {
+            SearchKind::Memory(memory) => {
+                let hit = memory.hits().get(index)?;
+                crate::search_jobs::resolve(info, hit.address, u64::from(hit.length), observed)
+                    .map(SearchTarget::Address)
+            }
+            SearchKind::Text(text) => {
+                use crate::search_text::TextSourceKey;
+                let hit = text.hits().get(index)?;
+                let item = match hit.key {
+                    TextSourceKey::Import(id) => crate::linkage_ui::LinkageItem::Import(id),
+                    TextSourceKey::Export(id) => crate::linkage_ui::LinkageItem::Export(id),
+                    TextSourceKey::String(_) => {
+                        // A preview start is data, opened exactly in Hex.
+                        let address = hit.address?;
+                        return crate::search_jobs::resolve(info, address, 1, |_| None).map(|_| {
+                            SearchTarget::Address(Destination::Data { address, length: 1 })
+                        });
+                    }
+                    TextSourceKey::Name(_)
+                    | TextSourceKey::Label(_)
+                    | TextSourceKey::Comment(_) => {
+                        return crate::search_jobs::resolve(info, hit.address?, 1, observed)
+                            .map(SearchTarget::Address);
+                    }
+                };
+                let linkage = self.search_linkage(text)?;
+                crate::linkage_ui::destination(linkage, item, self.pointer_width())
+                    .map(|place| SearchTarget::Linkage(item, place))
+            }
+        }
+    }
+
+    fn open_search_result(&mut self, index: usize, context: &egui::Context) {
+        let Some(view) = &self.searches.current else {
+            return;
+        };
+        match self.search_target(view, index) {
+            Some(SearchTarget::Address(Destination::Code { address, owner })) => {
+                self.navigate_location(address, Some(owner), true, context);
+            }
+            Some(SearchTarget::Address(Destination::Data { address, length })) => {
+                self.open_search_data(address, length, context);
+            }
+            Some(SearchTarget::Linkage(item, place)) => {
+                self.open_linkage_place(item, place, context);
+            }
+            None => {}
+        }
+    }
+
+    /// Exact bytes in Hex, recorded for Back/Forward. Unlike linkage places,
+    /// a validated mapping at address zero is a real destination here.
+    fn open_search_data(&mut self, address: u64, length: u64, context: &egui::Context) {
+        self.string_focus = None;
+        self.linkage_focus = false;
+        self.record_destination(crate::linkage_ui::Place::Data { address, length }, address);
+        self.open_data(address, length, context);
+    }
+
+    fn search_panel(&mut self, ui: &mut egui::Ui) {
+        let context = ui.ctx().clone();
+        let Some(view) = &self.searches.current else {
+            theme::empty_state(ui, "No search");
+            return;
+        };
+        let mut table = self.searches.table;
+        let linkage = match &view.kind {
+            SearchKind::Text(text) => self.search_linkage(text),
+            SearchKind::Memory(_) => None,
+        };
+        let openable = |index| self.search_target(view, index).is_some();
+        let action = crate::search_ui::show_results(
+            ui,
+            view,
+            &mut table,
+            &crate::search_ui::ResultContext {
+                sections: self
+                    .info
+                    .as_ref()
+                    .map_or(&[], |info| info.sections.as_slice()),
+                linkage,
+                pointer: self.pointer_width(),
+                openable: &openable,
+            },
+        );
+        let id = view.id;
+        if self
+            .searches
+            .current
+            .as_ref()
+            .is_some_and(|view| view.id == id)
+        {
+            self.searches.table = table;
+        }
+        if view_active(&self.searches) {
+            context.request_repaint_after(Duration::from_millis(100));
+        }
+        match action {
+            Some(ResultAction::Open(index)) => self.open_search_result(index, &context),
+            Some(ResultAction::OpenPlace(index, item, place)) => {
+                let still = self.searches.current.as_ref().is_some_and(|view| {
+                    matches!(&view.kind, SearchKind::Text(text)
+                        if self.search_linkage(text).is_some()
+                            && text.hits().get(index).is_some())
+                });
+                if still {
+                    self.open_linkage_place(item, place, &context);
+                }
+            }
+            Some(ResultAction::Cancel) => self.cancel_search(&context),
+            Some(ResultAction::Edit(kind)) => self.open_search_dialog(kind),
+            None => {}
+        }
+    }
+}
+
+fn view_active(searches: &Searches) -> bool {
+    searches.current.as_ref().is_some_and(SearchView::active)
+}
+
+/// A search row's resolved activation.
+enum SearchTarget {
+    Address(Destination),
+    Linkage(crate::linkage_ui::LinkageItem, crate::linkage_ui::Place),
+}
+
 fn is_legacy_load_note(note: &str) -> bool {
     matches!(
         note,
