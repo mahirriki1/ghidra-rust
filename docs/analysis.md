@@ -553,6 +553,88 @@ rapid paging retains the newest request only. Failed/canceled reads require
 **Retry**. Decoder behavior and constant-match caveats are in
 [coverage and provenance](crypto-signatures.md).
 
+## Search
+
+Search results, dialogs and bindings are transient. Projects store none of
+them; closing the binary, opening another or reopening a project clears them.
+
+**Memory** searches the exact file slices of every mapped, file-backed section in
+section order, including code and packed images. Zero-filled memory, headers or
+overlays outside sections, and runtime memory are not searched. A match never
+crosses a section boundary, even between adjacent sections; two mappings of the
+same file bytes are separate locations. Only the first 128 MiB of section bytes
+is searched; beyond that the result is **Partial**.
+
+Patterns are 1–256 encoded bytes. **Hex** takes whitespace-separated two-digit
+bytes; `??` matches any whole byte (no nibble wildcards; at least one byte must
+be fixed). **ASCII** and **UTF-16LE** take a literal without a terminator or
+escapes; UTF-16LE encodes surrogate pairs and matches at either byte parity.
+With **Match case** off, only ASCII letters fold; in UTF-16LE only ASCII-letter
+code units fold. Hex is always exact. Overlapping matches are all reported.
+
+The worker scans bounded pages: each examines at most 1 MiB of new start
+positions and returns at most 256 matches; one search sends at most 192 pages.
+After 10,000 results, further pages only probe for one more match: finding one
+or exhausting the work allowance gives **Partial**; exhausting the domain without
+one gives **Complete**. Pages alternate with symbol-name, import/export and
+discovery work; navigation waits for the current page. Automatic string and
+constant scans wait for the search to end. **Cancel** keeps committed matches;
+an active page is stopped with its worker and a replacement worker opens. A
+worker replaced for another reason resumes at the last committed position only
+after reopening the same verified binary; a failed or timed-out page is not
+retried and the search becomes **Unavailable**.
+
+Pages are checked for binding, section membership, ordering, lengths, counts
+and cursor progress before adoption; an invalid page stops the worker. The
+desktop does not rescan the bytes, so a match is worker-reported inspection
+output. It is not evidence of an instruction, function, data object or reference.
+
+**Program text** searches six toggleable sources, all on by default:
+
+| Source | Searched text |
+| --- | --- |
+| Names | Inventory names (with applied labels) and the adopted symbol table's raw and display names, merged by address |
+| Imports / Exports | Adopted raw and display names; `ordinal N` for ordinal-only entries |
+| Labels / Comments | Analyst labels and comments |
+| Strings | Loaded string previews |
+
+Library, version and forwarder-target text, listing and pseudocode text, local
+renames, signatures, decoded notes, unfetched or engine-internal symbols, bytes
+beyond a string preview, and unvisited functions are not searched. Search never
+requests more names or tables and never demangles. The query is a literal
+substring of one field (no regex or Unicode normalization) with ASCII-only case
+folding. Each record yields at most one hit; raw, display and inventory names at
+one address form one Names hit. Equal names of different imports, export aliases
+and different kinds at one address stay separate.
+
+A missing or still-loading name or import/export table is an unavailable source,
+not an empty one. Unavailable sources, a truncated inventory, name table, string
+scan or partial import/export table make the result **Partial**; the state
+tooltip names them. **Complete** means every selected loaded source was searched
+without omissions, not that the whole program was. Hits from saved inventory or
+saved strings keep **Saved analysis** provenance.
+
+Copied text and its bookkeeping are capped at 32 MiB, and matching scans at most
+32 MiB of field text, including the shared name and import/export tables. Sources
+are taken in the order Names, Imports, Exports, Labels, Comments, Strings, so a
+limit omits later sources first. Results are capped at 10,000 hits and 4 MiB,
+with 160-byte snippets. Copying runs on the GUI thread in slices of at most 4 ms,
+8,192 records or 1 MiB per frame; matching runs on a background thread. Copies,
+matcher scratch and results are charged to the session result store. Any later
+change to names, the name or import/export table, strings or annotations makes
+results **Stale**; selection changes do not. Search again to refresh.
+
+Activation uses the record's address, never its snippet. Memory matches, names,
+labels and comments open as code only at an exact known function entry or at
+an exact instruction observed in the current graph, a genuine decompiler
+mapping or recorded history; otherwise they open in Hex at the exact address
+(memory matches select their length), never at a nearest function. String hits
+open in Hex at the preview start. Imports and exports use the existing
+stub/slot/target destinations while the same table is loaded; forwarded and
+unresolved entries have none. A file-backed Hex span of at most 4 KiB that
+crosses a page keeps its full selection; **Prev** can return to the section's
+first page.
+
 ## Project formats and saved analysis
 
 A `.grproj` SQLite snapshot stores annotations, known functions, displayed-function
@@ -603,6 +685,8 @@ for project parsing and residual filesystem limitations.
 | Discovery batch | 128 seeds / 16,384 decode attempts; not cumulative ceilings |
 | References | 16,384 call refs, 16,384 data-access refs and 16,384 address-taking refs, each per reply and per discovery; 16,384 address candidates per batch |
 | Strings | 64 MiB scanned data / 10,000 results |
+| Memory search | 256-byte patterns; 192 pages of at most 1 MiB new positions and 256 hits; 10,000 results |
+| Program-text search | 32 MiB copied text and 32 MiB scanned text; 10,000 hits and 4 MiB results |
 | Bytes / decode | 64 KiB input and XOR keys / 256 KiB output; oversize is rejected |
 | Pseudocode | 2 MiB returned text |
 | Session result store | 64 MiB accounted allocations; see [eviction](#per-function-session-results) |
