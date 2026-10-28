@@ -43,6 +43,8 @@ const UNDO_BYTES: usize = 4 * 1024 * 1024;
 /// Per-frame work for the function filter, keeping typing responsive.
 const FILTER_FRAME_BUDGET: Duration = Duration::from_millis(4);
 
+mod listing_cursor;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Tab {
     Graph,
@@ -692,6 +694,7 @@ pub struct DesktopApp {
     pending_code_scroll: Option<usize>,
     pending_comment_scroll: Option<u64>,
     pending_listing_scroll: Option<usize>,
+    listing_cursor: listing_cursor::ListingCursor,
     /// Automatic discovery resumes since the last committed batch.
     discovery_resumes: u8,
     /// Widest Listing row, in monospace characters, for a stable scroll range.
@@ -847,6 +850,7 @@ impl DesktopApp {
             pending_code_scroll: None,
             pending_comment_scroll: None,
             pending_listing_scroll: None,
+            listing_cursor: Default::default(),
             discovery_resumes: 0,
             listing_chars: 0,
             code_chars: 0,
@@ -1068,6 +1072,7 @@ impl DesktopApp {
         self.pending_code_scroll = None;
         self.pending_comment_scroll = None;
         self.pending_listing_scroll = None;
+        self.listing_cursor = Default::default();
         self.saved_analysis = false;
         self.cached_graph = false;
         self.cached_functions = false;
@@ -4606,19 +4611,7 @@ impl DesktopApp {
     }
 
     fn handle_shortcuts(&mut self, context: &egui::Context) {
-        if self.opening.is_some()
-            || self.file_job.is_some()
-            || self.intent.is_some()
-            || self.browser_dialog.is_some()
-            || self.help_dialog.is_some()
-            || self.updater.open
-            || self.analyze_prompt.is_some()
-            || self.signature_editor.is_some()
-            || self.signature_change.is_some()
-            || context.egui_wants_keyboard_input()
-            || egui::Popup::is_any_open(context)
-            || context.memory(|memory| memory.top_modal_layer().is_some())
-        {
+        if self.navigation_shortcuts_blocked(context) {
             return;
         }
         let action = context.input_mut(|input| {
@@ -7503,6 +7496,7 @@ impl DesktopApp {
                 }
             }
             Tab::Listing => {
+                self.listing_cursor_input(ui);
                 let mut listing_xrefs = None;
                 if let Some(pc) = self.undisplayed_call {
                     ui.colored_label(theme::WARNING, format!("Outside graph: {pc:#x}"))
@@ -7544,6 +7538,7 @@ impl DesktopApp {
                 let mut decode = None;
                 let mut navigate = None;
                 let mut annotate = None;
+                let mut follow = None;
                 let reveal = self.pending_listing_scroll.take();
                 let (_, output) = theme::rows::<()>(
                     ui,
@@ -7632,10 +7627,8 @@ impl DesktopApp {
                             selected = Some(instruction.address);
                         }
                         let target = call.and_then(|call| call.target);
-                        if response.double_clicked()
-                            && let Some(target) = target
-                        {
-                            navigate = Some(target);
+                        if response.double_clicked() {
+                            follow = self.listing_follow_target(instruction.address);
                         }
                         response.context_menu(|ui| {
                             if let Some(target) = target
@@ -7678,6 +7671,10 @@ impl DesktopApp {
                 );
                 if let Some(address) = selected {
                     self.select_instruction(address);
+                }
+                self.listing_cursor_drawn(ui, output.inner_rect);
+                if let Some(target) = follow {
+                    self.follow_listing_target(target, &context);
                 }
                 if let Some(address) = navigate {
                     self.navigate(address, true, &context);
@@ -9344,7 +9341,7 @@ mod tests {
         assert!(app.filtered_functions.contains(&(0x1fff - 0x1000)));
     }
 
-    fn keyboard_app() -> DesktopApp {
+    pub(super) fn keyboard_app() -> DesktopApp {
         let mut app = DesktopApp::empty(None);
         app.info = Some(BinaryInfo {
             path: "fixture".into(),
@@ -10388,7 +10385,7 @@ mod tests {
         show_view(app, view);
     }
 
-    fn set_listing(app: &mut DesktopApp, instructions: Vec<Instruction>) {
+    pub(super) fn set_listing(app: &mut DesktopApp, instructions: Vec<Instruction>) {
         let address = instructions.first().map_or(0, |i| i.address);
         edit_view(app, |view| {
             view.address = address;
@@ -10400,7 +10397,7 @@ mod tests {
     }
 
     /// Displays `view` as an unstored live result.
-    fn show_view(app: &mut DesktopApp, view: FunctionView) {
+    pub(super) fn show_view(app: &mut DesktopApp, view: FunctionView) {
         let graph =
             app.results
                 .admit_graph(None, PreparedGraph::new(view), ResultOrigin::Computed, None);
@@ -10466,7 +10463,7 @@ mod tests {
         app
     }
 
-    fn semantic_app() -> DesktopApp {
+    pub(super) fn semantic_app() -> DesktopApp {
         let source = "int entry() { return café + 1; }";
         let mut app = call_navigation_app(source);
         let instructions: Vec<_> = [0x1000, 0x1004, 0x1008]
@@ -10499,7 +10496,7 @@ mod tests {
         app
     }
 
-    fn pointer_events(point: egui::Pos2) -> Vec<egui::Event> {
+    pub(super) fn pointer_events(point: egui::Pos2) -> Vec<egui::Event> {
         vec![
             egui::Event::PointerMoved(point),
             egui::Event::PointerButton {
@@ -10899,7 +10896,11 @@ mod tests {
         assert_eq!(app.selected, Some(0x1020));
     }
 
-    fn text_position(output: &egui::FullOutput, needle: &str, byte: usize) -> egui::Pos2 {
+    pub(super) fn text_position(
+        output: &egui::FullOutput,
+        needle: &str,
+        byte: usize,
+    ) -> egui::Pos2 {
         output
             .shapes
             .iter()
