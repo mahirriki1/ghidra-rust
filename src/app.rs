@@ -9114,32 +9114,15 @@ impl DesktopApp {
         }
     }
 
-    /// Cancel invalidates the search at once. An active memory page stops its
-    /// worker through the asynchronous drop/reap path and a replacement opens
-    /// for unrelated work; a queued page is simply never sent.
-    fn cancel_search(&mut self, context: &egui::Context) {
+    /// Cancel invalidates the search at once. An active memory page is one
+    /// bounded step, so it finishes and its late reply is dropped; replacing
+    /// the worker would cost a full reopen. A queued page is never sent.
+    fn cancel_search(&mut self) {
         let Some(view) = &self.searches.current else {
             return;
         };
-        let id = view.id;
         match view.kind {
-            SearchKind::Memory(_) => {
-                let active = matches!(
-                    &self.pending,
-                    Some(Pending { request: Request::SearchMemory { binding, .. }, .. })
-                        if binding.search_id == id
-                );
-                self.end_memory_search(SearchState::Canceled);
-                if active {
-                    let continue_discovery = self.discovery_running;
-                    self.stop_worker_transport();
-                    if let Some(path) = self.binary_path.clone() {
-                        self.start_open(path, true, None, context);
-                        self.discovery_running = continue_discovery && self.client.is_some();
-                        self.update_discovery_summary();
-                    }
-                }
-            }
+            SearchKind::Memory(_) => self.end_memory_search(SearchState::Canceled),
             SearchKind::Text(_) => self.searches.cancel_text(),
         }
     }
@@ -9169,9 +9152,16 @@ impl DesktopApp {
 
     /// Where activating row `index` of `view` goes, decided from current
     /// evidence and the captured record's own facts, never snippet text.
-    fn search_target(&self, view: &SearchView, index: usize) -> Option<SearchTarget> {
+    /// Without `observe`, owner evidence is skipped: a mapped address opens
+    /// either way, so rows can ask per frame without scanning mappings.
+    fn search_target(
+        &self,
+        view: &SearchView,
+        index: usize,
+        observe: bool,
+    ) -> Option<SearchTarget> {
         let info = self.info.as_ref()?;
-        let observed = |pc| self.observed_owner(pc);
+        let observed = |pc| observe.then(|| self.observed_owner(pc)).flatten();
         match &view.kind {
             SearchKind::Memory(memory) => {
                 let hit = memory.hits().get(index)?;
@@ -9209,7 +9199,7 @@ impl DesktopApp {
         let Some(view) = &self.searches.current else {
             return;
         };
-        match self.search_target(view, index) {
+        match self.search_target(view, index, true) {
             Some(SearchTarget::Address(Destination::Code { address, owner })) => {
                 self.navigate_location(address, Some(owner), true, context);
             }
@@ -9243,7 +9233,7 @@ impl DesktopApp {
             SearchKind::Text(text) => self.search_linkage(text),
             SearchKind::Memory(_) => None,
         };
-        let openable = |index| self.search_target(view, index).is_some();
+        let openable = |index| self.search_target(view, index, false).is_some();
         let action = crate::search_ui::show_results(
             ui,
             view,
@@ -9271,7 +9261,7 @@ impl DesktopApp {
                     self.open_linkage_place(item, place, &context);
                 }
             }
-            Some(ResultAction::Cancel) => self.cancel_search(&context),
+            Some(ResultAction::Cancel) => self.cancel_search(),
             Some(ResultAction::Edit(kind)) => self.open_search_dialog(kind),
             None => {}
         }
@@ -16968,11 +16958,12 @@ mod tests {
         app.start_memory_search(ascii("srch"), MemoryMode::Ascii, &context);
         let request = next(&mut app);
         app.pending = Some(search_pending(&app, request.clone()));
-        app.cancel_search(&context);
+        app.cancel_search();
         assert_eq!(search_state(&app), Some(SearchState::Canceled));
-        assert!(app.pending.is_none());
+        // The bounded page finishes on the same worker instead of a reopen.
+        let pending = app.pending.take().expect("in-flight page kept");
+        assert!(app.opening.is_none(), "cancel must not reopen the binary");
         let late = memory_page(&domain, &request, &image);
-        let pending = search_pending(&app, request);
         app.receive(pending, Response::MemorySearch(late), &context);
         assert_eq!(search_state(&app), Some(SearchState::Canceled));
         assert!(memory_addresses(&app).is_empty());
@@ -17204,7 +17195,7 @@ mod tests {
         assert_eq!(search_state(&app), Some(SearchState::Stale));
         app.start_text_search(spec(TextSources::ALL));
         app.pump_text_search(&context);
-        app.cancel_search(&context);
+        app.cancel_search();
         assert_eq!(search_state(&app), Some(SearchState::Canceled));
         app.start_text_search(spec(TextSources::STRINGS));
         wait_for_text(&mut app, &context);
@@ -17247,7 +17238,7 @@ mod tests {
         app.pump_text_search(&context);
         assert_eq!(search_state(&app), Some(SearchState::Stale));
         let view = app.searches.current.as_ref().unwrap();
-        assert!(app.search_target(view, index).is_none());
+        assert!(app.search_target(view, index, true).is_none());
     }
 
     fn search_frame(

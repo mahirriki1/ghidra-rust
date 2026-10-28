@@ -579,7 +579,7 @@ or exhausting the work allowance gives **Partial**; exhausting the domain withou
 one gives **Complete**. Pages alternate with symbol-name, import/export and
 discovery work; navigation waits for the current page. Automatic string and
 constant scans wait for the search to end. **Cancel** keeps committed matches;
-an active page is stopped with its worker and a replacement worker opens. A
+an active page finishes on the same worker and its reply is discarded. A
 worker replaced for another reason resumes at the last committed position only
 after reopening the same verified binary; a failed or timed-out page is not
 retried and the search becomes **Unavailable**.
