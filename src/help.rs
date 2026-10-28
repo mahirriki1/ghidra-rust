@@ -13,6 +13,10 @@ pub(crate) const SHORTCUTS: &[(&str, &str)] = &[
     ("Alt+Left / Right", "Back / forward"),
     (SAVE_KEYS, "Save project"),
     (UNDO_KEYS, "Undo annotation"),
+    ("Up / Down", "Listing: previous / next row"),
+    ("PageUp / PageDown", "Listing: previous / next page"),
+    ("Home / End", "Listing: first / last row"),
+    ("Enter", "Listing: follow target"),
 ];
 
 #[cfg(target_os = "macos")]

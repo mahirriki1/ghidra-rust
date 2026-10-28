@@ -119,9 +119,19 @@ every visited function is saved in a project.
 | `Alt+Left` / `Alt+Right` | Back / Forward |
 | `Ctrl+S` | Save project |
 | `Ctrl+Z` | Undo an annotation outside text editors |
+| `Up` / `Down` | Listing: previous / next instruction |
+| `PageUp` / `PageDown` | Listing: previous / next page |
+| `Home` / `End` | Listing: first / last instruction of the function |
+| `Enter` | Listing: follow the selected call or branch target |
 
 On macOS, Save and Undo use Command. Shortcuts pause while typing, in dialogs,
 and during file operations.
+
+Listing keys apply after clicking the Listing and stay within the current
+function; clicking elsewhere, focusing a text field or switching tabs releases
+them. Enter and Listing double-click follow a resolved call or a single taken
+branch target; ambiguous, unresolved or switch-table destinations, and a jump
+to the next instruction, are not followed.
 
 **Help → Keyboard shortcuts** opens the same reference as F1.
 **Help → About Ghidra Rust** shows the version and license/notice links.
