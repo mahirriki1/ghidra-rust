@@ -9258,18 +9258,7 @@ impl DesktopApp {
                 openable: &openable,
             },
         );
-        let id = view.id;
-        if self
-            .searches
-            .current
-            .as_ref()
-            .is_some_and(|view| view.id == id)
-        {
-            self.searches.table = table;
-        }
-        if view_active(&self.searches) {
-            context.request_repaint_after(Duration::from_millis(100));
-        }
+        self.searches.table = table;
         match action {
             Some(ResultAction::Open(index)) => self.open_search_result(index, &context),
             Some(ResultAction::OpenPlace(index, item, place)) => {
@@ -9287,10 +9276,6 @@ impl DesktopApp {
             None => {}
         }
     }
-}
-
-fn view_active(searches: &Searches) -> bool {
-    searches.current.as_ref().is_some_and(SearchView::active)
 }
 
 /// A search row's resolved activation.
