@@ -131,14 +131,38 @@ impl PreparedGraph {
 
     /// `view` must already have passed reply or project validation.
     pub fn new(view: FunctionView) -> Self {
+        Self::prepare(view, &|| false).expect("never cancelled")
+    }
+
+    /// As [`Self::new`], polling `cancelled` between phases; the desktop runs
+    /// this on its presentation thread.
+    pub fn prepare(view: FunctionView, cancelled: &dyn Fn() -> bool) -> Option<Self> {
         let geometry = crate::performance::span("gui_graph_geometry");
+        let listing = ListingIndex::new(&view);
+        if cancelled() {
+            return None;
+        }
+        let empty = std::collections::BTreeMap::new();
         let prepared = Self {
-            listing: ListingIndex::new(&view),
-            geometry: Arc::new(GraphGeometry::new(&view)),
+            listing,
+            geometry: Arc::new(GraphGeometry::prepare(&view, &empty, &empty, cancelled)?),
             view,
         };
         geometry.finish(prepared.view.blocks.len() as u64);
-        prepared
+        Some(prepared)
+    }
+
+    /// A conservative charge for preparing `view`, before any allocation.
+    pub fn estimated_bytes(view: &FunctionView) -> usize {
+        let instructions = view
+            .blocks
+            .iter()
+            .map(|block| block.instructions.len())
+            .fold(0usize, usize::saturating_add);
+        view_bytes(view)
+            .unwrap_or(usize::MAX)
+            .saturating_add(instructions.saturating_mul(size_of::<(u32, u32)>()))
+            .saturating_add(GraphGeometry::estimated_bytes(view, 0))
     }
 
     pub fn view(&self) -> &FunctionView {
@@ -163,28 +187,34 @@ impl PreparedGraph {
 
 impl Retained for PreparedGraph {
     fn retained_bytes(&self) -> Option<usize> {
-        let view = &self.view;
-        let mut bytes = Bytes::of::<Self>()
-            .slots::<crate::model::BasicBlock>(view.blocks.capacity())
-            .slots::<crate::model::Edge>(view.edges.capacity())
-            .slots::<crate::model::CallSite>(view.calls.capacity())
-            .slots::<String>(view.warnings.capacity())
+        Bytes::of::<Self>()
+            .add_total(view_bytes(&self.view))
             .slots::<(u32, u32)>(self.listing.0.len())
-            .add_total(self.geometry.retained_bytes());
-        for block in &view.blocks {
-            bytes = bytes.slots::<Instruction>(block.instructions.capacity());
-            for instruction in &block.instructions {
-                bytes = bytes
-                    .plus(instruction.bytes.capacity())
-                    .plus(instruction.mnemonic.capacity())
-                    .plus(instruction.operands.capacity());
-            }
-        }
-        for warning in &view.warnings {
-            bytes = bytes.plus(warning.capacity());
-        }
-        bytes.total()
+            .add_total(self.geometry.retained_bytes())
+            .total()
     }
+}
+
+/// Allocation capacity owned by a function view, excluding itself.
+fn view_bytes(view: &FunctionView) -> Option<usize> {
+    let mut bytes = Bytes::of::<()>()
+        .slots::<crate::model::BasicBlock>(view.blocks.capacity())
+        .slots::<crate::model::Edge>(view.edges.capacity())
+        .slots::<crate::model::CallSite>(view.calls.capacity())
+        .slots::<String>(view.warnings.capacity());
+    for block in &view.blocks {
+        bytes = bytes.slots::<Instruction>(block.instructions.capacity());
+        for instruction in &block.instructions {
+            bytes = bytes
+                .plus(instruction.bytes.capacity())
+                .plus(instruction.mnemonic.capacity())
+                .plus(instruction.operands.capacity());
+        }
+    }
+    for warning in &view.warnings {
+        bytes = bytes.plus(warning.capacity());
+    }
+    bytes.total()
 }
 
 /// One indivisible decompilation: text, mappings, semantic tokens/locals,
@@ -277,42 +307,48 @@ impl PreparedDecompilation {
 
 impl Retained for PreparedDecompilation {
     fn retained_bytes(&self) -> Option<usize> {
-        let semantics = &self.semantics;
         let mut bytes = Bytes::of::<Self>()
             .plus(self.text.capacity())
             .slots::<CodeMapping>(self.mappings.len())
             .slots::<(usize, usize)>(self.lines.len())
             .add_total(self.highlighted.retained_bytes())
-            .slots::<crate::semantic::SemanticToken>(semantics.tokens.capacity())
-            .slots::<crate::semantic::LocalVariable>(semantics.locals.capacity())
-            .slots::<String>(semantics.warnings.capacity());
+            .add_total(semantic_bytes(&self.semantics));
         for mapping in self.mappings.iter() {
             bytes = bytes.slots::<u64>(mapping.addresses.capacity());
         }
-        for local in &semantics.locals {
-            bytes = bytes
-                .plus(local.name.capacity())
-                .plus(local.identity.engine.capacity())
-                .plus(local.identity.verification.capacity());
-        }
-        for warning in &semantics.warnings {
-            bytes = bytes.plus(warning.capacity());
-        }
-        if let Some(prototype) = &semantics.prototype {
-            bytes = bytes
-                .slots::<crate::signatures::InferredSignature>(1)
-                .slots::<crate::signatures::InferredParameter>(prototype.parameters.capacity())
-                .slots::<String>(prototype.unsupported.capacity())
-                .plus(prototype.abi.capacity());
-            for parameter in &prototype.parameters {
-                bytes = bytes.plus(parameter.name.capacity());
-            }
-            for note in &prototype.unsupported {
-                bytes = bytes.plus(note.capacity());
-            }
-        }
         bytes.total()
     }
+}
+
+/// Heap allocations owned by semantic output, also retained by saved graph jobs.
+pub(crate) fn semantic_bytes(semantics: &SemanticInfo) -> Option<usize> {
+    let mut bytes = Bytes::of::<()>()
+        .slots::<crate::semantic::SemanticToken>(semantics.tokens.capacity())
+        .slots::<crate::semantic::LocalVariable>(semantics.locals.capacity())
+        .slots::<String>(semantics.warnings.capacity());
+    for local in &semantics.locals {
+        bytes = bytes
+            .plus(local.name.capacity())
+            .plus(local.identity.engine.capacity())
+            .plus(local.identity.verification.capacity());
+    }
+    for warning in &semantics.warnings {
+        bytes = bytes.plus(warning.capacity());
+    }
+    if let Some(prototype) = &semantics.prototype {
+        bytes = bytes
+            .slots::<crate::signatures::InferredSignature>(1)
+            .slots::<crate::signatures::InferredParameter>(prototype.parameters.capacity())
+            .slots::<String>(prototype.unsupported.capacity())
+            .plus(prototype.abi.capacity());
+        for parameter in &prototype.parameters {
+            bytes = bytes.plus(parameter.name.capacity());
+        }
+        for note in &prototype.unsupported {
+            bytes = bytes.plus(note.capacity());
+        }
+    }
+    bytes.total()
 }
 
 #[derive(Debug)]

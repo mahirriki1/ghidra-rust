@@ -49,6 +49,8 @@ const UNDO_BYTES: usize = 4 * 1024 * 1024;
 /// Per-frame work for the function filter, keeping typing responsive.
 const FILTER_FRAME_BUDGET: Duration = Duration::from_millis(4);
 
+#[path = "app/graph_preparation.rs"]
+mod graph_preparation;
 mod listing_cursor;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -696,6 +698,8 @@ pub struct DesktopApp {
     reference_focus: Option<(u64, u64)>,
     undisplayed_call: Option<u64>,
     canvas: Option<GraphCanvas>,
+    /// Off-thread base and comment geometry for `graph` and `canvas`.
+    graph_preparation: graph_preparation::GraphPreparation,
     saved_analysis: bool,
     cached_graph: bool,
     cached_functions: bool,
@@ -856,6 +860,7 @@ impl DesktopApp {
             reference_focus: None,
             undisplayed_call: None,
             canvas: None,
+            graph_preparation: Default::default(),
             saved_analysis: false,
             cached_graph: false,
             cached_functions: false,
@@ -1084,6 +1089,7 @@ impl DesktopApp {
         self.results.close();
         self.graph = None;
         self.canvas = None;
+        self.graph_preparation.cancel();
         self.code = None;
         self.semantic.clear();
         self.comment_rows_key = None;
@@ -1731,6 +1737,7 @@ impl DesktopApp {
         self.graph = None;
         self.cached_graph = false;
         self.canvas = None;
+        self.graph_preparation.cancel();
         if let Some(pc) = focus {
             self.selected = Some(pc);
             self.address = format!("{pc:x}");
@@ -1801,7 +1808,11 @@ impl DesktopApp {
             self.adopt_decompilation(code, origin);
         } else if self.should_auto_decompile() {
             crate::performance::event("function_result_miss_decompile", address);
-            self.schedule_request(Request::Decompile { address });
+            // Presentation can finish while linkage/search maintenance owns
+            // the worker. Never replace that request's pending reply binding.
+            if self.queue.len() < HISTORY_LIMIT {
+                self.queue.push_front(Request::Decompile { address });
+            }
         }
     }
 
@@ -1823,6 +1834,7 @@ impl DesktopApp {
     fn adopt_graph(&mut self, graph: Shared<PreparedGraph>, origin: ResultOrigin) {
         let _adoption = crate::performance::span("function_result_adopt_graph");
         let address = graph.address();
+        self.graph_preparation.cancel();
         self.canvas = Some(GraphCanvas::with_geometry(graph.view(), graph.geometry()));
         self.cached_graph = origin == ResultOrigin::Saved;
         self.graph = Some(graph);
@@ -2823,15 +2835,16 @@ impl DesktopApp {
                 {
                     return;
                 }
-                self.result_revision = self.result_revision.wrapping_add(1);
-                let graph = self.results.admit_graph(
-                    pending.result.as_ref(),
-                    PreparedGraph::new(view),
-                    ResultOrigin::Computed,
-                    Some(address),
-                );
-                self.adopt_graph(graph, ResultOrigin::Computed);
-                self.load_decompilation(address);
+                // Indexes and geometry are prepared off this thread; adoption
+                // repeats these checks.
+                let continuation = graph_preparation::Continuation::Live {
+                    generation: self.generation,
+                    selection: pending.selection,
+                    revision: pending.revision,
+                    result: pending.result,
+                    address,
+                };
+                self.prepare_graph(view, continuation, 0, context);
             }
             (
                 Request::Decompile { address: expected },
@@ -3563,6 +3576,305 @@ impl DesktopApp {
         });
     }
 
+    /// Queues listing and base geometry preparation for an accepted view.
+    /// `held` counts continuation data retained with the job.
+    fn prepare_graph(
+        &mut self,
+        view: FunctionView,
+        continuation: graph_preparation::Continuation,
+        held: usize,
+        context: &egui::Context,
+    ) {
+        let address = view.address;
+        let bytes = PreparedGraph::estimated_bytes(&view).saturating_add(held);
+        let Some(charge) = self.results.reserve_transient(bytes, &[address]) else {
+            self.graph_preparation.cancel();
+            self.status = "Graph presentation exceeds the memory budget".into();
+            return;
+        };
+        if let Err(error) = self.graph_preparation.submit(
+            graph_preparation::Work::Base(view),
+            continuation,
+            Some(charge),
+            context,
+        ) {
+            self.status = error;
+        }
+    }
+
+    /// Adopts finished presentation work still bound to the current state.
+    fn poll_graph_preparation(&mut self) {
+        use graph_preparation::{Continuation, Output};
+        let Some((continuation, output, charge)) = self.graph_preparation.poll() else {
+            return;
+        };
+        // Recheck context before either publishing output or reporting a job
+        // failure. A superseded job must not even replace the current status.
+        let current = match &continuation {
+            Continuation::Live {
+                generation,
+                selection,
+                revision,
+                result,
+                ..
+            } => {
+                *generation == self.generation
+                    && *selection == self.selection_generation
+                    && *revision == self.revision
+                    && result
+                        .as_ref()
+                        .is_none_or(|_| self.results.current(result.as_ref()))
+            }
+            Continuation::Saved(restore) => {
+                restore.generation == self.generation
+                    && restore.selection == self.selection_generation
+            }
+            Continuation::Annotation(key) => self.annotation_key().as_ref() == Some(key),
+        };
+        if !current {
+            // The selected function may still be waiting for its first graph.
+            // An inventory/name/comment change invalidates the reply binding,
+            // but must not abandon that selection with nothing to display.
+            if let Continuation::Live {
+                generation,
+                selection,
+                address,
+                ..
+            } = continuation
+                && generation == self.generation
+                && selection == self.selection_generation
+                && self.graph.is_none()
+            {
+                let queued = self.queue.iter().any(|request| {
+                    matches!(request, Request::Graph { address: target } if *target == address)
+                });
+                let in_flight = self.pending.as_ref().is_some_and(|pending| {
+                    matches!(pending.request, Request::Graph { address: target } if target == address)
+                        && pending.selection == self.selection_generation
+                        && pending.revision == self.revision
+                        && pending.result.as_ref().is_none_or(|_| self.results.current(pending.result.as_ref()))
+                });
+                if !queued && !in_flight {
+                    // The normal dispatcher waits for result-input preparation
+                    // and any in-flight maintenance before binding this request.
+                    if self.queue.len() >= HISTORY_LIMIT {
+                        self.queue.pop_back();
+                    }
+                    self.queue.push_front(Request::Graph { address });
+                }
+            }
+            return;
+        }
+        match (continuation, output) {
+            (
+                Continuation::Live {
+                    result, address, ..
+                },
+                Output::Base(graph),
+            ) => {
+                drop(charge);
+                self.result_revision = self.result_revision.wrapping_add(1);
+                let graph = self.results.admit_graph(
+                    result.as_ref(),
+                    graph,
+                    ResultOrigin::Computed,
+                    Some(address),
+                );
+                self.adopt_graph(graph, ResultOrigin::Computed);
+                self.load_decompilation(address);
+            }
+            (Continuation::Saved(restore), Output::Base(graph)) => {
+                drop(charge);
+                self.finish_restore(graph, *restore);
+            }
+            (Continuation::Annotation(key), Output::Annotated(geometry)) => {
+                let Some(charge) = charge else {
+                    return;
+                };
+                let bytes = geometry.retained_bytes().unwrap_or(usize::MAX);
+                let extra = bytes.saturating_sub(charge.capacity());
+                let protect = self.graph.as_ref().map(|graph| graph.address());
+                if extra > 0
+                    && !self
+                        .results
+                        .grow_transient(&charge, extra, protect.as_slice())
+                {
+                    if let Some(canvas) = &mut self.canvas {
+                        canvas.show_base(key.revisions(), false);
+                    }
+                    self.status = "Graph annotations exceed the memory budget".into();
+                    return;
+                }
+                if let Some(canvas) = &mut self.canvas
+                    && canvas.adopt_annotation(key.revisions(), geometry)
+                {
+                    self.graph_preparation.set_adopted_charge(Some(charge));
+                }
+            }
+            (continuation, Output::Failed) => {
+                if let Continuation::Annotation(key) = continuation
+                    && let Some(canvas) = &mut self.canvas
+                {
+                    canvas.show_base(key.revisions(), false);
+                }
+                self.status = "Graph presentation failed".into();
+            }
+            _ => {}
+        }
+    }
+
+    /// The saved graph, selection and decompilation of a restored project.
+    fn finish_restore(&mut self, graph: PreparedGraph, restore: graph_preparation::SavedRestore) {
+        let address = graph.address();
+        // Saved results enter the store with their provenance, so the
+        // marker stays visible on revisits until each is recomputed.
+        let binding = restore.binding;
+        let graph =
+            self.results
+                .admit_graph(binding.as_ref(), graph, ResultOrigin::Saved, Some(address));
+        self.adopt_graph(graph, ResultOrigin::Saved);
+        self.history.push(crate::linkage_ui::Place::Code(address));
+        self.history_index = 0;
+        self.selected = restore.selected;
+        self.address = format!("{:x}", restore.selected.unwrap_or(address));
+        if let Some(pc) = restore.selected {
+            self.pending_listing_scroll = self.listing().position(pc);
+            if self.pending_listing_scroll.is_some()
+                && let Some(canvas) = &mut self.canvas
+            {
+                // This survives annotation preparation and is consumed only
+                // when the graph is shown with its final rows.
+                canvas.reveal_instruction(pc);
+            }
+        }
+        let sections = self
+            .info
+            .as_ref()
+            .map(|info| info.sections.as_slice())
+            .unwrap_or(&[]);
+        let code = restore.decompiled.and_then(|text| {
+            PreparedDecompilation::validate(
+                address,
+                text,
+                restore.mappings,
+                restore.semantics,
+                sections,
+            )
+            .ok()
+        });
+        if let Some(code) = code {
+            let code = self.results.admit_decompilation(
+                binding.as_ref(),
+                code,
+                ResultOrigin::Saved,
+                Some(address),
+            );
+            self.adopt_decompilation(code, ResultOrigin::Saved);
+        } else if self.should_auto_decompile() && self.queue.len() < HISTORY_LIMIT {
+            self.queue.push_front(Request::Decompile { address });
+        }
+        self.saved_result_revision = self.result_revision;
+        self.status = "Project opened · saved analysis".into();
+    }
+
+    /// Waits for presentation work and adopts it, as a later frame would.
+    #[cfg(test)]
+    fn settle_graph(&mut self) {
+        self.graph_preparation.settle();
+        self.poll_graph_preparation();
+    }
+
+    /// The displayed graph and the revisions its comment rows depend on.
+    fn annotation_key(&self) -> Option<graph_preparation::AnnotationKey> {
+        Some(graph_preparation::AnnotationKey {
+            generation: self.generation,
+            selection: self.selection_generation,
+            revision: self.revision,
+            symbol_revision: self.symbol_revision,
+            graph: Arc::downgrade(self.graph.as_ref()?),
+        })
+    }
+
+    /// Requests comment and call-name geometry for the displayed graph when
+    /// its revisions changed. Only the graph's own PCs are snapshotted, as
+    /// bounded row prefixes.
+    fn request_graph_annotations(&mut self, context: &egui::Context) {
+        use graph_preparation::{Continuation, Work};
+        let (Some(key), Some(graph)) = (self.annotation_key(), self.graph.clone()) else {
+            return;
+        };
+        let Some(canvas) = &mut self.canvas else {
+            return;
+        };
+        let revisions = key.revisions();
+        let awaited = self.graph_preparation.awaits(
+            |continuation| matches!(continuation, Continuation::Annotation(k) if *k == key),
+        );
+        if canvas.annotation() == Some(revisions) && (!canvas.awaiting() || awaited) {
+            return;
+        }
+        let comments: BTreeMap<_, _> = graph
+            .listing()
+            .iter()
+            .filter_map(|instruction| {
+                let comment = self.annotation_browser.comments.get(&instruction.address)?;
+                Some((instruction.address, crate::graph::row_prefix(comment)))
+            })
+            .collect();
+        let symbols = self
+            .symbol_names
+            .as_ref()
+            .filter(|(generation, _)| *generation == self.generation)
+            .map(|(_, names)| names.as_ref());
+        let call_names: BTreeMap<_, _> = graph
+            .view()
+            .calls
+            .iter()
+            .filter_map(|call| {
+                let function = function_at(&self.info.as_ref()?.functions, call.target?)?;
+                let name = function_display(self.session.as_ref(), symbols, function).0;
+                Some((call.address, crate::graph::row_prefix(name)))
+            })
+            .collect();
+        if comments.is_empty() && call_names.is_empty() {
+            canvas.show_base(revisions, false);
+            self.graph_preparation.set_adopted_charge(None);
+            return;
+        }
+        let held = comments
+            .values()
+            .chain(call_names.values())
+            .map(|text| text.capacity() + size_of::<(u64, String)>() * 2)
+            .sum::<usize>();
+        let bytes = crate::graph::GraphGeometry::estimated_bytes(graph.view(), comments.len())
+            .saturating_add(held);
+        canvas.show_base(revisions, true);
+        self.graph_preparation.set_adopted_charge(None);
+        let address = graph.address();
+        let Some(charge) = self.results.reserve_transient(bytes, &[address]) else {
+            canvas.show_base(revisions, false);
+            self.graph_preparation.cancel();
+            self.status = "Graph annotations exceed the memory budget".into();
+            return;
+        };
+        let work = Work::Annotated {
+            graph,
+            comments,
+            call_names,
+        };
+        if let Err(error) = self.graph_preparation.submit(
+            work,
+            Continuation::Annotation(key),
+            Some(charge),
+            context,
+        ) {
+            if let Some(canvas) = &mut self.canvas {
+                canvas.show_base(revisions, false);
+            }
+            self.status = error;
+        }
+    }
+
     fn restore_project(&mut self, project: ProjectOpen, context: &egui::Context) {
         let ProjectOpen {
             project,
@@ -3632,50 +3944,28 @@ impl DesktopApp {
             })
         }) {
             let address = view.address;
-            // Saved results enter the store with their provenance, so the
-            // marker stays visible on revisits until each is recomputed.
             let binding = self
                 .results
                 .binding(address, self.local_override_state(address));
-            let graph = self.results.admit_graph(
-                binding.as_ref(),
-                PreparedGraph::new(view),
-                ResultOrigin::Saved,
-                Some(address),
-            );
-            self.adopt_graph(graph, ResultOrigin::Saved);
-            self.history.push(crate::linkage_ui::Place::Code(address));
-            self.history_index = 0;
-            self.selected = selected;
-            self.address = format!("{:x}", selected.unwrap_or(address));
-            let sections = self
-                .info
-                .as_ref()
-                .map(|info| info.sections.as_slice())
-                .unwrap_or(&[]);
-            let code = data.decompiled.and_then(|text| {
-                PreparedDecompilation::validate(
-                    address,
-                    text,
-                    data.mappings,
-                    data.semantics,
-                    sections,
-                )
-                .ok()
-            });
-            if let Some(code) = code {
-                let code = self.results.admit_decompilation(
-                    binding.as_ref(),
-                    code,
-                    ResultOrigin::Saved,
-                    Some(address),
-                );
-                self.adopt_decompilation(code, ResultOrigin::Saved);
-            } else if self.should_auto_decompile() {
-                self.schedule_request(Request::Decompile { address });
-            }
+            // The graph-dependent remainder runs once its geometry is ready,
+            // never paired with another graph.
+            let restore = graph_preparation::SavedRestore {
+                generation: self.generation,
+                selection: self.selection_generation,
+                binding,
+                selected,
+                decompiled: data.decompiled,
+                mappings: data.mappings,
+                semantics: data.semantics,
+            };
+            let held = restore.retained_bytes();
             self.saved_result_revision = self.result_revision;
-            self.status = "Project opened · saved analysis".into();
+            self.prepare_graph(
+                view,
+                graph_preparation::Continuation::Saved(Box::new(restore)),
+                held,
+                context,
+            );
         } else if let Some(address) = selected {
             self.navigate(address, true, context);
             self.status = if cache_compatible {
@@ -4281,6 +4571,7 @@ impl DesktopApp {
         self.selection_generation = self.selection_generation.wrapping_add(1);
         self.graph = None;
         self.canvas = None;
+        self.graph_preparation.cancel();
         self.clear_decompilation();
         self.pending_listing_scroll = None;
         self.comment_rows = CommentRows::default();
@@ -4345,6 +4636,7 @@ impl DesktopApp {
         self.selection_generation = self.selection_generation.wrapping_add(1);
         self.graph = None;
         self.canvas = None;
+        self.graph_preparation.cancel();
         self.clear_decompilation();
         self.pending_listing_scroll = None;
         self.signature_restore_pc = restore_pc;
@@ -7442,6 +7734,7 @@ impl DesktopApp {
             Tab::References => self.references_panel(ui),
             Tab::Search => self.search_panel(ui),
             Tab::Graph => {
+                self.request_graph_annotations(&context);
                 let mut navigate = None;
                 let mut xrefs = None;
                 if let Some(view) = graph_view(&self.graph) {
@@ -7509,28 +7802,6 @@ impl DesktopApp {
                         });
                     }
                     if let Some(canvas) = &mut self.canvas {
-                        let names = |target| {
-                            let function = function_at(&self.info.as_ref()?.functions, target)?;
-                            let symbols = self
-                                .symbol_names
-                                .as_ref()
-                                .filter(|(generation, _)| *generation == self.generation)
-                                .map(|(_, names)| names.as_ref());
-                            Some(function_display(self.session.as_ref(), symbols, function).0)
-                        };
-                        canvas.set_comments(
-                            view,
-                            (self.generation, self.revision, self.symbol_revision),
-                            &self.annotation_browser.comments,
-                            || {
-                                view.calls
-                                    .iter()
-                                    .filter_map(|call| {
-                                        Some((call.address, names(call.target?)?.to_owned()))
-                                    })
-                                    .collect()
-                            },
-                        );
                         let call_index = self.call_index.as_deref();
                         let info = self.info.as_ref();
                         let menu = |ui: &mut egui::Ui, pc: Option<u64>| {
@@ -7747,6 +8018,9 @@ impl DesktopApp {
                 theme::paint_listing_header(ui, header, &columns);
                 if let Some(address) = selected {
                     self.select_instruction(address);
+                    if let Some(canvas) = &mut self.canvas {
+                        canvas.reveal_instruction(address);
+                    }
                 }
                 self.listing_cursor_drawn(ui, output.inner_rect);
                 if let Some(target) = follow {
@@ -8310,6 +8584,7 @@ impl DesktopApp {
         }
         self.poll_files(&context);
         if !self.updater.installing() {
+            self.poll_graph_preparation();
             self.poll_worker(&context);
         }
         self.pump_text_search(&context);
@@ -9743,6 +10018,7 @@ mod tests {
                 result: None,
             };
             app.receive(pending, Response::Graph { view }, &egui::Context::default());
+            app.settle_graph();
             assert_eq!(app.selected, Some(expected));
             assert!(app.signature_restore_pc.is_none());
         }
@@ -9903,6 +10179,7 @@ mod tests {
             },
             &egui::Context::default(),
         );
+        app.settle_graph();
         assert!(app.status.contains("Basic block count"), "{}", app.status);
         assert!(app.graph.is_none() && app.listing().is_empty());
 
@@ -11611,6 +11888,7 @@ mod tests {
             },
             &context,
         );
+        app.settle_graph();
         assert_eq!(app.view().unwrap().address, 0x1000);
         assert_eq!(app.selected, Some(0x1008));
         assert_eq!(app.pending_listing_scroll, Some(2));
@@ -12136,6 +12414,9 @@ mod tests {
                 output.textures_delta.clear();
                 output
             };
+            // Graph call names are laid out off-thread after the first frame.
+            frame(&mut app, vec![]);
+            app.settle_graph();
             let output = frame(&mut app, vec![]);
             let point = text_position(&output, "00001008", 3);
             frame(&mut app, secondary_events(point));
@@ -12873,6 +13154,7 @@ mod tests {
             },
             &egui::Context::default(),
         );
+        app.settle_graph();
         assert_eq!(app.project_path, Some(project_path));
         assert_eq!(app.status, "Project opened · saved analysis");
         assert!(app.saved_analysis);
@@ -13020,6 +13302,7 @@ mod tests {
             },
             &context,
         );
+        app.settle_graph();
         assert!(app.saved_references);
         assert!(Arc::ptr_eq(app.discovery_saved.as_ref().unwrap(), &saved));
         assert_eq!(app.call_index.as_ref().unwrap().incoming[&0x1040], [0]);
@@ -13162,6 +13445,7 @@ mod tests {
             },
             &egui::Context::default(),
         );
+        app.settle_graph();
         assert!(app.view().is_none());
         let pending = Pending {
             id: 2,
@@ -14339,6 +14623,7 @@ mod tests {
                 result: None,
             };
             app.receive(pending, Response::Graph { view }, &context);
+            app.settle_graph();
             assert_eq!(app.selected, Some(pc));
             assert!(app.semantic.addresses.contains(&pc));
             assert_eq!(app.pending_listing_scroll, (pc == 0x1004).then_some(1));
@@ -14394,6 +14679,7 @@ mod tests {
             Response::Graph { view: caller },
             &context,
         );
+        app.settle_graph();
         assert_eq!(app.selected, Some(0x1008));
         // Forward reopens the recorded owner, not a guessed function at the PC.
         app.history_step(true, &context);
@@ -16343,12 +16629,14 @@ mod tests {
         let settle = |app: &mut DesktopApp| {
             let deadline = Instant::now() + Duration::from_secs(30);
             loop {
+                app.poll_graph_preparation();
                 app.poll_worker(&context);
                 if app.linkage.status() == Status::Ready
                     && app.pending.is_none()
                     && app.queue.is_empty()
                     && !app.results.preparing()
                     && app.deferred_restore.is_none()
+                    && !app.graph_preparation.awaits(|_| true)
                 {
                     break;
                 }
@@ -16497,7 +16785,12 @@ mod tests {
             path: binary.to_string_lossy().into_owned(),
         });
         let deadline = Instant::now() + Duration::from_secs(30);
-        while app.info.is_none() || app.pending.is_some() || !app.queue.is_empty() {
+        while app.info.is_none()
+            || app.pending.is_some()
+            || !app.queue.is_empty()
+            || app.graph_preparation.awaits(|_| true)
+        {
+            app.poll_graph_preparation();
             app.poll_worker(&context);
             assert!(
                 Instant::now() < deadline,
@@ -16599,6 +16892,7 @@ mod tests {
             },
             &egui::Context::default(),
         );
+        app.settle_graph();
         app.linkage.begin(app.generation, app.worker_epoch);
         assert_eq!(app.linkage.status(), Status::Loading);
         assert!(app.linkage.selected().is_none() && app.linkage.prepared().is_none());
@@ -17588,5 +17882,136 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn graph_selection_sync_after_preview_boundary() {
+        let context = egui::Context::default();
+        theme::install(&context);
+        let mut app = keyboard_app();
+        app.tab = Tab::Graph;
+        let pc = |row: u64| 0x1000 + row * 4;
+        show_view(
+            &mut app,
+            FunctionView {
+                address: 0x1000,
+                blocks: vec![BasicBlock {
+                    address: 0x1000,
+                    instructions: (0..40)
+                        .map(|row| Instruction {
+                            address: pc(row),
+                            bytes: vec![0x90],
+                            mnemonic: "mov".into(),
+                            operands: format!("r{row}, 1"),
+                        })
+                        .collect(),
+                }],
+                edges: vec![],
+                calls: vec![],
+                warnings: vec![],
+            },
+        );
+        let source = "int entry() {\n  a = 1;\n  return b + c;\n}\n";
+        let late = source.find("a = 1").unwrap();
+        let shared = source.find("return").unwrap();
+        show_code(
+            &mut app,
+            source,
+            vec![
+                CodeMapping {
+                    start: late,
+                    end: late + 6,
+                    addresses: vec![pc(30)],
+                },
+                CodeMapping {
+                    start: shared,
+                    end: shared + 13,
+                    addresses: vec![pc(9), pc(10)],
+                },
+            ],
+            SemanticInfo::default(),
+        );
+        let draw = |app: &mut DesktopApp, events| {
+            let time = context.input(|input| input.time) + 0.5;
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1000.0, 700.0),
+                    )),
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ui| app.main_panel(ui),
+            );
+            output.textures_delta.clear();
+            output
+        };
+        let row = |output: &egui::FullOutput, address: u64| {
+            output.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text)
+                    if text.galley.text().starts_with(&format!("{address:08x}  ")) =>
+                {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+        };
+        let highlights = |output: &egui::FullOutput| {
+            output
+                .shapes
+                .iter()
+                .filter(|shape| {
+                    matches!(&shape.shape,
+                    egui::epaint::Shape::Rect(rect) if rect.fill == theme::CURRENT_LINE)
+                })
+                .count()
+        };
+        draw(&mut app, vec![]);
+        // Row 9 was past the old eight-row preview.
+        let output = draw(&mut app, vec![]);
+        let text = row(&output, pc(9)).expect("row 9 is painted");
+        draw(&mut app, pointer_events(text.pos + egui::vec2(30.0, 4.0)));
+        assert_eq!(app.selected, Some(pc(9)));
+        assert_eq!(
+            app.semantic.ranges.as_slice(),
+            std::slice::from_ref(&(shared..shared + 13))
+        );
+        // A shared expression relates both of its rows; overlays keep the
+        // instruction text colors.
+        app.select_decompiled_byte(shared + 1);
+        assert_eq!(
+            app.semantic.addresses,
+            std::collections::BTreeSet::from([pc(9), pc(10)])
+        );
+        let output = draw(&mut app, vec![]);
+        assert_eq!(highlights(&output), 2);
+        for address in [pc(9), pc(10)] {
+            let text = row(&output, address).unwrap();
+            assert!(
+                text.galley
+                    .job
+                    .sections
+                    .iter()
+                    .all(|section| section.format.color == theme::TEXT)
+            );
+        }
+        // Reverse selection reveals the exact late instruction.
+        app.select_decompiled_byte(late + 1);
+        assert_eq!(app.selected, Some(pc(30)));
+        let output = draw(&mut app, vec![]);
+        let text = row(&output, pc(30)).expect("late row revealed");
+        assert_eq!(highlights(&output), 1);
+        // An unmapped row clears the previous source ranges.
+        let below = row(&output, pc(31)).expect("neighbouring row visible");
+        assert!(below.pos.y > text.pos.y);
+        draw(&mut app, pointer_events(below.pos + egui::vec2(30.0, 4.0)));
+        assert_eq!(app.selected, Some(pc(31)));
+        assert!(app.semantic.ranges.is_empty());
+        assert_eq!(
+            app.semantic.addresses,
+            std::collections::BTreeSet::from([pc(31)])
+        );
     }
 }

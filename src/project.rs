@@ -2063,4 +2063,58 @@ mod tests {
                 .contains("size limit")
         );
     }
+
+    #[test]
+    fn graph_budget_is_aggregate() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut data, _protection) = sample(directory.path());
+        data.info.sections[0].size = 0x4000;
+        let ranges = MappedRanges::new(&data.info.sections).unwrap();
+        let view = |sizes: &[usize]| {
+            let mut address = 0x1000;
+            let blocks = sizes
+                .iter()
+                .map(|&size| {
+                    let block = address;
+                    let instructions = (0..size)
+                        .map(|_| {
+                            address += 2;
+                            crate::model::Instruction {
+                                address: address - 2,
+                                bytes: vec![0x90, 0x90],
+                                mnemonic: "nop".into(),
+                                operands: String::new(),
+                            }
+                        })
+                        .collect();
+                    crate::model::BasicBlock {
+                        address: block,
+                        instructions,
+                    }
+                })
+                .collect();
+            FunctionView {
+                address: 0x1000,
+                blocks,
+                edges: vec![],
+                calls: vec![],
+                warnings: vec![],
+            }
+        };
+        let quarter = MAX_GRAPH_INSTRUCTIONS / 4;
+        validate_view(&view(&[MAX_GRAPH_INSTRUCTIONS]), &ranges, &data.info).unwrap();
+        validate_view(&view(&[quarter; 4]), &ranges, &data.info).unwrap();
+        // Every block fits alone; their sum does not.
+        let over = view(&[quarter, quarter, quarter, quarter + 1]);
+        assert!(
+            over.blocks
+                .iter()
+                .all(|b| b.instructions.len() < MAX_GRAPH_INSTRUCTIONS)
+        );
+        let error = validate_view(&over, &ranges, &data.info).unwrap_err();
+        assert!(error.contains("Instruction count"), "{error}");
+        // Projects apply the same aggregate rule.
+        data.view = Some(over);
+        assert!(data.validate().unwrap_err().contains("Instruction count"));
+    }
 }
