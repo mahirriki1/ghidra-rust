@@ -470,7 +470,11 @@ mod tests {
         }
     }
 
-    fn frame(app: &mut DesktopApp, context: &egui::Context) -> Vec<String> {
+    fn draw(
+        app: &mut DesktopApp,
+        context: &egui::Context,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
         let time = context.input(|input| input.time) + 0.1;
         let mut output = context.run_ui(
             egui::RawInput {
@@ -479,12 +483,17 @@ mod tests {
                     egui::vec2(1000.0, 700.0),
                 )),
                 time: Some(time),
+                events,
                 ..Default::default()
             },
             |ui| app.main_panel(ui),
         );
         output.textures_delta.clear();
         output
+    }
+
+    fn frame(app: &mut DesktopApp, context: &egui::Context) -> Vec<String> {
+        draw(app, context, vec![])
             .shapes
             .iter()
             .filter_map(|shape| match &shape.shape {
@@ -669,6 +678,81 @@ mod tests {
             assert_eq!(app.selection_generation, selection);
             assert_eq!(app.history, history);
             assert_eq!(app.selected, Some(0x1000));
+        }
+    }
+
+    #[test]
+    fn saved_deep_selection_reveals_its_graph_row_after_preparation() {
+        let deep = 0x1000 + 45 * 4;
+        for scale in [1.0, 1.25] {
+            let context = egui::Context::default();
+            crate::theme::install(&context);
+            context.set_pixels_per_point(scale);
+            context
+                .run_ui(egui::RawInput::default(), |_| {})
+                .textures_delta
+                .clear();
+            let mut app = keyboard_app();
+            comment(&mut app, deep, "saved deep note");
+            let mut saved = project(&app, view(50, "mov"));
+            saved.project.data.selected_address = Some(deep);
+            app.restore_project(saved, &context);
+            app.settle_graph();
+            assert_eq!(app.selected, Some(deep));
+            assert_eq!(app.pending_listing_scroll, Some(45));
+            app.tab = Tab::Graph;
+            frame(&mut app, &context);
+            app.settle_graph();
+            let rows = frame(&mut app, &context);
+            assert!(
+                rows.iter()
+                    .any(|text| text.starts_with(&format!("{deep:08x}  "))),
+                "saved deep row must be visible: {rows:?}"
+            );
+            assert!(rows.contains(&"; saved deep note".to_owned()));
+            assert!(app.cached_graph && app.saved_analysis);
+            let camera = app.canvas.as_ref().unwrap().camera();
+            frame(&mut app, &context);
+            frame(&mut app, &context);
+            assert_eq!(
+                app.canvas.as_ref().unwrap().camera(),
+                camera,
+                "restore reveal is one-shot"
+            );
+            // After explicitly returning to Entry, clicking the already
+            // selected Listing row must queue a fresh graph reveal too.
+            let output = draw(&mut app, &context, vec![]);
+            let point = |output: &egui::FullOutput, label: &str| {
+                output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) if text.galley.text() == label => {
+                            Some(text.galley.rect.translate(text.pos.to_vec2()).center())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| panic!("missing {label}"))
+            };
+            let entry = point(&output, "Entry");
+            draw(&mut app, &context, crate::app::tests::pointer_events(entry));
+            frame(&mut app, &context);
+            assert_ne!(app.canvas.as_ref().unwrap().camera(), camera);
+            app.tab = Tab::Listing;
+            app.pending_listing_scroll = Some(45);
+            let output = draw(&mut app, &context, vec![]);
+            let selected = point(&output, &format!("{deep:08x}"));
+            draw(
+                &mut app,
+                &context,
+                crate::app::tests::pointer_events(selected),
+            );
+            app.tab = Tab::Graph;
+            let rows = frame(&mut app, &context);
+            assert!(
+                rows.iter()
+                    .any(|text| text.starts_with(&format!("{deep:08x}  ")))
+            );
         }
     }
 

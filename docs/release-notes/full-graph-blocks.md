@@ -8,7 +8,8 @@
   exact instruction. Revealing an instruction from the Listing cursor,
   pseudocode or a navigation moves the camera only when that row is not
   already visible, and Entry returns to the entry block's header near the top
-  instead of centering a tall block.
+  instead of centering a tall block. Reopening a saved deep selection and
+  clicking a Listing row also queue an exact, one-shot graph reveal.
 - Graph indexes and layout, including comment and call-name rows, are prepared
   off the GUI thread. Results for a previous function, binary, selection,
   annotation revision or project are discarded; saved projects keep their

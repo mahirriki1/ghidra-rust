@@ -3737,6 +3737,16 @@ impl DesktopApp {
         self.history_index = 0;
         self.selected = restore.selected;
         self.address = format!("{:x}", restore.selected.unwrap_or(address));
+        if let Some(pc) = restore.selected {
+            self.pending_listing_scroll = self.listing().position(pc);
+            if self.pending_listing_scroll.is_some()
+                && let Some(canvas) = &mut self.canvas
+            {
+                // This survives annotation preparation and is consumed only
+                // when the graph is shown with its final rows.
+                canvas.reveal_instruction(pc);
+            }
+        }
         let sections = self
             .info
             .as_ref()
@@ -8008,6 +8018,9 @@ impl DesktopApp {
                 theme::paint_listing_header(ui, header, &columns);
                 if let Some(address) = selected {
                     self.select_instruction(address);
+                    if let Some(canvas) = &mut self.canvas {
+                        canvas.reveal_instruction(address);
+                    }
                 }
                 self.listing_cursor_drawn(ui, output.inner_rect);
                 if let Some(target) = follow {
