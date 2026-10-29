@@ -78,8 +78,11 @@ See [architecture coverage](docs/architectures.md).
 ## Using the desktop
 
 Browse or filter Functions, then select a function to inspect its listing,
-graph, and pseudocode. Pan and zoom the graph; **Fit** shows an overview and
-**Entry** returns to readable entry code.
+graph, and pseudocode. Graph blocks show every instruction and comment row the
+bounded analysis returned; zoomed out, rows become compact marks. Pan and zoom
+the graph; **Fit** shows an overview and **Entry** returns to readable entry
+code. Listing cursor keys, pseudocode selection and navigation to an
+instruction reveal its exact graph row.
 **Legend** and graph warnings are in the graph toolbar.
 
 Narrow dock headers keep the active tab visible and put additional tabs in **»**.

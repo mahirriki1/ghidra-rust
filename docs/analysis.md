@@ -465,6 +465,13 @@ and unapplied-local warnings. View cameras and selections remain mutable;
 exact instruction history precedes cache adoption. Empty success differs from
 missing results; failed analysis is not cached.
 
+Graph indexes and block geometry, including comment and call-name rows, are
+prepared on one presentation thread per window with at most one running, one
+pending and one finished job. Results are checked again against the binary,
+selection, request binding and annotation/name revisions before display, and
+job inputs are charged to the session result store. Stored results display
+immediately.
+
 Compatibility depends on binary SHA-256, engine/signature fingerprints,
 committed signatures, inventory, effective function names, and per-function local
 identities/names. Background jobs compute changed projections. Request, selection,

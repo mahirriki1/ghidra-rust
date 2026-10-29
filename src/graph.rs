@@ -46,6 +46,8 @@ struct GraphRow {
     address: u64,
     kind: RowKind,
     text: String,
+    /// Byte boundary of a bounded callee display name within `text`.
+    name_start: Option<usize>,
 }
 
 struct Node {
@@ -79,6 +81,7 @@ pub struct GraphGeometry {
     blocks: Box<[(u64, u32)]>,
 }
 
+#[cfg(test)]
 type Layout = GraphGeometry;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,7 +102,11 @@ pub struct GraphCanvas {
     needs_fit: bool,
     needs_initial_view: bool,
     reveal: Option<Reveal>,
+    /// Annotation revisions of the displayed or awaited comment geometry.
     comment_key: Option<(u64, u64, u64)>,
+    /// Base geometry stands in until geometry for `comment_key` is adopted;
+    /// camera requests wait for it, so they apply to the final rows.
+    awaiting: bool,
     /// The instruction under the last secondary click, kept while its context
     /// menu stays open and the pointer moves. Reset with the function.
     context: Option<u64>,
@@ -151,6 +158,7 @@ impl GraphCanvas {
             needs_initial_view: true,
             reveal: None,
             comment_key: None,
+            awaiting: false,
             context: None,
             #[cfg(test)]
             painted: Painted::default(),
@@ -163,38 +171,73 @@ impl GraphCanvas {
         self.reveal = Some(Reveal::Instruction(address));
     }
 
-    /// Refresh only derived geometry, retaining the user's camera and pending
-    /// reveal. Previews are bounded and cached by the app's annotation and
-    /// name revisions. `call_names` holds names of verified direct-call targets
-    /// by call-instruction address.
-    pub fn set_comments(
+    /// The annotation revisions last requested of this canvas.
+    pub fn annotation(&self) -> Option<(u64, u64, u64)> {
+        self.comment_key
+    }
+
+    /// Whether comment geometry for [`Self::annotation`] is still awaited.
+    pub fn awaiting(&self) -> bool {
+        self.awaiting
+    }
+
+    /// Shows the base geometry for annotation revisions `key`. With
+    /// `awaiting`, comment geometry for `key` is being prepared: edited or
+    /// deleted comments are no longer displayed, and the camera is kept.
+    pub fn show_base(&mut self, key: (u64, u64, u64), awaiting: bool) {
+        self.layout = self.base.clone();
+        self.comment_key = Some(key);
+        self.awaiting = awaiting;
+    }
+
+    /// Adopts prepared comment geometry for exactly the awaited `key`,
+    /// retaining the camera and any pending reveal.
+    pub fn adopt_annotation(&mut self, key: (u64, u64, u64), geometry: Arc<GraphGeometry>) -> bool {
+        if !self.awaiting || self.comment_key != Some(key) {
+            return false;
+        }
+        self.layout = geometry;
+        self.awaiting = false;
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn camera(&self) -> (f32, Vec2) {
+        (self.zoom, self.pan)
+    }
+
+    /// Whether the canvas displays exactly `geometry`.
+    #[cfg(test)]
+    pub(crate) fn shows(&self, geometry: &Arc<GraphGeometry>) -> bool {
+        Arc::ptr_eq(&self.layout, geometry)
+    }
+
+    /// Displayed comment rows, for app lifecycle tests.
+    #[cfg(test)]
+    pub(crate) fn comment_rows(&self) -> Vec<String> {
+        self.layout
+            .nodes
+            .iter()
+            .flat_map(|node| &node.rows)
+            .filter(|row| row.kind == RowKind::Comment)
+            .map(|row| row.text.clone())
+            .collect()
+    }
+
+    /// Synchronous comment layout for headless tests.
+    #[cfg(test)]
+    fn set_comments(
         &mut self,
         view: &FunctionView,
         key: (u64, u64, u64),
         comments: &BTreeMap<u64, String>,
         call_names: impl FnOnce() -> BTreeMap<u64, String>,
     ) {
-        if self.function != view.address {
-            *self = Self::new(view);
-        }
         if self.comment_key != Some(key) {
             let call_names = &call_names();
-            let commented = view
-                .blocks
-                .iter()
-                .take(MAX_GRAPH_BLOCKS)
-                .flat_map(|block| &block.instructions)
-                .any(|instruction| {
-                    comments.contains_key(&instruction.address)
-                        || call_names.contains_key(&instruction.address)
-                });
-            self.layout = if commented {
-                let _layout = crate::performance::span("gui_graph_comment_layout");
-                Arc::new(Layout::annotated(view, comments, call_names))
-            } else {
-                self.base.clone()
-            };
-            self.comment_key = Some(key);
+            self.show_base(key, true);
+            let geometry = Arc::new(Layout::annotated(view, comments, call_names));
+            self.adopt_annotation(key, geometry);
         }
     }
 
@@ -217,8 +260,10 @@ impl GraphCanvas {
         related: &BTreeSet<u64>,
         menu: impl FnOnce(&mut egui::Ui, Option<u64>),
     ) -> Option<GraphAction> {
+        // The app replaces the canvas with its graph; geometry is never
+        // rebuilt here for another view.
         if self.function != view.address {
-            *self = Self::new(view);
+            return None;
         }
         let mut zoom_change = 1.0;
         ui.horizontal_wrapped(|ui| {
@@ -276,13 +321,17 @@ impl GraphCanvas {
         });
         let size = ui.available_size().max(vec2(1.0, 1.0));
         let (canvas, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
-        if self.needs_initial_view {
+        if self.awaiting {
+            // Fit, Entry and reveals apply once the final rows are adopted.
+        } else if self.needs_initial_view {
             self.initial_view(canvas.size());
         } else if self.needs_fit {
             self.fit(canvas.size());
         }
         self.change_zoom(zoom_change, canvas.size() * 0.5);
-        if let Some(reveal) = self.reveal.take() {
+        if !self.awaiting
+            && let Some(reveal) = self.reveal.take()
+        {
             self.reveal_at(reveal, canvas.size());
         }
 
@@ -311,6 +360,10 @@ impl GraphCanvas {
         let painter = ui.painter_at(canvas);
         painter.rect_filled(canvas, 0.0, theme::GRAPH_BACKGROUND);
         let layout = Arc::clone(&self.layout);
+        if self.needs_initial_view {
+            // No camera yet: awaiting the first comment geometry.
+            return None;
+        }
         if layout.nodes.is_empty() {
             painter.text(
                 canvas.center(),
@@ -474,15 +527,37 @@ impl GraphCanvas {
                             theme::CURRENT_LINE,
                         );
                     }
-                    node_painter.text(
-                        area.left_center() + vec2(8.0 * zoom, 0.0),
-                        Align2::LEFT_CENTER,
-                        &line.text,
-                        FontId::monospace(12.0 * zoom),
-                        match line.kind {
-                            RowKind::Instruction => theme::TEXT,
-                            RowKind::Comment => theme::SYNTAX_COMMENT,
+                    let color = match line.kind {
+                        RowKind::Instruction => theme::TEXT,
+                        RowKind::Comment => theme::SYNTAX_COMMENT,
+                    };
+                    let mut job = egui::text::LayoutJob::default();
+                    let split = line.name_start.unwrap_or(line.text.len());
+                    job.append(
+                        &line.text[..split],
+                        0.0,
+                        egui::TextFormat {
+                            font_id: FontId::monospace(12.0 * zoom),
+                            color,
+                            ..Default::default()
                         },
+                    );
+                    if split < line.text.len() {
+                        job.append(
+                            &line.text[split..],
+                            0.0,
+                            egui::TextFormat {
+                                font_id: FontId::proportional(13.0 * zoom),
+                                color: theme::SYNTAX_FUNCTION,
+                                ..Default::default()
+                            },
+                        );
+                    }
+                    let galley = node_painter.layout_job(job);
+                    node_painter.galley(
+                        area.left_center() + vec2(8.0 * zoom, -galley.size().y * 0.5),
+                        galley,
+                        theme::TEXT,
                     );
                     #[cfg(test)]
                     {
@@ -748,7 +823,9 @@ impl GraphGeometry {
         Some(self.blocks[index].1 as usize)
     }
 
-    fn annotated(
+    /// Geometry with comment rows and verified call names, by instruction
+    /// address. Text beyond [`row_prefix`] is never displayed.
+    pub fn annotated(
         view: &FunctionView,
         comments: &BTreeMap<u64, String>,
         call_names: &BTreeMap<u64, String>,
@@ -756,9 +833,32 @@ impl GraphGeometry {
         Self::prepare(view, comments, call_names, &|| false).expect("never cancelled")
     }
 
+    /// A conservative allocation estimate for preparing `view` with
+    /// `comment_rows` comment rows, charged before the work starts.
+    pub fn estimated_bytes(view: &FunctionView, comment_rows: usize) -> usize {
+        let blocks = view.blocks.len().min(MAX_GRAPH_BLOCKS);
+        let instructions = view
+            .blocks
+            .iter()
+            .take(blocks)
+            .map(|block| block.instructions.len())
+            .fold(0usize, usize::saturating_add)
+            .min(MAX_GRAPH_INSTRUCTIONS);
+        let rows = instructions.saturating_add(comment_rows.min(instructions));
+        // Each row holds at most ROW_CHARS + 1 four-byte characters.
+        let row = size_of::<GraphRow>() + (ROW_CHARS + 1) * 4;
+        let edge = size_of::<RoutedEdge>() + 6 * size_of::<Pos2>() + 64;
+        let node = size_of::<Node>() + size_of::<(u64, u32)>() + 48;
+        size_of::<Self>()
+            .saturating_add(rows.saturating_mul(row))
+            .saturating_add(instructions.saturating_mul(size_of::<(u64, u32, u32)>()))
+            .saturating_add(blocks.saturating_mul(node))
+            .saturating_add(view.edges.len().min(MAX_GRAPH_EDGES).saturating_mul(edge))
+    }
+
     /// Lays out every row of `view` once. `cancelled` is polled between
     /// phases; a cancelled preparation returns `None`.
-    fn prepare(
+    pub fn prepare(
         view: &FunctionView,
         comments: &BTreeMap<u64, String>,
         call_names: &BTreeMap<u64, String>,
@@ -817,6 +917,9 @@ impl GraphGeometry {
             let mut row_height: f32 = 0.0;
             let row_width = addresses.len() as f32 * (WIDTH + 60.0) - 60.0;
             for (column, address) in addresses.iter().enumerate() {
+                if cancelled() {
+                    return None;
+                }
                 let block = blocks[address];
                 let instructions = &block.instructions[..block.instructions.len().min(budget)];
                 budget -= instructions.len();
@@ -825,21 +928,24 @@ impl GraphGeometry {
                     let callee = call_names
                         .get(&instruction.address)
                         .map_or(String::new(), |name| format!("  {name}"));
+                    let code = format!(
+                        "{:08x}  {:<8} {}",
+                        instruction.address, instruction.mnemonic, instruction.operands
+                    );
+                    let text = crop(&format!("{code}{callee}"), ROW_CHARS);
+                    let name_start = (!callee.is_empty() && code.len() + 2 < text.len())
+                        .then_some(code.len() + 2);
                     lines.push(GraphRow {
                         address: instruction.address,
                         kind: RowKind::Instruction,
-                        text: crop(
-                            &format!(
-                                "{:08x}  {:<8} {}{callee}",
-                                instruction.address, instruction.mnemonic, instruction.operands
-                            ),
-                            ROW_CHARS,
-                        ),
+                        text,
+                        name_start,
                     });
                     if let Some(comment) = comments.get(&instruction.address) {
                         lines.push(GraphRow {
                             address: instruction.address,
                             kind: RowKind::Comment,
+                            name_start: None,
                             text: format!(
                                 "; {}",
                                 crate::annotation_display::preview(comment, ROW_CHARS)
@@ -918,6 +1024,9 @@ impl GraphGeometry {
         let mut left_lanes = Vec::new();
         let mut right_lanes = Vec::new();
         for (index, edge) in view.edges.iter().take(MAX_GRAPH_EDGES).enumerate() {
+            if cancelled() {
+                return None;
+            }
             let Some(source) = positions.get(&edge.source) else {
                 continue;
             };
@@ -1048,6 +1157,12 @@ impl GraphGeometry {
             blocks: block_index.into(),
         })
     }
+}
+
+/// The bounded prefix of a comment or name that can reach a graph row, so
+/// annotation snapshots never copy longer text.
+pub fn row_prefix(text: &str) -> String {
+    text.chars().take(ROW_CHARS + 1).collect()
 }
 
 fn crop(text: &str, limit: usize) -> String {
@@ -2272,5 +2387,48 @@ mod tests {
             MAX_GRAPH_INSTRUCTIONS
         );
         assert!(graph_notes(&over).any(|note| note.contains("2048 instructions")));
+    }
+    #[test]
+    fn graph_call_names_keep_body_font_and_exact_row_selection() {
+        let view = tall_fixture();
+        let pc = view.calls[0].address;
+        let context = context(1.25);
+        let mut graph = GraphCanvas::new(&view);
+        graph.set_comments(&view, (1, 1, 1), &BTreeMap::new(), || {
+            BTreeMap::from([(pc, "callee_name".into())])
+        });
+        graph.reveal_instruction(pc);
+        let (output, _) = paint(
+            &context,
+            &mut graph,
+            &view,
+            vec2(760.0, 600.0),
+            vec![],
+            Some(pc),
+        );
+        let text = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text().contains("callee_name") => Some(text),
+                _ => None,
+            })
+            .expect("late callee is painted");
+        let section = text.galley.job.sections.last().unwrap();
+        assert_eq!(
+            section.format.font_id.family,
+            egui::FontFamily::Proportional
+        );
+        assert_eq!(section.format.color, theme::SYNTAX_FUNCTION);
+        let pos = text.pos + vec2(30.0, 2.0);
+        let (_, action) = paint(
+            &context,
+            &mut graph,
+            &view,
+            vec2(760.0, 600.0),
+            click(pos, 1),
+            None,
+        );
+        assert_eq!(action, Some(GraphAction::Select(pc)));
     }
 }
