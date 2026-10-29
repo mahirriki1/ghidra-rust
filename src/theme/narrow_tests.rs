@@ -382,3 +382,150 @@ fn replacing_overflowed_tabs_closes_the_obsolete_popup() {
     });
     assert!(!egui::Popup::is_any_open(&context));
 }
+
+#[test]
+fn saved_decompiler_keeps_warning_indicator_and_details_reachable() {
+    for scale in [1.0, 1.25] {
+        for width in [180.0, 240.0, 700.0] {
+            let context = context(scale);
+            let warnings = vec!["A specific name could not be applied".to_owned()];
+            let actions = [
+                DockAction {
+                    id: 0,
+                    label: "Copy",
+                    tooltip: "Copy",
+                    enabled: true,
+                    priority: 0,
+                    kind: DockActionKind::Button,
+                },
+                DockAction {
+                    id: 1,
+                    label: "Refresh",
+                    tooltip: "Refresh",
+                    enabled: true,
+                    priority: 1,
+                    kind: DockActionKind::Button,
+                },
+                DockAction {
+                    id: 2,
+                    label: "Warnings",
+                    tooltip: "Names not applied",
+                    enabled: true,
+                    priority: 2,
+                    kind: DockActionKind::Warnings(&warnings),
+                },
+                DockAction {
+                    id: 3,
+                    label: "Signature…",
+                    tooltip: "Signature",
+                    enabled: true,
+                    priority: 4,
+                    kind: DockActionKind::Button,
+                },
+                DockAction {
+                    id: 4,
+                    label: "Auto",
+                    tooltip: "Auto",
+                    enabled: true,
+                    priority: 3,
+                    kind: DockActionKind::Toggle(true),
+                },
+            ];
+            let mut dispatched = Vec::new();
+            let mut draw = |events| {
+                frame(&context, width, events, |ui| {
+                    if let Some(action) = dock_header_actions(
+                        ui,
+                        "Decompiler",
+                        Some(("Saved analysis", "Saved source")),
+                        &actions,
+                    ) {
+                        dispatched.push(action);
+                    }
+                })
+            };
+            draw(vec![]);
+            let output = draw(vec![]);
+            let indicator = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text)
+                        if ["⋯", "1"].contains(&text.galley.text())
+                            && text
+                                .galley
+                                .job
+                                .sections
+                                .iter()
+                                .any(|section| section.format.color == WARNING) =>
+                    {
+                        Some((
+                            text.galley.text().to_owned(),
+                            text.galley.rect.translate(text.pos.to_vec2()).center(),
+                        ))
+                    }
+                    _ => None,
+                })
+                .expect("warnings stay visible on the header");
+            draw(click(indicator.1));
+            if indicator.0 == "⋯" {
+                let output = draw(vec![]);
+                draw(click(point(&output, "Warnings (1)")));
+            }
+            let output = draw(vec![]);
+            assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == warnings[0])));
+            // Close warning details, then dispatch both enabled commands at
+            // narrow and wide widths through their actual controls.
+            egui::Popup::close_all(&context);
+            for label in ["Refresh", "Signature…"] {
+                let output = draw(vec![]);
+                if !output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == label)) {
+                    draw(click(point(&output, "⋯")));
+                }
+                let output = draw(vec![]);
+                draw(click(point(&output, label)));
+                draw(vec![]);
+            }
+            assert_eq!(dispatched, vec![1, 3]);
+        }
+    }
+}
+
+#[test]
+fn truncated_listing_addresses_keep_the_distinguishing_low_digits() {
+    for scale in [1.0, 1.25] {
+        let context = context(scale);
+        frame(&context, 180.0, vec![], |_| {});
+        for address in [0xffff_ffff_8100_0a3c, 0xffff_ffff_8100_0a40] {
+            let output = frame(&context, 180.0, vec![], |ui| {
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), ROW_HEIGHT),
+                    egui::Sense::hover(),
+                );
+                let columns = listing_columns(rect.width(), glyph_width(ui), 16, scale);
+                let elided = listing_cells(
+                    ui,
+                    rect,
+                    &columns,
+                    &ListingRow {
+                        address,
+                        address_digits: 16,
+                        bytes: &[0x90],
+                        mnemonic: "nop",
+                        operands: "",
+                        callee: None,
+                        comment: None,
+                    },
+                );
+                assert!(
+                    elided.address,
+                    "scale={scale} rect={rect:?} columns={columns:?} glyph={} visible={}",
+                    glyph_width(ui),
+                    ui.is_rect_visible(rect)
+                );
+            });
+            let suffix = format!("{:04x}", address & 0xffff);
+            assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if !text.galley.elided && text.galley.text().starts_with('…') && text.galley.text().ends_with(&suffix))));
+        }
+    }
+}

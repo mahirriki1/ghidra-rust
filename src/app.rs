@@ -7547,7 +7547,7 @@ impl DesktopApp {
                         }
                         if elided.address || elided.bytes || elided.code {
                             hover.push(format!(
-                                "{:x}  {}  {} {}",
+                                "{:0digits$x}  {}  {} {}",
                                 instruction.address,
                                 hex(&instruction.bytes),
                                 instruction.mnemonic,
@@ -7610,9 +7610,12 @@ impl DesktopApp {
                         None
                     },
                 );
-                let header = header.with_max_x(header.left() + output.inner_rect.width());
-                let columns =
-                    theme::listing_columns(header.width(), glyph, digits, ui.pixels_per_point());
+                let columns = theme::listing_columns(
+                    output.inner_rect.width(),
+                    glyph,
+                    digits,
+                    ui.pixels_per_point(),
+                );
                 theme::paint_listing_header(ui, header, &columns);
                 if let Some(address) = selected {
                     self.select_instruction(address);
@@ -10471,7 +10474,7 @@ mod tests {
     #[test]
     fn narrow_decompiler_header_keeps_actions_reachable_and_copies_full_source() {
         for scale in [1.0, 1.25] {
-            for width in [180.0, 260.0, 700.0] {
+            for width in [180.0, 240.0, 260.0, 700.0] {
                 let context = egui::Context::default();
                 theme::install(&context);
                 context.set_pixels_per_point(scale);
@@ -10497,6 +10500,27 @@ mod tests {
                     output
                 };
                 draw(vec![]);
+                if width == 240.0 {
+                    let output = draw(vec![]);
+                    for label in ["Decompiler", "Copy", "Refresh", "Saved"] {
+                        assert!(
+                            !exact_text(&output, label).is_empty(),
+                            "inline {label} at {scale}"
+                        );
+                    }
+                    for shape in &output.shapes {
+                        if let egui::Shape::Text(text) = &shape.shape
+                            && ["Decompiler", "Saved"].contains(&text.galley.text())
+                        {
+                            assert!(!text.galley.elided);
+                            assert!(
+                                shape
+                                    .clip_rect
+                                    .contains_rect(text.galley.rect.translate(text.pos.to_vec2()))
+                            );
+                        }
+                    }
+                }
                 for label in ["Copy", "Auto"] {
                     let output = draw(vec![]);
                     if exact_text(&output, label).is_empty() {
@@ -10988,11 +11012,23 @@ mod tests {
 
     #[test]
     fn side_docks_leave_the_central_views_room_as_the_window_shrinks() {
-        for width in [700.0_f32, 760.0, 1024.0, 1440.0, 2560.0] {
-            let (left, right) = dock_ranges(width);
-            let right = right(width - left.max);
-            assert!(left.min <= left.max && right.min <= right.max);
-            assert!(width - left.max - right.max >= 260.0, "{width}");
+        for width in [
+            0.0_f32, 20.0, 200.0, 400.0, 680.0, 700.0, 760.0, 1024.0, 1440.0, 2560.0,
+        ] {
+            let (left, right_range) = dock_ranges(width);
+            for left_width in [left.min, left.max] {
+                let right = right_range(width - left_width);
+                for range in [left, right] {
+                    assert!(range.min.is_finite() && range.max.is_finite());
+                    assert!(
+                        0.0 <= range.min && range.min <= range.max,
+                        "{width}: {range:?}"
+                    );
+                }
+                let usable = (width - 32.0).max(0.0);
+                let central = 260.0 * (usable / 680.0).min(1.0);
+                assert!(width - left_width - right.max + 0.001 >= central, "{width}");
+            }
         }
     }
 

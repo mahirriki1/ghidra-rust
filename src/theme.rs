@@ -276,19 +276,6 @@ pub fn history_button(ui: &mut Ui, forward: bool, enabled: bool) -> egui::Respon
         .on_disabled_hover_text(tooltip)
 }
 
-/// An editor-style tab on a recessed strip, with trailing passive content such
-/// as counts. `active` marks the focused provider with an accent rule.
-pub fn dock_header(
-    ui: &mut Ui,
-    title: &str,
-    active: bool,
-    saved: Option<(&str, &str)>,
-    passive: impl FnOnce(&mut Ui),
-) {
-    let mut current = active;
-    dock_strip::<bool, ()>(ui, &mut current, &[(active, title)], saved, &[], passive);
-}
-
 /// A lone dock title with declared actions. Actions that do not fit move into
 /// a More actions menu; the caller dispatches the returned action afterwards.
 pub fn dock_header_actions<A: Copy>(
@@ -346,10 +333,9 @@ struct DockResponse<A> {
 
 const DOCK_HEIGHT: f32 = 26.0;
 const DOCK_GAP: f32 = 4.0;
-/// Space between adjacent tabs.
-const DOCK_TAB_GAP: f32 = 1.0;
 const DOCK_TAB_PAD: f32 = 11.0;
 const DOCK_TIGHT_PAD: f32 = 4.0;
+const DOCK_ACTION_PAD: f32 = 3.0;
 /// Width of the More tabs and More actions buttons.
 const DOCK_ICON: f32 = 20.0;
 const DOCK_RIGHT: f32 = 4.0;
@@ -362,6 +348,8 @@ struct DockMeasure {
     tabs: Vec<f32>,
     selected: Option<usize>,
     minimum_tab: f32,
+    /// One physical pixel between adjacent tabs.
+    tab_gap: f32,
     /// Compact and preferred provenance label widths.
     saved: Option<(f32, f32)>,
     /// Inline width and priority of each declared action.
@@ -390,7 +378,7 @@ impl DockMeasure {
             used += compact + DOCK_GAP;
         }
         if more_tabs {
-            used += DOCK_ICON + DOCK_TAB_GAP;
+            used += DOCK_ICON + self.tab_gap;
         }
         if !self.tabs.is_empty() {
             used += self.minimum_tab;
@@ -398,8 +386,8 @@ impl DockMeasure {
         used
     }
 
-    /// One strict priority chain: the active tab's full label, the preferred
-    /// provenance label, actions by priority, then other tabs in order. The
+    /// One strict priority chain: the active tab's full label, actions by
+    /// priority, the preferred provenance label, then other tabs in order. The
     /// first item that does not fit ends the chain, so a wider strip only
     /// ever shows more.
     fn place(&self, more_tabs: bool, more_actions: bool) -> DockLayout {
@@ -432,16 +420,16 @@ impl DockMeasure {
             }
             *open
         };
-        if let Some((compact, full)) = self.saved {
-            layout.saved_full = fits(full - compact, &mut open);
-        }
         let mut order: Vec<usize> = (0..self.actions.len()).collect();
         order.sort_by_key(|&index| self.actions[index].1);
         for index in order {
             layout.inline[index] = fits(self.actions[index].0 + DOCK_GAP, &mut open);
         }
+        if let Some((compact, full)) = self.saved {
+            layout.saved_full = fits(full - compact, &mut open);
+        }
         for (index, &width) in self.tabs.iter().enumerate() {
-            if Some(index) != self.selected && fits(width + DOCK_TAB_GAP, &mut open) {
+            if Some(index) != self.selected && fits(width + self.tab_gap, &mut open) {
                 layout.tabs[index] = Some(width);
             }
         }
@@ -506,20 +494,6 @@ fn dock_strip<T: PartialEq + Copy, A: Copy>(
     );
     // Allocation order scopes every tab, control and popup to this strip.
     let base = strip_response.id;
-    // A changed tab list must not keep a popup keyed to obsolete entries.
-    let labels = {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::hash::DefaultHasher::new();
-        for (_, label) in tabs {
-            label.hash(&mut hasher);
-        }
-        hasher.finish()
-    };
-    let labels_key = base.with("dock-more-tabs-labels");
-    if ui.data(|data| data.get_temp::<u64>(labels_key)) != Some(labels) {
-        ui.data_mut(|data| data.insert_temp(labels_key, labels));
-        egui::Popup::close_id(ui.ctx(), base.with("dock-more-tabs").with("dock-popup"));
-    }
     let ppp = ui.pixels_per_point();
     let clip = strip.intersect(ui.clip_rect());
     let painter = ui.painter().with_clip_rect(clip);
@@ -535,7 +509,12 @@ fn dock_strip<T: PartialEq + Copy, A: Copy>(
     let tab_font = FontId::proportional(13.0);
     let button_font = TextStyle::Button.resolve(ui.style());
     let body_font = TextStyle::Body.resolve(ui.style());
-    let pad = ui.spacing().button_padding.x;
+    let pad = DOCK_ACTION_PAD;
+    let tab_pad = if actions.is_empty() {
+        DOCK_TAB_PAD
+    } else {
+        DOCK_TIGHT_PAD
+    };
     let selected = tabs.iter().position(|(value, _)| value == current);
     let minimum_tab = ceil_pixels(text_width(ui, "…", &tab_font) + DOCK_TIGHT_PAD * 2.0, ppp);
     let saved_widths = saved.map(|(preferred, _)| {
@@ -565,12 +544,11 @@ fn dock_strip<T: PartialEq + Copy, A: Copy>(
         available: 0.0,
         tabs: tabs
             .iter()
-            .map(|(_, label)| {
-                ceil_pixels(text_width(ui, label, &tab_font) + DOCK_TAB_PAD * 2.0, ppp)
-            })
+            .map(|(_, label)| ceil_pixels(text_width(ui, label, &tab_font) + tab_pad * 2.0, ppp))
             .collect(),
         selected,
         minimum_tab,
+        tab_gap: 1.0 / ppp,
         saved: saved_widths,
         actions: action_widths,
     };
@@ -600,13 +578,6 @@ fn dock_strip<T: PartialEq + Copy, A: Copy>(
     };
     measure.available = floor_pixels(right - strip.left(), ppp).max(0.0);
     let layout = measure.layout();
-    if !layout.more_tabs {
-        egui::Popup::close_id(ui.ctx(), base.with("dock-more-tabs").with("dock-popup"));
-    }
-    if !layout.more_actions {
-        egui::Popup::close_id(ui.ctx(), base.with("dock-more-actions").with("dock-popup"));
-    }
-
     let control_rect = |left: f32, right: f32| {
         egui::Rect::from_min_max(
             egui::pos2(left, strip.center().y - 10.0),
@@ -668,7 +639,7 @@ fn dock_strip<T: PartialEq + Copy, A: Copy>(
             continue;
         };
         let full = width >= measure.tabs[index];
-        let pad = if full { DOCK_TAB_PAD } else { DOCK_TIGHT_PAD };
+        let pad = if full { tab_pad } else { DOCK_TIGHT_PAD };
         let mut job =
             egui::text::LayoutJob::simple_singleline((*label).to_owned(), tab_font.clone(), TEXT);
         job.wrap = egui::text::TextWrapping::truncate_at_width((width - pad * 2.0).max(0.0));
@@ -677,7 +648,7 @@ fn dock_strip<T: PartialEq + Copy, A: Copy>(
             egui::pos2(x, strip.top() + 3.0),
             egui::vec2(width, DOCK_HEIGHT - 3.0),
         );
-        x = tab.right() + DOCK_TAB_GAP;
+        x = tab.right() + measure.tab_gap;
         let interact = tab.intersect(tab_clip);
         let tab_response = ui
             .interact(
@@ -755,7 +726,7 @@ fn dock_strip<T: PartialEq + Copy, A: Copy>(
 const WARNING_ICON: f32 = 16.0;
 
 /// The menu button listing hidden tabs in their order; returns the chosen one.
-/// A replaced tab list closes an open menu rather than reusing its indices.
+/// Entries are rebuilt from the current tab list each frame.
 fn more_tabs_menu<T>(
     ui: &mut Ui,
     base: egui::Id,
@@ -772,6 +743,7 @@ fn more_tabs_menu<T>(
         clip,
         "More tabs",
         "»",
+        false,
     );
     let popup = egui::Popup::menu(&button).id(base.with("dock-more-tabs").with("dock-popup"));
     let max_height = (ui.ctx().content_rect().bottom() - bottom - 12.0).max(ROW_HEIGHT * 3.0);
@@ -808,6 +780,10 @@ fn more_actions_menu<A: Copy>(
         clip,
         "More actions",
         "⋯",
+        actions.iter().zip(inline).any(|(action, inline)| {
+            !inline
+                && matches!(action.kind, DockActionKind::Warnings(warnings) if !warnings.is_empty())
+        }),
     );
     let mut chosen = None;
     egui::Popup::menu(&button)
@@ -875,6 +851,7 @@ fn icon_button(
     clip: egui::Rect,
     name: &str,
     icon: &str,
+    warning: bool,
 ) -> egui::Response {
     let response = ui
         .interact(rect.intersect(clip), id, egui::Sense::click())
@@ -895,7 +872,9 @@ fn icon_button(
         egui::Align2::CENTER_CENTER,
         icon,
         FontId::proportional(13.0),
-        if response.hovered() || open {
+        if warning {
+            WARNING
+        } else if response.hovered() || open {
             TEXT
         } else {
             MUTED
@@ -904,7 +883,8 @@ fn icon_button(
     response
 }
 
-/// One inline action painted in exactly `rect`; returns whether it activated.
+/// Place standard egui controls within the measured slot. Warning counts use
+/// the shared triangle and a detail popup.
 fn inline_action<A>(
     ui: &mut Ui,
     id: egui::Id,
@@ -913,79 +893,29 @@ fn inline_action<A>(
     action: &DockAction<'_, A>,
 ) -> bool {
     let mut child = ui.new_child(egui::UiBuilder::new().id_salt(id).max_rect(rect));
-    child.set_clip_rect(clip);
+    child.set_clip_rect(rect.intersect(clip));
+    child.spacing_mut().button_padding.x = DOCK_ACTION_PAD;
     if !action.enabled {
         child.disable();
     }
-    let response = child.interact(rect.intersect(clip), id, egui::Sense::click());
-    let response = if action.tooltip.is_empty() {
-        response
-    } else {
-        response
-            .on_hover_text(action.tooltip)
-            .on_disabled_hover_text(action.tooltip)
-    };
-    let enabled = response.enabled();
-    let visuals = *child.style().interact(&response);
-    let painter = child.painter();
-    let pad = child.spacing().button_padding.x;
-    let font = TextStyle::Button.resolve(child.style());
-    let text_color = if enabled {
-        TEXT
-    } else {
-        MUTED.gamma_multiply(0.6)
-    };
-    painter.rect_filled(rect, visuals.corner_radius, visuals.weak_bg_fill);
-    match action.kind {
-        DockActionKind::Button => {
-            response.widget_info(|| {
-                egui::WidgetInfo::labeled(egui::Role::Button, enabled, action.label)
-            });
-            painter.text(
-                egui::pos2(rect.left() + pad, rect.center().y),
-                egui::Align2::LEFT_CENTER,
-                action.label,
-                font,
-                text_color,
-            );
-        }
-        DockActionKind::Toggle(checked) => {
-            response.widget_info(|| {
-                egui::WidgetInfo::selected(egui::Role::CheckBox, enabled, checked, action.label)
-            });
-            let size = child.spacing().icon_width;
-            let icon = egui::Rect::from_center_size(
-                egui::pos2(rect.left() + pad + size / 2.0, rect.center().y),
-                egui::vec2(size, size),
-            );
-            painter.rect_filled(icon, 2, INPUT);
-            if checked {
-                let stroke = Stroke::new(1.6, if enabled { ACCENT } else { text_color });
-                painter.line(
-                    vec![
-                        egui::pos2(icon.left() + size * 0.22, icon.center().y),
-                        egui::pos2(icon.left() + size * 0.42, icon.bottom() - size * 0.25),
-                        egui::pos2(icon.right() - size * 0.2, icon.top() + size * 0.25),
-                    ],
-                    stroke,
-                );
-            }
-            painter.text(
-                egui::pos2(icon.right() + child.spacing().icon_spacing, rect.center().y),
-                egui::Align2::LEFT_CENTER,
-                action.label,
-                font,
-                text_color,
-            );
+    let response = match action.kind {
+        DockActionKind::Button => child.put(rect, egui::Button::new(action.label).small()),
+        DockActionKind::Toggle(mut checked) => {
+            child.put(rect, egui::Checkbox::new(&mut checked, action.label))
         }
         DockActionKind::Warnings(warnings) => {
+            let response = child.interact(rect.intersect(clip), id, egui::Sense::click());
             response.widget_info(|| {
                 egui::WidgetInfo::labeled(
                     egui::Role::Button,
-                    enabled,
+                    response.enabled(),
                     format!("{} warnings", warnings.len()),
                 )
             });
+            let visuals = child.style().interact(&response);
+            let painter = child.painter();
+            painter.rect_filled(rect, visuals.corner_radius, visuals.weak_bg_fill);
+            let pad = child.spacing().button_padding.x;
             paint_warning_icon(
                 painter,
                 egui::pos2(rect.left() + pad + 5.0, rect.center().y),
@@ -994,14 +924,18 @@ fn inline_action<A>(
                 egui::pos2(rect.left() + pad + WARNING_ICON, rect.center().y),
                 egui::Align2::LEFT_CENTER,
                 warnings.len().to_string(),
-                font,
+                TextStyle::Button.resolve(child.style()),
                 WARNING,
             );
             egui::Popup::menu(&response).show(|ui| warning_list(ui, warnings));
+            response.on_hover_text(action.tooltip);
             return false;
         }
-    }
-    response.clicked()
+    };
+    response
+        .on_hover_text(action.tooltip)
+        .on_disabled_hover_text(action.tooltip)
+        .clicked()
 }
 
 fn paint_warning_icon(painter: &egui::Painter, center: egui::Pos2) {
@@ -1217,13 +1151,18 @@ pub fn listing_cells(
     };
     let mono =
         |text: String, color| egui::text::LayoutJob::single_section(text, mono_format(color));
-    elided.address = paint(
-        columns.address,
-        mono(
-            format!("{:0digits$x}", row.address, digits = row.address_digits),
-            ADDRESS,
-        ),
-    );
+    let mut address = format!("{:0digits$x}", row.address, digits = row.address_digits);
+    let font = FontId::monospace(13.0);
+    // Keep the changing low digits visible when a wide address must shorten.
+    let shortened = text_width(ui, &address, &font) > columns.address.span() + slack;
+    if shortened {
+        let digits = ((columns.address.span() - text_width(ui, "…", &font)) / glyph_width(ui))
+            .max(0.0)
+            .floor() as usize;
+        address = format!("…{}", &address[address.len() - digits.min(address.len())..]);
+    }
+    let clipped = paint(columns.address, mono(address, ADDRESS));
+    elided.address = shortened || clipped;
     if let Some(range) = columns.bytes {
         elided.bytes |= paint(range, mono(listing_bytes(row.bytes), BYTES));
     }
@@ -1698,10 +1637,10 @@ mod tests {
                                 ..Default::default()
                             },
                             |ui| {
-                                super::dock_header(
+                                super::dock_tabs(
                                     ui,
-                                    title,
-                                    false,
+                                    &mut false,
+                                    &[(false, title)],
                                     Some(("Saved analysis", "Saved results")),
                                     |ui| {
                                         if title == "Decompiler" {
