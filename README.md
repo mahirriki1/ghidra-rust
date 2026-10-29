@@ -20,6 +20,8 @@ are recorded separately; no general speed advantage over Ghidra is claimed yet.
   references, and bounded recovery from supported metadata, pointer tables,
   and function-start patterns.
 - Strings, Hex / Memory Map, byte decoding, and FindCrypt-style constant scans.
+- Memory search for hex, ASCII or UTF-16LE patterns, and text search over
+  loaded names, imports, exports, labels, comments and string previews.
 - Declared imports grouped by library and exports in the Symbol Tree, plus
   flat, filterable Imports and Exports tabs in the Functions dock, with exact
   navigation and references.
@@ -120,6 +122,8 @@ every visited function is saved in a project.
 | `G` | Go to a hexadecimal address or exact function, label, raw or display name |
 | `;` | Edit the comment at the selected address |
 | `X` | Show references to the selection's exact target |
+| `S` | Search memory |
+| `Ctrl+F` | Search program text |
 | `Space` | Switch Listing / Function Graph |
 | `Alt+Left` / `Alt+Right` | Back / Forward |
 | `Ctrl+S` | Save project |
@@ -129,8 +133,8 @@ every visited function is saved in a project.
 | `Home` / `End` | Listing: first / last instruction of the function |
 | `Enter` | Listing: follow the selected call or branch target |
 
-On macOS, Save and Undo use Command. Shortcuts pause while typing, in dialogs,
-and during file operations.
+On macOS, Save, Undo and program-text search use Command. Shortcuts pause while
+typing, in dialogs, and during file operations.
 
 Listing keys apply after clicking the Listing and stay within the current
 function; clicking elsewhere, focusing a text field or switching tabs releases
@@ -168,6 +172,27 @@ it does not provide complete Unicode or Rust string-slice recovery.
 **Hex / Memory Map** browses mapped sections of the analyzed snapshot.
 Select bytes and choose **Decode selection**. Unmapped headers, overlays,
 and runtime process memory are outside this view.
+
+### Search
+
+**Search → Memory…** (`S`) finds hex bytes (`??` matches any one byte), ASCII
+or UTF-16LE text in the mapped, file-backed bytes of the analyzed snapshot.
+**Search → Program text…** (`Ctrl+F`) finds a literal in the names, imports,
+exports, labels, comments and string previews already loaded in the desktop. It
+does not fetch more metadata, demangle, or search listing or pseudocode text.
+
+Results appear in a **Search** tab with a state and count: Searching, Complete,
+Partial, Canceled, Stale or Unavailable. Click selects a row; double-click,
+Enter, or **Open** in its menu goes there. A match opens as code only at a known
+function entry or at an instruction already observed in a recovered graph or
+decompiler mapping. Otherwise it opens in Hex at its exact bytes, even inside
+code. Strings open in Hex; imports and exports open like their Functions-dock
+rows. Back / Forward records each destination.
+
+Search state is transient: it is not saved in projects and is cleared when the
+binary or project changes. Program-text results become **Stale** when the
+searched names, annotations, tables or strings change; search again to refresh.
+See [search scope and limits](docs/analysis.md#search).
 
 **Decode** supports UTF-8, UTF-16LE/BE, hex, Base64, and supplied-key XOR.
 **FindCrypt** finds a small set of standardized constants; matches are

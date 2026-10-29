@@ -16,6 +16,31 @@ pub enum WorkerEvent {
     Failed(String),
 }
 
+struct SentSearch {
+    id: u64,
+    request: Request,
+}
+
+impl SentSearch {
+    fn validate(
+        &self,
+        page: &crate::search::MemorySearchPage,
+        sections: &[crate::model::SectionInfo],
+        image_len: u64,
+        image_hash: &str,
+    ) -> Result<(), String> {
+        let Request::SearchMemory { binding, .. } = &self.request else {
+            return Err("Invalid search context".into());
+        };
+        if binding.binary_sha256 != image_hash {
+            return Err("Search image binding mismatch".into());
+        }
+        let domain = crate::search::SearchDomain::new(sections, image_len)?;
+        let context = domain.request_context(&self.request)?;
+        domain.validate_page(&context, page)
+    }
+}
+
 pub struct WorkerClient {
     child: Option<Child>,
     #[cfg(windows)]
@@ -29,6 +54,7 @@ pub struct WorkerClient {
     protection: BinaryProtection,
     source_lease: Option<Arc<dyn Send + Sync>>,
     signature_context: Arc<Mutex<String>>,
+    sent_search: Arc<Mutex<Option<SentSearch>>>,
 }
 
 impl WorkerClient {
@@ -83,6 +109,8 @@ impl WorkerClient {
         let reader_sent = sent.clone();
         let signature_context = Arc::new(Mutex::new(String::new()));
         let reader_signature_context = Arc::clone(&signature_context);
+        let sent_search: Arc<Mutex<Option<SentSearch>>> = Arc::new(Mutex::new(None));
+        let reader_sent_search = Arc::clone(&sent_search);
         let worker_pid = child.id();
         std::thread::Builder::new()
             .name("analysis-responses".into())
@@ -91,6 +119,8 @@ impl WorkerClient {
                 let mut reader = BufReader::new(output);
                 let mut answered = 0;
                 let mut sections = Vec::new();
+                let mut binary_sha256 = String::new();
+                let mut image_len = 0;
                 loop {
                     let event = match bounded_line(&mut reader, MAX_RESPONSE).and_then(|line| {
                         match line {
@@ -127,6 +157,8 @@ impl WorkerClient {
                                         }
                                         info.path.clone_from(&display_path);
                                         sections.clone_from(&info.sections);
+                                        binary_sha256.clone_from(&info.sha256);
+                                        image_len = info.file_len;
                                     }
                                     if let crate::model::Response::Decompiled {
                                         address,
@@ -176,6 +208,40 @@ impl WorkerClient {
                                             return;
                                         }
                                     }
+                                    let search_check = {
+                                        let mut sent = reader_sent_search
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner());
+                                        if sent.as_ref().is_some_and(|sent| sent.id == reply.id) {
+                                            let sent =
+                                                sent.take().expect("matched search transport");
+                                            match &reply.response {
+                                                crate::model::Response::MemorySearch(page) => sent
+                                                    .validate(
+                                                        page,
+                                                        &sections,
+                                                        image_len,
+                                                        &binary_sha256,
+                                                    ),
+                                                crate::model::Response::Error { .. } => Ok(()),
+                                                _ => {
+                                                    Err("Unexpected reply to memory search".into())
+                                                }
+                                            }
+                                        } else if matches!(
+                                            reply.response,
+                                            crate::model::Response::MemorySearch(..)
+                                        ) {
+                                            Err("Unsolicited memory search reply".into())
+                                        } else {
+                                            Ok(())
+                                        }
+                                    };
+                                    if let Err(error) = search_check {
+                                        let _ = sender.send(WorkerEvent::Failed(error));
+                                        ctx.request_repaint();
+                                        return;
+                                    }
                                     WorkerEvent::Reply(Box::new(reply))
                                 }
                                 Err(e) => {
@@ -216,6 +282,7 @@ impl WorkerClient {
             protection,
             source_lease: None,
             signature_context,
+            sent_search,
         })
     }
 
@@ -268,6 +335,18 @@ impl WorkerClient {
             .next_id
             .checked_add(1)
             .ok_or("Request counter overflow")?;
+        let next_search = if let Request::SearchMemory { binding, spec, .. } = &request {
+            if !crate::search::valid_digest(&binding.binary_sha256) {
+                return Err("Invalid search image digest".into());
+            }
+            spec.compile()?;
+            Some(SentSearch {
+                id: self.next_id,
+                request: request.clone(),
+            })
+        } else {
+            None
+        };
         let mut bytes = serde_json::to_vec(&WorkerRequest {
             id: self.next_id,
             request,
@@ -281,6 +360,13 @@ impl WorkerClient {
                 .signature_context
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = context;
+        }
+        if let Some(context) = next_search {
+            let mut sent = self.sent_search.lock().unwrap_or_else(|e| e.into_inner());
+            if sent.is_some() {
+                return Err("Memory search page already in flight".into());
+            }
+            *sent = Some(context);
         }
         bytes.push(b'\n');
         // Publish before writing so the reader never sees an unsent reply id.

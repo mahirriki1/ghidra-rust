@@ -186,7 +186,9 @@ impl HexPanel {
 
     /// Exact navigation that also selects up to `length` bytes from `address`,
     /// clipped to its page and to the section's file-backed bytes. Zero-fill
-    /// or unbacked destinations keep the single-byte focus.
+    /// or unbacked destinations keep the single-byte focus. A file-backed span
+    /// of at most one page that crosses its default page instead reads a page
+    /// beginning at `address`, so the whole span stays selected.
     pub(crate) fn go_to_span(
         &mut self,
         address: u64,
@@ -207,7 +209,7 @@ impl HexPanel {
         });
         let result = index
             .ok_or_else(|| "Address is unmapped or its section range overflows".to_owned())
-            .and_then(|index| page_for(index, &sections[index], address))
+            .and_then(|index| span_page(index, &sections[index], address, length))
             .and_then(|page| {
                 let offset = page_offset(page, address)?;
                 Ok((page, offset))
@@ -406,10 +408,9 @@ impl HexPanel {
         let result = sections
             .get(target.section)
             .ok_or_else(|| "Section is no longer available".to_owned())
-            .and_then(|section| page_for(target.section, section, target.address))
-            .and_then(|page| {
-                if page == target {
-                    Ok(page)
+            .and_then(|section| {
+                if still_valid(target, section) {
+                    Ok(target)
                 } else {
                     Err("Section metadata changed; reopen this binary".into())
                 }
@@ -431,17 +432,23 @@ impl HexPanel {
         let page = self.target?;
         let section = sections.get(page.section)?;
         let end = section_end(section).ok()?;
-        if forward {
+        // Neighbours are the default pages adjoining this one. After an exact
+        // span page, Prev can return to the section's first page.
+        let address = if forward {
             let address = page.address.checked_add(u64::try_from(page.length).ok()?)?;
-            (address < end).then_some(address)
-        } else {
-            let offset = page.address.checked_sub(section.address)?;
-            let step = u64::try_from(PAGE_BYTES).ok()?;
-            if offset < step {
+            if address >= end {
                 return None;
             }
-            page.address.checked_sub(step)
-        }
+            address
+        } else {
+            if page.address <= section.address {
+                return None;
+            }
+            page.address.checked_sub(1)?
+        };
+        page_for(page.section, section, address)
+            .ok()
+            .map(|page| page.address)
     }
 
     fn selection_range(&self) -> Option<std::ops::Range<usize>> {
@@ -560,7 +567,7 @@ impl HexPanel {
             );
             return;
         };
-        if page_for(page.spec.section, section, page.spec.address).ok() != Some(page.spec) {
+        if !still_valid(page.spec, section) {
             ui.colored_label(theme::ERROR, "Section metadata changed; reopen this binary");
             return;
         }
@@ -796,6 +803,60 @@ fn page_for(index: usize, section: &SectionInfo, address: u64) -> Result<PageSpe
     })
 }
 
+/// The default page for `address`, unless a fully file-backed span of at most
+/// one page crosses its end: then a page beginning at `address`, clipped to the
+/// section. Longer or zero-fill spans keep the default page.
+fn span_page(
+    index: usize,
+    section: &SectionInfo,
+    address: u64,
+    length: u64,
+) -> Result<PageSpec, String> {
+    let page = page_for(index, section, address)?;
+    let backed_end = section
+        .address
+        .checked_add(section.file_size.min(section.size))
+        .ok_or("Section virtual range overflows")?;
+    let page_end = page
+        .address
+        .checked_add(u64::try_from(page.length).map_err(|_| "Invalid page length")?)
+        .ok_or("Page end overflow")?;
+    let crosses = length > 1
+        && usize::try_from(length).is_ok_and(|length| length <= PAGE_BYTES)
+        && address
+            .checked_add(length)
+            .is_some_and(|end| end <= backed_end && end > page_end);
+    if crosses {
+        page_at(index, section, address)
+    } else {
+        Ok(page)
+    }
+}
+
+/// A page beginning exactly at `address`, at most one page and within the section.
+fn page_at(index: usize, section: &SectionInfo, address: u64) -> Result<PageSpec, String> {
+    validate_section(section)?;
+    if !contains(section, address) {
+        return Err("Address lies outside this section".into());
+    }
+    let remaining = section_end(section)?
+        .checked_sub(address)
+        .ok_or("Address exceeds section")?;
+    let length = remaining.min(u64::try_from(PAGE_BYTES).map_err(|_| "Invalid Hex page limit")?);
+    let length = usize::try_from(length).map_err(|_| "Page does not fit host offsets")?;
+    Ok(PageSpec {
+        section: index,
+        address,
+        length,
+    })
+}
+
+/// Whether `page` is still a default or exact-span page of `section`.
+fn still_valid(page: PageSpec, section: &SectionInfo) -> bool {
+    page_for(page.section, section, page.address).ok() == Some(page)
+        || page_at(page.section, section, page.address).ok() == Some(page)
+}
+
 fn page_offset(page: PageSpec, address: u64) -> Result<usize, String> {
     let offset = address
         .checked_sub(page.address)
@@ -994,6 +1055,59 @@ mod tests {
         assert_eq!(panel.selected_bytes(), Some((0x20f0, vec![0])));
         assert!(panel.go_to_span(0x2100, 8, &sections).is_none());
         assert_eq!(panel.selected_bytes(), Some((0x20f0, vec![0])));
+    }
+
+    #[test]
+    fn crossing_spans_read_a_page_at_their_start_and_paging_returns_to_default_pages() {
+        // Pages default to 0x1000, 0x2000, 0x3000; all bytes are file-backed.
+        let sections = [section(0x1000, 0x2800, 0x2800)];
+        let mut panel = HexPanel::default();
+        let request = read(panel.go_to_span(0x1ff0, 0x20, &sections));
+        assert_eq!((request.1, request.2), (0x1ff0, PAGE_BYTES));
+        deliver(&mut panel, request);
+        assert_eq!(panel.focused_span(), Some((0x1ff0, 0x20)));
+        assert_eq!(panel.selected_bytes(), Some((0x1ff0, vec![0; 0x20])));
+        // Prev reaches the section's first page even within its first 4 KiB.
+        assert_eq!(panel.neighbor(&sections, false), Some(0x1000));
+        assert_eq!(panel.neighbor(&sections, true), Some(0x2000));
+        // A Retry of the exact page is not mistaken for changed metadata.
+        panel.cancel("interrupted");
+        let retry = read(panel.retry(&sections));
+        assert_eq!((retry.1, retry.2), (0x1ff0, PAGE_BYTES));
+        deliver(&mut panel, retry);
+        let previous = read(panel.turn_page(0x1000, &sections));
+        assert_eq!((previous.1, previous.2), (0x1000, PAGE_BYTES));
+        assert_eq!(panel.neighbor(&sections, false), None);
+        // Near the section end the exact page is clipped to the section.
+        let tail = read(panel.go_to_span(0x37f8, 8, &sections));
+        assert_eq!((tail.1, tail.2), (0x3000, 0x800));
+        let crossing = read(panel.go_to_span(0x2ffc, 8, &sections));
+        assert_eq!((crossing.1, crossing.2), (0x2ffc, 0x804));
+        deliver(&mut panel, crossing);
+        assert_eq!(panel.selected_bytes(), Some((0x2ffc, vec![0; 8])));
+        assert_eq!(panel.neighbor(&sections, false), Some(0x2000));
+        assert_eq!(panel.neighbor(&sections, true), None);
+    }
+
+    #[test]
+    fn oversized_or_zero_fill_spans_keep_default_page_clipping() {
+        let sections = [section(0x1000, 0x3000, 0x1004)];
+        let mut panel = HexPanel::default();
+        // Longer than a page: default page, clipped selection.
+        let long = read(panel.go_to_span(0x1ff0, PAGE_BYTES as u64 + 1, &sections));
+        assert_eq!((long.1, long.2), (0x1000, PAGE_BYTES));
+        deliver(&mut panel, long);
+        assert_eq!(panel.focused_span(), Some((0x1ff0, 0x10)));
+        // Crossing into zero-fill: default page, file-backed bytes only.
+        assert!(panel.go_to_span(0x1ffc, 0x10, &sections).is_none());
+        assert_eq!(panel.focused_span(), Some((0x1ffc, 4)));
+        // A second jump into an in-flight exact page gets a fresh token.
+        let first = read(panel.go_to_span(0x1ff8, 0x0c, &sections));
+        let second = read(panel.go_to_span(0x1ff8, 0x0c, &sections));
+        assert_eq!(first.1, 0x1ff8);
+        assert_ne!(first.0, second.0);
+        assert!(!panel.expects(first.0, first.1, first.2));
+        assert!(panel.expects(second.0, second.1, second.2));
     }
 
     #[test]

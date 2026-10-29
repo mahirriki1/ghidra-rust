@@ -204,6 +204,7 @@ impl super::DesktopApp {
             || self.analyze_prompt.is_some()
             || self.signature_editor.is_some()
             || self.signature_change.is_some()
+            || self.search_dialog.is_some()
             || context.egui_wants_keyboard_input()
             || egui::Popup::is_any_open(context)
             || context.memory(|memory| memory.top_modal_layer().is_some())

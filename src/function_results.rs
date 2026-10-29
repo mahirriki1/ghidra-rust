@@ -457,6 +457,29 @@ impl FunctionResults {
         self.store.set_metadata_bytes(MetadataOwner::Linkage, bytes)
     }
 
+    /// Before a text job shares the adopted linkage table, retain its existing
+    /// metadata charge through the last Arc, including binary replacement.
+    pub fn share_linkage_charge(&mut self, linkage: &Arc<crate::linkage::Linkage>) -> bool {
+        self.store.share_metadata(MetadataOwner::Linkage, linkage)
+    }
+
+    pub fn reserve_transient(
+        &mut self,
+        bytes: usize,
+        protect: &[u64],
+    ) -> Option<crate::result_store::TransientReservation> {
+        self.store.reserve_transient(bytes, protect)
+    }
+
+    pub fn grow_transient(
+        &mut self,
+        reservation: &crate::result_store::TransientReservation,
+        bytes: usize,
+        protect: &[u64],
+    ) -> bool {
+        self.store.grow_transient(reservation, bytes, protect)
+    }
+
     pub fn usage(&self) -> StoreUsage {
         let mut usage = self.store.usage();
         usage.preparation = self.preparation_bytes.saturating_add(

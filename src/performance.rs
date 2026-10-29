@@ -411,6 +411,7 @@ pub fn operation(request: &crate::model::Request) -> &'static str {
         Crypto => "crypto",
         SymbolNames { .. } => "symbol_names",
         Linkage { .. } => "linkage",
+        SearchMemory { .. } => "search_memory",
     }
 }
 
