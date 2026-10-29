@@ -5,6 +5,13 @@ pub const MAX_DECOMPILED_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_CODE_MAPPINGS: usize = 32_768;
 pub const MAX_MAPPING_ADDRESSES: usize = 64;
 pub const MAX_CODE_ADDRESS_REFS: usize = 131_072;
+pub const MAX_SEARCH_PATTERN_BYTES: usize = 256;
+pub const MAX_SEARCH_RESULTS: usize = 10_000;
+pub const MAX_SEARCH_PAGE_RESULTS: usize = 256;
+pub const MAX_SEARCH_STEP_BYTES: u64 = 1024 * 1024;
+pub const MAX_SEARCH_STEPS: u64 = 192;
+pub const MAX_MEMORY_SEARCH_REPLY_BYTES: usize = 32 * 1024;
+
 pub const MAX_STRING_RESULTS: usize = 10_000;
 /// Function inventory ceiling shared by loaders, worker replies, projects, and
 /// reference validation. Large x64 PEs near the 128 MiB input limit can carry
@@ -858,7 +865,7 @@ pub struct CryptoMatch {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
     Open {
         path: String,
@@ -920,6 +927,13 @@ pub enum Request {
     /// One page of the symbol-name table derived when the image was opened.
     SymbolNames {
         cursor: usize,
+    },
+    /// One bounded memory page over the immutable file-backed image.
+    SearchMemory {
+        binding: crate::search::SearchBinding,
+        spec: crate::search::MemorySearchSpec,
+        cursor: crate::search::SearchCursor,
+        remaining_results: usize,
     },
     /// One page of the import/export table derived from the immutable snapshot.
     Linkage {
@@ -1005,6 +1019,7 @@ pub enum Response {
         summary: crate::linkage::LinkageSummary,
         page: crate::linkage::LinkagePage,
     },
+    MemorySearch(crate::search::MemorySearchPage),
     Error {
         message: String,
     },

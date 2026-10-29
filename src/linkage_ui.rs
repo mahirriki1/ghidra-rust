@@ -168,6 +168,10 @@ impl PreparedLinkage {
         &self.view.linkage
     }
 
+    pub(crate) fn shared_linkage(&self) -> Arc<Linkage> {
+        Arc::clone(&self.view.linkage)
+    }
+
     /// Allocation capacity retained by the table, its view and filter keys.
     pub(crate) fn retained_bytes(&self) -> usize {
         let keys =

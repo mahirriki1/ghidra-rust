@@ -18,6 +18,7 @@ mod function_candidates;
 pub(crate) mod linkage;
 mod patterns;
 mod pointers;
+mod search;
 mod strings;
 
 use cfg::*;
@@ -53,6 +54,7 @@ pub struct LoadedProgram {
     /// Original symbols and display names derived at open, before any replay.
     symbol_names: Arc<crate::symbol_names::SymbolTable>,
     linkage: Option<crate::linkage::LinkageTable>,
+    search: Option<search::CachedSearch>,
     signatures: Vec<crate::signatures::FunctionSignature>,
     applied_signatures: BTreeSet<u64>,
     signature_state: Option<String>,
@@ -395,6 +397,7 @@ impl LoadedProgram {
             no_return: Arc::new(no_return),
             symbol_names,
             linkage: None,
+            search: None,
             signatures: Vec::new(),
             applied_signatures: BTreeSet::new(),
             signature_state: None,
@@ -516,6 +519,7 @@ impl LoadedProgram {
             self.analysis_started = true;
         }
         match request {
+            request @ Request::SearchMemory { .. } => self.search_memory(request),
             Request::Graph { address } => Ok(Response::Graph {
                 view: self.graph(address)?,
             }),
@@ -1720,6 +1724,7 @@ pub(crate) mod tests {
             no_return: Arc::default(),
             symbol_names: Arc::default(),
             linkage: None,
+            search: None,
             signatures: Vec::new(),
             applied_signatures: BTreeSet::new(),
             signature_state: None,
@@ -2537,6 +2542,7 @@ pub(crate) mod tests {
             no_return: Arc::default(),
             symbol_names: Arc::default(),
             linkage: None,
+            search: None,
             signatures: Vec::new(),
             applied_signatures: BTreeSet::new(),
             signature_state: None,

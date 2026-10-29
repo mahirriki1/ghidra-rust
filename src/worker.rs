@@ -130,12 +130,24 @@ fn send(output: &mut impl Write, response: WorkerResponse) -> Result<(), String>
     // Encode atomically into a bounded buffer: an oversized response must not
     // publish a partial JSON line and desynchronize the parent protocol.
     let encoding = crate::performance::span("reply_encode");
-    let mut encoded = ResponseBuffer::default();
+    let limit = if matches!(response.response, Response::MemorySearch(..)) {
+        crate::model::MAX_MEMORY_SEARCH_REPLY_BYTES - 1
+    } else {
+        MAX_RESPONSE_BYTES
+    };
+    let mut encoded = ResponseBuffer {
+        limit: Some(limit),
+        ..Default::default()
+    };
     if serde_json::to_writer(&mut encoded, &response).is_err() {
         encoded.bytes.clear();
         let fallback = WorkerResponse {
             id: response.id,
-            response: Response::Error { message: "Analysis response exceeds the 32 MiB protocol limit; narrow the requested analysis.".into() },
+            response: Response::Error {
+                message: format!(
+                    "Analysis response exceeds its {limit}-byte protocol limit; narrow the requested analysis."
+                ),
+            },
         };
         serde_json::to_writer(&mut encoded, &fallback)
             .map_err(|e| format!("Worker error response encoding failed: {e}"))?;
@@ -156,11 +168,17 @@ use crate::model::MAX_REPLY_BYTES as MAX_RESPONSE_BYTES;
 #[derive(Default)]
 struct ResponseBuffer {
     bytes: Vec<u8>,
+    limit: Option<usize>,
 }
 
 impl Write for ResponseBuffer {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if bytes.len() > MAX_RESPONSE_BYTES.saturating_sub(self.bytes.len()) {
+        if bytes.len()
+            > self
+                .limit
+                .unwrap_or(MAX_RESPONSE_BYTES)
+                .saturating_sub(self.bytes.len())
+        {
             return Err(io::Error::other("Response size limit exceeded"));
         }
         self.bytes.extend_from_slice(bytes);

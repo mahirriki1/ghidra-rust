@@ -106,6 +106,27 @@ fn all_known_seeds_survive_cancel_restart_and_interactive_requests() {
         .unwrap();
     let first_functions = inventory.functions().to_vec();
     assert!(!state.report.references.is_empty());
+    // Search pages are independent of discovery and survive a same-image
+    // worker replacement without replenishing the session's attempt budget.
+    let mut results = ghidra_rust::function_results::FunctionResults::default();
+    let reservation = results
+        .reserve_transient(ghidra_rust::search::MEMORY_SEARCH_RESERVATION_BYTES, &[])
+        .unwrap();
+    let mut search = ghidra_rust::search::MemorySearchSession::new(
+        &info,
+        1,
+        99,
+        ghidra_rust::search::MemorySearchSpec::hex("00").unwrap(),
+        reservation,
+    )
+    .unwrap();
+    let query = search.next_request(1).unwrap().unwrap();
+    let Response::MemorySearch(page) = request(&mut worker, query) else {
+        panic!("Search page");
+    };
+    search.accept(page).unwrap();
+    let committed_hits = search.hits().to_vec();
+    assert!(!committed_hits.is_empty());
     let committed = state.report.references.clone();
     let committed_addresses = state.report.addresses.clone().unwrap();
     let abandoned = state.begin(1, 1, 0).unwrap();
@@ -136,6 +157,24 @@ fn all_known_seeds_survive_cancel_restart_and_interactive_requests() {
         ),
         Response::Bytes { .. }
     ));
+    assert!(matches!(
+        request(
+            &mut worker,
+            Request::Graph {
+                address: info.entry
+            }
+        ),
+        Response::Graph { .. }
+    ));
+    if let Some(query) = search.next_request(2).unwrap() {
+        let Response::MemorySearch(page) = request(&mut worker, query) else {
+            panic!("Search after restart");
+        };
+        search.accept(page).unwrap();
+    }
+    assert!(search.hits().starts_with(&committed_hits));
+    assert_eq!(search.attempts(), 2);
+    assert_eq!(state.report.references, committed);
     let mut unchanged = 0;
     while let Some(batch) = state.begin(1, 2, 0) {
         let batch = inventory.bind(batch);

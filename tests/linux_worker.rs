@@ -1386,3 +1386,127 @@ fn plt_stubs_link_to_their_imports_in_classic_and_ibt_layouts() {
         assert_eq!(section.name().unwrap(), plt, "{name}");
     }
 }
+
+// Exact original arrays and independently specified offsets; the production
+// matcher/domain are never used to calculate the expected answers.
+fn verify_search_fixture(
+    info: &ghidra_rust::model::BinaryInfo,
+    original: &[u8],
+    mut invoke: impl FnMut(Request) -> Response,
+) {
+    use ghidra_rust::search::{MemoryPattern, MemorySearchSession, MemorySearchSpec, SearchState};
+    use object::{Object, ObjectSection};
+    let image = object::File::parse(original).unwrap();
+    let marker_address = |marker: &[u8]| {
+        let mut addresses = Vec::new();
+        for section in image.sections() {
+            if let Ok(bytes) = section.data() {
+                for (offset, _) in bytes
+                    .windows(marker.len())
+                    .enumerate()
+                    .filter(|(_, bytes)| *bytes == marker)
+                {
+                    addresses.push(section.address() + offset as u64);
+                }
+            }
+        }
+        assert_eq!(addresses.len(), 1, "original marker must occur once");
+        addresses[0]
+    };
+    let ascii = marker_address(&[
+        0xd3, 0x71, 0x53, 0x72, 0x63, 0x48, 0x34, 0x41, 0x42, 0x41, 0x42, 0x41, 0xf2,
+    ]);
+    let utf16 = marker_address(&[
+        0xf1, 0x51, 0, 0x34, 0, 0x3e, 0xd8, 0x80, 0xdd, 0, 0x51, 0, 0x34, 0, 0x3e, 0xd8, 0x80,
+        0xdd, 0xfe,
+    ]);
+    let wildcard = marker_address(&[
+        0xe3, 0xd9, 0x6e, 0xa5, 0x16, 0xb7, 0xc8, 0x71, 0xd9, 0x6e, 0xa5, 0x80, 0xb7, 0xc8, 0xae,
+    ]);
+    let dense = marker_address(&[0xa6; 600]);
+    for (spec, expected) in [
+        (
+            MemorySearchSpec {
+                pattern: MemoryPattern::Ascii {
+                    text: "srch4aba".into(),
+                },
+                match_case: false,
+            },
+            vec![ascii + 2],
+        ),
+        (
+            MemorySearchSpec {
+                pattern: MemoryPattern::Utf16Le {
+                    text: "Q4🦀".into(),
+                },
+                match_case: true,
+            },
+            vec![utf16 + 1, utf16 + 10],
+        ),
+        (
+            MemorySearchSpec::hex("D9 6E A5 ?? B7 C8").unwrap(),
+            vec![wildcard + 1, wildcard + 8],
+        ),
+        (
+            MemorySearchSpec::hex("A6 A6 A6 A6 A6 A6 A6 A6").unwrap(),
+            (0..593).map(|offset| dense + offset).collect(),
+        ),
+    ] {
+        let mut results = ghidra_rust::function_results::FunctionResults::default();
+        let reservation = results
+            .reserve_transient(ghidra_rust::search::MEMORY_SEARCH_RESERVATION_BYTES, &[])
+            .unwrap();
+        let mut search = MemorySearchSession::new(info, 7, 9, spec, reservation).unwrap();
+        while let Some(query) = search.next_request(1).unwrap() {
+            let Response::MemorySearch(page) = invoke(query) else {
+                panic!("memory search page");
+            };
+            search.accept(page).unwrap();
+        }
+        assert_eq!(search.state(), SearchState::Complete);
+        assert_eq!(
+            search
+                .hits()
+                .iter()
+                .map(|hit| hit.address)
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn sandboxed_memory_search_validates_pages_and_immutable_markers() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = dir.path().join("search-fixture");
+    assert!(
+        Command::new("gcc")
+            .args(["-O2", "-g", "-fno-pie", "-no-pie"])
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/sample.c"
+            ))
+            .arg("-o")
+            .arg(&binary)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let original = std::fs::read(&binary).unwrap();
+    let mut worker = WorkerClient::start_using_executable(
+        eframe::egui::Context::default(),
+        &binary,
+        Path::new(env!("CARGO_BIN_EXE_ghidra-rust")),
+    )
+    .unwrap();
+    let Response::Opened { info, .. } = request(
+        &mut worker,
+        Request::Open {
+            path: binary.to_string_lossy().into_owned(),
+        },
+    ) else {
+        panic!("open");
+    };
+    std::fs::write(&binary, b"changed only this private fixture after Open").unwrap();
+    verify_search_fixture(&info, &original, |query| request(&mut worker, query));
+}

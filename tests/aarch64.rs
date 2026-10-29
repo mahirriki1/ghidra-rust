@@ -666,3 +666,58 @@ fn stripped_arm64_pe_recovers_unwind_entries_and_names_confirmed_import_veneers(
     );
     assert_eq!(std::fs::read(&binary).unwrap(), bytes);
 }
+
+#[test]
+fn memory_search_is_architecture_and_container_neutral() {
+    use ghidra_rust::search::{MemorySearchSession, MemorySearchSpec, SearchState};
+    for (format, (mut bytes, base), code_offset) in [
+        ("ELF", common::elf(true), 0x100),
+        ("PE", common::pe(), 0x200),
+        ("Mach-O", common::macho(), 0x1000),
+    ] {
+        // Original literal at a known offset in the generated text section.
+        bytes[code_offset + 16..code_offset + 23]
+            .copy_from_slice(&[0xd9, 0x6e, 0xa5, 0x16, 0xb7, 0xc8, 0xae]);
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("search-arm64");
+        std::fs::write(&binary, bytes).unwrap();
+        let mut worker = WorkerClient::start_using_executable(
+            eframe::egui::Context::default(),
+            &binary,
+            Path::new(env!("CARGO_BIN_EXE_ghidra-rust")),
+        )
+        .unwrap();
+        let Response::Opened { info, .. } = request(
+            &mut worker,
+            Request::Open {
+                path: binary.to_string_lossy().into_owned(),
+            },
+        ) else {
+            panic!("Open {format}");
+        };
+        let mut results = ghidra_rust::function_results::FunctionResults::default();
+        let reservation = results
+            .reserve_transient(ghidra_rust::search::MEMORY_SEARCH_RESERVATION_BYTES, &[])
+            .unwrap();
+        let mut session = MemorySearchSession::new(
+            &info,
+            1,
+            1,
+            MemorySearchSpec::hex("D9 6E A5 ?? B7 C8 AE").unwrap(),
+            reservation,
+        )
+        .unwrap();
+        while let Some(query) = session.next_request(1).unwrap() {
+            let Response::MemorySearch(page) = request(&mut worker, query) else {
+                panic!("Search {format}");
+            };
+            session.accept(page).unwrap();
+        }
+        assert_eq!(session.state(), SearchState::Complete);
+        assert_eq!(
+            session.hits().iter().map(|h| h.address).collect::<Vec<_>>(),
+            [base + 16],
+            "{format}"
+        );
+    }
+}

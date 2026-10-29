@@ -73,6 +73,33 @@ impl Ledger {
     }
 }
 
+/// Shared transient allocation charge. Cloning a token never charges it twice.
+#[derive(Clone)]
+pub struct TransientReservation(Arc<ReservationCharge>);
+
+struct ReservationCharge {
+    bytes: AtomicUsize,
+    ledger: Arc<Ledger>,
+}
+
+impl TransientReservation {
+    pub fn capacity(&self) -> usize {
+        self.bytes() - size_of::<ReservationCharge>() - 2 * size_of::<usize>()
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.0.bytes.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for ReservationCharge {
+    fn drop(&mut self) {
+        self.ledger
+            .charged
+            .fetch_sub(self.bytes.load(Ordering::Acquire), Ordering::AcqRel);
+    }
+}
+
 /// One immutable payload and its allocation charge.
 pub struct Stored<T> {
     value: T,
@@ -413,6 +440,43 @@ impl<G: Retained, D: Retained> ResultStore<G, D> {
         Admission::Stored(shared)
     }
 
+    /// Reserve before allocating transient source, result, or scratch storage.
+    /// Tokens remain charged through clear/open and while background jobs retain them.
+    pub fn reserve_transient(
+        &mut self,
+        bytes: usize,
+        protect: &[u64],
+    ) -> Option<TransientReservation> {
+        let bytes = bytes.checked_add(size_of::<ReservationCharge>() + 2 * size_of::<usize>())?;
+        if !self.make_room(bytes, protect) {
+            return None;
+        }
+        self.ledger.charged.fetch_add(bytes, Ordering::AcqRel);
+        crate::performance::event("search_reserved_bytes", bytes as u64);
+        Some(TransientReservation(Arc::new(ReservationCharge {
+            bytes: AtomicUsize::new(bytes),
+            ledger: Arc::clone(&self.ledger),
+        })))
+    }
+
+    /// Grow one existing charge; only the store owner can admit more storage.
+    pub fn grow_transient(
+        &mut self,
+        reservation: &TransientReservation,
+        bytes: usize,
+        protect: &[u64],
+    ) -> bool {
+        if !Arc::ptr_eq(&self.ledger, &reservation.0.ledger)
+            || reservation.bytes().checked_add(bytes).is_none()
+            || !self.make_room(bytes, protect)
+        {
+            return false;
+        }
+        self.ledger.charged.fetch_add(bytes, Ordering::AcqRel);
+        reservation.0.bytes.fetch_add(bytes, Ordering::AcqRel);
+        true
+    }
+
     /// Reserve shared discovery allocations without taking ownership. The
     /// charge survives index replacement while a save still pins the snapshot.
     /// Failed reservation defers publication; it never exceeds the cap.
@@ -550,6 +614,45 @@ impl<G: Retained, D: Retained> ResultStore<G, D> {
         self.metadata
             .iter()
             .fold(0usize, |total, bytes| total.saturating_add(*bytes))
+    }
+
+    /// Move an existing metadata charge onto its immutable owner's lifetime.
+    /// A text job can then share that owner through clear/open without copying
+    /// or charging its payload a second time. Admission adds bookkeeping only.
+    pub fn share_metadata<T: Send + Sync + 'static>(
+        &mut self,
+        owner: MetadataOwner,
+        value: &Arc<T>,
+    ) -> bool {
+        self.reap_external();
+        let identity = Arc::as_ptr(value) as usize;
+        if self
+            .external
+            .borrow()
+            .iter()
+            .any(|lease| lease.identity == identity)
+        {
+            return true;
+        }
+        let slot = owner as usize;
+        if self.metadata[slot] == 0 {
+            return false;
+        }
+        let Some(bytes) = self.metadata[slot].checked_add(COMPONENT_OVERHEAD) else {
+            return false;
+        };
+        if !self.make_room(COMPONENT_OVERHEAD, &[]) {
+            return false;
+        }
+        let weak = Arc::downgrade(value);
+        self.external.borrow_mut().push(ExternalLease {
+            identity,
+            bytes,
+            alive: Box::new(move || weak.strong_count() != 0),
+        });
+        self.ledger.charged.fetch_add(bytes, Ordering::AcqRel);
+        self.metadata[slot] = 0;
+        true
     }
 
     /// Replaces one owner's metadata charge, evicting results to make room.
@@ -726,6 +829,60 @@ mod tests {
     const UNIT: usize = 1000;
     fn unit() -> usize {
         UNIT + COMPONENT_OVERHEAD
+    }
+
+    #[test]
+    fn shared_metadata_keeps_its_original_charge_through_background_ownership() {
+        let mut store = Store::new(20_000);
+        assert!(store.set_metadata_bytes(MetadataOwner::LocalNames, 700));
+        assert!(store.set_metadata_bytes(MetadataOwner::Linkage, 3000));
+        let table = Arc::new(Blob(3000));
+        assert!(store.share_metadata(MetadataOwner::Linkage, &table));
+        let charged = store.usage().charged;
+        assert_eq!(charged, 3700 + COMPONENT_OVERHEAD);
+        assert!(store.share_metadata(MetadataOwner::Linkage, &table));
+        assert_eq!(store.usage().charged, charged);
+        let background = Arc::clone(&table);
+        store.clear();
+        drop(table);
+        assert_eq!(store.usage().charged, 3000 + COMPONENT_OVERHEAD);
+        drop(background);
+        assert_eq!(store.usage().charged, 0);
+    }
+
+    #[test]
+    fn transient_reservations_share_the_ledger_and_survive_clear() {
+        let mut store = Store::new(10_000);
+        let token = store.reserve_transient(1000, &[]).unwrap();
+        let charged = store.usage().charged;
+        assert!(charged > 1000);
+        let held = token.clone();
+        assert_eq!(store.usage().charged, charged);
+        assert!(store.grow_transient(&token, 2000, &[]));
+        assert_eq!(held.bytes(), charged + 2000);
+        store.clear();
+        assert_eq!(store.usage().charged, charged + 2000);
+        assert!(store.reserve_transient(8000, &[]).is_none());
+        assert!(!Store::new(10_000).grow_transient(&token, 1, &[]));
+        assert!(!store.grow_transient(&token, usize::MAX, &[]));
+        drop(token);
+        assert_eq!(store.usage().charged, charged + 2000);
+        std::thread::spawn(move || drop(held)).join().unwrap();
+        assert_eq!(store.usage().charged, 0);
+        assert!(store.reserve_transient(8000, &[]).is_some());
+    }
+
+    #[test]
+    fn transient_admission_cannot_evict_pinned_results() {
+        let mut store = Store::new(unit() * 2);
+        let current = context("one");
+        store.set_context(current.clone());
+        let pinned = store
+            .admit_graph(&key(&current, 1), Blob(UNIT), ResultOrigin::Computed, None)
+            .into_shared();
+        assert!(store.reserve_transient(unit() * 2, &[]).is_none());
+        drop(pinned);
+        assert!(store.reserve_transient(unit(), &[]).is_some());
     }
 
     #[test]
