@@ -592,6 +592,87 @@ mod tests {
     }
 
     #[test]
+    fn invalidated_base_preparation_retries_the_selected_function_once() {
+        let context = egui::Context::default();
+        for change in 0..3 {
+            let mut app = keyboard_app();
+            app.results.open(&"a".repeat(64), &[]);
+            app.update_result_inputs(crate::function_results::Invalidation::Inventory);
+            let settle_inputs = |app: &mut DesktopApp| {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while app.results.preparing() {
+                    app.results.poll_inputs();
+                    assert!(Instant::now() < deadline);
+                    std::thread::yield_now();
+                }
+            };
+            settle_inputs(&mut app);
+            let selection = app.selection_generation;
+            let history = app.history.clone();
+            let mut old = pending(&app);
+            old.result = app.results.binding(0x1000, String::new());
+            assert!(old.result.is_some());
+            app.graph_preparation.pause(true, &context);
+            app.receive(
+                old,
+                Response::Graph {
+                    view: view(4, "old"),
+                },
+                &context,
+            );
+            app.graph_preparation.wait_running();
+            if change == 0 {
+                comment(&mut app, 0x1004, "edited while preparing");
+            } else {
+                app.info
+                    .as_mut()
+                    .unwrap()
+                    .functions
+                    .push(crate::model::FunctionInfo {
+                        address: 0x1080,
+                        name: "discovered".into(),
+                    });
+                app.update_result_inputs(crate::function_results::Invalidation::Inventory);
+                if change == 2 {
+                    settle_inputs(&mut app);
+                }
+            }
+            app.graph_preparation.pause(false, &context);
+            app.settle_graph();
+            assert!(app.view().is_none(), "never admit old graph: {change}");
+            app.poll_graph_preparation();
+            assert_eq!(
+                app.queue
+                    .iter()
+                    .filter(|request| matches!(request, Request::Graph { address: 0x1000 }))
+                    .count(),
+                1
+            );
+            settle_inputs(&mut app);
+            // Model the dispatcher's fresh binding and worker response, with
+            // no additional navigation or selection change by the user.
+            let request = app.queue.pop_front().unwrap();
+            assert!(matches!(request, Request::Graph { address: 0x1000 }));
+            let mut fresh = pending(&app);
+            fresh.request = request;
+            fresh.result = app.results.binding(0x1000, String::new());
+            assert!(fresh.result.is_some());
+            app.receive(
+                fresh,
+                Response::Graph {
+                    view: view(4, "replacement"),
+                },
+                &context,
+            );
+            app.settle_graph();
+            assert_eq!(mnemonic(&app), Some("replacement"));
+            assert_eq!(app.selection_generation, selection);
+            assert_eq!(app.history, history);
+            assert_eq!(app.selected, Some(0x1000));
+        }
+    }
+
+    #[test]
     fn annotation_geometry_tracks_revisions_and_keeps_the_camera() {
         let context = egui::Context::default();
         crate::theme::install(&context);

@@ -3632,6 +3632,37 @@ impl DesktopApp {
             Continuation::Annotation(key) => self.annotation_key().as_ref() == Some(key),
         };
         if !current {
+            // The selected function may still be waiting for its first graph.
+            // An inventory/name/comment change invalidates the reply binding,
+            // but must not abandon that selection with nothing to display.
+            if let Continuation::Live {
+                generation,
+                selection,
+                address,
+                ..
+            } = continuation
+                && generation == self.generation
+                && selection == self.selection_generation
+                && self.graph.is_none()
+            {
+                let queued = self.queue.iter().any(|request| {
+                    matches!(request, Request::Graph { address: target } if *target == address)
+                });
+                let in_flight = self.pending.as_ref().is_some_and(|pending| {
+                    matches!(pending.request, Request::Graph { address: target } if target == address)
+                        && pending.selection == self.selection_generation
+                        && pending.revision == self.revision
+                        && pending.result.as_ref().is_none_or(|_| self.results.current(pending.result.as_ref()))
+                });
+                if !queued && !in_flight {
+                    // The normal dispatcher waits for result-input preparation
+                    // and any in-flight maintenance before binding this request.
+                    if self.queue.len() >= HISTORY_LIMIT {
+                        self.queue.pop_back();
+                    }
+                    self.queue.push_front(Request::Graph { address });
+                }
+            }
             return;
         }
         match (continuation, output) {

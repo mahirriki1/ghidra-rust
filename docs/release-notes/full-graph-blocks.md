@@ -13,6 +13,8 @@
   off the GUI thread. Results for a previous function, binary, selection,
   annotation revision or project are discarded; saved projects keep their
   Saved provenance and adopt graph, pseudocode and mappings together.
+  Invalidated preparation for the still-selected function requests fresh work
+  instead of leaving its graph and Listing blank.
 - While edited comments or names are laid out again, the graph briefly shows
   rows without comments rather than outdated text, and keeps the camera.
 - The graph remains limited to the analyzer's bounded results of 2,048
