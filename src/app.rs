@@ -710,8 +710,6 @@ pub struct DesktopApp {
     listing_cursor: listing_cursor::ListingCursor,
     /// Automatic discovery resumes since the last committed batch.
     discovery_resumes: u8,
-    /// Widest Listing row, in monospace characters, for a stable scroll range.
-    listing_chars: usize,
     /// Widest decompiler display row, in monospace characters.
     code_chars: usize,
     auto_decompile: bool,
@@ -871,7 +869,6 @@ impl DesktopApp {
             pending_listing_scroll: None,
             listing_cursor: Default::default(),
             discovery_resumes: 0,
-            listing_chars: 0,
             code_chars: 0,
             auto_decompile: true,
             selected: None,
@@ -5582,32 +5579,6 @@ impl DesktopApp {
                 }
             }
         }
-        let digits = theme::address_digits(listing.last().map_or(0, |i| i.address));
-        let operands = theme::listing_columns(digits)[3];
-        let calls: BTreeMap<u64, usize> = graph_view(&self.graph)
-            .into_iter()
-            .flat_map(|view| &view.calls)
-            .filter_map(|call| {
-                let name = self.reference_name(call.target?)?;
-                Some((
-                    call.address,
-                    name.chars().count().min(LISTING_CALL_NAME) + 3,
-                ))
-            })
-            .collect();
-        self.listing_chars = listing
-            .iter()
-            .map(|instruction| {
-                let comment = self
-                    .annotation_browser
-                    .comments
-                    .get(&instruction.address)
-                    .map_or(0, |comment| comment.chars().count() + 4);
-                let call = calls.get(&instruction.address).copied().unwrap_or(0);
-                operands + instruction.operands.chars().count() + call + comment
-            })
-            .max()
-            .unwrap_or(0);
         self.code_chars = self
             .comment_rows
             .rows
@@ -5840,89 +5811,73 @@ impl DesktopApp {
     fn side_panel(&mut self, ui: &mut egui::Ui) {
         self.update_comment_rows();
         let context = ui.ctx().clone();
-        theme::dock_header(
+        #[derive(Clone, Copy)]
+        enum Action {
+            Copy,
+            Refresh,
+            Auto,
+            Signature,
+            Warnings,
+        }
+        let warnings = &semantics_of(&self.code).warnings;
+        let mut actions = vec![
+            theme::DockAction {
+                id: Action::Copy,
+                label: "Copy",
+                tooltip: "Copy full pseudocode",
+                enabled: true,
+                priority: 0,
+                kind: theme::DockActionKind::Button,
+            },
+            theme::DockAction {
+                id: Action::Refresh,
+                label: "Refresh",
+                tooltip: "Refresh pseudocode",
+                enabled: true,
+                priority: 1,
+                kind: theme::DockActionKind::Button,
+            },
+            theme::DockAction {
+                id: Action::Signature,
+                label: "Signature…",
+                tooltip: "Edit return type, ordered parameters and current image ABI",
+                enabled: self.graph.is_some() && self.signature_replay.is_none(),
+                priority: 4,
+                kind: theme::DockActionKind::Button,
+            },
+            theme::DockAction {
+                id: Action::Auto,
+                label: "Auto",
+                tooltip: "Automatically decompile selected functions",
+                enabled: true,
+                priority: 3,
+                kind: theme::DockActionKind::Toggle(self.auto_decompile),
+            },
+        ];
+        if !warnings.is_empty() {
+            actions.push(theme::DockAction {
+                id: Action::Warnings,
+                label: "Warnings",
+                tooltip: "Names not applied",
+                enabled: true,
+                priority: 2,
+                kind: theme::DockActionKind::Warnings(warnings),
+            });
+        }
+        let action = theme::dock_header_actions(
             ui,
             "Decompiler",
-            false,
             self.saved_analysis
                 .then_some(("Saved analysis", "Saved pseudocode; Refresh to recompute.")),
-            |ui| {
-                if ui
-                    .small_button("Copy")
-                    .on_hover_text("Copy full pseudocode")
-                    .clicked()
-                {
-                    context.copy_text(self.decompiled().to_owned());
-                }
-                if ui.small_button("Refresh").clicked() {
-                    self.refresh_decompilation(&context);
-                }
-                // Narrow docks drop controls that the context and View menus
-                // also offer, keeping the title and warning count visible.
-                let warning_count = semantics_of(&self.code).warnings.len();
-                let not_applied = format!("{warning_count} names not applied");
-                let text = |text: &str| {
-                    egui::WidgetText::from(text)
-                        .into_galley(
-                            ui,
-                            Some(egui::TextWrapMode::Extend),
-                            f32::INFINITY,
-                            egui::TextStyle::Button,
-                        )
-                        .size()
-                        .x
-                };
-                let spacing = ui.spacing();
-                let button = |label: &str| {
-                    text(label) + spacing.button_padding.x * 2.0 + spacing.item_spacing.x
-                };
-                let warning_width = if warning_count == 0 {
-                    0.0
-                } else {
-                    button(&format!("    {warning_count}"))
-                };
-                let tools_width = button("Signature…")
-                    + text("Auto")
-                    + spacing.icon_width
-                    + spacing.icon_spacing
-                    + spacing.item_spacing.x;
-                let label_width = text(&not_applied) + spacing.item_spacing.x;
-                let title_room = theme::dock_title_room(ui, "Decompiler");
-                let show_tools = ui.available_width() >= tools_width + warning_width + title_room;
-                if show_tools {
-                    if ui
-                        .add_enabled(
-                            self.graph.is_some() && self.signature_replay.is_none(),
-                            egui::Button::new("Signature…").small(),
-                        )
-                        .on_hover_text("Edit return type, ordered parameters and current image ABI")
-                        .clicked()
-                    {
-                        self.begin_signature_editor();
-                    }
-                    ui.checkbox(&mut self.auto_decompile, "Auto");
-                }
-                let warnings = &semantics_of(&self.code).warnings;
-                if !warnings.is_empty() {
-                    if ui.available_width() >= label_width + warning_width {
-                        ui.colored_label(theme::WARNING, &not_applied);
-                    }
-                    theme::warning_menu(ui, warnings.len(), |ui| {
-                        ui.set_max_width(420.0);
-                        ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
-                            for warning in warnings {
-                                ui.add(
-                                    egui::Label::new(RichText::new(warning).color(theme::WARNING))
-                                        .wrap(),
-                                );
-                            }
-                        });
-                    })
-                    .response
-                    .on_hover_text(not_applied);
-                }
-            },
+            &actions,
         );
+        match action {
+            Some(Action::Copy) => context.copy_text(self.decompiled().to_owned()),
+            Some(Action::Refresh) => self.refresh_decompilation(&context),
+            Some(Action::Auto) => self.auto_decompile = !self.auto_decompile,
+            Some(Action::Signature) => self.begin_signature_editor(),
+            Some(Action::Warnings) | None => {}
+        }
         if let Some(error) = &self.signature_error {
             ui.colored_label(theme::WARNING, error);
         }
@@ -7656,7 +7611,6 @@ impl DesktopApp {
                     }
                 });
                 let digits = theme::address_digits(listing.last().map_or(0, |i| i.address));
-                let columns = theme::listing_columns(digits);
                 let glyph = theme::glyph_width(ui);
                 let (header, _) = ui.allocate_exact_size(
                     egui::vec2(ui.available_width(), theme::ROW_HEIGHT),
@@ -7673,7 +7627,7 @@ impl DesktopApp {
                     ("instruction-list", entry),
                     listing.len(),
                     theme::ROW_HEIGHT,
-                    self.listing_chars as f32 * glyph + 12.0,
+                    0.0,
                     reveal,
                     |ui, index, rect| {
                         let instruction = listing.get(index)?;
@@ -7691,46 +7645,45 @@ impl DesktopApp {
                         let callee = call
                             .and_then(|call| call.target)
                             .and_then(|target| self.function_names(target));
-                        if ui.is_rect_visible(rect) {
-                            let mut job = theme::listing_row(
-                                instruction.address,
-                                digits,
-                                &instruction.bytes,
-                                &instruction.mnemonic,
-                                &instruction.operands,
-                            );
-                            if let Some((name, _)) = callee {
-                                job.append(
-                                    &format!("  {}", crop(name, LISTING_CALL_NAME)),
-                                    0.0,
-                                    theme::mono_format(theme::SYNTAX_FUNCTION),
-                                );
-                            }
-                            if let Some(comment) =
-                                self.annotation_browser.comments.get(&instruction.address)
-                            {
-                                job.append(
-                                    &format!("  ; {comment}"),
-                                    0.0,
-                                    theme::mono_format(theme::SYNTAX_COMMENT),
-                                );
-                            }
-                            let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
-                            ui.painter().galley(
-                                egui::pos2(
-                                    rect.left() + 6.0,
-                                    rect.center().y - galley.size().y / 2.0,
-                                ),
-                                galley,
-                                theme::TEXT,
-                            );
-                        }
+                        let columns = theme::listing_columns(
+                            rect.width(),
+                            glyph,
+                            digits,
+                            ui.pixels_per_point(),
+                        );
+                        let elided = theme::listing_cells(
+                            ui,
+                            rect,
+                            &columns,
+                            &theme::ListingRow {
+                                address: instruction.address,
+                                address_digits: digits,
+                                bytes: &instruction.bytes,
+                                mnemonic: &instruction.mnemonic,
+                                operands: &instruction.operands,
+                                callee: callee.map(|(name, _)| name),
+                                comment: self
+                                    .annotation_browser
+                                    .comments
+                                    .get(&instruction.address)
+                                    .map(String::as_str),
+                            },
+                        );
                         let mut hover = Vec::new();
                         if let Some((_, Some(raw))) = callee {
                             hover.push(crop(raw, MAX_HOVER_NAME));
                         }
-                        if instruction.bytes.len() > theme::LISTING_BYTES {
-                            hover.push(hex(&instruction.bytes));
+                        if elided.address || elided.bytes || elided.code {
+                            hover.push(format!(
+                                "{:0digits$x}  {}  {} {}",
+                                instruction.address,
+                                hex(&instruction.bytes),
+                                instruction.mnemonic,
+                                instruction.operands
+                            ));
+                            if let Some((name, _)) = callee {
+                                hover.push(crop(name, MAX_HOVER_NAME));
+                            }
                         }
                         if let Some(note) = self
                             .session
@@ -7785,18 +7738,13 @@ impl DesktopApp {
                         None
                     },
                 );
-                let x = |column: usize| columns[column] as f32 * glyph;
-                theme::paint_column_header(
-                    ui,
-                    header,
-                    &[
-                        ("Address", x(0)),
-                        ("Bytes", x(1)),
-                        ("Mnemonic", x(2)),
-                        ("Operands", x(3)),
-                    ],
-                    output.state.clamped_offset().x,
+                let columns = theme::listing_columns(
+                    output.inner_rect.width(),
+                    glyph,
+                    digits,
+                    ui.pixels_per_point(),
                 );
+                theme::paint_listing_header(ui, header, &columns);
                 if let Some(address) = selected {
                     self.select_instruction(address);
                 }
@@ -9305,12 +9253,17 @@ fn discovery_summary(
 /// decompiler dock, given the width left beside the navigation dock. Both
 /// docks keep a usable minimum but never take the central views' minimum.
 fn dock_ranges(width: f32) -> (egui::Rangef, impl Fn(f32) -> egui::Rangef) {
-    const CENTRAL: f32 = 260.0;
-    let left_max = (width * 0.35).max(120.0);
-    let left = egui::Rangef::new(180.0_f32.min(left_max), left_max);
-    let right = |remaining: f32| {
-        let max = (remaining - CENTRAL).max(160.0);
-        egui::Rangef::new(240.0_f32.min(max), max)
+    let width = width.max(0.0);
+    // Reserve frame margins and both resize gutters before sharing width.
+    let usable = (width - 32.0).max(0.0);
+    let scale = (usable / (180.0 + 240.0 + 260.0)).min(1.0);
+    let central = 260.0 * scale;
+    let right_min = 240.0 * scale;
+    let left_max = (width * 0.35).min((usable - central - right_min).max(0.0));
+    let left = egui::Rangef::new((180.0 * scale).min(left_max), left_max);
+    let right = move |remaining: f32| {
+        let max = (remaining - central - 32.0).max(0.0);
+        egui::Rangef::new(right_min.min(max), max)
     };
     (left, right)
 }
@@ -9432,9 +9385,6 @@ fn function_title(
         None => response,
     }
 }
-/// Characters of a call target's name appended to a Listing row.
-const LISTING_CALL_NAME: usize = 120;
-
 fn crop(text: &str, maximum: usize) -> String {
     let mut chars = text.chars();
     let mut result: String = chars.by_ref().take(maximum).collect();
@@ -11260,21 +11210,26 @@ mod tests {
     }
 
     #[test]
-    fn narrow_decompiler_header_keeps_title_provenance_and_actions_unclipped() {
+    fn narrow_decompiler_header_keeps_actions_reachable_and_copies_full_source() {
         for scale in [1.0, 1.25] {
-            for width in [600.0, 340.0, 300.0, 240.0] {
+            for width in [180.0, 240.0, 260.0, 700.0] {
                 let context = egui::Context::default();
                 theme::install(&context);
                 context.set_pixels_per_point(scale);
+                context.all_styles_mut(|style| style.animation_time = 0.0);
                 let mut app = semantic_app();
                 app.saved_analysis = true;
-                let mut frame = || {
+                let source = app.decompiled().to_owned();
+                let mut draw = |events| {
+                    let time = context.input(|input| input.time) + 0.1;
                     let mut output = context.run_ui(
                         egui::RawInput {
                             screen_rect: Some(egui::Rect::from_min_size(
                                 egui::Pos2::ZERO,
-                                egui::vec2(width, 300.0),
+                                egui::vec2(width, 500.0),
                             )),
+                            time: Some(time),
+                            events,
                             ..Default::default()
                         },
                         |ui| app.side_panel(ui),
@@ -11282,49 +11237,85 @@ mod tests {
                     output.textures_delta.clear();
                     output
                 };
-                frame();
-                let output = frame();
-                let mut header = Vec::new();
-                for shape in &output.shapes {
-                    if let egui::epaint::Shape::Text(text) = &shape.shape {
-                        let bounds = text.galley.rect.translate(text.pos.to_vec2());
-                        if bounds.bottom() <= 26.0 {
+                draw(vec![]);
+                if width == 240.0 {
+                    let output = draw(vec![]);
+                    for label in ["Decompiler", "Copy", "Refresh", "Saved"] {
+                        assert!(
+                            !exact_text(&output, label).is_empty(),
+                            "inline {label} at {scale}"
+                        );
+                    }
+                    for shape in &output.shapes {
+                        if let egui::Shape::Text(text) = &shape.shape
+                            && ["Decompiler", "Saved"].contains(&text.galley.text())
+                        {
+                            assert!(!text.galley.elided);
                             assert!(
-                                shape.clip_rect.contains_rect(bounds),
-                                "width={width}, scale={scale}: {} clipped",
-                                text.galley.text()
+                                shape
+                                    .clip_rect
+                                    .contains_rect(text.galley.rect.translate(text.pos.to_vec2()))
                             );
-                            if text.galley.text() == "Decompiler" {
-                                assert!(!text.galley.elided, "width={width}, scale={scale}");
-                            }
-                            header.push(text.galley.text().to_owned());
                         }
                     }
                 }
-                for label in ["Decompiler", "Copy", "Refresh"] {
-                    assert!(
-                        header.iter().any(|text| text == label),
-                        "{width}: {header:?}"
-                    );
+                for label in ["Copy", "Auto"] {
+                    let output = draw(vec![]);
+                    if exact_text(&output, label).is_empty() {
+                        let more = exact_text(&output, "⋯")[0];
+                        draw(pointer_events(more));
+                        draw(vec![]);
+                    }
+                    let output = draw(vec![]);
+                    let target = exact_text(&output, label)[0];
+                    let output = draw(pointer_events(target));
+                    if label == "Copy" {
+                        assert!(output.platform_output.commands.iter().any(|command| matches!(command, egui::OutputCommand::CopyText(text) if text == &source)), "full source copied at {width}/{scale}");
+                    }
                 }
-                let saved = if width >= 300.0 {
-                    "Saved analysis"
-                } else {
-                    "Saved"
-                };
                 assert!(
-                    header.iter().any(|text| text == saved),
-                    "{width}: {header:?}"
+                    !app.auto_decompile,
+                    "Auto toggles through its actual control"
                 );
-                if width >= 600.0 || width <= 240.0 {
-                    assert_eq!(
-                        header.iter().any(|text| text == "Signature…"),
-                        width >= 600.0,
-                        "{width}: {header:?}"
-                    );
-                }
             }
         }
+    }
+
+    fn rendered_listing_rows(output: &egui::FullOutput) -> Vec<String> {
+        let anchors: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text)
+                    if text.galley.text().len() == 8
+                        && text.galley.text().bytes().all(|c| c.is_ascii_hexdigit()) =>
+                {
+                    Some(text.pos.y)
+                }
+                _ => None,
+            })
+            .collect();
+        anchors
+            .into_iter()
+            .map(|y| {
+                let mut cells: Vec<_> = output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) if (text.pos.y - y).abs() < 1.0 => {
+                            Some((text.pos.x, text.galley.text()))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                cells.sort_by(|a, b| a.0.total_cmp(&b.0));
+                cells
+                    .into_iter()
+                    .map(|(_, text)| text)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect()
     }
 
     #[test]
@@ -11355,7 +11346,8 @@ mod tests {
         }
         let original_source = app.decompiled().to_owned();
         let mut output = context.run_ui(egui::RawInput::default(), |ui| app.main_panel(ui));
-        let listing = rendered_text(&output);
+        output.textures_delta.clear();
+        let listing = rendered_listing_rows(&output);
         assert!(
             listing
                 .iter()
@@ -11742,13 +11734,13 @@ mod tests {
         frame(&mut app);
         let text = frame(&mut app);
         assert!(text.contains(&format!("{:08x}", 0x1000 + 1500 * 4)));
-        assert!(!text.contains("00001000 "));
+        assert!(!text.contains("00001000"));
         // Another function starts at its first instruction, not at row 1500.
         edit_view(&mut app, |view| view.address = 0x9000);
         set_listing(&mut app, function(0x9000));
         app.comment_rows_key = None;
         let text = frame(&mut app);
-        assert!(text.contains("00009000 "), "{text}");
+        assert!(text.contains("00009000"), "{text}");
         // Returning restores the earlier function's position.
         edit_view(&mut app, |view| view.address = 0x1000);
         set_listing(&mut app, function(0x1000));
@@ -11758,16 +11750,28 @@ mod tests {
 
     #[test]
     fn side_docks_leave_the_central_views_room_as_the_window_shrinks() {
-        for width in [700.0_f32, 760.0, 1024.0, 1440.0, 2560.0] {
-            let (left, right) = dock_ranges(width);
-            let right = right(width - left.max);
-            assert!(left.min <= left.max && right.min <= right.max);
-            assert!(width - left.max - right.max >= 260.0, "{width}");
+        for width in [
+            0.0_f32, 20.0, 200.0, 400.0, 680.0, 700.0, 760.0, 1024.0, 1440.0, 2560.0,
+        ] {
+            let (left, right_range) = dock_ranges(width);
+            for left_width in [left.min, left.max] {
+                let right = right_range(width - left_width);
+                for range in [left, right] {
+                    assert!(range.min.is_finite() && range.max.is_finite());
+                    assert!(
+                        0.0 <= range.min && range.min <= range.max,
+                        "{width}: {range:?}"
+                    );
+                }
+                let usable = (width - 32.0).max(0.0);
+                let central = 260.0 * (usable / 680.0).min(1.0);
+                assert!(width - left_width - right.max + 0.001 >= central, "{width}");
+            }
         }
     }
 
     #[test]
-    fn narrow_listing_keeps_long_instructions_on_single_scrollable_rows() {
+    fn narrow_listing_clips_long_instructions_without_horizontal_scrolling() {
         let context = egui::Context::default();
         theme::install(&context);
         let mut app = semantic_app();
@@ -11809,10 +11813,8 @@ mod tests {
                 1,
                 "long instructions must not consume adjacent rows"
             );
-            assert!(
-                row.rect.width() > 360.0,
-                "retain the full horizontally scrollable instruction"
-            );
+            assert!(row.rect.width() < 360.0, "fit the operand cell");
+            assert!(row.elided, "long operands are visibly ellipsized");
         }
     }
 
@@ -16203,8 +16205,11 @@ mod tests {
                 shown[2].unwrap()
             } else {
                 // Collapsed to a view menu: every tab is one of its entries.
-                let face = shown[0].expect("selected tab face");
-                frame(&mut app, pointer_events(face));
+                assert!(shown[0].is_some(), "selected tab remains visible");
+                let more = *exact_text(&output, "»")
+                    .last()
+                    .expect("Functions overflow chevron");
+                frame(&mut app, pointer_events(more));
                 let output = frame(&mut app, vec![]);
                 for label in labels {
                     assert!(!exact_text(&output, label).is_empty(), "{width}: {label}");

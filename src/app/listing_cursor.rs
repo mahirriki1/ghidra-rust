@@ -784,20 +784,26 @@ mod tests {
         assert_eq!(keyed.app.selected, Some(0x1000));
         assert!(keyed.app.semantic.ranges.is_empty());
         assert!(keyed.app.pending_code_scroll.is_none());
-        let row = output
+        let row_y = output
             .shapes
             .iter()
             .find_map(|shape| match &shape.shape {
-                egui::epaint::Shape::Text(text) if text.galley.text().starts_with("00001000") => {
-                    Some(text.galley.clone())
+                egui::epaint::Shape::Text(text) if text.galley.text() == "00001000" => {
+                    Some(text.pos.y)
                 }
                 _ => None,
             })
             .unwrap();
-        let colors: std::collections::BTreeSet<_> = row
-            .job
-            .sections
+        let colors: std::collections::BTreeSet<_> = output
+            .shapes
             .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) if (text.pos.y - row_y).abs() < 1.0 => {
+                    Some(&text.galley.job.sections)
+                }
+                _ => None,
+            })
+            .flatten()
             .map(|section| section.format.color.to_array())
             .collect();
         assert!(colors.contains(&theme::SYNTAX_KEYWORD.to_array()) && colors.len() > 2);
