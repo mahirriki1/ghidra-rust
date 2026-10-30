@@ -1522,6 +1522,38 @@ pub fn sortable_column_header(
     (rect, clicked)
 }
 
+/// A compact sort menu at `rect`, for a header whose columns do not all
+/// fit. `active` is the sorted column; returns the chosen one.
+pub fn sort_menu(
+    ui: &mut Ui,
+    rect: egui::Rect,
+    id: egui::Id,
+    titles: &[&str],
+    active: Option<usize>,
+) -> Option<usize> {
+    let response = ui
+        .interact(rect, id, egui::Sense::click())
+        .on_hover_text("Sort");
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Sort"));
+    if response.hovered() || response.has_focus() {
+        ui.painter()
+            .rect_filled(rect, 3, ui.visuals().widgets.hovered.weak_bg_fill);
+    }
+    for offset in [-4.0, 0.0, 4.0] {
+        ui.painter()
+            .circle_filled(rect.center() + egui::vec2(offset, 0.0), 1.2, MUTED);
+    }
+    let mut chosen = None;
+    egui::Popup::menu(&response).show(|ui| {
+        for (index, title) in titles.iter().enumerate() {
+            if ui.selectable_label(active == Some(index), *title).clicked() {
+                chosen = Some(index);
+            }
+        }
+    });
+    chosen
+}
+
 /// A muted placeholder centered in an empty view.
 pub fn empty_state(ui: &mut Ui, text: &str) {
     ui.add_space(24.0);

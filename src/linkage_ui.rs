@@ -25,6 +25,7 @@ use crate::linkage::{
 };
 use crate::model::{BinaryInfo, Request};
 use crate::session::Session;
+use crate::table_sort::{SortKey, TableSort, tsv_row};
 use crate::theme;
 
 /// Height of one expanded category's virtualized list.
@@ -316,6 +317,8 @@ enum State {
 
 /// One flat list's filtered record identities in presentation order.
 struct FlatRows {
+    /// Distinguishes every rebuilt list, for its sorted order.
+    epoch: u64,
     /// The filter text as typed; lowercased only when rebuilding.
     filter: String,
     revision: u64,
@@ -356,6 +359,10 @@ pub(crate) struct LinkageTree {
     flat: [Option<FlatRows>; 2],
     /// The selection each flat list last scrolled to.
     flat_revealed: [Option<LinkageItem>; 2],
+    flat_epoch: u64,
+    /// Display orders of the flat lists: Address, Name, then Library or
+    /// Ordinal.
+    sorts: [TableSort<u64, u32>; 2],
 }
 
 impl Default for LinkageTree {
@@ -371,6 +378,8 @@ impl Default for LinkageTree {
             rows: None,
             flat: [None, None],
             flat_revealed: [None, None],
+            flat_epoch: 0,
+            sorts: Default::default(),
         }
     }
 }
@@ -850,6 +859,7 @@ fn row_menu(
     response: &egui::Response,
     item: LinkageItem,
     places: impl FnOnce() -> Vec<Place>,
+    copy: Option<&dyn Fn() -> String>,
     action: &mut Option<TreeAction>,
 ) {
     response.context_menu(|ui| {
@@ -868,7 +878,84 @@ fn row_menu(
             *action = Some(TreeAction::Xrefs(item));
             ui.close();
         }
+        if let Some(copy) = copy
+            && ui.button("Copy row").clicked()
+        {
+            ui.ctx().copy_text(copy());
+            ui.close();
+        }
     });
+}
+
+/// A flat Imports/Exports row's value in a column: its opened address, its
+/// shown name, then its library label or ordinal. Entries without an
+/// address, a name or an ordinal sort last.
+fn flat_sort_key(
+    prepared: &PreparedLinkage,
+    session: Option<&Session>,
+    table: Table,
+    id: u32,
+    column: usize,
+    pointer: u64,
+) -> SortKey {
+    let linkage = prepared.linkage();
+    let name = |label: Option<&str>,
+                raw: &Option<String>,
+                display: &Option<String>,
+                ordinal: Option<u32>| {
+        if label.is_none() && raw.is_none() && display.is_none() && ordinal.is_none() {
+            SortKey::Missing
+        } else {
+            SortKey::text(&shown_name(label, raw, display, ordinal))
+        }
+    };
+    match (table, column) {
+        (Table::Imports, 0) => SortKey::number(
+            destination(linkage, LinkageItem::Import(id), pointer).map(Place::address),
+        ),
+        (Table::Exports, 0) => SortKey::number(
+            destination(linkage, LinkageItem::Export(id), pointer).map(Place::address),
+        ),
+        (Table::Imports, 1) => {
+            linkage
+                .imports
+                .get(id as usize)
+                .map_or(SortKey::Missing, |import| {
+                    name(
+                        label_at(session, import_address(import)),
+                        &import.raw,
+                        &import.display,
+                        import.ordinal,
+                    )
+                })
+        }
+        (Table::Exports, 1) => {
+            linkage
+                .exports
+                .get(id as usize)
+                .map_or(SortKey::Missing, |export| {
+                    name(
+                        label_at(session, export.target.address()),
+                        &export.raw,
+                        &export.display,
+                        export.ordinal,
+                    )
+                })
+        }
+        (Table::Imports, _) => prepared
+            .view
+            .import_groups
+            .get(id as usize)
+            .and_then(|&group| prepared.view.groups.get(group as usize))
+            .map_or(SortKey::Missing, |group| SortKey::text(&group.label)),
+        (Table::Exports, _) => SortKey::number(
+            linkage
+                .exports
+                .get(id as usize)
+                .and_then(|export| export.ordinal)
+                .map(u64::from),
+        ),
+    }
 }
 
 fn click_action(response: &egui::Response, item: LinkageItem) -> Option<TreeAction> {
@@ -1000,7 +1087,9 @@ impl LinkageTree {
             .as_ref()
             .is_some_and(|rows| rows.filter == filter && rows.revision == revision)
         {
+            self.flat_epoch = self.flat_epoch.wrapping_add(1);
             *slot = Some(FlatRows {
+                epoch: self.flat_epoch,
                 filter: filter.to_owned(),
                 revision,
                 query: filter.to_lowercase(),
@@ -1093,7 +1182,9 @@ impl LinkageTree {
             ui.ctx().request_repaint();
         }
         self.refresh_flat(table, session, revision, filter);
+        let mut sort = std::mem::take(&mut self.sorts[table as usize]);
         let (Some(prepared), Some(rows)) = (self.prepared(), &self.flat[table as usize]) else {
+            self.sorts[table as usize] = sort;
             return None;
         };
         if !rows.complete {
@@ -1103,12 +1194,6 @@ impl LinkageTree {
         let item = |id: u32| match table {
             Table::Imports => LinkageItem::Import(id),
             Table::Exports => LinkageItem::Export(id),
-        };
-        let selected = self.selected;
-        let reveal = if self.flat_revealed[table as usize] == selected {
-            None
-        } else {
-            selected.and_then(|selected| rows.ids.iter().position(|&id| item(id) == selected))
         };
         let glyph = theme::glyph_width(ui);
         let digits = theme::address_digits(prepared.last_address);
@@ -1126,17 +1211,60 @@ impl LinkageTree {
         }
         // Optional columns must leave useful name space and fit their heading.
         .filter(|&x| x - name_x >= 10.0 * glyph && width - x >= 9.0 * glyph);
-        let mut columns = vec![("Address", 0.0), ("Name", name_x)];
+        let titles = [
+            "Address",
+            "Name",
+            match table {
+                Table::Imports => "Library",
+                Table::Exports => "Ordinal",
+            },
+        ];
+        let mut columns = vec![(titles[0], 0.0), (titles[1], name_x)];
         if let Some(x) = tail_x {
-            columns.push((
-                match table {
-                    Table::Imports => "Library",
-                    Table::Exports => "Ordinal",
-                },
-                x,
-            ));
+            columns.push((titles[2], x));
         }
-        theme::column_header(ui, &columns, 0.0);
+        let active = sort.applied().filter(|(column, _)| *column < columns.len());
+        let (header, clicked) = theme::sortable_column_header(
+            ui,
+            ("flat-linkage-header", table as u8),
+            &columns,
+            0.0,
+            active,
+        );
+        let mut clicked = clicked;
+        if tail_x.is_none() {
+            // The hidden tail column stays sortable from a compact menu.
+            let gutter = ui.spacing().scroll.allocated_width();
+            let rect = egui::Rect::from_min_size(
+                egui::pos2(header.right() - gutter - 22.0, header.top() + 1.0),
+                egui::vec2(20.0, header.height() - 2.0),
+            );
+            let id = ui.make_persistent_id(("flat-linkage-sort", table as u8));
+            let active = sort.applied().map(|(column, _)| column);
+            clicked = clicked.or(theme::sort_menu(ui, rect, id, &titles, active));
+        }
+        if let Some(column) = clicked {
+            sort.click(column);
+        }
+        sort.prepare(
+            ui.ctx(),
+            &rows.epoch,
+            rows.complete,
+            &rows.ids,
+            |column, &id| flat_sort_key(prepared, session, table, id, column, pointer),
+        );
+        let selected = self.selected;
+        let revealed = if sort.take_reveal() {
+            None
+        } else {
+            self.flat_revealed[table as usize]
+        };
+        let ids = sort.rows(&rows.ids);
+        let reveal = if revealed == selected {
+            None
+        } else {
+            selected.and_then(|selected| ids.iter().position(|&id| item(id) == selected))
+        };
         let mut action = None;
         theme::rows::<()>(
             ui,
@@ -1144,12 +1272,12 @@ impl LinkageTree {
                 Table::Imports => "flat-import-rows",
                 Table::Exports => "flat-export-rows",
             },
-            rows.ids.len(),
+            ids.len(),
             theme::ROW_HEIGHT,
             0.0,
             reveal,
             |ui, row, rect| {
-                let id = rows.ids[row];
+                let id = ids[row];
                 let item = item(id);
                 let response = theme::row_response(
                     ui,
@@ -1179,59 +1307,78 @@ impl LinkageTree {
                     theme::MUTED
                 };
                 let name = cell(name_x, tail_x);
+                let (shown, tail) = match table {
+                    Table::Imports => {
+                        let import = &linkage.imports[id as usize];
+                        let group = prepared.view.import_groups[id as usize];
+                        (
+                            shown_name(
+                                label_at(session, import_address(import)),
+                                &import.raw,
+                                &import.display,
+                                import.ordinal,
+                            ),
+                            Some(Cow::Borrowed(
+                                prepared.view.groups[group as usize].label.as_str(),
+                            )),
+                        )
+                    }
+                    Table::Exports => {
+                        let export = &linkage.exports[id as usize];
+                        (
+                            shown_name(
+                                label_at(session, export.target.address()),
+                                &export.raw,
+                                &export.display,
+                                export.ordinal,
+                            ),
+                            export
+                                .ordinal
+                                .map(|ordinal| Cow::Owned(ordinal.to_string())),
+                        )
+                    }
+                };
+                theme::cell_text(ui, name, body(shown.as_ref()), color);
+                if let (Some(x), Some(tail)) = (tail_x, &tail) {
+                    let text = match table {
+                        Table::Imports => body(tail.as_ref()),
+                        Table::Exports => RichText::new(tail.as_ref()).monospace(),
+                    };
+                    theme::cell_text(ui, cell(x, None), text, theme::MUTED);
+                }
                 let response = match table {
                     Table::Imports => {
                         let import = &linkage.imports[id as usize];
-                        let shown = shown_name(
-                            label_at(session, import_address(import)),
-                            &import.raw,
-                            &import.display,
-                            import.ordinal,
-                        );
-                        theme::cell_text(ui, name, body(shown), color);
-                        if let Some(x) = tail_x {
-                            let group = prepared.view.import_groups[id as usize];
-                            theme::cell_text(
-                                ui,
-                                cell(x, None),
-                                body(prepared.view.groups[group as usize].label.as_str()),
-                                theme::MUTED,
-                            );
-                        }
                         response.on_hover_ui(|ui| import_hover(ui, linkage, import))
                     }
                     Table::Exports => {
                         let export = &linkage.exports[id as usize];
-                        let shown = shown_name(
-                            label_at(session, export.target.address()),
-                            &export.raw,
-                            &export.display,
-                            export.ordinal,
-                        );
-                        theme::cell_text(ui, name, body(shown), color);
-                        if let (Some(x), Some(ordinal)) = (tail_x, export.ordinal) {
-                            theme::cell_text(
-                                ui,
-                                cell(x, None),
-                                RichText::new(ordinal.to_string()).monospace(),
-                                theme::MUTED,
-                            );
-                        }
                         response.on_hover_ui(|ui| export_hover(ui, export))
                     }
                 };
                 if let Some(chosen) = click_action(&response, item) {
                     action = Some(chosen);
                 }
+                // Visible columns only, with full rather than clipped text.
+                let copy = || {
+                    let address = address.map_or(String::new(), |a| format!("{a:0digits$x}"));
+                    let mut cells = vec![address.as_str(), shown.as_ref()];
+                    if tail_x.is_some() {
+                        cells.push(tail.as_deref().unwrap_or(""));
+                    }
+                    tsv_row(cells)
+                };
                 row_menu(
                     &response,
                     item,
                     || places(linkage, item, pointer),
+                    Some(&copy),
                     &mut action,
                 );
                 None
             },
         );
+        self.sorts[table as usize] = sort;
         // One-shot: a selection outside this filter is not searched again.
         if rows.complete || reveal.is_some() {
             self.flat_revealed[table as usize] = selected;
@@ -1321,7 +1468,13 @@ impl LinkageTree {
                             if let Some(chosen) = click_action(&response, item) {
                                 *action = Some(chosen);
                             }
-                            row_menu(&response, item, || places(linkage, item, pointer), action);
+                            row_menu(
+                                &response,
+                                item,
+                                || places(linkage, item, pointer),
+                                None,
+                                action,
+                            );
                             response.on_hover_ui(|ui| import_hover(ui, linkage, import));
                         }
                         Row::Location(index) => {
@@ -1347,7 +1500,13 @@ impl LinkageTree {
                             if let Some(chosen) = click_action(&response, item) {
                                 *action = Some(chosen);
                             }
-                            row_menu(&response, item, || places(linkage, item, pointer), action);
+                            row_menu(
+                                &response,
+                                item,
+                                || places(linkage, item, pointer),
+                                None,
+                                action,
+                            );
                         }
                     }
                     None
@@ -1407,7 +1566,13 @@ impl LinkageTree {
                     if let Some(chosen) = click_action(&response, item) {
                         *action = Some(chosen);
                     }
-                    row_menu(&response, item, || places(linkage, item, pointer), action);
+                    row_menu(
+                        &response,
+                        item,
+                        || places(linkage, item, pointer),
+                        None,
+                        action,
+                    );
                     response.on_hover_ui(|ui| export_hover(ui, export));
                     None
                 },
@@ -2142,6 +2307,157 @@ mod tests {
         frame(&mut tree, 2.0, 0.0);
         let shown = frame(&mut tree, 2.1, 0.0);
         assert!(shown.contains(&42), "revealed: {shown:?}");
+    }
+
+    #[test]
+    fn flat_sorts_keep_identities_reveal_the_selection_and_copy_the_clicked_row() {
+        let info = fixture::info(&sha());
+        let mut records = vec![LinkageRecord::Library(crate::linkage::Library {
+            id: 0,
+            name: "library.dll".into(),
+        })];
+        // More rows than the GUI thread sorts itself.
+        records.extend((0..6_000).map(|id| {
+            LinkageRecord::Import(fixture::import(
+                id,
+                Some(&format!("import_{id:05}")),
+                Some(0),
+            ))
+        }));
+        let table = LinkageTable::new(records, Vec::new()).with_image(&sha());
+        let context = egui::Context::default();
+        theme::install(&context);
+        context.set_pixels_per_point(1.25);
+        context.all_styles_mut(|style| style.animation_time = 0.0);
+        let mut tree = LinkageTree::default();
+        tree.begin(1, 1);
+        let linkage = fixture::fetch(&mut tree, &table, &info, 1, 1).unwrap();
+        tree.build(linkage, &context);
+        assert!(matches!(tree.wait(), Polled::Ready(_)));
+        tree.select(LinkageItem::Import(42));
+        let mut filter = String::new();
+        let mut time = 0.0;
+        let mut frame = |tree: &mut LinkageTree, events: Vec<egui::Event>| {
+            time += 1.0 / 30.0;
+            let mut action = None;
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(320.0, 240.0),
+                    )),
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    ui.allocate_ui(egui::vec2(320.0, 240.0), |ui| {
+                        action = tree.show_flat(ui, Table::Imports, None, 0, &mut filter, 8);
+                    });
+                },
+            );
+            output.textures_delta.clear();
+            let texts = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some((
+                        text.galley.text().to_owned(),
+                        text.galley.rect.translate(text.pos.to_vec2()),
+                    )),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert!(action.is_none(), "sorting and copying never navigate");
+            (texts, output.platform_output.commands)
+        };
+        let shown = |texts: &[(String, egui::Rect)]| {
+            texts
+                .iter()
+                .filter_map(|(text, _)| text.strip_prefix("import_")?.parse::<u32>().ok())
+                .collect::<Vec<_>>()
+        };
+        let click = |point: egui::Pos2, button| {
+            let event = |pressed| egui::Event::PointerButton {
+                pos: point,
+                button,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            vec![egui::Event::PointerMoved(point), event(true), event(false)]
+        };
+        let (texts, _) = frame(&mut tree, Vec::new());
+        let name = texts.iter().find(|(text, _)| text == "Name").unwrap().1;
+        let rows = shown(&texts);
+        assert!(
+            rows.contains(&42) && rows.windows(2).all(|pair| pair[0] + 1 == pair[1]),
+            "native order first: {rows:?}"
+        );
+        // Ascending matches the native order; a second click descends.
+        frame(
+            &mut tree,
+            click(name.center(), egui::PointerButton::Primary),
+        );
+        frame(
+            &mut tree,
+            click(name.center(), egui::PointerButton::Primary),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let texts = loop {
+            let (texts, _) = frame(&mut tree, Vec::new());
+            if tree.sorts[0].applied() == Some((1, theme::SortDirection::Descending)) {
+                break frame(&mut tree, Vec::new()).0;
+            }
+            assert!(std::time::Instant::now() < deadline, "sort finished");
+            drop(texts);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        let rows = shown(&texts);
+        assert!(
+            rows.contains(&42),
+            "selection revealed after sorting: {rows:?}"
+        );
+        assert!(
+            rows.windows(2).all(|pair| pair[0] == pair[1] + 1),
+            "descending names: {rows:?}"
+        );
+        assert_eq!(tree.selected(), Some(LinkageItem::Import(42)));
+        assert_eq!(tree.flat_items(Table::Imports).unwrap().len(), 6_000);
+        // The menu copies the row it opened on, with its visible columns.
+        let row = texts
+            .iter()
+            .find(|(text, _)| text == "import_00042")
+            .unwrap()
+            .1;
+        frame(
+            &mut tree,
+            click(row.center(), egui::PointerButton::Secondary),
+        );
+        let (texts, _) = frame(&mut tree, Vec::new());
+        let copy = texts.iter().find(|(text, _)| text == "Copy row").unwrap().1;
+        let (_, commands) = frame(
+            &mut tree,
+            click(copy.center(), egui::PointerButton::Primary),
+        );
+        assert!(
+            commands.iter().any(|command| matches!(
+                command,
+                egui::OutputCommand::CopyText(text) if text == "\timport_00042\tlibrary.dll"
+            )),
+            "{commands:?}"
+        );
+        // A third click restores the native order.
+        frame(
+            &mut tree,
+            click(name.center(), egui::PointerButton::Primary),
+        );
+        let (texts, _) = frame(&mut tree, Vec::new());
+        assert_eq!(tree.sorts[0].applied(), None);
+        let rows = shown(&texts);
+        assert!(
+            rows.contains(&42) && rows.windows(2).all(|pair| pair[0] + 1 == pair[1]),
+            "native order, selection revealed: {rows:?}"
+        );
     }
 
     #[test]
