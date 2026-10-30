@@ -415,6 +415,22 @@ pub(crate) fn tsv_row<'a>(cells: impl IntoIterator<Item = &'a str>) -> String {
     row
 }
 
+/// One clipboard value built from `parts` without escaping. It is capped
+/// at the row budget, ending in an ellipsis at a character boundary.
+pub(crate) fn bounded_text<'a>(parts: impl IntoIterator<Item = &'a str>) -> String {
+    let mut text = String::new();
+    let limit = MAX_COPY_BYTES - '…'.len_utf8();
+    for part in parts {
+        if text.len() + part.len() > limit {
+            text.push_str(&part[..part.floor_char_boundary(limit - text.len())]);
+            text.push('…');
+            return text;
+        }
+        text.push_str(part);
+    }
+    text
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -580,5 +596,17 @@ mod tests {
         let row = tsv_row(["1", &long]);
         assert!(row.len() <= MAX_COPY_BYTES);
         assert!(row.starts_with("1\tü") && row.ends_with('…'));
+    }
+
+    #[test]
+    fn copied_values_keep_raw_text_within_the_budget() {
+        assert_eq!(bounded_text(["mov", " ", "a\tb"]), "mov a\tb");
+        // A part crossing the budget is cut at a character boundary.
+        let long = "ü".repeat(MAX_COPY_BYTES);
+        for parts in [vec!["x", long.as_str()], vec![long.as_str(), "tail"]] {
+            let text = bounded_text(parts);
+            assert!(text.len() <= MAX_COPY_BYTES && text.ends_with('…'));
+            assert!(!text.contains("tail"));
+        }
     }
 }

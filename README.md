@@ -120,6 +120,16 @@ once. A narrow Imports or Exports list sorts its hidden column from **⋯**.
 Right-click a row and choose **Copy row** to copy its visible columns as
 tab-separated text. Sort choices reset when a binary closes.
 
+Right-click acts on exactly the clicked row or pseudocode token and does not
+change the selection. Listing rows offer **Go to target**, **Show in Graph**,
+**Show in Hex**, **Rename…**, **Comment…**, xrefs and copying the address,
+bytes or instruction. Decompiler call and local tokens can be copied, renamed
+and followed; a call to code that is not a known function cannot be renamed,
+a local without verified storage cannot be renamed, and other pseudocode
+offers **Copy line**. Functions, Strings and Symbol Tree rows add **Go to** and
+**Copy row**. An open menu closes when the binary, function, pseudocode, graph,
+annotations or table it came from changes.
+
 Visited functions reuse compatible session results. **Analysis → Refresh
 function** recomputes the selected function. This session cache does not mean
 every visited function is saved in a project.
