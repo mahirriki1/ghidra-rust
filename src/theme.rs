@@ -1424,6 +1424,104 @@ pub fn paint_column_header(ui: &Ui, rect: egui::Rect, columns: &[(&str, f32)], s
     }
 }
 
+/// The direction shown by [`sortable_column_header`]; presentation only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SortDirection {
+    Ascending,
+    Descending,
+}
+
+/// A [`column_header`] whose cells are focusable sort buttons. `active` marks
+/// the sorted column. Returns the strip and the clicked column; the caller
+/// owns the data and the sort state.
+pub fn sortable_column_header(
+    ui: &mut Ui,
+    id_salt: impl std::hash::Hash + std::fmt::Debug,
+    columns: &[(&str, f32)],
+    scroll_x: f32,
+    active: Option<(usize, SortDirection)>,
+) -> (egui::Rect, Option<usize>) {
+    const INDICATOR: f32 = 14.0;
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), ROW_HEIGHT),
+        egui::Sense::hover(),
+    );
+    let id = ui.make_persistent_id(egui::IdSalt::new(id_salt));
+    let clip = rect.intersect(ui.clip_rect());
+    let painter = ui.painter().with_clip_rect(clip);
+    painter.rect_filled(rect, 0, HEADER);
+    let mut clicked = None;
+    for (index, (title, x)) in columns.iter().enumerate() {
+        let left = rect.left() + x - scroll_x;
+        let right = columns
+            .get(index + 1)
+            .map_or(rect.right(), |(_, next)| rect.left() + next - scroll_x);
+        if right <= left {
+            continue;
+        }
+        let cell = egui::Rect::from_x_y_ranges(left..=right, rect.y_range());
+        let direction = active
+            .filter(|(column, _)| *column == index)
+            .map(|(_, direction)| direction);
+        let response = ui.interact(cell.intersect(clip), id.with(index), egui::Sense::click());
+        response.widget_info(|| {
+            let name = match direction {
+                Some(SortDirection::Ascending) => format!("{title}, sorted ascending"),
+                Some(SortDirection::Descending) => format!("{title}, sorted descending"),
+                None => (*title).to_owned(),
+            };
+            egui::WidgetInfo::labeled(egui::Role::Button, true, name)
+        });
+        if response.hovered() {
+            painter.rect_filled(cell, 0, HOVER);
+        }
+        if response.has_focus() {
+            painter.rect_stroke(
+                cell.shrink(1.0),
+                0,
+                Stroke::new(1.0, ACCENT),
+                egui::StrokeKind::Inside,
+            );
+        }
+        let label_clip = egui::Rect::from_x_y_ranges(
+            cell.left()..=(cell.right() - INDICATOR).max(cell.left()),
+            cell.y_range(),
+        );
+        painter.with_clip_rect(label_clip.intersect(clip)).text(
+            egui::pos2(cell.left() + 6.0, cell.center().y),
+            egui::Align2::LEFT_CENTER,
+            *title,
+            FontId::proportional(12.0),
+            if direction.is_some() { TEXT } else { MUTED },
+        );
+        if let Some(direction) = direction {
+            let center = egui::pos2(cell.right() - INDICATOR / 2.0, cell.center().y);
+            let (tip, base) = match direction {
+                SortDirection::Ascending => (-3.0, 2.0),
+                SortDirection::Descending => (3.0, -2.0),
+            };
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    center + egui::vec2(0.0, tip),
+                    center + egui::vec2(3.5, base),
+                    center + egui::vec2(-3.5, base),
+                ],
+                MUTED,
+                Stroke::NONE,
+            ));
+        }
+        if response.clicked() {
+            clicked = Some(index);
+        }
+    }
+    painter.hline(
+        rect.x_range(),
+        rect.bottom() - 0.5,
+        Stroke::new(1.0, BORDER),
+    );
+    (rect, clicked)
+}
+
 /// A muted placeholder centered in an empty view.
 pub fn empty_state(ui: &mut Ui, text: &str) {
     ui.add_space(24.0);
@@ -1810,6 +1908,78 @@ mod tests {
         assert_eq!(super::listing_bytes(&[0x66; 15]), "66 66 66 66 66 66 66…");
         assert_eq!(super::address_digits(0x1000), 8);
         assert_eq!(super::address_digits(0x1_4000_1000), 9);
+    }
+
+    #[test]
+    fn sortable_header_reports_clicks_and_keyboard_activation() {
+        let context = egui::Context::default();
+        super::install(&context);
+        let columns = [("Name", 0.0), ("Size", 120.0), ("Modified", 200.0)];
+        let frame = |events: Vec<egui::Event>| {
+            let mut clicked = None;
+            let mut strip = egui::Rect::NOTHING;
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(300.0, 100.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    let (rect, index) = super::sortable_column_header(
+                        ui,
+                        "header",
+                        &columns,
+                        0.0,
+                        Some((1, super::SortDirection::Descending)),
+                    );
+                    strip = rect;
+                    clicked = index;
+                },
+            );
+            output.textures_delta.clear();
+            // Labels are clipped inside their own cells.
+            for shape in &output.shapes {
+                if let egui::Shape::Text(text) = &shape.shape
+                    && text.galley.text() == "Size"
+                {
+                    assert!(shape.clip_rect.right() <= strip.left() + 200.0 - 14.0 + 0.01);
+                }
+            }
+            (strip, clicked)
+        };
+        let (strip, _) = frame(vec![]);
+        assert_eq!(strip.height(), super::ROW_HEIGHT);
+        let at = egui::pos2(strip.left() + 150.0, strip.center().y);
+        let button = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(vec![egui::Event::PointerMoved(at)]);
+        frame(vec![button(true)]);
+        assert_eq!(frame(vec![button(false)]).1, Some(1));
+        // Tab reaches the first heading; Enter activates it.
+        let key = |key, pressed| egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(vec![key(egui::Key::Tab, true), key(egui::Key::Tab, false)]);
+        frame(vec![]);
+        assert_eq!(
+            frame(vec![
+                key(egui::Key::Enter, true),
+                key(egui::Key::Enter, false)
+            ])
+            .1,
+            Some(0)
+        );
     }
 }
 
