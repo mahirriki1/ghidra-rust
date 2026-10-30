@@ -98,8 +98,8 @@ struct BrowserDialog {
     error: Option<String>,
     focus: bool,
     generation: u64,
-    /// Annotation revision a menu-origin draft was opened against.
-    revision: Option<u64>,
+    /// Exact source snapshot a menu-origin draft was opened against.
+    menu_context: Option<context_menu::MenuDraft>,
 }
 
 #[derive(Clone, Copy)]
@@ -4506,7 +4506,7 @@ impl DesktopApp {
             error: None,
             focus: true,
             generation: self.generation,
-            revision: None,
+            menu_context: None,
         });
         true
     }
@@ -4544,7 +4544,7 @@ impl DesktopApp {
             error: None,
             focus: true,
             generation: self.generation,
-            revision: None,
+            menu_context: None,
         });
     }
 
@@ -4927,7 +4927,7 @@ impl DesktopApp {
                 error: None,
                 focus: true,
                 generation: self.generation,
-                revision: None,
+                menu_context: None,
             });
         }
     }
@@ -5073,11 +5073,12 @@ impl DesktopApp {
         let Some(mut dialog) = self.browser_dialog.take() else {
             return;
         };
-        // A menu-origin draft is discarded once its annotations change.
+        // A menu-origin draft cannot apply to a replaced source snapshot.
         if dialog.generation != self.generation
             || dialog
-                .revision
-                .is_some_and(|revision| revision != self.revision)
+                .menu_context
+                .as_ref()
+                .is_some_and(|draft| !self.menu_draft_current(draft))
         {
             return;
         }

@@ -101,7 +101,7 @@ impl PartialEq for MenuBinding {
     }
 }
 
-struct ActiveMenu {
+pub(super) struct MenuDraft {
     source: MenuSource,
     binding: MenuBinding,
 }
@@ -109,7 +109,7 @@ struct ActiveMenu {
 /// The one open exact-target menu of the desktop.
 #[derive(Default)]
 pub(super) struct ContextMenus {
-    active: Option<ActiveMenu>,
+    active: Option<MenuDraft>,
     /// The frame a menu last owned input, including its closing frame.
     input_frame: Option<u64>,
 }
@@ -227,6 +227,9 @@ impl DesktopApp {
         let strings = (self.source_epochs.strings, self.table_sorts.string_rows);
         match source {
             MenuSource::Instruction { entry, .. } => {
+                if self.tab != Tab::Listing {
+                    return None;
+                }
                 let graph = self.graph.as_ref().filter(|g| g.address() == entry)?;
                 binding.graph = Some(Arc::downgrade(graph));
                 binding.tab = Some(Tab::Listing);
@@ -236,8 +239,17 @@ impl DesktopApp {
                 binding.code = Some(Arc::downgrade(code));
                 binding.graph = self.graph.as_ref().map(Arc::downgrade);
             }
-            MenuSource::FunctionRow(_) | MenuSource::TreeFunction(_) => binding.rows = functions,
+            MenuSource::FunctionRow(_) => {
+                if self.function_dock != super::FunctionDock::Functions {
+                    return None;
+                }
+                binding.rows = functions;
+            }
+            MenuSource::TreeFunction(_) => binding.rows = functions,
             MenuSource::StringRow { .. } => {
+                if self.tab != Tab::Strings {
+                    return None;
+                }
                 binding.rows = strings;
                 binding.tab = Some(Tab::Strings);
             }
@@ -245,6 +257,10 @@ impl DesktopApp {
             MenuSource::TreeLabel(_) | MenuSource::TreeSection(_) => {}
         }
         Some(binding)
+    }
+
+    pub(super) fn menu_draft_current(&self, draft: &MenuDraft) -> bool {
+        self.menu_binding(draft.source).as_ref() == Some(&draft.binding)
     }
 
     fn menu_current(&self, source: MenuSource) -> bool {
@@ -330,7 +346,7 @@ impl DesktopApp {
         if let Some(source) = opened {
             self.menus.active = self
                 .menu_binding(source)
-                .map(|binding| ActiveMenu { source, binding });
+                .map(|binding| MenuDraft { source, binding });
         }
         if let Some((source, command)) = chosen {
             self.run_menu(source, command, context);
@@ -457,8 +473,11 @@ impl DesktopApp {
     }
 
     /// Opens the rename for the captured identity. Drafts stay bound to the
-    /// annotation revision they were opened against.
+    /// source snapshot they were opened against.
     fn menu_rename(&mut self, source: MenuSource) {
+        let Some(binding) = self.menu_binding(source) else {
+            return;
+        };
         match source {
             MenuSource::Instruction { pc, .. } => self.begin_address_rename(pc),
             MenuSource::FunctionRow(address) => self.begin_address_rename(address),
@@ -472,7 +491,7 @@ impl DesktopApp {
             _ => return,
         }
         if let Some(dialog) = &mut self.browser_dialog {
-            dialog.revision = Some(self.revision);
+            dialog.menu_context = Some(MenuDraft { source, binding });
         }
     }
 
@@ -1109,7 +1128,7 @@ mod tests {
     #[test]
     fn captured_menus_expire_with_their_state_but_survive_repaints() {
         type Change = (&'static str, fn(&mut DesktopApp));
-        let changes: [Change; 6] = [
+        let changes: [Change; 7] = [
             ("same-entry graph", |app| fixture::show_view(app, view())),
             ("annotation edit", |app| {
                 app.edit_annotation(
@@ -1129,6 +1148,7 @@ mod tests {
             }),
             ("reopened binary", |app| app.generation += 1),
             ("reference evidence", |app| app.set_call_index(None)),
+            ("source pane change", |app| app.tab = Tab::Hex),
         ];
         for (name, change) in changes {
             let mut app = menu_app();
@@ -1219,7 +1239,10 @@ mod tests {
                 function: true
             }
         ));
-        assert_eq!(dialog.revision, Some(desk.app.revision));
+        assert!(
+            desk.app
+                .menu_draft_current(dialog.menu_context.as_ref().unwrap())
+        );
         assert_eq!(position(&desk.app), before, "the callee is not visited");
 
         let menu = desk.open(Pane::Decompiler, "a = b", 6);
@@ -1369,6 +1392,34 @@ mod tests {
                 .annotations
                 .get(&0x1001)
                 .is_none_or(|n| n.label.is_empty())
+        );
+    }
+
+    #[test]
+    fn menu_rename_draft_expires_after_same_function_graph_refresh() {
+        let mut desk = Desk::new(menu_app());
+        let menu = desk.open(Pane::Listing, "00001001", 3);
+        desk.choose(Pane::Listing, &menu, "Rename…");
+        desk.app.browser_dialog.as_mut().unwrap().text = "stale_name".into();
+        fixture::show_view(&mut desk.app, view());
+        let app = &mut desk.app;
+        let mut output = desk.context.run_ui(
+            egui::RawInput {
+                events: vec![fixture::key_event(egui::Key::Enter, egui::Modifiers::NONE)],
+                ..Default::default()
+            },
+            |ui| app.browser_dialog(ui.ctx()),
+        );
+        output.textures_delta.clear();
+        assert!(app.browser_dialog.is_none());
+        assert!(
+            app.session
+                .as_ref()
+                .unwrap()
+                .annotations
+                .get(&0x1001)
+                .is_none_or(|note| note.label.is_empty()),
+            "stale menu draft changed the refreshed view"
         );
     }
 

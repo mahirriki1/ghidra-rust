@@ -913,7 +913,7 @@ mod tests {
                     error: None,
                     focus: false,
                     generation: h.app.generation,
-                    revision: None,
+                    menu_context: None,
                 })
             }),
             ("update", |h| h.app.updater.open = true),

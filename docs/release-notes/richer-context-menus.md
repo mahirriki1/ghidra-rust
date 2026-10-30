@@ -12,8 +12,8 @@
   **Copy instruction** and **Decode bytes**. Copy address gives a `0x`-prefixed
   address; Copy bytes gives lowercase hex separated by spaces; Copy
   instruction gives the mnemonic and operands without addresses, bytes,
-  comments or callee names. Rows without cached bytes, or whose bytes are not
-  file-backed, disable the byte commands.
+  comments or callee names. Rows without cached bytes disable Copy bytes and
+  Decode bytes; Show in Hex also requires a file-backed byte span.
 - Decompiler call tokens offer **Go to target**, **Rename…** of the called
   function, its call-target xrefs, **Copy token** and **Copy address** of the
   real call target, even when two calls print the same name. Calls to code
