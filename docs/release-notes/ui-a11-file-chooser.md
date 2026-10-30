@@ -14,8 +14,8 @@
   but Cancel stays responsive.
 - Saving checks whether a typed name is a folder before adding the default
   `.grproj` extension, and replacing an existing file still needs an explicit
-  Replace. Names with control characters or invalid UTF-8 are shown escaped
-  while the exact file is used.
+  Replace. Control characters in names are shown escaped and invalid UTF-8 uses
+  replacement characters; selection still uses the exact file path.
 - Recent folders reset on exit. Windows Places lists existing USERPROFILE
   folders and local drives, so redirected known folders may need a typed path;
   network (UNC) paths remain unsupported.

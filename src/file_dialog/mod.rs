@@ -480,6 +480,7 @@ impl Picker {
         self.selected = None;
         self.reveal = None;
         if let FilenameSource::Entry(index, generation) = self.source {
+            self.touch();
             let exact = generation == self.generation
                 && self
                     .entry(index)
@@ -685,6 +686,7 @@ impl Picker {
         let directory = entry.kind == EntryKind::Directory;
         let label = entry.label.clone();
         if directory {
+            self.touch();
             self.clear_selection();
         } else {
             self.filename = label;
@@ -858,8 +860,15 @@ impl Picker {
             });
             keys
         });
-        let last = self.visible.len().checked_sub(1)?;
         for (key, repeat) in keys {
+            // Going up must also work in an empty directory or with no matches.
+            if key == egui::Key::Backspace && !repeat {
+                self.go_up(io);
+                continue;
+            }
+            let Some(last) = self.visible.len().checked_sub(1) else {
+                continue;
+            };
             let row = self
                 .selected
                 .and_then(|selected| self.visible.iter().position(|&index| index == selected));
@@ -879,7 +888,6 @@ impl Picker {
                         return self.activate(io, selected);
                     }
                 }
-                egui::Key::Backspace if !repeat => self.go_up(io),
                 _ => {}
             }
         }
@@ -2178,6 +2186,71 @@ mod tests {
             Some(PathBuf::from("/d/zeta"))
         );
         drop(result);
+    }
+
+    #[test]
+    fn changing_native_selection_discards_pending_save_inspection() {
+        for select_folder in [false, true] {
+            let fs = Arc::new(Fake::default());
+            fs.dir(
+                "/d",
+                &[
+                    ("target.json", EntryKind::File),
+                    ("folder", EntryKind::Directory),
+                ],
+            );
+            let mut dialogs = dialogs_on(fs);
+            let result = open(
+                &mut dialogs,
+                FileDialogKind::SaveAnnotations,
+                Some(Path::new("/d")),
+            );
+            settle(&mut dialogs);
+            let file = index_of(picker(&dialogs), "target.json");
+            let folder = index_of(picker(&dialogs), "folder");
+            act(&mut dialogs, |picker, io| {
+                picker.select(file);
+                assert!(picker.submit(io).is_none());
+            });
+            dialogs.start();
+            act(&mut dialogs, |picker, _| {
+                if select_folder {
+                    picker.select(folder);
+                } else {
+                    picker.filter = "folder".into();
+                    picker.rebuild_visible();
+                }
+            });
+            // Neither an existing target nor a target removed during the
+            // inspection may prompt or finish after its selection is abandoned.
+            let mut reply = dialogs.scheduler.wait(WAIT).expect("inspection replied");
+            reply.outcome = Outcome::Inspected(Verdict::Missing("/d/target.json".into()));
+            assert!(dialogs.route(reply).is_none());
+            assert!(matches!(picker(&dialogs).confirmation, Confirmation::Idle));
+            assert!(result.try_recv().is_err());
+            assert_eq!(
+                selected_label(&dialogs).as_deref(),
+                if select_folder { Some("folder") } else { None }
+            );
+        }
+    }
+
+    #[test]
+    fn backspace_goes_up_from_an_empty_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let empty = root.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        let mut dialogs = FileDialogs::default();
+        let _result = open(&mut dialogs, FileDialogKind::OpenBinary, Some(&empty));
+        settle(&mut dialogs);
+        let context = egui::Context::default();
+        theme::install(&context);
+        let screen = egui::vec2(1000.0, 700.0);
+        frame(&context, &mut dialogs, screen, vec![]);
+        context.memory_mut(|memory| memory.request_focus(egui::Id::unique(TABLE_ID)));
+        frame(&context, &mut dialogs, screen, press(egui::Key::Backspace));
+        settle(&mut dialogs);
+        assert_eq!(picker(&dialogs).committed.as_deref(), Some(root.path()));
     }
 
     #[cfg(unix)]
