@@ -7,12 +7,19 @@
 use crate::theme::SortDirection;
 use eframe::egui;
 use std::cmp::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering as Atomic};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-/// Tables up to this many rows sort on the GUI thread.
+/// Tables up to this many rows, with at most [`INLINE_TEXT`] bytes of text
+/// keys, sort on the GUI thread.
 const INLINE_ROWS: usize = 4096;
+const INLINE_TEXT: usize = 64 * 1024;
+/// Sort threads alive at once across every table, including threads whose
+/// table was reset while they ran.
+const MAX_SORT_THREADS: usize = 2;
+static SORT_THREADS: AtomicUsize = AtomicUsize::new(0);
 /// Leading bytes of a text value that take part in comparisons.
 const MAX_KEY_TEXT: usize = 1024;
 /// GUI time spent per frame collecting sort keys.
@@ -41,7 +48,12 @@ pub(crate) fn cycle(current: Sort, column: usize) -> Sort {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SortKey {
     Number(u64),
-    Text(Box<str>),
+    /// Text and its lowercase form, when that differs. Folding happens once,
+    /// while keys are collected, so comparisons are plain byte orders.
+    Text {
+        folded: Option<Box<str>>,
+        exact: Box<str>,
+    },
     /// Unknown or empty; always after every known value.
     Missing,
 }
@@ -61,25 +73,32 @@ impl SortKey {
         while !text.is_char_boundary(end) {
             end -= 1;
         }
-        Self::Text(text[..end].into())
+        let exact = &text[..end];
+        let folded = exact.to_lowercase();
+        Self::Text {
+            folded: (folded != exact).then(|| folded.into()),
+            exact: exact.into(),
+        }
+    }
+
+    /// Text bytes this key holds.
+    fn text_bytes(&self) -> usize {
+        match self {
+            Self::Text { folded, exact } => exact.len() + folded.as_ref().map_or(0, |f| f.len()),
+            _ => 0,
+        }
     }
 }
 
-/// Case-folded, then exact, code-point order.
-fn compare_text(left: &str, right: &str) -> Ordering {
-    let fold = |text: &str| {
-        text.chars()
-            .flat_map(char::to_lowercase)
-            .collect::<Vec<_>>()
-    };
-    if left.is_ascii() && right.is_ascii() {
-        let folded = left
-            .bytes()
-            .map(|byte| byte.to_ascii_lowercase())
-            .cmp(right.bytes().map(|byte| byte.to_ascii_lowercase()));
-        return folded.then_with(|| left.cmp(right));
-    }
-    fold(left).cmp(&fold(right)).then_with(|| left.cmp(right))
+/// Case-folded, then exact, code-point order. UTF-8 byte order is code-point
+/// order.
+fn compare_text(
+    (left_folded, left): (&Option<Box<str>>, &str),
+    (right_folded, right): (&Option<Box<str>>, &str),
+) -> Ordering {
+    let left_key = left_folded.as_deref().unwrap_or(left);
+    let right_key = right_folded.as_deref().unwrap_or(right);
+    left_key.cmp(right_key).then_with(|| left.cmp(right))
 }
 
 fn compare(left: &SortKey, right: &SortKey, direction: SortDirection) -> Ordering {
@@ -88,9 +107,18 @@ fn compare(left: &SortKey, right: &SortKey, direction: SortDirection) -> Orderin
         (SortKey::Missing, _) => return Ordering::Greater,
         (_, SortKey::Missing) => return Ordering::Less,
         (SortKey::Number(left), SortKey::Number(right)) => left.cmp(right),
-        (SortKey::Text(left), SortKey::Text(right)) => compare_text(left, right),
-        (SortKey::Number(_), SortKey::Text(_)) => Ordering::Less,
-        (SortKey::Text(_), SortKey::Number(_)) => Ordering::Greater,
+        (
+            SortKey::Text {
+                folded: left_folded,
+                exact: left,
+            },
+            SortKey::Text {
+                folded: right_folded,
+                exact: right,
+            },
+        ) => compare_text((left_folded, left), (right_folded, right)),
+        (SortKey::Number(_), SortKey::Text { .. }) => Ordering::Less,
+        (SortKey::Text { .. }, SortKey::Number(_)) => Ordering::Greater,
     };
     match direction {
         SortDirection::Ascending => known,
@@ -124,6 +152,27 @@ fn is_permutation(positions: &[u32], len: usize) -> bool {
 struct Keys {
     column: usize,
     keys: Vec<SortKey>,
+    text: usize,
+}
+
+/// One of the [`MAX_SORT_THREADS`] slots, released when its thread ends.
+struct ThreadSlot;
+
+impl ThreadSlot {
+    fn claim() -> Option<Self> {
+        SORT_THREADS
+            .fetch_update(Atomic::AcqRel, Atomic::Acquire, |live| {
+                (live < MAX_SORT_THREADS).then_some(live + 1)
+            })
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for ThreadSlot {
+    fn drop(&mut self) {
+        SORT_THREADS.fetch_sub(1, Atomic::AcqRel);
+    }
 }
 
 /// A background sort. Its result is dropped when the request or the input
@@ -242,36 +291,46 @@ impl<K: PartialEq + Clone, T: Copy> TableSort<K, T> {
             slot => slot.insert(Keys {
                 column: sort.0,
                 keys: Vec::with_capacity(baseline.len()),
+                text: 0,
             }),
         };
         let started = Instant::now();
         while let Some(row) = baseline.get(keys.keys.len()) {
-            keys.keys.push(key(sort.0, row));
+            let value = key(sort.0, row);
+            keys.text += value.text_bytes();
+            keys.keys.push(value);
             if keys.keys.len().is_multiple_of(64) && started.elapsed() >= KEY_BUDGET {
                 context.request_repaint();
                 return;
             }
         }
-        if baseline.len() <= INLINE_ROWS {
+        if baseline.len() <= INLINE_ROWS && keys.text <= INLINE_TEXT {
             let positions = order(&keys.keys, sort.1);
             self.adopt(sort, &positions, baseline);
             return;
         }
-        // One thread per table: a superseded sort finishes before the next.
-        if self
+        // One thread per table, and few overall: a superseded sort, even one
+        // from a closed binary, finishes before another starts.
+        let slot = if self
             .job
             .as_ref()
             .is_some_and(|job| !job.thread.is_finished())
         {
+            None
+        } else {
+            ThreadSlot::claim()
+        };
+        let Some(slot) = slot else {
             context.request_repaint_after(Duration::from_millis(15));
             return;
-        }
+        };
         let keys = self.keys.take().map(|keys| keys.keys).unwrap_or_default();
         let (sender, receiver) = mpsc::channel();
         let repaint = context.clone();
         let spawned = std::thread::Builder::new()
             .name("table-sort".into())
             .spawn(move || {
+                let _slot = slot;
                 if sender.send(order(&keys, sort.1)).is_ok() {
                     repaint.request_repaint();
                 }
@@ -393,11 +452,11 @@ mod tests {
     #[test]
     fn long_text_keys_are_bounded_on_a_character_boundary() {
         let text = "é".repeat(MAX_KEY_TEXT);
-        let SortKey::Text(key) = SortKey::text(&text) else {
+        let SortKey::Text { exact, .. } = SortKey::text(&text) else {
             panic!("text key expected");
         };
-        assert!(key.len() <= MAX_KEY_TEXT);
-        assert!(text.starts_with(&*key));
+        assert!(exact.len() <= MAX_KEY_TEXT);
+        assert!(text.starts_with(&*exact));
     }
 
     #[test]
@@ -454,6 +513,30 @@ mod tests {
         assert_eq!(shown, (1..=20_000u64).rev().collect::<Vec<_>>());
         sort.click(0);
         assert_eq!(settle(&mut sort, &2u8, &replaced, by_value), replaced);
+    }
+
+    #[test]
+    fn long_text_sorts_leave_the_gui_thread_and_resets_cannot_add_threads() {
+        let context = egui::Context::default();
+        // Few rows, but enough key text to sort in the background.
+        let rows: Vec<u64> = (0..200).rev().collect();
+        let names: Vec<String> = rows
+            .iter()
+            .map(|row| format!("{}{row:04}", "Ünïcode".repeat(80)))
+            .collect();
+        let by_name = |_: usize, row: &u64| SortKey::text(&names[199 - *row as usize]);
+        for _ in 0..6 {
+            // A closed binary drops its table mid-sort.
+            let mut sort = TableSort::<u8, u64>::default();
+            sort.click(0);
+            sort.prepare(&context, &0, true, &rows, by_name);
+            assert_eq!(sort.applied(), None, "not sorted on the GUI thread");
+            assert!(SORT_THREADS.load(Atomic::Acquire) <= MAX_SORT_THREADS);
+        }
+        let mut sort = TableSort::<u8, u64>::default();
+        sort.click(0);
+        let shown = settle(&mut sort, &0, &rows, by_name);
+        assert_eq!(shown, (0..200).collect::<Vec<_>>());
     }
 
     #[test]

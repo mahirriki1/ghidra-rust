@@ -9,8 +9,9 @@
   1 KiB of each value.
 - Sorting keeps the active filter and the selected function, string, import or
   export. After a sort change the selection scrolls into view once; later
-  filtering does not move the view. Tables over 4,096 rows sort on a
-  background thread and keep their previous order until the new one is ready.
+  filtering does not move the view. Tables over 4,096 rows, or with long text
+  values, sort on a background thread and keep their previous order until the
+  new one is ready. At most two sorts run at once.
 - The Calls direction column is now headed **Dir** and sorts From before To.
   Its Function column sorts by the counterpart's shown name, unnamed last.
   Data reference kinds sort Read, Write, then Address, each direct before
