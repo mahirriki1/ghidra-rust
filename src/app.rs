@@ -34,6 +34,7 @@ use crate::semantic::{LocalIdentity, LocalRename, SemanticInfo, TokenKind};
 use crate::session::{Annotation, BinaryProtection, Session};
 use crate::signature_ui::{DraftParameter, SignatureAction, SignatureEditor};
 use crate::signatures::{self, FunctionSignature};
+use crate::table_sort::{SortKey, TableSort, tsv_row};
 use crate::theme;
 use crate::xrefs::{
     AccessFilter, CallDirection, CallRow, DataRow, TargetKind, TargetSet, XrefTarget,
@@ -323,6 +324,29 @@ struct ReferenceRows {
     key: ReferenceRowsKey,
     calls: Vec<CallRow>,
     data: Vec<DataRow>,
+}
+
+/// Display orders of the app's sortable tables. Each native row list's
+/// epoch changes whenever that list is rebuilt.
+#[derive(Default)]
+struct TableSorts {
+    functions: TableSort<(u64, u64), usize>,
+    function_rows: u64,
+    strings: TableSort<(u64, u64), usize>,
+    string_rows: u64,
+    calls: TableSort<ReferenceRowsKey, CallRow>,
+    data: TableSort<ReferenceRowsKey, DataRow>,
+}
+
+impl TableSorts {
+    /// A binary closed: every sort returns to native order.
+    fn reset(&mut self) {
+        *self = Self {
+            function_rows: self.function_rows.wrapping_add(1),
+            string_rows: self.string_rows.wrapping_add(1),
+            ..Self::default()
+        };
+    }
 }
 
 /// Decompiler context captured by the opening secondary click.
@@ -727,6 +751,7 @@ pub struct DesktopApp {
     /// Flat Imports and Exports filters, indexed by `linkage_ui::Table`.
     linkage_filters: [String; 2],
     filtered_functions: Vec<usize>,
+    table_sorts: TableSorts,
     /// Lowercased effective labels, aligned with `info.functions` and valid for
     /// `filter_keys_revision`.
     filter_keys: Vec<String>,
@@ -885,6 +910,7 @@ impl DesktopApp {
             function_dock: FunctionDock::Functions,
             linkage_filters: [String::new(), String::new()],
             filtered_functions: Vec::new(),
+            table_sorts: TableSorts::default(),
             filter_keys: Vec::new(),
             filter_keys_revision: (0, 0),
             filter_query: String::new(),
@@ -1122,6 +1148,7 @@ impl DesktopApp {
         self.annotation_browser = AnnotationBrowser::default();
         self.history_index = 0;
         self.filtered_functions.clear();
+        self.table_sorts.reset();
         self.filter_keys.clear();
         self.filter_cursor = None;
         self.decoder = DecoderPanel::default();
@@ -3295,6 +3322,7 @@ impl DesktopApp {
     fn restart_filter(&mut self) {
         self.filter_query = self.function_filter.to_lowercase();
         self.filtered_functions.clear();
+        self.table_sorts.function_rows = self.table_sorts.function_rows.wrapping_add(1);
         self.filter_cursor = Some(0);
         self.step_filter(FILTER_FRAME_BUDGET);
     }
@@ -3309,6 +3337,7 @@ impl DesktopApp {
             self.filter_keys_revision = revision;
             self.filter_keys.clear();
             self.filtered_functions.clear();
+            self.table_sorts.function_rows = self.table_sorts.function_rows.wrapping_add(1);
             self.filter_cursor = Some(0);
         }
         let Some(mut index) = self.filter_cursor else {
@@ -3385,6 +3414,7 @@ impl DesktopApp {
     }
 
     fn rebuild_string_filter(&mut self) {
+        self.table_sorts.string_rows = self.table_sorts.string_rows.wrapping_add(1);
         let filter = self.string_filter.to_lowercase();
         self.filtered_strings = self
             .strings
@@ -5738,20 +5768,61 @@ impl DesktopApp {
         let glyph = theme::glyph_width(ui);
         let digits = theme::address_digits(info.functions.last().map_or(0, |f| f.address));
         let name_x = (digits + 2) as f32 * glyph;
-        theme::column_header(ui, &[("Address", 0.0), ("Name", name_x)], 0.0);
+        let sort = &mut self.table_sorts.functions;
+        let (_, clicked) = theme::sortable_column_header(
+            ui,
+            "function-list-header",
+            &[("Address", 0.0), ("Name", name_x)],
+            0.0,
+            sort.applied(),
+        );
+        if let Some(column) = clicked {
+            sort.click(column);
+        }
+        let generation = self.generation;
+        let symbols = self
+            .symbol_names
+            .as_ref()
+            .filter(|(names, _)| *names == generation)
+            .map(|(_, names)| names.as_ref());
+        sort.prepare(
+            ui.ctx(),
+            &(generation, self.table_sorts.function_rows),
+            self.filter_cursor.is_none(),
+            &self.filtered_functions,
+            |column, &index| {
+                let function = &info.functions[index];
+                match column {
+                    0 => SortKey::Number(function.address),
+                    _ => {
+                        SortKey::text(function_display(self.session.as_ref(), symbols, function).0)
+                    }
+                }
+            },
+        );
         let mut navigate = None;
         let mut xrefs = None;
         let mut annotate = None;
         let displayed = self.view().map(|view| view.address);
+        let reveal = self.table_sorts.functions.take_reveal();
+        let rows = self.table_sorts.functions.rows(&self.filtered_functions);
+        let reveal = reveal
+            .then(|| {
+                displayed.and_then(|address| {
+                    rows.iter()
+                        .position(|&index| info.functions[index].address == address)
+                })
+            })
+            .flatten();
         theme::rows::<()>(
             ui,
             "function-list",
-            self.filtered_functions.len(),
+            rows.len(),
             theme::ROW_HEIGHT,
             0.0,
-            None,
+            reveal,
             |ui, row, rect| {
-                let function = &info.functions[self.filtered_functions[row]];
+                let function = &info.functions[rows[row]];
                 let (label, raw) =
                     function_display(self.session.as_ref(), self.symbols(), function);
                 let response = theme::row_response(
@@ -5805,6 +5876,11 @@ impl DesktopApp {
                     }
                     if ui.button("Xrefs to this function").clicked() {
                         xrefs = Some(function.address);
+                        ui.close();
+                    }
+                    if ui.button("Copy row").clicked() {
+                        let address = format!("{:0digits$x}", function.address);
+                        ui.ctx().copy_text(tsv_row([address.as_str(), label]));
                         ui.close();
                     }
                 });
@@ -7288,8 +7364,10 @@ impl DesktopApp {
         let size_x = 11.0 * glyph;
         let target_x = size_x + 6.0 * glyph;
         let source_x = target_x + 18.0 * glyph;
-        theme::column_header(
+        let mut sort = std::mem::take(&mut self.table_sorts.data);
+        let (_, clicked) = theme::sortable_column_header(
             ui,
+            "data-references-header",
             &[
                 ("Kind", 0.0),
                 ("Size", size_x),
@@ -7297,7 +7375,23 @@ impl DesktopApp {
                 ("Source", source_x),
             ],
             0.0,
+            sort.applied(),
         );
+        if let Some(column) = clicked {
+            sort.click(column);
+        }
+        let key = self.reference_rows.as_ref().map(|rows| &rows.key);
+        if let Some(key) = key {
+            sort.prepare(ui.ctx(), key, true, rows, |column, row| {
+                data_sort_key(report, *row, column)
+            });
+        }
+        self.table_sorts.data = sort;
+        let (Some(index), Some(rows)) = (&self.call_index, &self.reference_rows) else {
+            return;
+        };
+        let report = &index.report;
+        let rows = self.table_sorts.data.rows(&rows.data);
         let functions = self.info.as_ref().map(|info| info.functions.as_slice());
         theme::rows::<()>(
             ui,
@@ -7307,6 +7401,10 @@ impl DesktopApp {
             source_x + 60.0 * glyph,
             None,
             |ui, row, rect| {
+                let identity = match rows[row] {
+                    DataRow::Access(i) => (false, i),
+                    DataRow::Address(i) => (true, i),
+                };
                 // Rows are validated indices into the same immutable report.
                 let (function, pc, destination, size, provenance, kind, color) = match rows[row] {
                     DataRow::Access(i) => {
@@ -7344,7 +7442,7 @@ impl DesktopApp {
                     .is_some_and(|pos| pos.x < rect.left() + size_x);
                 let response = theme::row_response(
                     ui,
-                    ui.scope_id().with(("data-reference", row)),
+                    ui.scope_id().with(("data-reference", identity)),
                     rect,
                     false,
                     false,
@@ -7368,7 +7466,7 @@ impl DesktopApp {
                 theme::cell_text(
                     ui,
                     cell(0.0, size_x),
-                    RichText::new(kind).monospace(),
+                    RichText::new(&kind).monospace(),
                     color,
                 );
                 theme::cell_text(
@@ -7384,13 +7482,15 @@ impl DesktopApp {
                     RichText::new(format!("{destination:x}")).monospace(),
                     theme::SYNTAX_CONSTANT,
                 );
-                let name = self
-                    .reference_name(function)
-                    .map_or(String::new(), |name| format!(" {}", crop(name, 40)));
+                let name = self.reference_name(function);
                 theme::cell_text(
                     ui,
                     rect.with_min_x(rect.left() + source_x),
-                    RichText::new(format!("{pc:x} @ {function:x}{name}")).monospace(),
+                    RichText::new(format!(
+                        "{pc:x} @ {function:x}{}",
+                        name.map_or(String::new(), |name| format!(" {}", crop(name, 40)))
+                    ))
+                    .monospace(),
                     theme::TEXT,
                 );
                 if response.clicked() {
@@ -7425,6 +7525,17 @@ impl DesktopApp {
                         .clicked()
                     {
                         target = Some((destination, size.is_none()));
+                        ui.close();
+                    }
+                    if ui.button("Copy row").clicked() {
+                        let size = size.map_or_else(|| "—".to_owned(), |size| format!("{size}B"));
+                        let destination = format!("{destination:x}");
+                        let source = match name {
+                            Some(name) => format!("{pc:x} @ {function:x} {name}"),
+                            None => format!("{pc:x} @ {function:x}"),
+                        };
+                        ui.ctx()
+                            .copy_text(tsv_row([kind.as_str(), &size, &destination, &source]));
                         ui.close();
                     }
                 });
@@ -7594,11 +7705,45 @@ impl DesktopApp {
         let glyph = theme::glyph_width(ui);
         let function_x = 6.0 * glyph;
         let site_x = function_x + 44.0 * glyph;
-        theme::column_header(
+        let mut sort = std::mem::take(&mut self.table_sorts.calls);
+        let (_, clicked) = theme::sortable_column_header(
             ui,
-            &[("", 0.0), ("Function", function_x), ("Call site", site_x)],
+            "call-references-header",
+            &[
+                ("Dir", 0.0),
+                ("Function", function_x),
+                ("Call site", site_x),
+            ],
             0.0,
+            sort.applied(),
         );
+        if let Some(column) = clicked {
+            sort.click(column);
+        }
+        if let Some(key) = self.reference_rows.as_ref().map(|rows| &rows.key) {
+            sort.prepare(ui.ctx(), key, true, rows, |column, row| {
+                let Some(call) = report.references.get(row.reference) else {
+                    return SortKey::Missing;
+                };
+                match column {
+                    0 => SortKey::Number(u64::from(!row.incoming)),
+                    1 => self
+                        .reference_name(if row.incoming {
+                            call.caller
+                        } else {
+                            call.target
+                        })
+                        .map_or(SortKey::Missing, SortKey::text),
+                    _ => SortKey::Number(call.address),
+                }
+            });
+        }
+        self.table_sorts.calls = sort;
+        let (Some(index), Some(rows)) = (&self.call_index, &self.reference_rows) else {
+            return;
+        };
+        let report = &index.report;
+        let rows = self.table_sorts.calls.rows(&rows.calls);
         theme::rows::<()>(
             ui,
             "call-references",
@@ -7608,23 +7753,22 @@ impl DesktopApp {
             None,
             |ui, row, rect| {
                 let CallRow {
-                    reference,
+                    reference: evidence,
                     incoming,
                 } = rows[row];
-                let reference = &report.references[reference];
+                let reference = &report.references[evidence];
                 let counterpart = if incoming {
                     reference.caller
                 } else {
                     reference.target
                 };
-                let (shown, raw) = self
-                    .function_names(counterpart)
-                    .unwrap_or(("function", None));
+                let names = self.function_names(counterpart);
+                let (shown, raw) = names.unwrap_or(("function", None));
                 let action =
                     "Click to open the call instruction · double-click to open the function";
                 let response = theme::row_response(
                     ui,
-                    ui.scope_id().with(("call-reference", row)),
+                    ui.scope_id().with(("call-reference", evidence, incoming)),
                     rect,
                     false,
                     false,
@@ -7673,6 +7817,19 @@ impl DesktopApp {
                     }
                     if ui.button("Xrefs to this function").clicked() {
                         inspect = Some(counterpart);
+                        ui.close();
+                    }
+                    if ui.button("Copy row").clicked() {
+                        let function = match names {
+                            Some((shown, _)) => format!("{counterpart:x} {shown}"),
+                            None => format!("{counterpart:x}"),
+                        };
+                        let site = format!("{:x}", reference.address);
+                        ui.ctx().copy_text(tsv_row([
+                            if incoming { "From" } else { "To" },
+                            &function,
+                            &site,
+                        ]));
                         ui.close();
                     }
                 });
@@ -8094,21 +8251,51 @@ impl DesktopApp {
                 });
                 let type_x = (digits + 2) as f32 * glyph;
                 let text_x = type_x + 10.0 * glyph;
-                theme::column_header(
+                let sort = &mut self.table_sorts.strings;
+                let (_, clicked) = theme::sortable_column_header(
                     ui,
+                    "strings-header",
                     &[("Address", 0.0), ("Type", type_x), ("String", text_x)],
                     0.0,
+                    sort.applied(),
+                );
+                if let Some(column) = clicked {
+                    sort.click(column);
+                }
+                sort.prepare(
+                    ui.ctx(),
+                    &(self.generation, self.table_sorts.string_rows),
+                    true,
+                    &self.filtered_strings,
+                    |column, &index| {
+                        let string = &self.strings[index];
+                        match column {
+                            0 => SortKey::Number(string.address),
+                            1 => SortKey::text(&string.encoding),
+                            _ => SortKey::text(&string.text),
+                        }
+                    },
                 );
                 let selected = self.selected;
+                let reveal = self.table_sorts.strings.take_reveal();
+                let rows = self.table_sorts.strings.rows(&self.filtered_strings);
+                let reveal = reveal
+                    .then(|| {
+                        selected.and_then(|address| {
+                            rows.iter()
+                                .position(|&index| self.strings[index].address == address)
+                        })
+                    })
+                    .flatten();
                 theme::rows::<()>(
                     ui,
                     "strings-list",
-                    self.filtered_strings.len(),
+                    rows.len(),
                     theme::ROW_HEIGHT,
                     0.0,
-                    None,
+                    reveal,
                     |ui, index, rect| {
-                        let string = &self.strings[self.filtered_strings[index]];
+                        let string = &self.strings[rows[index]];
                         let response = theme::row_response(
                             ui,
                             ui.scope_id().with(("string-row", string.address)),
@@ -8138,6 +8325,15 @@ impl DesktopApp {
                         response.context_menu(|ui| {
                             if ui.button("Xrefs to…").clicked() {
                                 xrefs = Some(string.address);
+                                ui.close();
+                            }
+                            if ui.button("Copy row").clicked() {
+                                let address = format!("{:0digits$x}", string.address);
+                                ui.ctx().copy_text(tsv_row([
+                                    address.as_str(),
+                                    &string.encoding,
+                                    &string.text,
+                                ]));
                                 ui.close();
                             }
                         });
@@ -9659,6 +9855,53 @@ fn function_title(
         None => response,
     }
 }
+/// A data-reference row's value in a References column: kind (reads, then
+/// writes, then taken addresses, each direct before propagated), size,
+/// target and source instruction.
+fn data_sort_key(report: &CallAnalysis, row: DataRow, column: usize) -> SortKey {
+    let rank =
+        |kind: u64, provenance| kind * 2 + u64::from(provenance == DataProvenance::Propagated);
+    let fields = match row {
+        DataRow::Access(i) => report
+            .data
+            .as_ref()
+            .and_then(|data| data.references.get(i))
+            .map(|reference| {
+                let kind = match reference.access {
+                    DataAccess::Read => 0,
+                    DataAccess::Write => 1,
+                };
+                (
+                    rank(kind, reference.provenance),
+                    Some(u64::from(reference.size)),
+                    reference.target,
+                    reference.address,
+                )
+            }),
+        DataRow::Address(i) => report
+            .addresses
+            .as_ref()
+            .and_then(|addresses| addresses.references.get(i))
+            .map(|reference| {
+                (
+                    rank(2, reference.provenance),
+                    None,
+                    reference.target,
+                    reference.address,
+                )
+            }),
+    };
+    let Some((kind, size, target, source)) = fields else {
+        return SortKey::Missing;
+    };
+    match column {
+        0 => SortKey::Number(kind),
+        1 => SortKey::number(size),
+        2 => SortKey::Number(target),
+        _ => SortKey::Number(source),
+    }
+}
+
 fn crop(text: &str, maximum: usize) -> String {
     let mut chars = text.chars();
     let mut result: String = chars.by_ref().take(maximum).collect();
@@ -16335,6 +16578,141 @@ mod tests {
             matches!(&shape.shape, egui::epaint::Shape::Rect(rect)
                 if rect.fill == theme::SELECTION && rect.rect.contains(point))
         })
+    }
+
+    #[test]
+    fn sorted_function_and_call_tables_keep_identities_through_renames_and_copies() {
+        let context = egui::Context::default();
+        theme::install(&context);
+        context.set_pixels_per_point(1.25);
+        context.all_styles_mut(|style| style.animation_time = 0.0);
+        let mut app = xref_app();
+        app.info.as_mut().unwrap().functions.push(FunctionInfo {
+            address: 0x1080,
+            name: "Alpha".into(),
+        });
+        app.rebuild_filter();
+        let frame =
+            |app: &mut DesktopApp, events| function_dock_frame(&context, app, 340.0, events);
+        let order = |output: &egui::FullOutput, names: &[&str]| {
+            let rows: Vec<f32> = names
+                .iter()
+                .map(|name| exact_text(output, name).last().unwrap().y)
+                .collect();
+            rows.windows(2).all(|pair| pair[0] < pair[1])
+        };
+        frame(&mut app, vec![]);
+        let output = frame(&mut app, vec![]);
+        assert!(order(&output, &["entry", "next", "Alpha"]), "native order");
+        let name = exact_text(&output, "Name")[0];
+        frame(&mut app, pointer_events(name));
+        let output = frame(&mut app, vec![]);
+        assert!(
+            order(&output, &["Alpha", "entry", "next"]),
+            "case-folded names"
+        );
+        // The displayed function stays highlighted by identity.
+        assert!(selection_fill_at(&output, exact_text(&output, "entry")[0]));
+        assert!(!selection_fill_at(&output, exact_text(&output, "Alpha")[0]));
+        // A rename re-sorts by the effective label.
+        app.edit_annotation(
+            0x1080,
+            Annotation {
+                label: "zulu".into(),
+                ..Default::default()
+            },
+        );
+        frame(&mut app, vec![]);
+        let output = frame(&mut app, vec![]);
+        assert!(order(&output, &["entry", "next", "zulu"]), "renamed");
+        frame(&mut app, pointer_events(exact_text(&output, "Name")[0]));
+        let output = frame(&mut app, vec![]);
+        assert!(order(&output, &["zulu", "next", "entry"]), "descending");
+        let history = app.history.clone();
+        frame(&mut app, secondary_events(exact_text(&output, "next")[0]));
+        let output = frame(&mut app, vec![]);
+        let output = frame(&mut app, pointer_events(exact_text(&output, "Copy row")[0]));
+        let digits = theme::address_digits(0x1080);
+        let expected = format!("{:0digits$x}\tnext", 0x1040);
+        assert!(
+            output
+                .platform_output
+                .commands
+                .iter()
+                .any(|command| matches!(
+                    command,
+                    egui::OutputCommand::CopyText(text) if *text == expected
+                )),
+            "{:?}",
+            output.platform_output.commands
+        );
+        assert_eq!(app.history, history, "sorting and copying never navigate");
+
+        // Calls: incoming, the self-call, then the self-call outgoing.
+        app.open_xrefs(XrefTarget {
+            address: 0x1040,
+            kind: TargetKind::Function,
+        });
+        assert!(!app.reference_data);
+        let references = |app: &mut DesktopApp, events| {
+            let time = context.input(|input| input.time) + 0.05;
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(760.0, 500.0),
+                    )),
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ui| app.references_panel(ui),
+            );
+            output.textures_delta.clear();
+            output
+        };
+        references(&mut app, vec![]);
+        let output = references(&mut app, vec![]);
+        let sites = |output: &egui::FullOutput| {
+            ["1004", "1044"].map(|site| {
+                exact_text(output, site)
+                    .iter()
+                    .map(|p| p.y)
+                    .collect::<Vec<_>>()
+            })
+        };
+        let [early, late] = sites(&output);
+        assert!(early.len() == 1 && late.len() == 2 && early[0] < late[0]);
+        let site = exact_text(&output, "Call site")[0];
+        references(&mut app, pointer_events(site));
+        references(&mut app, vec![]);
+        references(&mut app, pointer_events(site));
+        let output = references(&mut app, vec![]);
+        let [early, late] = sites(&output);
+        assert!(late.iter().all(|&y| y < early[0]), "descending call sites");
+        // Copy and click act on the row's own evidence, not its position.
+        let to = exact_text(&output, "To")[0];
+        references(&mut app, secondary_events(to));
+        let output = references(&mut app, vec![]);
+        let output = references(&mut app, pointer_events(exact_text(&output, "Copy row")[0]));
+        assert!(
+            output
+                .platform_output
+                .commands
+                .iter()
+                .any(|command| matches!(
+                    command,
+                    egui::OutputCommand::CopyText(text) if text == "To\t1040 next\t1044"
+                )),
+            "{:?}",
+            output.platform_output.commands
+        );
+        for _ in 0..10 {
+            references(&mut app, vec![]);
+        }
+        let output = references(&mut app, vec![]);
+        references(&mut app, pointer_events(exact_text(&output, "1004")[0]));
+        assert_eq!((app.tab, app.selected), (Tab::Listing, Some(0x1004)));
     }
 
     #[test]

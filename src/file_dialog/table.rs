@@ -287,31 +287,10 @@ fn sort_menu(
     id: egui::Id,
     sort: SortState,
 ) -> Option<SortColumn> {
-    let response = ui
-        .interact(rect, id, egui::Sense::click())
-        .on_hover_text("Sort");
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Sort"));
-    if response.hovered() || response.has_focus() {
-        ui.painter()
-            .rect_filled(rect, 3, ui.visuals().widgets.hovered.weak_bg_fill);
-    }
-    for offset in [-4.0, 0.0, 4.0] {
-        ui.painter()
-            .circle_filled(rect.center() + egui::vec2(offset, 0.0), 1.2, theme::MUTED);
-    }
-    let mut chosen = None;
-    egui::Popup::menu(&response).show(|ui| {
-        for (column, label) in [
-            (SortColumn::Name, "Name"),
-            (SortColumn::Size, "Size"),
-            (SortColumn::Modified, "Modified"),
-        ] {
-            if ui.selectable_label(sort.column == column, label).clicked() {
-                chosen = Some(column);
-            }
-        }
-    });
-    chosen
+    const COLUMNS: [SortColumn; 3] = [SortColumn::Name, SortColumn::Size, SortColumn::Modified];
+    let active = COLUMNS.iter().position(|column| *column == sort.column);
+    theme::sort_menu(ui, rect, id, &["Name", "Size", "Modified"], active)
+        .map(|index| COLUMNS[index])
 }
 
 /// Draw the header and virtual body into the remaining space.

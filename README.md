@@ -112,6 +112,14 @@ The Imports and Exports tabs list every entry by name, with its address and
 library (or export ordinal), and each has its own filter. They share the Symbol
 Tree's selection, opening behaviour and context menu.
 
+Click a column heading in the Functions, Imports, Exports, Strings and
+References tables to sort ascending, again for descending, and a third time to
+restore the original order. Text sorts ignore case; unknown or empty values
+stay last. Sorting keeps the filter and the selection, which scrolls into view
+once. A narrow Imports or Exports list sorts its hidden column from **⋯**.
+Right-click a row and choose **Copy row** to copy its visible columns as
+tab-separated text. Sort choices reset when a binary closes.
+
 Visited functions reuse compatible session results. **Analysis → Refresh
 function** recomputes the selected function. This session cache does not mean
 every visited function is saved in a project.
