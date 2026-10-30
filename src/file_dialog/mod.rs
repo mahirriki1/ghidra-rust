@@ -2027,7 +2027,11 @@ mod tests {
             );
             act(&mut dialogs, |picker, io| {
                 picker.navigate(io, "/fast".into(), Intent::New, None);
-                picker.filename = "/fast/new".into();
+                picker.filename = if cfg!(windows) {
+                    r"C:\fast\new".into()
+                } else {
+                    "/fast/new".into()
+                };
                 picker.submit(io);
             });
             dialogs.start();
