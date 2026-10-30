@@ -366,6 +366,8 @@ struct DiscoveryPublication {
 }
 
 struct DiscoveryUpdate {
+    budget_exhausted: bool,
+    partial_index: Option<Arc<crate::call_analysis::CallIndex>>,
     generation: u64,
     state: crate::discovery::Discovery,
     /// Committed results for project saves, built off the GUI thread.
@@ -1167,8 +1169,8 @@ impl DesktopApp {
 
     /// Stop the worker after its current request failed. Discovery that the
     /// failure did not belong to continues on a fresh worker; interrupted
-    /// batches retry within their own limits, and consecutive automatic resumes
-    /// without a committed batch are bounded.
+    /// batches retry within their own limits. Automatic resumes are bounded for
+    /// the entire user run, including successfully committed replay batches.
     fn stop_after_failure(&mut self, resumable: bool, context: &egui::Context) {
         let resume = resumable
             && self.discovery_running
@@ -2138,6 +2140,8 @@ impl DesktopApp {
                     state.start_sources(elf_pointers);
                 }
                 let _ = sender.send(DiscoveryUpdate {
+                    budget_exhausted: false,
+                    partial_index: None,
                     generation,
                     saved: Arc::new(state.save()),
                     state,
@@ -2179,10 +2183,16 @@ impl DesktopApp {
         if update.generation != self.generation {
             return;
         }
-        if let Ok(Some(publication)) = &update.publication {
+        let index = update
+            .publication
+            .as_ref()
+            .ok()
+            .and_then(|publication| publication.as_ref().map(|publication| &publication.index))
+            .or(update.partial_index.as_ref());
+        if let Some(index) = index {
             let preparation = crate::result_store::Retained::retained_bytes(update.saved.as_ref())
                 .and_then(|snapshot| {
-                    crate::result_store::Retained::retained_bytes(publication.index.as_ref())
+                    crate::result_store::Retained::retained_bytes(index.as_ref())
                         .and_then(|index| snapshot.checked_add(index))
                 })
                 .unwrap_or(usize::MAX);
@@ -2200,12 +2210,10 @@ impl DesktopApp {
                     .discovery_saved
                     .as_ref()
                     .is_some_and(|saved| Arc::ptr_eq(saved, old.snapshot()));
-                if !self.results.can_replace_discovery(
-                    &publication.index,
-                    old,
-                    saved_owner,
-                    &protect,
-                ) {
+                if !self
+                    .results
+                    .can_replace_discovery(index, old, saved_owner, &protect)
+                {
                     self.deferred_discovery = Some(update);
                     _context.request_repaint_after(Duration::from_millis(20));
                     return;
@@ -2216,7 +2224,7 @@ impl DesktopApp {
             // an in-flight save continues to pin and charge its old snapshot.
             self.call_index = None;
             self.discovery_saved = None;
-            if !self.results.retain_discovery(&publication.index, &protect) {
+            if !self.results.retain_discovery(index, &protect) {
                 self.deferred_discovery = Some(update);
                 _context.request_repaint_after(Duration::from_millis(20));
                 return;
@@ -2225,6 +2233,9 @@ impl DesktopApp {
         crate::performance::event("result_store_discovery_preparation_bytes", 0);
         self.discovery = Some(update.state);
         self.discovery_saved = Some(update.saved);
+        if let Some(index) = update.partial_index {
+            self.set_call_index(Some(index));
+        }
         match update.publication {
             Ok(Some(publication)) => {
                 self.set_call_index(Some(publication.index));
@@ -2255,8 +2266,13 @@ impl DesktopApp {
                     self.result_revision = self.result_revision.wrapping_add(1);
                     self.rebuild_filter();
                 }
-                self.discovery_resumes = 0;
                 self.status = "Discovery batch committed".into();
+            }
+            Ok(None) if update.budget_exhausted => {
+                self.inventory_synced = false;
+                self.worker_inventory = None;
+                self.status =
+                    "Function-start pattern work budget exhausted; discovery is partial".into();
             }
             Ok(None) => {}
             Err(error) => {
@@ -2456,7 +2472,7 @@ impl DesktopApp {
         // Each WorkerClient owns a fresh event channel; dropped clients cannot
         // deliver replies into this generation's queue.
         for _ in 0..8 {
-            let Some(event) = self.client.as_ref().and_then(WorkerClient::poll) else {
+            let Some(event) = self.client.as_mut().and_then(WorkerClient::poll) else {
                 break;
             };
             match event {
@@ -3066,8 +3082,20 @@ impl DesktopApp {
                         state.commit_reply(&validation, base.as_ref(), inventory_base, &mut batch);
                     commit.finish(0);
                     let saved = Arc::new(state.save());
+                    let budget_exhausted = matches!(
+                        &committed,
+                        Ok(crate::discovery::ReplyCommit::PatternBudgetExhausted)
+                    );
+                    // Only previously committed evidence enters this partial
+                    // publication. Its index and saved snapshot share one
+                    // accounted owner, including when a save pins the old one.
+                    let partial_index = budget_exhausted.then(|| {
+                        Arc::new(crate::call_analysis::CallIndex::from_snapshot(
+                            saved.clone(),
+                        ))
+                    });
                     let publication = committed.map(|adopted| {
-                        adopted.map(|(inventory, changed)| {
+                        adopted.into_adopted().map(|(inventory, changed)| {
                             let _index = crate::performance::span("parent_reference_index");
                             DiscoveryPublication {
                                 functions: changed.then(|| inventory.functions().to_vec()),
@@ -3082,6 +3110,8 @@ impl DesktopApp {
                     let saving = crate::performance::span("parent_discovery_snapshot");
                     saving.finish(0);
                     let _ = sender.send(DiscoveryUpdate {
+                        budget_exhausted,
+                        partial_index,
                         generation,
                         saved,
                         state,
@@ -10163,6 +10193,8 @@ mod tests {
         app.comment_owners.insert(0x1001, 0x1000);
         let deferred_state = crate::discovery::Discovery::new(Some(0x1000), [0x1000], false);
         app.deferred_discovery = Some(DiscoveryUpdate {
+            budget_exhausted: false,
+            partial_index: None,
             generation: app.generation,
             saved: Arc::new(deferred_state.save()),
             state: deferred_state,
@@ -13880,6 +13912,8 @@ mod tests {
         app.discovery_job = Some(receiver);
         sender
             .send(DiscoveryUpdate {
+                budget_exhausted: false,
+                partial_index: None,
                 generation: app.generation,
                 saved: Arc::new(state.save()),
                 state,
@@ -14176,6 +14210,108 @@ mod tests {
         assert_eq!(display.elapsed, Duration::from_secs(3));
         app.stop_worker();
         assert!(app.analysis_presentation(now).is_none());
+    }
+
+    #[test]
+    fn budget_partial_publication_waits_for_save_pin_and_shares_accounted_snapshot() {
+        let context = egui::Context::default();
+        let mut app = run_progress_app(Instant::now());
+        let state = crate::discovery::Discovery::new(None, [0x1000], false);
+        let mut snapshot = state.save();
+        snapshot.report.references = (0..4096)
+            .map(|offset| crate::model::CallReference {
+                caller: 0x1000,
+                address: 0x1000 + offset,
+                target: 0x1040,
+            })
+            .collect();
+        let saved = Arc::new(snapshot);
+        let index = Arc::new(crate::call_analysis::CallIndex::from_snapshot(
+            saved.clone(),
+        ));
+        app.results = crate::function_results::FunctionResults::new(64 * 1024 * 1024);
+        assert!(app.results.retain_discovery(&index, &[]));
+        let budget = app.results.usage().charged;
+        app.results = crate::function_results::FunctionResults::new(budget);
+        assert!(app.results.retain_discovery(&index, &[]));
+        app.discovery_saved = Some(saved.clone());
+        app.call_index = Some(index);
+        let mut partial = (*saved).clone();
+        partial.report.partial = true;
+        let partial = Arc::new(partial);
+        let partial_index = Arc::new(crate::call_analysis::CallIndex::from_snapshot(
+            partial.clone(),
+        ));
+        app.deferred_discovery = Some(DiscoveryUpdate {
+            budget_exhausted: true,
+            partial_index: Some(partial_index),
+            generation: app.generation,
+            state,
+            saved: partial.clone(),
+            publication: Ok(None),
+        });
+        // The save pins the old large evidence allocation. Publication must
+        // defer without losing it, rather than installing an uncharged clone.
+        app.poll_discovery(&context);
+        assert!(app.deferred_discovery.is_some());
+        assert!(Arc::ptr_eq(app.discovery_saved.as_ref().unwrap(), &saved));
+        assert_eq!(app.results.usage().charged, budget);
+        drop(saved);
+        drop(partial);
+        app.poll_discovery(&context);
+        assert!(app.deferred_discovery.is_none());
+        let saved = app.discovery_saved.as_ref().unwrap();
+        assert!(saved.report.partial);
+        assert_eq!(saved.report.references.len(), 4096);
+        assert!(Arc::ptr_eq(
+            saved,
+            app.call_index.as_ref().unwrap().snapshot()
+        ));
+        assert!(app.results.usage().charged <= budget);
+        assert!(app.results.usage().charged > 4096 * size_of::<crate::model::CallReference>());
+        assert!(!app.inventory_synced && app.worker_inventory.is_none());
+    }
+
+    #[test]
+    fn committed_replay_does_not_replenish_run_recovery_allowance() {
+        let context = egui::Context::default();
+        let mut app = run_progress_app(Instant::now());
+        app.discovery_resumes = MAX_DISCOVERY_RESUMES;
+        let info = app.info.as_ref().unwrap();
+        let (inventory, _) = crate::discovery::WorkerInventory::adopt(
+            info,
+            None,
+            None,
+            app.worker_epoch,
+            InventoryChange::Replace {
+                revision: 1,
+                functions: info.functions.clone(),
+            },
+            false,
+        )
+        .unwrap();
+        let state =
+            crate::discovery::Discovery::new(None, info.functions.iter().map(|f| f.address), false);
+        let saved = Arc::new(state.save());
+        app.deferred_discovery = Some(DiscoveryUpdate {
+            budget_exhausted: false,
+            partial_index: None,
+            generation: app.generation,
+            state,
+            saved: saved.clone(),
+            publication: Ok(Some(DiscoveryPublication {
+                functions: None,
+                inventory,
+                truncated: false,
+                index: Arc::new(crate::call_analysis::CallIndex::from_snapshot(saved)),
+            })),
+        });
+        app.poll_discovery(&context);
+        assert_eq!(app.status, "Discovery batch committed");
+        assert_eq!(app.discovery_resumes, MAX_DISCOVERY_RESUMES);
+        app.stop_after_failure(true, &context);
+        assert!(app.client.is_none());
+        assert!(!app.discovery_running);
     }
 
     #[test]

@@ -155,6 +155,14 @@ reconstructs established coverage before judging new matches.
 
 Scans and cumulative cursor/reconstruction work are bounded. Match floods,
 interruptions, stalled steps, or a full inventory leave coverage partial.
+Parent pattern-work exhaustion ends the scan as partial, discards the pending
+reply and preserves previously committed references and functions. It does not
+mark the rejected inventory as synchronized or stop a healthy worker. Automatic
+worker resumes are limited across the whole discovery run; accepted replay
+batches do not replenish that allowance. An explicit new run starts a new
+allowance. Coverage reconstructed in a replacement worker includes instruction
+ranges, not just remembered function identities.
+
 Optimized code without recognizable prologues can be missed. AArch64, 32-bit x86,
 and Mach-O have no pattern set.
 
@@ -698,6 +706,18 @@ for project parsing and residual filesystem limitations.
 | Pseudocode | 2 MiB returned text |
 | Session result store | 64 MiB accounted allocations; see [eviction](#per-function-session-results) |
 | Worker request | 30-second wall-time deadline; progress does not extend it |
+
+Cleared p-code and varnode backing storage is released after flow recovery and
+decompilation when no retained override, callback or debug state can reference
+its identities. Function symbols, scopes, signatures and locked locals remain.
+Other engine allocations and guarded functions can still retain memory; this
+is not a bound on all engine storage.
+
+Unexpected worker output closure reports the observed child exit status when
+available and a predefined allocator-failure hint when detected. Raw engine
+stderr is not displayed. The hint alone does not prove a resource-limit exit;
+an unavailable status remains unknown. Intentional cancellation and request
+timeouts keep their own outcomes.
 
 Returned-result limits do not bound the engine's internal allocations. Total
 memory includes workers, retained image copies, and uncached results. Linux

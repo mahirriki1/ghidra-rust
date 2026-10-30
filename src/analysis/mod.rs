@@ -1754,6 +1754,210 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn cleanup_after_action_error_or_panic_restores_rendering_and_function_scope() {
+        use ghidra_decompiler::{
+            action::{Action, ActionBase, ActionGroupList},
+            architecture::Architecture,
+            error::{Error, Result},
+            funcdata::Funcdata,
+        };
+        struct Failure {
+            base: ActionBase,
+            panic: bool,
+        }
+        impl Action for Failure {
+            fn base(&self) -> &ActionBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut ActionBase {
+                &mut self.base
+            }
+            fn clone_action(&self, _: &ActionGroupList) -> Option<Box<dyn Action>> {
+                None
+            }
+            fn apply(&mut self, _: &mut Funcdata, _: &mut Architecture) -> Result<i32> {
+                if self.panic {
+                    panic!("injected action panic");
+                }
+                Err(Error::Lowlevel("injected action error".into()))
+            }
+        }
+        let mut loaded = raw_x86(vec![0x89, 0xf8, 0xc3]);
+        loaded
+            .program
+            .set_function_name(0x1000, "identity")
+            .unwrap();
+        let baseline =
+            crate::decompile::render(&mut loaded.program, 0x1000, &loaded.info.sections).unwrap();
+        for panic in [false, true] {
+            let architecture = loaded.program.architecture();
+            let name = architecture.allacts.currentact.clone().unwrap();
+            let original = architecture
+                .allacts
+                .actionmap
+                .insert(
+                    name.clone(),
+                    Box::new(Failure {
+                        base: ActionBase::new(0, "injected", "base"),
+                        panic,
+                    }),
+                )
+                .unwrap();
+            assert!(
+                crate::decompile::render(&mut loaded.program, 0x1000, &loaded.info.sections)
+                    .is_err()
+            );
+            let architecture = loaded.program.architecture();
+            let returned = architecture
+                .allacts
+                .actionmap
+                .insert(name, original)
+                .unwrap();
+            assert_eq!(returned.base().name, "injected");
+            let rendered =
+                crate::decompile::render(&mut loaded.program, 0x1000, &loaded.info.sections)
+                    .unwrap();
+            assert_eq!(rendered.0, baseline.0);
+            assert_eq!(
+                serde_json::to_value(rendered.1).unwrap(),
+                serde_json::to_value(&baseline.1).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(rendered.2).unwrap(),
+                serde_json::to_value(&baseline.2).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn printing_failure_clears_expression_ids_before_reusing_banks() {
+        let mut loaded = raw_x86(vec![0x89, 0xf8, 0x83, 0xc0, 0x01, 0xc3, 0x89, 0xf8, 0xc3]);
+        loaded
+            .program
+            .set_function_name(0x1000, "increment")
+            .unwrap();
+        loaded
+            .program
+            .set_function_name(0x1006, "identity")
+            .unwrap();
+        let baseline: Vec<_> = [0x1000, 0x1006]
+            .into_iter()
+            .map(|address| {
+                serde_json::to_value(
+                    crate::decompile::render(&mut loaded.program, address, &loaded.info.sections)
+                        .unwrap(),
+                )
+                .unwrap()
+            })
+            .collect();
+        for mode in [1, 2] {
+            crate::decompile::PRINT_FAILURE.set(mode);
+            assert!(
+                crate::decompile::render(&mut loaded.program, 0x1000, &loaded.info.sections)
+                    .is_err()
+            );
+            assert_eq!(crate::decompile::PRINT_FAILURE.get(), 0);
+            let architecture = loaded.program.architecture();
+            let printer = architecture.printlist[architecture.print].as_ref().unwrap();
+            assert!(printer.base().revpol.is_empty());
+            assert!(printer.base().nodepend.is_empty());
+            for (index, address) in [0x1000, 0x1006].into_iter().enumerate() {
+                let output =
+                    crate::decompile::render(&mut loaded.program, address, &loaded.info.sections)
+                        .unwrap();
+                assert_eq!(serde_json::to_value(output).unwrap(), baseline[index]);
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_engine_analysis_releases_tombstones_and_preserves_output() {
+        use ghidra_decompiler::address::Address;
+        let mut loaded = raw_x86(vec![0x89, 0xf8, 0x83, 0xc0, 0x01, 0xc3]);
+        loaded
+            .program
+            .set_function_name(0x1000, "increment")
+            .unwrap();
+        let mut expected = None;
+        let mut first_id = None;
+        for _ in 0..32 {
+            let output = loaded
+                .handle(Request::Decompile { address: 0x1000 })
+                .unwrap();
+            let value = serde_json::to_value(output).unwrap();
+            if let Some(expected) = &expected {
+                assert_eq!(&value, expected);
+            } else {
+                expected = Some(value);
+            }
+            let architecture = loaded.program.architecture();
+            let space = architecture.manager.get_default_code_space().unwrap();
+            let address = Address::new(space.clone(), 0x1000);
+            let table = architecture.symboltab_ref().unwrap();
+            let symbol = table
+                .scope_query_function(table.get_global_scope().unwrap(), &address)
+                .unwrap();
+            architecture
+                .with_function(symbol, |function, architecture| {
+                    let scope = function.localmap;
+                    function.follow_flow(
+                        &Address::new(space.clone(), 0),
+                        &Address::new(space.clone(), space.get_highest()),
+                        architecture,
+                    )?;
+                    let id = function.obank.begin_alive().unwrap();
+                    if let Some(first) = first_id {
+                        assert_eq!(id, first, "arena tombstones accumulated");
+                    } else {
+                        first_id = Some(id);
+                    }
+                    crate::engine_cleanup::clear(function, architecture);
+                    assert_eq!(function.localmap, scope);
+                    assert_eq!(function.name, "increment");
+                    Ok(())
+                })
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn override_cleanup_keeps_bank_identity_and_override_targets() {
+        use ghidra_decompiler::{address::Address, jumptable::JumpTable};
+        let mut loaded = raw_x86(vec![0xc3]);
+        loaded.program.set_function_name(0x1000, "guarded").unwrap();
+        let architecture = loaded.program.architecture();
+        let address = Address::new(
+            architecture.manager.get_default_code_space().unwrap(),
+            0x1000,
+        );
+        let table = architecture.symboltab_ref().unwrap();
+        let symbol = table
+            .scope_query_function(table.get_global_scope().unwrap(), &address)
+            .unwrap();
+        architecture
+            .with_function(symbol, |function, architecture| {
+                function.follow_flow(
+                    &Address::new(address.get_space().unwrap().clone(), 0),
+                    &Address::new(address.get_space().unwrap().clone(), u64::MAX),
+                    architecture,
+                )?;
+                let old = function.obank.begin_alive().expect("flow produced p-code");
+                let mut table = JumpTable::new(address.clone());
+                table.set_indirect_op(function, old);
+                table.set_override(std::slice::from_ref(&address), &address, 0, 0)?;
+                let id = function.jumptables.alloc(table);
+                function.jumpvec.push(id);
+                crate::engine_cleanup::clear(function, architecture);
+                assert_eq!(function.jumpvec, vec![id]);
+                assert!(function.jump_table(id).is_override());
+                let new = function.new_op(0, &address);
+                assert_ne!(old, new, "override bank IDs must not be reissued");
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
     fn demangled_leaf_names_are_display_only_never_no_return_evidence() {
         let mut loaded = raw_x86(vec![0xc3; 0x40]);
         bulk_functions(
