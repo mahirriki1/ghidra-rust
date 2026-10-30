@@ -19,3 +19,6 @@
 - Recent folders reset on exit. Windows Places lists existing USERPROFILE
   folders and local drives, so redirected known folders may need a typed path;
   network (UNC) paths remain unsupported.
+- File names use the application's bundled fonts; unsupported glyphs, including
+  some CJK characters, can appear as missing-glyph boxes. Paths retain their
+  native identity independently of their rendered labels.

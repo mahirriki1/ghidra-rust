@@ -76,6 +76,7 @@ pub(super) trait Filesystem: Send + Sync + 'static {
     fn kind(&self, path: &Path) -> io::Result<EntryKind>;
     /// The kind of a link's target.
     fn target_kind(&self, path: &Path) -> io::Result<EntryKind>;
+    #[cfg(target_os = "linux")]
     fn read_limited(&self, path: &Path, limit: usize) -> io::Result<Vec<u8>>;
     fn var(&self, key: &str) -> Option<OsString>;
 }
@@ -132,6 +133,7 @@ impl Filesystem for NativeFilesystem {
         std::fs::metadata(path).map(|metadata| kind_of(metadata.file_type()))
     }
 
+    #[cfg(target_os = "linux")]
     fn read_limited(&self, path: &Path, limit: usize) -> io::Result<Vec<u8>> {
         use std::io::Read;
         let mut bytes = Vec::new();
@@ -624,6 +626,7 @@ pub(super) mod fake {
         kinds: Mutex<HashMap<PathBuf, Kind>>,
         targets: Mutex<HashMap<PathBuf, Kind>>,
         gates: Mutex<HashMap<PathBuf, Gate>>,
+        #[cfg(target_os = "linux")]
         files: Mutex<HashMap<PathBuf, Vec<u8>>>,
         vars: Mutex<HashMap<String, OsString>>,
         active: AtomicUsize,
@@ -658,6 +661,7 @@ pub(super) mod fake {
             self.targets.lock().unwrap().insert(path.into(), kind);
         }
 
+        #[cfg(target_os = "linux")]
         pub(in crate::file_dialog) fn file(&self, path: &str, bytes: &[u8]) {
             self.files
                 .lock()
@@ -747,6 +751,7 @@ pub(super) mod fake {
             }
         }
 
+        #[cfg(target_os = "linux")]
         fn read_limited(&self, path: &Path, limit: usize) -> io::Result<Vec<u8>> {
             let _guard = self.enter();
             let bytes = self
