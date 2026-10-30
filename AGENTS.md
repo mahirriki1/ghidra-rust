@@ -29,7 +29,7 @@ the relevant source modules before changing behavior. Follow more specific
 - `src/main.rs`: native eframe startup and the internal worker entry point.
 - `src/app.rs`: GUI state, navigation, annotations, asynchronous jobs, and result
   adoption. `theme.rs` owns the shared dark appearance and the fixed-height
-  row/table helpers; `file_dialog.rs` owns the in-app chooser.
+  row/table helpers; `file_dialog/` owns the in-app chooser.
 - `src/window_chrome.rs`: Windows menu-row window controls and resize borders;
   other platforms retain native decorations.
 - `src/client.rs`, `worker.rs`, `model.rs`: disposable worker lifecycle, bounded

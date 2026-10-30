@@ -47,8 +47,9 @@ Choose **Open binary**, **Open project**, or drag a file into the window.
 The menu row includes minimize, maximize/restore, and close controls. Drag empty
 menu-row space to move the window, double-click it to maximize/restore, or drag
 the window edges to resize; there is no separate native title bar.
-In the built-in file chooser, enter a directory such as `D:\Binaries` into the
-location field and press **Go**, or enter an absolute file path in **File name**.
+In the built-in file chooser, pick a drive under Places, or click the path bar
+(or press **Ctrl+L**), type a directory such as `D:\Binaries` and press Enter.
+You can also enter an absolute file path in **Name**.
 Spaces and Unicode paths are supported. UNC/network shares (including
 `\\wsl.localhost`), mapped network drives, device paths, and alternate data streams
 are rejected. Copy files to a local drive before opening them.

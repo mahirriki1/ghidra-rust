@@ -116,6 +116,18 @@ Visited functions reuse compatible session results. **Analysis → Refresh
 function** recomputes the selected function. This session cache does not mean
 every visited function is saved in a project.
 
+Opening and saving use an in-app file chooser rather than a desktop portal or
+native dialog. It has Back / Forward / Up, clickable breadcrumbs (**Ctrl+L**
+edits the path), Places, recent folders from the current session, a name
+filter, file-type filters and a table sortable by name, size or age. Arrow keys,
+Home/End and Page Up/Down move the selection, Enter opens it, and Backspace
+goes up. Listings stop at 4,096 entries and are marked **Partial**; type a path
+to reach anything else. Saving over an existing file asks first. Recent folders
+reset when the app exits. On Windows, Places shows existing `USERPROFILE`
+folders and local drives, so redirected known folders need a typed path;
+network (UNC) paths are not supported. Directory reads run off the UI thread,
+but a stalled filesystem still delays further listings until it returns.
+
 ### Keyboard shortcuts
 
 | Shortcut | Action |

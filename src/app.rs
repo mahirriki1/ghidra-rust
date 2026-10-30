@@ -3513,7 +3513,6 @@ impl DesktopApp {
             .and_then(|path| path.parent())
             .or_else(|| self.binary_path.as_ref().and_then(|path| path.parent()))
             .map(std::path::Path::to_path_buf)
-            .or_else(|| std::env::current_dir().ok())
     }
 
     /// The existing project field describes a code selection, never a Hex span.
@@ -11160,6 +11159,77 @@ mod tests {
             assert!(app.tab == tab);
             assert!(!app.dirty());
         }
+    }
+
+    #[test]
+    fn chooser_does_not_leak_application_shortcuts() {
+        let tap = |key, modifiers| {
+            let press = key_event(key, modifiers);
+            let mut release = press.clone();
+            if let egui::Event::Key { pressed, .. } = &mut release {
+                *pressed = false;
+            }
+            [press, release]
+        };
+        let shortcuts = || {
+            [
+                (egui::Key::F1, egui::Modifiers::NONE),
+                (egui::Key::L, egui::Modifiers::NONE),
+                (egui::Key::G, egui::Modifiers::NONE),
+                (egui::Key::Semicolon, egui::Modifiers::NONE),
+                (egui::Key::X, egui::Modifiers::NONE),
+                (egui::Key::Space, egui::Modifiers::NONE),
+                (egui::Key::S, egui::Modifiers::COMMAND),
+                (egui::Key::Z, egui::Modifiers::COMMAND),
+                (egui::Key::ArrowLeft, egui::Modifiers::ALT),
+                (egui::Key::ArrowRight, egui::Modifiers::ALT),
+            ]
+            .into_iter()
+            .flat_map(|(key, modifiers)| tap(key, modifiers))
+            .collect::<Vec<_>>()
+        };
+        let context = egui::Context::default();
+        let mut app = keyboard_app();
+        app.selected = Some(0x1004);
+        keyboard_frame(&context, &mut app, vec![]);
+        let before = (app.tab, app.selected, app.history_index);
+        let unchanged = |app: &DesktopApp| {
+            assert!(app.help_dialog.is_none() && app.browser_dialog.is_none());
+            assert!(!app.annotations_open);
+            assert_eq!((app.tab, app.selected, app.history_index), before);
+        };
+        // The file job exists before its chooser request arrives.
+        let (_events, receiver) = mpsc::sync_channel(1);
+        app.file_job = Some(receiver);
+        let directory = tempfile::tempdir().unwrap();
+        let initial = directory.path().to_path_buf();
+        let sender = app.file_dialogs.sender();
+        let task = std::thread::spawn(move || {
+            request_file(&sender, FileDialogKind::OpenBinary, Some(initial))
+        });
+        for _ in 0..10_000 {
+            keyboard_frame(&context, &mut app, shortcuts());
+            unchanged(&app);
+            if app.file_dialogs.is_open() {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(app.file_dialogs.is_open());
+        for _ in 0..3 {
+            keyboard_frame(&context, &mut app, shortcuts());
+            unchanged(&app);
+        }
+        keyboard_frame(
+            &context,
+            &mut app,
+            tap(egui::Key::Escape, egui::Modifiers::NONE).into(),
+        );
+        assert!(!app.file_dialogs.is_open());
+        assert_eq!(task.join().unwrap(), None);
+        // The completion frame, before the job reply is adopted.
+        keyboard_frame(&context, &mut app, shortcuts());
+        unchanged(&app);
     }
 
     #[test]
