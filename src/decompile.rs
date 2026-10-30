@@ -42,6 +42,11 @@ struct Capture {
     prototype: Option<crate::signatures::InferredSignature>,
 }
 
+#[cfg(test)]
+std::thread_local! {
+    pub(crate) static PRINT_FAILURE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
 type Shared = Arc<Mutex<Capture>>;
 type ReturnedAction = Arc<Mutex<Option<Box<dyn Action>>>>;
 
@@ -271,11 +276,34 @@ pub fn render_named(
     {
         architecture.allacts.actionmap.insert(name, original_action);
     }
-    architecture.printlist[print_index]
+    let printer = architecture.printlist[print_index]
         .as_mut()
-        .expect("Restored printer")
-        .base_mut()
-        .emit = original_emit;
+        .expect("Restored printer");
+    // A printing panic can leave expression stacks holding bank IDs. Clear
+    // them with the temporary emitter still installed before reclaiming banks.
+    printer.clear();
+    printer.base_mut().emit = original_emit;
+    // The engine has returned (also on its converted error path), and the
+    // original action/printer are restored. Captured IDs are no longer queried.
+    if let Some(space) = architecture.manager.get_default_code_space() {
+        let address = ghidra_decompiler::address::Address::new(space, address);
+        let symbol = architecture.symboltab_ref().ok().and_then(|table| {
+            table
+                .get_global_scope()
+                .and_then(|scope| table.scope_query_function(scope, &address))
+        });
+        if let Some(symbol) = symbol {
+            architecture.with_function(symbol, |function, architecture| {
+                // Action implementations may cache IDs until reset.
+                architecture.with_current_action(|action, architecture| {
+                    action.reset(function, architecture);
+                    Ok(())
+                })?;
+                crate::engine_cleanup::clear(function, architecture);
+                Ok(())
+            })?;
+        }
+    }
     let mut text = result.unwrap_or_else(|payload| std::panic::resume_unwind(payload))?;
     let mut capture = capture.lock().unwrap_or_else(|error| error.into_inner());
     let flattening = crate::performance::span("mapping_flatten");
@@ -518,6 +546,14 @@ impl Emit for LocationEmitter {
         node: Option<VarnodeMark>,
         op: Option<OpMark>,
     ) -> Result<()> {
+        #[cfg(test)]
+        if op.is_some() {
+            match PRINT_FAILURE.replace(0) {
+                1 => panic!("injected expression printing panic"),
+                2 => return Err(Error::Lowlevel("injected expression printing error".into())),
+                _ => {}
+            }
+        }
         let start = self.text.len();
         self.token(text, op)?;
         if matches!(
