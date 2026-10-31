@@ -14,8 +14,8 @@
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt::Write;
-use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::{Arc, Weak};
 
 use eframe::egui::{self, RichText};
 
@@ -854,14 +854,46 @@ fn place_label(place: Place, stub: bool) -> String {
     }
 }
 
-/// A row's secondary-click menu: every exact location, then Xrefs.
+/// The adopted table and label revision a row menu was opened against.
+#[derive(Clone)]
+struct RowMenu {
+    row: egui::Id,
+    linkage: Weak<Linkage>,
+    revision: u64,
+}
+
+/// A row's secondary-click menu: every exact location, then Xrefs, then
+/// Copy row. It stays open only for the table and labels it was opened on.
 fn row_menu(
     response: &egui::Response,
+    prepared: &PreparedLinkage,
+    revision: u64,
     item: LinkageItem,
     places: impl FnOnce() -> Vec<Place>,
-    copy: Option<&dyn Fn() -> String>,
+    copy: &dyn Fn() -> String,
     action: &mut Option<TreeAction>,
 ) {
+    let key = egui::Id::unique("linkage-row-menu");
+    let linkage = &prepared.view.linkage;
+    if response.secondary_clicked() {
+        let menu = RowMenu {
+            row: response.id,
+            linkage: Arc::downgrade(linkage),
+            revision,
+        };
+        response.ctx.data_mut(|data| data.insert_temp(key, menu));
+    }
+    let current = response
+        .ctx
+        .data(|data| data.get_temp::<RowMenu>(key))
+        .is_some_and(|menu| {
+            menu.row == response.id
+                && menu.revision == revision
+                && std::ptr::eq(menu.linkage.as_ptr(), Arc::as_ptr(linkage))
+        });
+    if !current {
+        return;
+    }
     response.context_menu(|ui| {
         let places = places();
         let stub = matches!(item, LinkageItem::Import(_) | LinkageItem::Location(_));
@@ -878,9 +910,8 @@ fn row_menu(
             *action = Some(TreeAction::Xrefs(item));
             ui.close();
         }
-        if let Some(copy) = copy
-            && ui.button("Copy row").clicked()
-        {
+        ui.separator();
+        if ui.button("Copy row").clicked() {
             ui.ctx().copy_text(copy());
             ui.close();
         }
@@ -1026,14 +1057,16 @@ impl LinkageTree {
         let header = egui::CollapsingHeader::new(header_text(ui, "Imports", import_count, state))
             .id_salt("tree-imports")
             .show(ui, |ui| {
-                self.import_list(ui, session, pointer, &mut action, &mut toggle)
+                self.import_list(ui, session, revision, pointer, &mut action, &mut toggle)
             });
         if partial {
             self.gaps_hover(header.header_response);
         }
         let header = egui::CollapsingHeader::new(header_text(ui, "Exports", export_count, state))
             .id_salt("tree-exports")
-            .show(ui, |ui| self.export_list(ui, session, pointer, &mut action));
+            .show(ui, |ui| {
+                self.export_list(ui, session, revision, pointer, &mut action)
+            });
         if partial {
             self.gaps_hover(header.header_response);
         }
@@ -1370,9 +1403,11 @@ impl LinkageTree {
                 };
                 row_menu(
                     &response,
+                    prepared,
+                    revision,
                     item,
                     || places(linkage, item, pointer),
-                    Some(&copy),
+                    &copy,
                     &mut action,
                 );
                 None
@@ -1390,6 +1425,7 @@ impl LinkageTree {
         &self,
         ui: &mut egui::Ui,
         session: Option<&Session>,
+        revision: u64,
         pointer: u64,
         action: &mut Option<TreeAction>,
         toggle: &mut Option<GroupKey>,
@@ -1462,7 +1498,7 @@ impl LinkageTree {
                             theme::cell_text(
                                 ui,
                                 rect.with_min_x(rect.left() + INDENT),
-                                body(name),
+                                body(name.as_ref()),
                                 theme::TEXT,
                             );
                             if let Some(chosen) = click_action(&response, item) {
@@ -1470,9 +1506,11 @@ impl LinkageTree {
                             }
                             row_menu(
                                 &response,
+                                prepared,
+                                revision,
                                 item,
                                 || places(linkage, item, pointer),
-                                None,
+                                &|| tsv_row([name.as_ref()]),
                                 action,
                             );
                             response.on_hover_ui(|ui| import_hover(ui, linkage, import));
@@ -1491,10 +1529,11 @@ impl LinkageTree {
                                 LocationKind::Stub => "stub",
                                 LocationKind::Slot => "slot",
                             };
+                            let shown = format!("{kind} {:x}", location.address);
                             theme::cell_text(
                                 ui,
                                 rect.with_min_x(rect.left() + 2.0 * INDENT),
-                                format!("{kind} {:x}", location.address),
+                                shown.as_str(),
                                 theme::MUTED,
                             );
                             if let Some(chosen) = click_action(&response, item) {
@@ -1502,9 +1541,11 @@ impl LinkageTree {
                             }
                             row_menu(
                                 &response,
+                                prepared,
+                                revision,
                                 item,
                                 || places(linkage, item, pointer),
-                                None,
+                                &|| tsv_row([shown.as_str()]),
                                 action,
                             );
                         }
@@ -1519,6 +1560,7 @@ impl LinkageTree {
         &self,
         ui: &mut egui::Ui,
         session: Option<&Session>,
+        revision: u64,
         pointer: u64,
         action: &mut Option<TreeAction>,
     ) {
@@ -1562,15 +1604,17 @@ impl LinkageTree {
                     } else {
                         theme::MUTED
                     };
-                    theme::cell_text(ui, rect, body(name), color);
+                    theme::cell_text(ui, rect, body(name.as_ref()), color);
                     if let Some(chosen) = click_action(&response, item) {
                         *action = Some(chosen);
                     }
                     row_menu(
                         &response,
+                        prepared,
+                        revision,
                         item,
                         || places(linkage, item, pointer),
-                        None,
+                        &|| tsv_row([name.as_ref()]),
                         action,
                     );
                     response.on_hover_ui(|ui| export_hover(ui, export));
@@ -1992,6 +2036,113 @@ mod tests {
     }
 
     #[test]
+    fn tree_rows_copy_their_own_values_until_the_table_or_labels_change() {
+        let context = egui::Context::default();
+        theme::install(&context);
+        context.set_pixels_per_point(1.25);
+        context.all_styles_mut(|style| style.animation_time = 0.0);
+        let mut tree = ready(Vec::new());
+        let kernel = tree.prepared().unwrap().view.groups[0].key;
+        tree.toggle(kernel, false);
+        let mut time = 0.0;
+        let mut frame = |tree: &mut LinkageTree, revision: u64, events: Vec<egui::Event>| {
+            time += 1.0;
+            let mut action = None;
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(260.0, 400.0),
+                    )),
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ui| action = tree.show(ui, None, revision, "", false, 8),
+            );
+            output.textures_delta.clear();
+            assert!(action.is_none(), "menus and copies never navigate");
+            output
+        };
+        let text = |output: &egui::FullOutput, shown: &str| {
+            output.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == shown => {
+                    Some(text.galley.rect.translate(text.pos.to_vec2()).center())
+                }
+                _ => None,
+            })
+        };
+        let click = |point: egui::Pos2, button| {
+            let event = |pressed| egui::Event::PointerButton {
+                pos: point,
+                button,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            vec![egui::Event::PointerMoved(point), event(true), event(false)]
+        };
+        // Both categories open, as the analyst would expand them.
+        for header in ["Imports (4)", "Exports (5)"] {
+            let output = frame(&mut tree, 0, vec![]);
+            frame(
+                &mut tree,
+                0,
+                click(text(&output, header).unwrap(), egui::PointerButton::Primary),
+            );
+        }
+        for (row, places, copied) in [
+            ("stub 1030", true, "stub 1030"),
+            ("forwarded", false, "forwarded"),
+            ("ordinal 9", false, "ordinal 9"),
+        ] {
+            frame(&mut tree, 0, vec![]);
+            let output = frame(&mut tree, 0, vec![]);
+            let point = text(&output, row).unwrap_or_else(|| panic!("{row}"));
+            frame(&mut tree, 0, click(point, egui::PointerButton::Secondary));
+            let menu = frame(&mut tree, 0, vec![]);
+            assert_eq!(text(&menu, "Go to stub 1030").is_some(), places, "{row}");
+            let output = frame(
+                &mut tree,
+                0,
+                click(
+                    text(&menu, "Copy row").unwrap(),
+                    egui::PointerButton::Primary,
+                ),
+            );
+            assert!(
+                output
+                    .platform_output
+                    .commands
+                    .iter()
+                    .any(|command| matches!(
+                        command,
+                        egui::OutputCommand::CopyText(text) if text == copied
+                    )),
+                "{row}"
+            );
+        }
+        // A replaced table or a label revision closes a menu opened on the
+        // same dense row identity.
+        for replace in [true, false] {
+            frame(&mut tree, 0, vec![]);
+            let output = frame(&mut tree, 0, vec![]);
+            let point = text(&output, "forwarded").unwrap();
+            frame(&mut tree, 0, click(point, egui::PointerButton::Secondary));
+            assert!(text(&frame(&mut tree, 0, vec![]), "Copy row").is_some());
+            let revision = if replace {
+                let (expanded, expansion) = (tree.expanded.clone(), tree.expansion);
+                tree = ready(Vec::new());
+                (tree.expanded, tree.expansion) = (expanded, expansion);
+                0
+            } else {
+                1
+            };
+            assert!(text(&frame(&mut tree, revision, vec![]), "Copy row").is_none());
+            assert!(text(&frame(&mut tree, revision, vec![]), "Copy row").is_none());
+        }
+    }
+
+    #[test]
     fn every_verified_location_is_an_explicit_choice() {
         let tree = ready(Vec::new());
         let linkage = tree.prepared().unwrap().linkage();
@@ -2150,7 +2301,7 @@ mod tests {
                         ..Default::default()
                     },
                     |ui| {
-                        tree.import_list(ui, None, 8, &mut None, &mut None);
+                        tree.import_list(ui, None, 0, 8, &mut None, &mut None);
                     },
                 );
                 let mut rows = Vec::new();

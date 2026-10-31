@@ -39,6 +39,7 @@ use crate::theme;
 use crate::xrefs::{
     AccessFilter, CallDirection, CallRow, DataRow, TargetKind, TargetSet, XrefTarget,
 };
+use context_menu::MenuSource;
 
 const DEADLINE: Duration = Duration::from_secs(30);
 /// Consecutive automatic discovery resumes after unrelated worker failures.
@@ -50,6 +51,7 @@ const UNDO_BYTES: usize = 4 * 1024 * 1024;
 /// Per-frame work for the function filter, keeping typing responsive.
 const FILTER_FRAME_BUDGET: Duration = Duration::from_millis(4);
 
+mod context_menu;
 #[path = "app/graph_preparation.rs"]
 mod graph_preparation;
 mod listing_cursor;
@@ -96,6 +98,8 @@ struct BrowserDialog {
     error: Option<String>,
     focus: bool,
     generation: u64,
+    /// Exact source snapshot a menu-origin draft was opened against.
+    menu_context: Option<context_menu::MenuDraft>,
 }
 
 #[derive(Clone, Copy)]
@@ -347,14 +351,6 @@ impl TableSorts {
             ..Self::default()
         };
     }
-}
-
-/// Decompiler context captured by the opening secondary click.
-#[derive(Clone)]
-struct DecompilerMenu {
-    key: XrefKey,
-    local: Option<crate::semantic::SemanticToken>,
-    targets: TargetSet,
 }
 
 struct DiscoveryPublication {
@@ -736,6 +732,7 @@ pub struct DesktopApp {
     pending_comment_scroll: Option<u64>,
     pending_listing_scroll: Option<usize>,
     listing_cursor: listing_cursor::ListingCursor,
+    menus: context_menu::ContextMenus,
     /// Automatic discovery resumes since the last committed batch.
     discovery_resumes: u8,
     /// Widest decompiler display row, in monospace characters.
@@ -898,6 +895,7 @@ impl DesktopApp {
             pending_comment_scroll: None,
             pending_listing_scroll: None,
             listing_cursor: Default::default(),
+            menus: Default::default(),
             discovery_resumes: 0,
             code_chars: 0,
             auto_decompile: true,
@@ -4479,28 +4477,43 @@ impl DesktopApp {
                 "Local rename unsupported: select a verified local-variable token; refresh legacy pseudocode if needed".into();
             return;
         }
-        if let Some(local) = self
-            .selected_local
-            .and_then(|i| semantics_of(&self.code).locals.get(i))
+        if let Some(index) = self.selected_local
+            && self.begin_local_rename(index)
         {
-            if local.signature_parameter.is_some() {
-                self.status = "Parameter names are edited in the function signature".into();
-                self.begin_signature_editor();
-                return;
-            }
-            self.browser_dialog = Some(BrowserDialog {
-                kind: BrowserDialogKind::RenameLocal {
-                    identity: local.identity.clone(),
-                },
-                text: local.name.clone(),
-                error: None,
-                focus: true,
-                generation: self.generation,
-            });
             return;
         }
-        let (Some(address), Some(info), Some(session)) = (self.selected, &self.info, &self.session)
-        else {
+        if let Some(address) = self.selected {
+            self.begin_address_rename(address);
+        }
+    }
+
+    /// Renames local `index` of the displayed pseudocode; parameters open
+    /// the signature editor. False when the pseudocode has no such local.
+    fn begin_local_rename(&mut self, index: usize) -> bool {
+        let Some(local) = semantics_of(&self.code).locals.get(index) else {
+            return false;
+        };
+        if local.signature_parameter.is_some() {
+            self.status = "Parameter names are edited in the function signature".into();
+            self.begin_signature_editor();
+            return true;
+        }
+        self.browser_dialog = Some(BrowserDialog {
+            kind: BrowserDialogKind::RenameLocal {
+                identity: local.identity.clone(),
+            },
+            text: local.name.clone(),
+            error: None,
+            focus: true,
+            generation: self.generation,
+            menu_context: None,
+        });
+        true
+    }
+
+    /// Opens the label or function rename of exactly `address`.
+    fn begin_address_rename(&mut self, address: u64) {
+        let (Some(info), Some(session)) = (&self.info, &self.session) else {
             return;
         };
         let function = function_at(&info.functions, address);
@@ -4531,6 +4544,7 @@ impl DesktopApp {
             error: None,
             focus: true,
             generation: self.generation,
+            menu_context: None,
         });
     }
 
@@ -4913,6 +4927,7 @@ impl DesktopApp {
                 error: None,
                 focus: true,
                 generation: self.generation,
+                menu_context: None,
             });
         }
     }
@@ -5058,7 +5073,13 @@ impl DesktopApp {
         let Some(mut dialog) = self.browser_dialog.take() else {
             return;
         };
-        if dialog.generation != self.generation {
+        // A menu-origin draft cannot apply to a replaced source snapshot.
+        if dialog.generation != self.generation
+            || dialog
+                .menu_context
+                .as_ref()
+                .is_some_and(|draft| !self.menu_draft_current(draft))
+        {
             return;
         }
         let mut apply = false;
@@ -5446,8 +5467,9 @@ impl DesktopApp {
         let mut function = None;
         let mut read = None;
         let mut string_read = false;
-        let mut string_xrefs = None;
         let mut section_index = None;
+        let mut menu_opened = None;
+        let mut menu_chosen = None;
         let mut scan_strings = false;
         let mut linkage_action = None;
         // Rendered beside borrowed program state, then returned unchanged.
@@ -5488,7 +5510,7 @@ impl DesktopApp {
                                                 self.symbols(),
                                                 item,
                                             );
-                                            if ui
+                                            let response = ui
                                                 .add(
                                                     egui::Button::selectable(
                                                         self.view().is_some_and(|v| {
@@ -5498,10 +5520,17 @@ impl DesktopApp {
                                                     )
                                                     .truncate(),
                                                 )
-                                                .on_hover_text(name_hover(label, raw))
-                                                .clicked()
-                                            {
+                                                .on_hover_text(name_hover(label, raw));
+                                            if response.clicked() {
                                                 function = Some(item.address);
+                                            }
+                                            let source = MenuSource::TreeFunction(item.address);
+                                            if let Some(source) =
+                                                self.menu_shown(&response, source, &mut menu_opened)
+                                            {
+                                                response.context_menu(|ui| {
+                                                    self.menu_body(ui, source, &mut menu_chosen)
+                                                });
                                             }
                                         }
                                     });
@@ -5516,15 +5545,22 @@ impl DesktopApp {
                                         .take(512)
                                     {
                                         found = true;
-                                        if ui
-                                            .selectable_label(false, crop(&annotation.label, 100))
-                                            .clicked()
-                                        {
+                                        let response = ui
+                                            .selectable_label(false, crop(&annotation.label, 100));
+                                        if response.clicked() {
                                             if function_at(&info.functions, *address).is_some() {
                                                 function = Some(*address);
                                             } else {
                                                 read = Some((*address, 128));
                                             }
+                                        }
+                                        let source = MenuSource::TreeLabel(*address);
+                                        if let Some(source) =
+                                            self.menu_shown(&response, source, &mut menu_opened)
+                                        {
+                                            response.context_menu(|ui| {
+                                                self.menu_body(ui, source, &mut menu_chosen)
+                                            });
                                         }
                                     }
                                 }
@@ -5563,26 +5599,24 @@ impl DesktopApp {
                                                         .truncate(),
                                                     )
                                                     .on_hover_text(&string.text);
-                                                response.context_menu(|ui| {
-                                                    if ui.button("Xrefs to…").clicked() {
-                                                        string_xrefs = Some(string.address);
-                                                        ui.close();
-                                                    }
-                                                });
+                                                let source = MenuSource::TreeString {
+                                                    index,
+                                                    address: string.address,
+                                                };
+                                                if let Some(source) = self.menu_shown(
+                                                    &response,
+                                                    source,
+                                                    &mut menu_opened,
+                                                ) {
+                                                    response.context_menu(|ui| {
+                                                        self.menu_body(ui, source, &mut menu_chosen)
+                                                    });
+                                                }
                                                 if response.clicked() {
                                                     string_read = true;
-                                                    let length = if string.encoding.contains("16") {
-                                                        string
-                                                            .text
-                                                            .encode_utf16()
-                                                            .count()
-                                                            .saturating_mul(2)
-                                                    } else {
-                                                        string.text.len()
-                                                    };
                                                     read = Some((
                                                         string.address,
-                                                        length.clamp(1, crate::decode::MAX_INPUT),
+                                                        context_menu::string_span(string),
                                                     ));
                                                 }
                                             }
@@ -5602,7 +5636,7 @@ impl DesktopApp {
                             .default_open(self.program_tree)
                             .show(ui, |ui| {
                                 for (index, section) in info.sections.iter().enumerate().take(512) {
-                                    if ui
+                                    let response = ui
                                         .selectable_label(
                                             false,
                                             format!(
@@ -5619,10 +5653,17 @@ impl DesktopApp {
                                             } else {
                                                 ""
                                             }
-                                        ))
-                                        .clicked()
-                                    {
+                                        ));
+                                    if response.clicked() {
                                         section_index = Some(index);
+                                    }
+                                    let source = MenuSource::TreeSection(index);
+                                    if let Some(source) =
+                                        self.menu_shown(&response, source, &mut menu_opened)
+                                    {
+                                        response.context_menu(|ui| {
+                                            self.menu_body(ui, source, &mut menu_chosen)
+                                        });
                                     }
                                 }
                             });
@@ -5643,13 +5684,7 @@ impl DesktopApp {
             self.tab = Tab::Decode;
             self.request(Request::Bytes { address, length }, &context);
         }
-        if let Some(address) = string_xrefs {
-            self.select_string(address);
-            self.open_xrefs(XrefTarget {
-                address,
-                kind: TargetKind::StringStart,
-            });
-        }
+        self.finish_menu(menu_opened, menu_chosen, &context);
         if let Some(index) = section_index {
             self.open_hex_section(index, &context);
         }
@@ -5766,7 +5801,7 @@ impl DesktopApp {
             return;
         };
         let glyph = theme::glyph_width(ui);
-        let digits = theme::address_digits(info.functions.last().map_or(0, |f| f.address));
+        let digits = context_menu::function_digits(info);
         let name_x = (digits + 2) as f32 * glyph;
         let sort = &mut self.table_sorts.functions;
         let (_, clicked) = theme::sortable_column_header(
@@ -5801,8 +5836,8 @@ impl DesktopApp {
             },
         );
         let mut navigate = None;
-        let mut xrefs = None;
-        let mut annotate = None;
+        let mut menu_opened = None;
+        let mut menu_chosen = None;
         let displayed = self.view().map(|view| view.address);
         let reveal = self.table_sorts.functions.take_reveal();
         let rows = self.table_sorts.functions.rows(&self.filtered_functions);
@@ -5869,37 +5904,17 @@ impl DesktopApp {
                 if response.clicked() {
                     navigate = Some(function.address);
                 }
-                response.context_menu(|ui| {
-                    if ui.button("Rename / comment…").clicked() {
-                        annotate = Some(function.address);
-                        ui.close();
-                    }
-                    if ui.button("Xrefs to this function").clicked() {
-                        xrefs = Some(function.address);
-                        ui.close();
-                    }
-                    if ui.button("Copy row").clicked() {
-                        let address = format!("{:0digits$x}", function.address);
-                        ui.ctx().copy_text(tsv_row([address.as_str(), label]));
-                        ui.close();
-                    }
-                });
+                let source = MenuSource::FunctionRow(function.address);
+                if let Some(source) = self.menu_shown(&response, source, &mut menu_opened) {
+                    response.context_menu(|ui| self.menu_body(ui, source, &mut menu_chosen));
+                }
                 None
             },
         );
-        if let Some(address) = annotate {
-            navigate = Some(address);
-            self.annotations_open = true;
-        }
         if let Some(address) = navigate {
             self.navigate(address, true, ui.ctx());
         }
-        if let Some(address) = xrefs {
-            self.open_xrefs(XrefTarget {
-                address,
-                kind: TargetKind::Function,
-            });
-        }
+        self.finish_menu(menu_opened, menu_chosen, ui.ctx());
     }
 
     fn update_comment_rows(&mut self) {
@@ -6317,8 +6332,8 @@ impl DesktopApp {
         let mut select_code = None;
         let mut edit_comment = None;
         let mut select_comment = None;
-        let mut rename_local_byte = None;
-        let mut xrefs = None;
+        let mut menu_opened = None;
+        let mut menu_chosen = None;
         let code_target = self.pending_code_scroll.take().map(|target| {
             self.comment_rows
                 .source_rows
@@ -6421,7 +6436,7 @@ impl DesktopApp {
                             .nth(cursor.index.0)
                             .map_or(visible, |(at, _)| at);
                         pointer_byte = (byte < visible).then_some(start + byte);
-                        if byte < visible && (response.clicked() || response.secondary_clicked()) {
+                        if byte < visible && response.clicked() {
                             select_code = Some(start + byte);
                         }
                         if byte < visible
@@ -6445,64 +6460,21 @@ impl DesktopApp {
                         }
                     }
                     // Egui retains context menus after the pointer leaves the row,
-                    // so capture the clicked token and its exact targets once.
-                    let menu_id = response.id.with("decompiler-menu");
-                    if response.secondary_clicked() {
-                        let token = pointer_byte.and_then(|byte| self.semantics().token_at(byte));
-                        let local = token
-                            .filter(|t| matches!(t.kind, TokenKind::Local { .. }))
-                            .cloned();
-                        let view = self.info.as_ref().zip(self.view());
-                        let targets = match (token.map(|t| &t.kind), pointer_byte, view) {
-                            (Some(TokenKind::Call { target }), _, _) => {
-                                TargetSet::single(XrefTarget {
-                                    address: *target,
-                                    kind: TargetKind::CallTarget,
-                                })
-                            }
-                            (_, Some(byte), Some(view)) => crate::xrefs::instruction_targets(
-                                Some(view),
-                                self.call_index.as_deref(),
-                                view.1.address,
-                                self.semantic.addresses_at(byte).iter().copied(),
-                            ),
-                            _ => TargetSet::default(),
-                        };
-                        let menu = DecompilerMenu {
-                            key: self.xref_key(),
-                            local,
-                            targets,
-                        };
-                        context.data_mut(|d| d.insert_temp(menu_id, menu));
-                    }
-                    let menu = context
-                        .data(|d| d.get_temp::<DecompilerMenu>(menu_id))
-                        .filter(|menu| menu.key == self.xref_key());
-                    if let Some(menu) = menu {
-                        let function = self.view().map(|view| view.address);
-                        response.context_menu(|ui| {
-                            if let Some(token) = &menu.local {
-                                if matches!(token.kind, TokenKind::Local { local: Some(_) }) {
-                                    if ui.button("Rename local variable…  L").clicked() {
-                                        rename_local_byte = Some(token.start);
-                                        ui.close();
-                                    }
-                                } else {
-                                    ui.add_enabled(false, egui::Label::new("Rename unavailable"))
-                                        .on_disabled_hover_text("No verified storage identity.");
-                                }
-                                ui.separator();
-                            }
-                            xref_menu_items(ui, &menu.targets, function, &mut xrefs);
-                        });
+                    // so the clicked line and byte are captured once.
+                    let source = MenuSource::Code {
+                        entry: code.address(),
+                        line: index,
+                        byte: pointer_byte,
+                    };
+                    if let Some(source) = self.menu_shown(&response, source, &mut menu_opened) {
+                        response.context_menu(|ui| self.menu_body(ui, source, &mut menu_chosen));
                     }
                 });
                 None
             },
         );
-        if let Some(target) = xrefs {
-            self.open_xrefs(target);
-        } else if let Some(target) = navigate {
+        self.finish_menu(menu_opened, menu_chosen, &context);
+        if let Some(target) = navigate {
             self.navigate(target, true, &context);
         } else if let Some(address) = edit_comment {
             self.open_comment(address);
@@ -6512,9 +6484,6 @@ impl DesktopApp {
             if let Some(canvas) = &mut self.canvas {
                 canvas.reveal_instruction(address);
             }
-        } else if let Some(byte) = rename_local_byte {
-            self.select_decompiled_byte(byte);
-            self.begin_rename();
         } else if let Some(byte) = select_code {
             self.select_decompiled_byte(byte);
             if matches!(
@@ -8044,10 +8013,9 @@ impl DesktopApp {
                     egui::Sense::hover(),
                 );
                 let mut selected = None;
-                let mut decode = None;
-                let mut navigate = None;
-                let mut annotate = None;
                 let mut follow = None;
+                let mut menu_opened = None;
+                let mut menu_chosen = None;
                 let reveal = self.pending_listing_scroll.take();
                 let (_, output) = theme::rows::<()>(
                     ui,
@@ -8134,34 +8102,17 @@ impl DesktopApp {
                         if response.clicked() {
                             selected = Some(instruction.address);
                         }
-                        let target = call.and_then(|call| call.target);
                         if response.double_clicked() {
                             follow = self.listing_follow_target(instruction.address);
                         }
-                        response.context_menu(|ui| {
-                            if let Some(target) = target
-                                && ui.button(format!("Go to {target:x}")).clicked()
-                            {
-                                navigate = Some(target);
-                                ui.close();
-                            }
-                            if ui.button("Rename / comment…").clicked() {
-                                annotate = Some(instruction.address);
-                                ui.close();
-                            }
-                            if ui.button("Decode selected bytes").clicked() {
-                                decode = Some((instruction.address, instruction.bytes.clone()));
-                                ui.close();
-                            }
-                            ui.separator();
-                            let targets = crate::xrefs::instruction_targets(
-                                self.info.as_ref().map(|info| (info, view)),
-                                self.call_index.as_deref(),
-                                view.address,
-                                [instruction.address],
-                            );
-                            xref_menu_items(ui, &targets, Some(view.address), &mut listing_xrefs);
-                        });
+                        let source = MenuSource::Instruction {
+                            entry,
+                            pc: instruction.address,
+                        };
+                        if let Some(source) = self.menu_shown(&response, source, &mut menu_opened) {
+                            response
+                                .context_menu(|ui| self.menu_body(ui, source, &mut menu_chosen));
+                        }
                         None
                     },
                 );
@@ -8182,15 +8133,7 @@ impl DesktopApp {
                 if let Some(target) = follow {
                     self.follow_listing_target(target, &context);
                 }
-                if let Some(address) = navigate {
-                    self.navigate(address, true, &context);
-                }
-                if let Some(address) = annotate {
-                    self.open_comment(address);
-                }
-                if let Some((address, bytes)) = decode {
-                    self.decode_loaded_bytes(address, bytes);
-                }
+                self.finish_menu(menu_opened, menu_chosen, &context);
                 if let Some(target) = listing_xrefs {
                     self.open_xrefs(target);
                 }
@@ -8238,17 +8181,10 @@ impl DesktopApp {
                     }
                 });
                 let mut read = None;
-                let mut xrefs = None;
+                let mut menu_opened = None;
+                let mut menu_chosen = None;
                 let glyph = theme::glyph_width(ui);
-                let digits = self.info.as_ref().map_or(8, |info| {
-                    theme::address_digits(
-                        info.sections
-                            .iter()
-                            .map(|s| s.address.saturating_add(s.size))
-                            .max()
-                            .unwrap_or(0),
-                    )
-                });
+                let digits = context_menu::string_digits(self.info.as_ref());
                 let type_x = (digits + 2) as f32 * glyph;
                 let text_x = type_x + 10.0 * glyph;
                 let sort = &mut self.table_sorts.strings;
@@ -8322,29 +8258,16 @@ impl DesktopApp {
                             RichText::new(crop(&string.text, 240)).monospace(),
                             theme::SYNTAX_CONSTANT,
                         );
-                        response.context_menu(|ui| {
-                            if ui.button("Xrefs to…").clicked() {
-                                xrefs = Some(string.address);
-                                ui.close();
-                            }
-                            if ui.button("Copy row").clicked() {
-                                let address = format!("{:0digits$x}", string.address);
-                                ui.ctx().copy_text(tsv_row([
-                                    address.as_str(),
-                                    &string.encoding,
-                                    &string.text,
-                                ]));
-                                ui.close();
-                            }
-                        });
+                        let source = MenuSource::StringRow {
+                            index: rows[index],
+                            address: string.address,
+                        };
+                        if let Some(source) = self.menu_shown(&response, source, &mut menu_opened) {
+                            response
+                                .context_menu(|ui| self.menu_body(ui, source, &mut menu_chosen));
+                        }
                         if response.clicked() {
-                            let length = if string.encoding.contains("16") {
-                                string.text.encode_utf16().count().saturating_mul(2)
-                            } else {
-                                string.text.len()
-                            };
-                            read =
-                                Some((string.address, length.clamp(1, crate::decode::MAX_INPUT)));
+                            read = Some((string.address, context_menu::string_span(string)));
                         }
                         None
                     },
@@ -8352,13 +8275,8 @@ impl DesktopApp {
                 if let Some((address, length)) = read {
                     self.select_string(address);
                     self.request(Request::Bytes { address, length }, &context);
-                } else if let Some(address) = xrefs {
-                    self.select_string(address);
-                    self.open_xrefs(XrefTarget {
-                        address,
-                        kind: TargetKind::StringStart,
-                    });
                 }
+                self.finish_menu(menu_opened, menu_chosen, &context);
             }
             Tab::Crypto => {
                 ui.horizontal(|ui| {
@@ -8861,6 +8779,7 @@ impl DesktopApp {
         {
             self.request_intent(Intent::InstallUpdate, &context);
         }
+        self.release_menu(&context);
         self.handle_shortcuts(&context);
         crate::window_chrome::resize_borders(ui);
     }
@@ -10942,7 +10861,7 @@ mod tests {
         assert!(app.reference_query.is_empty());
     }
 
-    fn key_event(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+    pub(super) fn key_event(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
         egui::Event::Key {
             key,
             physical_key: Some(key),
@@ -11680,7 +11599,7 @@ mod tests {
     }
 
     /// Displays one unstored decompilation, keeping the current selection.
-    fn show_code(
+    pub(super) fn show_code(
         app: &mut DesktopApp,
         text: &str,
         mappings: Vec<CodeMapping>,
@@ -11788,7 +11707,7 @@ mod tests {
         ]
     }
 
-    fn rendered_text(output: &egui::FullOutput) -> Vec<String> {
+    pub(super) fn rendered_text(output: &egui::FullOutput) -> Vec<String> {
         output
             .shapes
             .iter()
@@ -12503,7 +12422,7 @@ mod tests {
         app
     }
 
-    fn secondary_events(point: egui::Pos2) -> Vec<egui::Event> {
+    pub(super) fn secondary_events(point: egui::Pos2) -> Vec<egui::Event> {
         let button = |pressed| egui::Event::PointerButton {
             pos: point,
             button: egui::PointerButton::Secondary,
@@ -16647,6 +16566,35 @@ mod tests {
             output.platform_output.commands
         );
         assert_eq!(app.history, history, "sorting and copying never navigate");
+        // Edits and Go to use the clicked row's function, not the displayed one.
+        let reopen = |app: &mut DesktopApp| {
+            let output = frame(app, vec![]);
+            frame(app, secondary_events(exact_text(&output, "next")[0]));
+            frame(app, vec![])
+        };
+        let menu = reopen(&mut app);
+        frame(&mut app, pointer_events(exact_text(&menu, "Rename…")[0]));
+        assert!(matches!(
+            app.browser_dialog.take().map(|dialog| dialog.kind),
+            Some(BrowserDialogKind::Rename {
+                address: 0x1040,
+                function: true
+            })
+        ));
+        assert_eq!(app.history, history);
+        let menu = reopen(&mut app);
+        frame(&mut app, pointer_events(exact_text(&menu, "Go to")[0]));
+        assert_eq!(
+            app.history.last(),
+            Some(&crate::linkage_ui::Place::Code(0x1040))
+        );
+        assert_eq!(app.view().map(|view| view.address), None);
+        let output = frame(&mut app, vec![]);
+        assert!(
+            order(&output, &["zulu", "next", "entry"]),
+            "Go to keeps the sort"
+        );
+        app.navigate(0x1000, false, &context);
 
         // Calls: incoming, the self-call, then the self-call outgoing.
         app.open_xrefs(XrefTarget {

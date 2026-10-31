@@ -207,6 +207,7 @@ impl super::DesktopApp {
             || self.search_dialog.is_some()
             || context.egui_wants_keyboard_input()
             || egui::Popup::is_any_open(context)
+            || self.menu_owns_input(context)
             || context.memory(|memory| memory.top_modal_layer().is_some())
     }
 
@@ -912,6 +913,7 @@ mod tests {
                     error: None,
                     focus: false,
                     generation: h.app.generation,
+                    menu_context: None,
                 })
             }),
             ("update", |h| h.app.updater.open = true),
