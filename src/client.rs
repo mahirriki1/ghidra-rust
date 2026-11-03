@@ -1,7 +1,7 @@
 //! Disposable worker client. Parsing and blocking reads never run on the GUI thread.
 use crate::model::{Request, WorkerRequest, WorkerResponse};
 use crate::session::BinaryProtection;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,6 +14,13 @@ const MAX_RESPONSE: usize = crate::model::MAX_REPLY_BYTES + 1;
 pub enum WorkerEvent {
     Reply(Box<WorkerResponse>),
     Failed(String),
+}
+
+struct EventSender(mpsc::SyncSender<Option<WorkerEvent>>);
+impl EventSender {
+    fn send(&self, event: WorkerEvent) -> Result<(), mpsc::SendError<Option<WorkerEvent>>> {
+        self.0.send(Some(event))
+    }
 }
 
 struct SentSearch {
@@ -43,10 +50,14 @@ impl SentSearch {
 
 pub struct WorkerClient {
     child: Option<Child>,
+    diagnostics: Arc<Mutex<Diagnostics>>,
+    eof: Option<std::time::Instant>,
+    eof_reported: bool,
+    context: eframe::egui::Context,
     #[cfg(windows)]
-    _job: crate::windows::WorkerJob,
+    _job: Arc<crate::windows::WorkerJob>,
     input: ChildStdin,
-    events: Receiver<WorkerEvent>,
+    events: Receiver<Option<WorkerEvent>>,
     next_id: u64,
     /// Highest request id written; replies may only answer sent requests.
     sent: Arc<AtomicU64>,
@@ -83,7 +94,7 @@ impl WorkerClient {
             .stdout(Stdio::piped())
             // Engine diagnostics may contain untrusted symbol names or terminal
             // control sequences. Structured errors use the bounded JSON channel.
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| format!("Cannot start analysis worker: {e}"))?;
         spawning.finish(child.id() as u64);
@@ -102,7 +113,21 @@ impl WorkerClient {
         _assigning.finish(0);
         let input = child.stdin.take().ok_or("Worker has no input pipe")?;
         let output = child.stdout.take().ok_or("Worker has no output pipe")?;
+        let stderr = child.stderr.take().ok_or("Worker has no diagnostic pipe")?;
+        let diagnostics = Arc::new(Mutex::new(Diagnostics::default()));
+        let draining = Arc::clone(&diagnostics);
+        std::thread::Builder::new()
+            .name("analysis-diagnostics".into())
+            .spawn(move || {
+                drain_diagnostics(stderr, &draining);
+            })
+            .map_err(|error| {
+                let _ = child.kill();
+                let _ = child.wait();
+                format!("Cannot start diagnostic reader: {error}")
+            })?;
         let (sender, events) = mpsc::sync_channel(8);
+        let sender = EventSender(sender);
         let display_path = binary_path.to_string_lossy().into_owned();
         let reader_protection = protection.clone();
         let sent = Arc::new(AtomicU64::new(0));
@@ -112,6 +137,7 @@ impl WorkerClient {
         let sent_search: Arc<Mutex<Option<SentSearch>>> = Arc::new(Mutex::new(None));
         let reader_sent_search = Arc::clone(&sent_search);
         let worker_pid = child.id();
+        let context = ctx.clone();
         std::thread::Builder::new()
             .name("analysis-responses".into())
             .spawn(move || {
@@ -249,9 +275,11 @@ impl WorkerClient {
                                 }
                             }
                         }
-                        Ok(None) => WorkerEvent::Failed(
-                            "Analysis worker exited. Reopen the binary to restart it.".into(),
-                        ),
+                        Ok(None) => {
+                            let _ = sender.0.send(None);
+                            ctx.request_repaint();
+                            return;
+                        }
                         Err(e) => WorkerEvent::Failed(e),
                     };
                     let failed = matches!(event, WorkerEvent::Failed(_));
@@ -272,8 +300,12 @@ impl WorkerClient {
         startup.finish(child.id() as u64);
         Ok(Self {
             child: Some(child),
+            diagnostics,
+            eof: None,
+            eof_reported: false,
+            context,
             #[cfg(windows)]
-            _job: job,
+            _job: Arc::new(job),
             input,
             events,
             next_id: 0,
@@ -297,6 +329,9 @@ impl WorkerClient {
     }
 
     pub fn send(&mut self, mut request: Request) -> Result<u64, String> {
+        if self.eof.is_some() {
+            return Err("Analysis worker output has closed".into());
+        }
         let _trace_context = crate::performance::context(self.next_id.saturating_add(1));
         let _sending = crate::performance::span("request_send");
         crate::performance::event(crate::performance::operation(&request), 0);
@@ -378,8 +413,35 @@ impl WorkerClient {
         Ok(self.next_id)
     }
 
-    pub fn poll(&self) -> Option<WorkerEvent> {
-        self.events.try_recv().ok()
+    pub fn poll(&mut self) -> Option<WorkerEvent> {
+        if self.eof_reported {
+            return None;
+        }
+        if self.eof.is_none() {
+            match self.events.try_recv().ok()? {
+                None => self.eof = Some(std::time::Instant::now()),
+                Some(event) => return Some(event),
+            }
+        }
+        // Never block the GUI on exit/reaping or stderr drain. A bounded grace
+        // admits late status/diagnostics; an unobserved exit remains unknown.
+        let status = self
+            .child
+            .as_mut()
+            .and_then(|child| child.try_wait().ok().flatten());
+        let diagnostics = self.diagnostics.lock().unwrap_or_else(|e| e.into_inner());
+        if (status.is_none() || !diagnostics.done)
+            && self
+                .eof
+                .is_some_and(|start| start.elapsed() < std::time::Duration::from_millis(250))
+        {
+            self.context
+                .request_repaint_after(std::time::Duration::from_millis(20));
+            return None;
+        }
+        self.eof_reported = true;
+        let message = exit_diagnostic(status, diagnostics.allocation_failed);
+        Some(WorkerEvent::Failed(message))
     }
 
     /// Update jobs call this off the GUI thread before replacing the executable.
@@ -498,7 +560,11 @@ impl Drop for WorkerClient {
             let _ = child.kill();
             // Reap without making the UI wait for a worker to finish analysis.
             // Keep ownership recoverable if the OS refuses to create a thread.
-            let cleanup = Arc::new(Mutex::new(Some((child, self.source_lease.take()))));
+            let source_lease = self.source_lease.take();
+            #[cfg(windows)]
+            let source_lease =
+                Some(Arc::new((source_lease, Arc::clone(&self._job))) as Arc<dyn Send + Sync>);
+            let cleanup = Arc::new(Mutex::new(Some((child, source_lease))));
             let thread_cleanup = Arc::clone(&cleanup);
             if std::thread::Builder::new()
                 .name("worker-cleanup".into())
@@ -525,6 +591,62 @@ impl Drop for WorkerClient {
             }
         }
     }
+}
+
+// Retain classification only, never untrusted engine text or symbol names.
+#[derive(Default)]
+struct Diagnostics {
+    allocation_failed: bool,
+    done: bool,
+}
+
+fn drain_diagnostics(mut input: impl Read, diagnostics: &Mutex<Diagnostics>) {
+    let mut buffer = [0u8; 4096];
+    let mut line = Vec::with_capacity(256);
+    let mut overflow = false;
+    loop {
+        let count = match input.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        for &byte in &buffer[..count] {
+            if byte == b'\n' {
+                if !overflow && allocator_message(&line) {
+                    diagnostics
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .allocation_failed = true;
+                }
+                line.clear();
+                overflow = false;
+            } else if line.len() < 256 {
+                line.push(byte);
+            } else {
+                overflow = true;
+            }
+        }
+    }
+    let mut diagnostics = diagnostics.lock().unwrap_or_else(|e| e.into_inner());
+    diagnostics.allocation_failed |= !overflow && allocator_message(&line);
+    diagnostics.done = true;
+}
+
+fn allocator_message(line: &[u8]) -> bool {
+    line.strip_prefix(b"memory allocation of ")
+        .and_then(|rest| rest.strip_suffix(b" bytes failed"))
+        .is_some_and(|digits| !digits.is_empty() && digits.iter().all(u8::is_ascii_digit))
+}
+
+fn exit_diagnostic(status: Option<std::process::ExitStatus>, allocation: bool) -> String {
+    let status = status.map_or_else(|| "exit status unknown".into(), |status| status.to_string());
+    let hint = if allocation {
+        "; allocator failure reported (memory limit may have been reached)"
+    } else {
+        ""
+    };
+    format!("Analysis worker exited: {status}{hint}. Reopen the binary to restart it.")
 }
 
 /// Shape-checks a reply before serde buffers it, and admits at most one
@@ -573,6 +695,82 @@ fn bounded_line(reader: &mut impl BufRead, limit: usize) -> Result<Option<Vec<u8
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn idle_eof_schedules_grace_poll_and_delivers_failure_once() {
+        let context = eframe::egui::Context::default();
+        let delays = Arc::new(Mutex::new(Vec::new()));
+        let observed = delays.clone();
+        context.set_repaint_observer(move |info| observed.lock().unwrap().push(info.delay));
+        let mut child = Command::new("sh")
+            .args(["-c", "exec 1>&-; exec sleep 2"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let input = child.stdin.take().unwrap();
+        let output = child.stdout.take().unwrap();
+        let (sender, events) = mpsc::sync_channel(1);
+        let reader = std::thread::spawn(move || {
+            assert!(
+                bounded_line(&mut BufReader::new(output), 1)
+                    .unwrap()
+                    .is_none()
+            );
+            sender.send(None).unwrap();
+        });
+        reader.join().unwrap();
+        let path = std::env::current_exe().unwrap();
+        let mut client = WorkerClient {
+            child: Some(child),
+            diagnostics: Arc::new(Mutex::new(Diagnostics::default())),
+            eof: None,
+            eof_reported: false,
+            context,
+            input,
+            events,
+            next_id: 0,
+            sent: Arc::new(AtomicU64::new(0)),
+            binary_path: path.clone(),
+            protection: BinaryProtection::open(&path).unwrap(),
+            source_lease: None,
+            signature_context: Arc::new(Mutex::new(String::new())),
+            sent_search: Arc::new(Mutex::new(None)),
+        };
+        assert!(client.poll().is_none());
+        assert!(
+            delays
+                .lock()
+                .unwrap()
+                .contains(&std::time::Duration::from_millis(20))
+        );
+        // Simulate the scheduled wakeup after the grace, without depending on
+        // wall-clock sleeps or unrelated input to drive the client.
+        client.eof = Some(std::time::Instant::now() - std::time::Duration::from_millis(300));
+        assert!(matches!(client.poll(), Some(WorkerEvent::Failed(_))));
+        assert!(client.poll().is_none());
+    }
+
+    #[test]
+    fn diagnostic_stream_is_bounded_and_never_renders_engine_text() {
+        let diagnostic = Mutex::new(Diagnostics::default());
+        let mut input = vec![b'x'; 1_000_000];
+        input.extend_from_slice(
+            b"\n\x1b[31mhostile symbol\nmemory allocation of 2097152 bytes failed\n",
+        );
+        drain_diagnostics(std::io::Cursor::new(input), &diagnostic);
+        let state = diagnostic.lock().unwrap();
+        assert!(state.done && state.allocation_failed);
+        let text = exit_diagnostic(None, state.allocation_failed);
+        assert!(text.contains("unknown") && text.contains("allocator"));
+        assert!(!text.contains("hostile") && !text.contains('\x1b'));
+        assert!(!allocator_message(
+            b"symbol memory allocation of 2 bytes failed"
+        ));
+        assert!(!allocator_message(b"memory allocation of NaN bytes failed"));
+    }
 
     #[test]
     fn replies_must_answer_sent_requests_once_and_in_order() {

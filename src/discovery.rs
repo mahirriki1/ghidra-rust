@@ -148,6 +148,21 @@ pub struct WorkerInventory {
     data_checked: bool,
 }
 
+/// A local work stop is distinct from malformed or stale worker data.
+#[derive(Debug)]
+pub enum ReplyCommit {
+    Adopted(WorkerInventory, bool),
+    PatternBudgetExhausted,
+}
+impl ReplyCommit {
+    pub fn into_adopted(self) -> Option<(WorkerInventory, bool)> {
+        match self {
+            Self::Adopted(inventory, changed) => Some((inventory, changed)),
+            Self::PatternBudgetExhausted => None,
+        }
+    }
+}
+
 impl WorkerInventory {
     pub fn functions(&self) -> &[FunctionInfo] {
         &self.functions
@@ -806,7 +821,6 @@ impl Discovery {
         phase.scanned_bytes = scanned_bytes;
         phase.admitted = admitted;
         phase.partial |= scan.partial;
-        phase.interruptions = 0;
         self.flight = None;
         self.report.partial |= batch.truncated;
         self.pointer_recovery.retain(batch);
@@ -828,13 +842,15 @@ impl Discovery {
     /// inventory adopted from that worker, then commits the batch. `requested`
     /// is the revision the request named. Shared by the desktop's adoption job
     /// and integration tests. Also reports whether the inventory rows changed.
+    /// `PatternBudgetExhausted` is an expected pattern-work stop: the entire payload was
+    /// discarded without adoption. The caller must request replacement inventory.
     pub fn commit_reply(
         &mut self,
         info: &BinaryInfo,
         base: Option<&WorkerInventory>,
         requested: Option<u64>,
         batch: &mut DiscoveryBatch,
-    ) -> Result<Option<(WorkerInventory, bool)>, String> {
+    ) -> Result<ReplyCommit, String> {
         if self
             .flight
             .as_ref()
@@ -862,7 +878,7 @@ impl Discovery {
             self.pattern_preflight(base, requested, batch)?
         };
         if matches!(preflight, PatternPreflight::Exhausted) {
-            return Err("Function-start pattern work budget exhausted".into());
+            return Ok(ReplyCommit::PatternBudgetExhausted);
         }
         let inventory_validation_rows = match preflight {
             PatternPreflight::Pattern(charge) => charge.inventory_validation_rows,
@@ -885,7 +901,7 @@ impl Discovery {
         )?;
         adoption.finish(u64::from(changed));
         self.commit_charged(info, batch, &inventory, inventory_validation_rows)?;
-        Ok(Some((inventory, changed)))
+        Ok(ReplyCommit::Adopted(inventory, changed))
     }
 
     /// Charges parent-observed protocol work before inventory reconstruction or
@@ -912,6 +928,7 @@ impl Discovery {
             .ok_or("A pattern-scan step returned no scan")?;
         let phase = self.patterns.as_ref().ok_or("No pattern scan is pending")?;
         let cursor = phase.cursor.ok_or("The pattern scan is already complete")?;
+        validate_inventory_base(base, requested, batch.binding.epoch, &batch.inventory)?;
         let rows =
             inventory_validation_rows(base, requested, batch.binding.epoch, &batch.inventory);
         let charge = pattern_charge(cursor, scan, rows);
@@ -928,6 +945,36 @@ impl Discovery {
             || resume_steps.is_none_or(|steps| steps > MAX_PATTERN_RESUME_STEPS)
             || inventory_rows.is_none_or(|rows| rows > MAX_PATTERN_INVENTORY_VALIDATION_ROWS)
         {
+            // Scalars only: no symbol names, addresses or unvalidated payload
+            // contents enter diagnostics. Overflow remains an exhausted charge.
+            for (name, value) in [
+                ("pattern_budget_cursor_before", phase.cursor_steps),
+                (
+                    "pattern_budget_cursor_charge",
+                    usize::from(charge.cursor_step),
+                ),
+                ("pattern_budget_cursor_limit", MAX_PATTERN_CURSOR_STEPS),
+                ("pattern_budget_resume_before", phase.resume_steps),
+                (
+                    "pattern_budget_resume_charge",
+                    usize::from(charge.resume_step),
+                ),
+                ("pattern_budget_resume_limit", MAX_PATTERN_RESUME_STEPS),
+                (
+                    "pattern_budget_inventory_before",
+                    phase.inventory_validation_rows,
+                ),
+                (
+                    "pattern_budget_inventory_charge",
+                    charge.inventory_validation_rows,
+                ),
+                (
+                    "pattern_budget_inventory_limit",
+                    MAX_PATTERN_INVENTORY_VALIDATION_ROWS,
+                ),
+            ] {
+                crate::performance::event(name, value as u64);
+            }
             let phase = self.patterns.as_mut().expect("validated pattern phase");
             phase.cursor = None;
             phase.partial = true;
@@ -1022,9 +1069,45 @@ fn pattern_charge(cursor: u64, scan: &PatternScan, inventory_rows: usize) -> Pat
     }
 }
 
-/// Rows whose complete reconstructed inventory is cloned and validated by
-/// [`WorkerInventory::adopt`]. Invalid base relationships are left for adoption
-/// to reject and are not mistaken for budget exhaustion.
+/// Constant-work checks must precede local budget classification.
+fn validate_inventory_base(
+    base: Option<&WorkerInventory>,
+    requested: Option<u64>,
+    epoch: u64,
+    change: &InventoryChange,
+) -> Result<(), String> {
+    let base = base.filter(|base| base.epoch == epoch);
+    if base.is_some_and(|base| {
+        change.revision() < base.revision
+            || change.revision() == base.revision
+                && !matches!(change, InventoryChange::Unchanged { .. })
+    }) {
+        return Err("Worker inventory revision moved backwards".into());
+    }
+    match change {
+        InventoryChange::Replace { .. } => Ok(()),
+        InventoryChange::Unchanged { revision }
+            if base.is_some_and(|base| {
+                requested == Some(base.revision) && *revision == base.revision
+            }) =>
+        {
+            Ok(())
+        }
+        InventoryChange::Delta {
+            base: from,
+            revision,
+            ..
+        } if from.checked_add(1) == Some(*revision)
+            && base
+                .is_some_and(|base| requested == Some(base.revision) && *from == base.revision) =>
+        {
+            Ok(())
+        }
+        _ => Err("Worker inventory has no valid adopted base".into()),
+    }
+}
+
+/// Rows cloned and validated by inventory reconstruction.
 pub(crate) fn inventory_validation_rows(
     base: Option<&WorkerInventory>,
     requested: Option<u64>,
@@ -1672,6 +1755,47 @@ mod tests {
     }
 
     #[test]
+    fn exhausted_pattern_allowance_does_not_hide_invalid_base_or_binding() {
+        let info = info(2);
+        let mut state = Discovery::new(None, [], false);
+        state.start_patterns();
+        state.patterns.as_mut().unwrap().inventory_validation_rows =
+            MAX_PATTERN_INVENTORY_VALIDATION_ROWS;
+        let Request::DiscoverBatch { binding, .. } = state.begin(1, 1, 0).unwrap() else {
+            panic!()
+        };
+        let mut reply = pattern_reply(binding, &info, Some(0), vec![]);
+        reply.inventory = InventoryChange::Unchanged { revision: 999 };
+        assert!(
+            state
+                .commit_reply(&info, None, Some(999), &mut reply)
+                .is_err()
+        );
+        assert!(state.scanning());
+        reply.inventory = InventoryChange::Replace {
+            revision: 1,
+            functions: info.functions.clone(),
+        };
+        reply.binding.epoch += 1;
+        assert!(state.commit_reply(&info, None, None, &mut reply).is_err());
+        reply.binding = binding;
+        assert!(matches!(
+            state.commit_reply(&info, None, None, &mut reply).unwrap(),
+            ReplyCommit::PatternBudgetExhausted
+        ));
+        // The rejected revision is not a base, even after explicitly starting
+        // another phase. A replacement is required before unchanged can work.
+        state.start_patterns();
+        let Request::DiscoverBatch { binding, .. } = state.begin(1, 1, 0).unwrap() else {
+            panic!()
+        };
+        reply.binding = binding;
+        reply.inventory = InventoryChange::Unchanged { revision: 1 };
+        assert!(state.commit_reply(&info, None, None, &mut reply).is_err());
+        assert_eq!(state.admitted, None);
+    }
+
+    #[test]
     fn pattern_inventory_work_exhaustion_fails_closed_and_preserves_prior_commits() {
         let info = info(2);
         let mut state = Discovery::new(
@@ -1688,6 +1812,7 @@ mod tests {
         let (inventory, changed) = state
             .commit_reply(&info, None, None, &mut first)
             .unwrap()
+            .into_adopted()
             .unwrap();
         assert!(changed);
         let prior_references = state.report.references.clone();
@@ -1721,16 +1846,17 @@ mod tests {
         scan.matches = MAX_PATTERN_MATCHES + 1;
         scan.covered = vec![u64::MAX];
 
-        assert_eq!(
+        assert!(
             state
                 .commit_reply(
                     &info,
                     Some(&inventory),
                     Some(inventory.revision()),
-                    &mut reply,
+                    &mut reply
                 )
-                .unwrap_err(),
-            "Function-start pattern work budget exhausted"
+                .unwrap()
+                .into_adopted()
+                .is_none()
         );
         let InventoryChange::Replace { functions, .. } = &reply.inventory else {
             panic!()

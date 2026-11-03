@@ -86,7 +86,7 @@ pub(crate) fn recover(program: &mut Program, entry: u64) -> Result<Recovered, St
                     "The function has no code".into(),
                 ));
             }
-            architecture.clear_analysis(function);
+            crate::engine_cleanup::clear(function, architecture);
             let code = |address: &Address| {
                 address
                     .get_space()
@@ -138,7 +138,7 @@ pub(crate) fn recover(program: &mut Program, entry: u64) -> Result<Recovered, St
                     }
                 }
             }
-            architecture.clear_analysis(function);
+            crate::engine_cleanup::clear(function, architecture);
             flowed.map(|()| recovered)
         })
         .map_err(|error| format!("Switch recovery failed: {error}"))
