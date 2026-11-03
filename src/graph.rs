@@ -1,7 +1,9 @@
 //! A bounded native instruction CFG. Every returned row is laid out at its true
 //! height; painting visits only the rows inside the viewport, and zoomed-out
-//! blocks draw compact row marks instead of text. Construct a new canvas when
-//! analysis changes; selection changes alone intentionally retain the camera.
+//! blocks draw compact row marks instead of text. A corner overview draws one
+//! silhouette per block and the viewport; clicking it only moves the camera.
+//! Construct a new canvas when analysis changes; selection changes alone
+//! intentionally retain the camera.
 
 use crate::model::{
     EdgeEvidence, EdgeKind, FunctionView, MAX_GRAPH_BLOCKS, MAX_GRAPH_EDGES, MAX_GRAPH_INSTRUCTIONS,
@@ -34,6 +36,89 @@ const MARK_PIXELS: f32 = 2.0;
 const CHAR_WIDTH: f32 = 7.2;
 /// Screen margin kept above an entry block and beside a wide one.
 const REVEAL_MARGIN: f32 = 24.0;
+
+/// Overview panel: desired and smallest shown size, canvas margin and inner
+/// padding, in points.
+const MAP_SIZE: Vec2 = vec2(160.0, 112.0);
+const MAP_MIN: Vec2 = vec2(96.0, 72.0);
+const MAP_MARGIN: f32 = 8.0;
+const MAP_PADDING: f32 = 6.0;
+/// The largest fraction of either visible canvas dimension the overview uses.
+const MAP_FRACTION: f32 = 0.3;
+
+/// The overview's placement and its uniform map from graph to screen points.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Minimap {
+    /// The opaque, interactive panel.
+    panel: Rect,
+    /// The panel content, into which `bounds` is letterboxed.
+    inner: Rect,
+    /// The represented graph domain.
+    bounds: Rect,
+    scale: f32,
+}
+
+impl Minimap {
+    /// The overview at the bottom right of the visible canvas `area`, or
+    /// `None` when the canvas is too small or `bounds` is unusable.
+    fn new(area: Rect, bounds: Rect) -> Option<Self> {
+        if !area.is_finite() || !bounds.is_finite() || area.is_negative() || bounds.is_negative() {
+            return None;
+        }
+        let size = MAP_SIZE.min(area.size() * MAP_FRACTION);
+        if size.x < MAP_MIN.x || size.y < MAP_MIN.y {
+            return None;
+        }
+        let panel = Rect::from_min_size(area.max - Vec2::splat(MAP_MARGIN) - size, size);
+        let inner = panel.shrink(MAP_PADDING);
+        // A degenerate domain gets a small symmetric extent.
+        let bounds = Rect::from_center_size(bounds.center(), bounds.size().max(Vec2::splat(1.0)));
+        let scale = (inner.width() / bounds.width()).min(inner.height() / bounds.height());
+        let map = Self {
+            panel,
+            inner,
+            bounds,
+            scale,
+        };
+        (scale.is_finite() && scale > 0.0 && bounds.is_finite() && map.domain().is_finite())
+            .then_some(map)
+    }
+
+    fn overview_point(&self, world: Pos2) -> Pos2 {
+        self.inner.center() + (world - self.bounds.center()) * self.scale
+    }
+
+    fn graph_point(&self, point: Pos2) -> Pos2 {
+        self.bounds.center() + (point - self.inner.center()) / self.scale
+    }
+
+    /// The represented domain in screen points.
+    fn domain(&self) -> Rect {
+        Rect::from_min_max(
+            self.overview_point(self.bounds.min),
+            self.overview_point(self.bounds.max),
+        )
+    }
+
+    /// The camera's world rectangle on the overview, clipped to its content.
+    fn viewport(&self, world: Rect) -> Option<Rect> {
+        let rect = Rect::from_min_max(
+            self.overview_point(world.min),
+            self.overview_point(world.max),
+        );
+        let rect = rect.intersect(self.inner);
+        (rect.is_finite() && rect.is_positive()).then_some(rect)
+    }
+
+    /// The pan centering a canvas of `size` at `zoom` on the graph point
+    /// under `pointer`. Letterbox and padding points clamp to the graph.
+    fn pan_to(&self, pointer: Pos2, size: Vec2, zoom: f32) -> Option<Vec2> {
+        let domain = self.domain();
+        let target = self.graph_point(pointer.clamp(domain.min, domain.max));
+        let pan = size * 0.5 - target.to_vec2() * zoom;
+        (zoom.is_finite() && zoom > 0.0 && pan.is_finite()).then_some(pan)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RowKind {
@@ -120,6 +205,7 @@ pub struct GraphCanvas {
 struct Painted {
     text_rows: usize,
     marks: usize,
+    map: Option<Minimap>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -321,6 +407,11 @@ impl GraphCanvas {
         });
         let size = ui.available_size().max(vec2(1.0, 1.0));
         let (canvas, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
+        let map = if self.layout.nodes.is_empty() {
+            None
+        } else {
+            Minimap::new(canvas.intersect(ui.clip_rect()), self.layout.bounds)
+        };
         if self.awaiting {
             // Fit, Entry and reveals apply once the final rows are adopted.
         } else if self.needs_initial_view {
@@ -332,7 +423,26 @@ impl GraphCanvas {
         if !self.awaiting
             && let Some(reveal) = self.reveal.take()
         {
-            self.reveal_at(reveal, canvas.size());
+            let covered = map.map(|map| map.panel.translate(-canvas.min.to_vec2()));
+            self.reveal_at(reveal, canvas.size(), covered);
+        }
+        // No camera yet while awaiting the first comment geometry.
+        let map = map.filter(|_| !self.needs_initial_view);
+        if let Some(map) = map {
+            // Registered above the canvas, so egui gives the overview every
+            // press, wheel hover and secondary click inside it, while a drag
+            // begun on the canvas keeps panning across it.
+            let overview = ui.interact(
+                map.panel,
+                ui.make_persistent_id("graph-minimap"),
+                Sense::click_and_drag(),
+            );
+            if overview.clicked()
+                && let Some(pointer) = overview.interact_pointer_pos()
+                && let Some(pan) = map.pan_to(pointer, canvas.size(), self.zoom)
+            {
+                self.pan = pan;
+            }
         }
 
         if response.dragged() {
@@ -632,6 +742,9 @@ impl GraphCanvas {
                 clicked = Some(GraphAction::Select(address));
             }
         }
+        if let Some(map) = &map {
+            self.paint_minimap(&painter, map, &layout, world, ppp);
+        }
         let context = self.context;
         response.context_menu(|ui| menu(ui, context));
         clicked
@@ -665,8 +778,9 @@ impl GraphCanvas {
 
     /// Brings the target row into view at readable scale. The camera is left
     /// alone when the row is already visible; a block taller than the canvas
-    /// is never centered as a whole.
-    fn reveal_at(&mut self, reveal: Reveal, size: Vec2) {
+    /// is never centered as a whole. A row under `covered`, canvas-relative,
+    /// is not visible and is centered vertically.
+    fn reveal_at(&mut self, reveal: Reveal, size: Vec2, covered: Option<Rect>) {
         let layout = &self.layout;
         let (node, target) = match reveal {
             Reveal::Instruction(address) => {
@@ -700,7 +814,8 @@ impl GraphCanvas {
         if !fits {
             target.max.x = target.min.x + size.x * 0.5;
         }
-        if Rect::from_min_size(Pos2::ZERO, size).contains_rect(target) {
+        let covered = covered.is_some_and(|covered| covered.intersects(target));
+        if Rect::from_min_size(Pos2::ZERO, size).contains_rect(target) && !covered {
             return;
         }
         if target.left() < 0.0 || target.right() > size.x {
@@ -710,11 +825,57 @@ impl GraphCanvas {
                 REVEAL_MARGIN.min(size.x * 0.1) - block.left()
             };
         }
-        if target.top() < 0.0 || target.bottom() > size.y || reveal == Reveal::Entry {
+        if target.top() < 0.0 || target.bottom() > size.y || covered || reveal == Reveal::Entry {
             self.pan.y += match reveal {
                 Reveal::Entry => REVEAL_MARGIN.min(size.y * 0.1) - target.top(),
                 Reveal::Instruction(_) => size.y * 0.5 - target.center().y,
             };
+        }
+    }
+
+    /// Block silhouettes and the camera viewport `world`; no rows, edges or
+    /// text. Minimum sizes are display-only and never affect navigation.
+    fn paint_minimap(
+        &mut self,
+        painter: &egui::Painter,
+        map: &Minimap,
+        layout: &GraphGeometry,
+        world: Rect,
+        ppp: f32,
+    ) {
+        let painter = painter.with_clip_rect(map.panel.intersect(painter.clip_rect()));
+        painter.rect(
+            map.panel,
+            2.0,
+            theme::CHROME,
+            Stroke::new(1.0, theme::BORDER),
+            StrokeKind::Inside,
+        );
+        let content = painter.with_clip_rect(map.inner.intersect(painter.clip_rect()));
+        let pixel = Vec2::splat(1.0 / ppp);
+        for node in &layout.nodes {
+            let rect = Rect::from_min_max(
+                map.overview_point(node.rect.min),
+                map.overview_point(node.rect.max),
+            );
+            content.rect_filled(
+                Rect::from_center_size(rect.center(), rect.size().max(pixel)),
+                0.0,
+                theme::MUTED.gamma_multiply(0.5),
+            );
+        }
+        if let Some(view) = map.viewport(world) {
+            content.rect(
+                Rect::from_center_size(view.center(), view.size().max(pixel * 2.0)),
+                0.0,
+                theme::ACCENT.gamma_multiply(0.12),
+                Stroke::new(1.0, theme::ACCENT),
+                StrokeKind::Inside,
+            );
+        }
+        #[cfg(test)]
+        {
+            self.painted.map = Some(*map);
         }
     }
 
@@ -2430,5 +2591,536 @@ mod tests {
             None,
         );
         assert_eq!(action, Some(GraphAction::Select(pc)));
+    }
+
+    /// The graph drawing area of the last frame.
+    fn canvas_rect(output: &egui::FullOutput) -> Rect {
+        output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Rect(rect) if rect.fill == theme::GRAPH_BACKGROUND => Some(rect.rect),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    fn button(pos: Pos2, button: egui::PointerButton, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    fn wheel(pos: Pos2, modifiers: egui::Modifiers) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: vec2(0.0, -120.0),
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Wheel,
+                modifiers,
+            },
+        ]
+    }
+
+    fn same(a: Rect, b: Rect) -> bool {
+        (a.min - b.min).length() < 0.01 && (a.max - b.max).length() < 0.01
+    }
+
+    /// The camera centre in graph coordinates.
+    fn camera_center(graph: &GraphCanvas, canvas: Rect) -> Vec2 {
+        (canvas.size() * 0.5 - graph.pan) / graph.zoom
+    }
+
+    #[test]
+    fn minimap_transform_letterboxes_clamps_and_hides() {
+        let area = Rect::from_min_size(pos2(10.0, 40.0), vec2(800.0, 600.0));
+        let size = area.size();
+        // A tall domain with a negative origin is letterboxed horizontally.
+        let bounds = Rect::from_min_max(pos2(-500.0, -2000.0), pos2(300.0, 40_000.0));
+        let map = Minimap::new(area, bounds).unwrap();
+        assert_eq!(map.panel.max, area.max - Vec2::splat(MAP_MARGIN));
+        assert_eq!(map.panel.size(), MAP_SIZE);
+        let domain = map.domain();
+        assert!(map.inner.expand(0.01).contains_rect(domain));
+        assert!((domain.height() - map.inner.height()).abs() < 0.01);
+        assert!(domain.width() < map.inner.width() - 1.0);
+        assert!((domain.center() - map.inner.center()).length() < 0.01);
+        let aspect = |rect: Rect| rect.width() / rect.height();
+        assert!((aspect(domain) - aspect(bounds)).abs() < 1e-4);
+        // A clicked graph point becomes the main viewport centre at any zoom.
+        let tolerance = 0.01 / map.scale;
+        for zoom in [MIN_ZOOM, 0.3, 1.0, MAX_ZOOM] {
+            for world in [
+                bounds.center(),
+                bounds.min,
+                bounds.max,
+                pos2(-100.0, 12_345.0),
+            ] {
+                let pan = map.pan_to(map.overview_point(world), size, zoom).unwrap();
+                let center = (size * 0.5 - pan) / zoom;
+                assert!(
+                    (center - world.to_vec2()).length() <= tolerance,
+                    "{zoom} {world:?}"
+                );
+            }
+        }
+        // Letterbox, padding and outside points clamp to the graph.
+        let center = |pointer: Pos2| size * 0.5 - map.pan_to(pointer, size, 1.0).unwrap();
+        let left = center(pos2(map.panel.left(), map.inner.center().y));
+        assert!((left.x - bounds.left()).abs() <= tolerance);
+        assert!((left.y - bounds.center().y).abs() <= tolerance);
+        let corner = center(map.panel.right_bottom() + vec2(50.0, 50.0));
+        assert!((corner - bounds.max.to_vec2()).length() <= tolerance);
+        // The viewport follows the camera and is clipped to the content.
+        let world = |pan: Vec2, zoom: f32| {
+            Rect::from_min_max((-pan / zoom).to_pos2(), ((size - pan) / zoom).to_pos2())
+        };
+        let far = world(size * 0.5 - bounds.center().to_vec2() * MIN_ZOOM, MIN_ZOOM);
+        assert_eq!(map.viewport(far), Some(map.inner));
+        // A camera wider than the tall graph shows a band across the letterbox.
+        let zoom = size.y / bounds.height();
+        let band = map
+            .viewport(world(size * 0.5 - bounds.center().to_vec2() * zoom, zoom))
+            .unwrap();
+        assert!(band.width() > domain.width() + 1.0);
+        let near = map.viewport(world(vec2(0.0, 0.0), 1.0)).unwrap();
+        let moved = map.viewport(world(vec2(-1000.0, -2000.0), 1.0)).unwrap();
+        assert!(
+            (moved.center() - near.center() - vec2(1000.0, 2000.0) * map.scale).length() < 0.01
+        );
+        // A camera far off the graph and its letterbox draws no viewport.
+        assert_eq!(map.viewport(world(vec2(1e7, 1e7), 1.0)), None);
+        // 30% of the visible canvas, hidden below 96 × 72 points.
+        let panel = |w: f32, h: f32| {
+            Minimap::new(Rect::from_min_size(Pos2::ZERO, vec2(w, h)), bounds).map(|m| m.panel)
+        };
+        let small = panel(320.0, 240.0).unwrap();
+        assert!((small.size() - MAP_MIN).length() < 0.01);
+        assert!(panel(319.0, 240.0).is_none() && panel(320.0, 239.0).is_none());
+        assert_eq!(panel(2000.0, 1000.0).unwrap().size(), MAP_SIZE);
+        // Degenerate domains get a finite extent; invalid input shows nothing.
+        let point = Minimap::new(area, Rect::from_min_size(pos2(5.0, -5.0), Vec2::ZERO)).unwrap();
+        assert!(point.scale.is_finite() && point.domain().is_finite());
+        let pan = point.pan_to(point.inner.left_top(), size, 1.0).unwrap();
+        assert!((size * 0.5 - pan - vec2(5.0, -5.0)).length() < 1.0);
+        for bad in [
+            Rect::NAN,
+            Rect::EVERYTHING,
+            Rect::NOTHING,
+            Rect::from_min_max(pos2(-f32::MAX, 0.0), pos2(f32::MAX, 1.0)),
+        ] {
+            assert_eq!(Minimap::new(area, bad), None, "{bad:?}");
+            assert_eq!(Minimap::new(bad, bounds), None, "{bad:?}");
+        }
+        for zoom in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert_eq!(map.pan_to(map.inner.center(), size, zoom), None);
+        }
+    }
+
+    /// A tall graph at readable zoom whose late resolved call row lies under
+    /// the overview centre, after a frame has registered the overview.
+    fn call_under_overview(
+        context: &egui::Context,
+        view: &FunctionView,
+        size: Vec2,
+    ) -> (GraphCanvas, Minimap, Rect, Pos2) {
+        let mut graph = GraphCanvas::new(view);
+        let (output, _) = paint(context, &mut graph, view, size, vec![], None);
+        let canvas = canvas_rect(&output);
+        let map = graph.painted.map.expect("overview is shown");
+        let call = view.calls[0].address;
+        let (node, row) = graph.layout.instruction(call).unwrap();
+        let row = graph.layout.nodes[node].row_rect(row);
+        let at = map.panel.center();
+        graph.zoom = 1.0;
+        graph.pan = (at - canvas.min) - (row.left_center() + vec2(60.0, 0.0)).to_vec2();
+        paint(context, &mut graph, view, size, vec![], None);
+        let world = ((at - canvas.min) - graph.pan) / graph.zoom;
+        assert_eq!(
+            graph.layout.nodes[node].hit_at(world.to_pos2(), graph.zoom),
+            call,
+            "the call row is under the overview"
+        );
+        (graph, map, canvas, at)
+    }
+
+    #[test]
+    fn minimap_click_recenters_without_graph_actions_or_leaks() {
+        let view = tall_fixture();
+        let size = vec2(760.0, 600.0);
+        for scale in [1.0, 1.25] {
+            let context = context(scale);
+            let (mut graph, map, canvas, at) = call_under_overview(&context, &view, size);
+            assert_eq!(context.pixels_per_point(), scale);
+            let under = graph.pan;
+            let zoom = graph.zoom;
+            // A click recenters at the clicked graph point, at the same zoom.
+            let (_, action) = paint(&context, &mut graph, &view, size, click(at, 1), None);
+            assert_eq!(action, None);
+            assert_eq!(graph.zoom, zoom);
+            assert_eq!(Some(graph.pan), map.pan_to(at, canvas.size(), zoom));
+            let target = map.graph_point(at).to_vec2();
+            assert!((camera_center(&graph, canvas) - target).length() <= 0.01 / map.scale);
+            assert!(graph.reveal.is_none() && graph.context.is_none());
+            // The second click of a double click over the call never follows it.
+            graph.pan = under;
+            let (_, action) = paint(&context, &mut graph, &view, size, click(at, 1), None);
+            assert_eq!(action, None);
+            for _ in 0..4 {
+                paint(&context, &mut graph, &view, size, vec![], None);
+            }
+            // Secondary and middle presses, wheel and Ctrl-wheel do nothing.
+            graph.pan = under;
+            for pressed in [egui::PointerButton::Secondary, egui::PointerButton::Middle] {
+                let events = vec![
+                    egui::Event::PointerMoved(at),
+                    button(at, pressed, true),
+                    button(at, pressed, false),
+                ];
+                let (_, action) = paint(&context, &mut graph, &view, size, events, None);
+                assert_eq!(action, None);
+                assert!(!egui::Popup::is_any_open(&context), "{pressed:?}");
+            }
+            for modifiers in [egui::Modifiers::NONE, egui::Modifiers::COMMAND] {
+                paint(
+                    &context,
+                    &mut graph,
+                    &view,
+                    size,
+                    wheel(at, modifiers),
+                    None,
+                );
+                for _ in 0..4 {
+                    paint(&context, &mut graph, &view, size, vec![], None);
+                }
+            }
+            let events = vec![egui::Event::PointerMoved(at), egui::Event::Zoom(1.5)];
+            paint(&context, &mut graph, &view, size, events, None);
+            assert_eq!((graph.zoom, graph.pan), (zoom, under));
+            assert!(graph.context.is_none());
+            // The same wheel over the canvas still pans it.
+            let outside = canvas.min + vec2(200.0, 200.0);
+            paint(
+                &context,
+                &mut graph,
+                &view,
+                size,
+                wheel(outside, egui::Modifiers::NONE),
+                None,
+            );
+            for _ in 0..4 {
+                paint(&context, &mut graph, &view, size, vec![], None);
+            }
+            assert_ne!(graph.pan, under);
+        }
+    }
+
+    #[test]
+    fn minimap_drags_stay_with_the_widget_that_was_pressed() {
+        let view = tall_fixture();
+        let size = vec2(760.0, 600.0);
+        for scale in [1.0, 1.25] {
+            let context = context(scale);
+            let (mut graph, map, _, at) = call_under_overview(&context, &view, size);
+            // A drag begun on the overview neither pans nor recenters, even
+            // when released over the canvas.
+            let start = graph.pan;
+            let mut events = vec![
+                egui::Event::PointerMoved(at),
+                button(at, egui::PointerButton::Primary, true),
+            ];
+            for step in 1..=4 {
+                let (_, action) = paint(&context, &mut graph, &view, size, events, None);
+                assert_eq!(action, None);
+                assert_eq!(graph.pan, start, "step {step}");
+                events = vec![egui::Event::PointerMoved(
+                    at - vec2(60.0, 45.0) * step as f32,
+                )];
+            }
+            let end = at - vec2(240.0, 180.0);
+            assert!(!map.panel.contains(end));
+            let release = vec![button(end, egui::PointerButton::Primary, false)];
+            let (_, action) = paint(&context, &mut graph, &view, size, release, None);
+            assert_eq!((action, graph.pan), (None, start));
+            // A canvas drag crosses the overview, applying each delta once,
+            // and its release over the overview does not recenter.
+            let from = map.panel.left_top() - vec2(120.0, 60.0);
+            let mut pointer = from;
+            let press = vec![
+                egui::Event::PointerMoved(from),
+                button(from, egui::PointerButton::Primary, true),
+            ];
+            paint(&context, &mut graph, &view, size, press, None);
+            let mut camera = graph.pan;
+            let delta = vec2(40.0, 20.0);
+            for step in 1..=5 {
+                pointer += delta;
+                paint(
+                    &context,
+                    &mut graph,
+                    &view,
+                    size,
+                    vec![egui::Event::PointerMoved(pointer)],
+                    None,
+                );
+                if step > 1 {
+                    assert!((graph.pan - camera - delta).length() < 0.01, "step {step}");
+                }
+                camera = graph.pan;
+            }
+            assert!(map.panel.contains(pointer));
+            let release = vec![button(pointer, egui::PointerButton::Primary, false)];
+            let (_, action) = paint(&context, &mut graph, &view, size, release, None);
+            assert_eq!((action, graph.pan), (None, camera));
+        }
+    }
+
+    #[test]
+    fn minimap_respects_open_menus_modals_and_disabled_ui() {
+        let view = tall_fixture();
+        let size = vec2(760.0, 600.0);
+        let context = context(1.25);
+        let (mut graph, _, canvas, at) = call_under_overview(&context, &view, size);
+        let frame = |graph: &mut GraphCanvas,
+                     events: Vec<egui::Event>,
+                     modal: bool,
+                     enabled: bool| {
+            let mut menu = None;
+            let time = context.input(|input| input.time) + 0.1;
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    if !enabled {
+                        ui.disable();
+                    }
+                    graph.show_selected(ui, &view, None, &BTreeSet::new(), |_, pc| menu = Some(pc));
+                    if modal {
+                        egui::Modal::new(egui::Id::unique("test-modal")).show(ui.ctx(), |ui| {
+                            ui.label("modal");
+                        });
+                    }
+                },
+            );
+            output.textures_delta.clear();
+            menu
+        };
+        let secondary = |pos| {
+            vec![
+                egui::Event::PointerMoved(pos),
+                button(pos, egui::PointerButton::Secondary, true),
+                button(pos, egui::PointerButton::Secondary, false),
+            ]
+        };
+        // A right-click on the overview opens no graph menu.
+        assert_eq!(frame(&mut graph, secondary(at), false, true), None);
+        assert_eq!(frame(&mut graph, vec![], false, true), None);
+        // A menu opened on a row stays open, with its row, over the overview.
+        // The tall block's rows, above the overview.
+        let row = pos2(at.x - 50.0, canvas.min.y + 100.0);
+        let opened = frame(&mut graph, secondary(row), false, true);
+        let pc = opened.expect("canvas right-click opens the menu");
+        assert!(pc.is_some());
+        for pointer in [at - vec2(30.0, 30.0), at] {
+            let menu = frame(
+                &mut graph,
+                vec![egui::Event::PointerMoved(pointer)],
+                false,
+                true,
+            );
+            assert_eq!(menu, Some(pc));
+        }
+        egui::Popup::close_all(&context);
+        frame(&mut graph, vec![], false, true);
+        // A modal and disabled UI keep the overview from recentering.
+        let camera = (graph.zoom, graph.pan);
+        // A new modal area becomes hit-testable after its sizing pass.
+        for _ in 0..2 {
+            frame(&mut graph, vec![], true, true);
+        }
+        frame(&mut graph, click(at, 1), true, true);
+        assert_eq!((graph.zoom, graph.pan), camera);
+        frame(&mut graph, vec![], false, false);
+        frame(&mut graph, click(at, 1), false, false);
+        assert_eq!((graph.zoom, graph.pan), camera);
+        frame(&mut graph, vec![], false, true);
+        frame(&mut graph, click(at, 1), false, true);
+        assert_ne!(graph.pan, camera.1, "the same click recenters when enabled");
+    }
+
+    #[test]
+    fn revealing_a_row_under_the_overview_moves_it_clear_once() {
+        let view = tall_fixture();
+        let size = vec2(760.0, 600.0);
+        let instructions = &view.blocks[0].instructions;
+        let deep = instructions[1900].address;
+        let comments = BTreeMap::from([(deep, "deep".to_owned())]);
+        for scale in [1.0, 1.25] {
+            let context = context(scale);
+            let mut graph = GraphCanvas::new(&view);
+            graph.set_comments(&view, (1, 1, 0), &comments, BTreeMap::new);
+            let (output, _) = paint(&context, &mut graph, &view, size, vec![], None);
+            let canvas = canvas_rect(&output);
+            let map = graph.painted.map.unwrap();
+            let screen = |graph: &GraphCanvas, address| {
+                let (node, row) = graph.layout.instruction(address).unwrap();
+                let rect = graph.layout.nodes[node].row_rect(row);
+                Rect::from_min_max(
+                    canvas.min + graph.pan + rect.min.to_vec2() * graph.zoom,
+                    canvas.min + graph.pan + rect.max.to_vec2() * graph.zoom,
+                )
+            };
+            // A late row inside the canvas but covered by the overview.
+            let target = instructions[2030].address;
+            graph.zoom = 1.0;
+            let row = screen(&graph, target);
+            graph.pan += pos2(map.panel.left() - 300.0, map.panel.center().y) - row.left_center();
+            let covered = screen(&graph, target);
+            assert!(canvas.contains_rect(covered) && covered.intersects(map.panel));
+            // Readable reveals from the covered row and from Fit.
+            for fit in [false, true] {
+                if fit {
+                    graph.fit(canvas.size());
+                }
+                graph.reveal_instruction(target);
+                let (output, _) = paint(&context, &mut graph, &view, size, vec![], None);
+                assert!(graph.reveal.is_none() && graph.zoom >= READABLE_ZOOM);
+                let row = screen(&graph, target);
+                assert!(canvas.contains_rect(row), "fit {fit}");
+                assert!(!row.intersects(map.panel), "fit {fit}");
+                assert!(row_text(&output, target).is_some());
+            }
+            // An overview click afterwards stays put; the reveal is not reapplied.
+            let point = map.inner.center() + vec2(0.0, 20.0);
+            paint(&context, &mut graph, &view, size, click(point, 1), None);
+            let camera = (graph.zoom, graph.pan);
+            assert_eq!(Some(camera.1), map.pan_to(point, canvas.size(), camera.0));
+            for selected in [None, Some(target), Some(deep)] {
+                paint(&context, &mut graph, &view, size, vec![], selected);
+            }
+            assert_eq!((graph.zoom, graph.pan), camera);
+        }
+    }
+
+    #[test]
+    fn minimap_camera_survives_resize_selection_and_annotation_but_not_fit() {
+        let view = tall_fixture();
+        let context = context(1.25);
+        let size = vec2(760.0, 600.0);
+        // No overview while the first comment geometry is awaited.
+        let mut graph = GraphCanvas::new(&view);
+        graph.show_base((1, 1, 0), true);
+        paint(&context, &mut graph, &view, size, vec![], None);
+        assert!(graph.painted.map.is_none());
+        let comments = BTreeMap::from([(view.address, "entry".to_owned())]);
+        assert!(graph.adopt_annotation(
+            (1, 1, 0),
+            Arc::new(Layout::annotated(&view, &comments, &BTreeMap::new()))
+        ));
+        let (output, _) = paint(&context, &mut graph, &view, size, vec![], None);
+        let canvas = canvas_rect(&output);
+        let map = graph.painted.map.expect("shown with the adopted geometry");
+        assert!(same(map.bounds, graph.layout.bounds));
+        paint(
+            &context,
+            &mut graph,
+            &view,
+            size,
+            click(map.inner.center(), 1),
+            None,
+        );
+        let camera = (graph.zoom, graph.pan);
+        // Idle, resize, hiding the overview, selection and comment adoption.
+        let tiny = vec2(300.0, 260.0);
+        for (size, selected) in [
+            (size, None),
+            (size + vec2(80.0, 40.0), None),
+            (tiny, None),
+            (size, Some(view.address)),
+        ] {
+            paint(&context, &mut graph, &view, size, vec![], selected);
+            assert_eq!(graph.painted.map.is_none(), size == tiny);
+            assert_eq!((graph.zoom, graph.pan), camera);
+        }
+        let old = graph.layout.bounds;
+        let more = BTreeMap::from([
+            (view.address, "entry".to_owned()),
+            (view.address + 4, "x".to_owned()),
+        ]);
+        graph.set_comments(&view, (1, 2, 0), &more, BTreeMap::new);
+        paint(&context, &mut graph, &view, size, vec![], None);
+        assert_eq!((graph.zoom, graph.pan), camera);
+        let map = graph.painted.map.unwrap();
+        assert!(same(map.bounds, graph.layout.bounds) && !same(map.bounds, old));
+        // Fit still fits the whole graph to the full canvas.
+        graph.needs_fit = true;
+        paint(&context, &mut graph, &view, size, vec![], None);
+        let mut fitted = GraphCanvas::new(&view);
+        fitted.layout = graph.layout.clone();
+        fitted.fit(canvas.size());
+        assert_eq!((graph.zoom, graph.pan), (fitted.zoom, fitted.pan));
+        // Entry shows the entry header near the top.
+        graph.reveal = Some(Reveal::Entry);
+        let (output, _) = paint(&context, &mut graph, &view, size, vec![], None);
+        assert!(texts(&output).iter().any(
+            |(text, pos)| text == "block 100000" && pos.y < canvas.top() + 2.0 * REVEAL_MARGIN
+        ));
+        // Graphs without blocks have no overview.
+        let empty = FunctionView {
+            blocks: vec![],
+            edges: vec![],
+            calls: vec![],
+            ..view.clone()
+        };
+        let mut graph = GraphCanvas::new(&empty);
+        paint(&context, &mut graph, &empty, size, vec![], None);
+        assert!(graph.painted.map.is_none());
+    }
+
+    #[test]
+    fn minimap_paints_one_silhouette_per_block_and_no_text() {
+        for (view, size) in [
+            (tall_fixture(), vec2(760.0, 600.0)),
+            (distributed_fixture(), vec2(1200.0, 900.0)),
+        ] {
+            let context = context(1.25);
+            let mut graph = GraphCanvas::new(&view);
+            for fit in [false, true] {
+                graph.needs_fit = fit;
+                let (output, _) = paint(&context, &mut graph, &view, size, vec![], None);
+                let map = graph.painted.map.unwrap();
+                let start = output
+                    .shapes
+                    .iter()
+                    .position(|shape| matches!(&shape.shape,
+                        egui::Shape::Rect(rect) if rect.rect == map.panel && rect.fill == theme::CHROME))
+                    .expect("overview panel");
+                let shapes: Vec<_> = output.shapes[start..]
+                    .iter()
+                    .filter(|shape| map.panel.expand(0.01).contains_rect(shape.clip_rect))
+                    .collect();
+                // Panel, one silhouette per block and the viewport; no rows,
+                // edges or text.
+                assert_eq!(shapes.len(), graph.layout.nodes.len() + 2, "fit {fit}");
+                for shape in shapes {
+                    let egui::Shape::Rect(rect) = &shape.shape else {
+                        panic!("{:?}", shape.shape);
+                    };
+                    assert!(rect.rect.is_finite());
+                    assert!(
+                        map.inner.expand(1.0).contains_rect(rect.rect) || rect.rect == map.panel
+                    );
+                }
+            }
+        }
     }
 }
