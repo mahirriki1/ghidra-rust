@@ -134,6 +134,19 @@ offers **Copy line**. Functions, Strings and Symbol Tree rows add **Go to** and
 **Copy row**. An open menu closes when the binary, function, pseudocode, graph,
 annotations or table it came from changes.
 
+**G** and the toolbar address field share one Go resolver. A query is first
+tried whole as a hexadecimal address, then an exact label, function name, raw
+symbol and display name, so names such as `operator+` or `a-b` keep working.
+Only if that fails is the last `+` or `-` read as one hexadecimal offset
+(optional `0x`, up to 16 digits) from a base address or exact name, as in
+`main+0x20` or `0x401000-0x10`. Nested arithmetic and signed offsets are
+rejected. The result must lie in mapped memory and must not wrap. A known
+function entry, or an instruction the current graph, pseudocode or history
+saw, opens in that function; Graph stays Graph, other tabs switch to Listing.
+Any other mapped address opens in Hex, including executable bytes that are not
+a known entry. A rejected query changes nothing; the toolbar keeps the text
+and reports the reason in the status bar.
+
 Visited functions reuse compatible session results. **Analysis → Refresh
 function** recomputes the selected function. This session cache does not mean
 every visited function is saved in a project.
@@ -156,7 +169,7 @@ but a stalled filesystem still delays further listings until it returns.
 | --- | --- |
 | `F1` | Open Keyboard shortcuts |
 | `L` | Rename the selected function, address label, or supported local |
-| `G` | Go to a hexadecimal address or exact function, label, raw or display name |
+| `G` | Go to a hexadecimal address or exact name, optionally with a `+`/`-` hex offset |
 | `;` | Edit the comment at the selected address |
 | `X` | Show references to the selection's exact target |
 | `S` | Search memory |
