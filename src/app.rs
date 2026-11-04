@@ -4962,28 +4962,54 @@ impl DesktopApp {
         }
     }
 
-    fn resolve_location(&self, query: &str) -> Result<u64, String> {
-        let info = self.info.as_ref().ok_or("Open a binary first")?;
-        let query = query.trim();
-        let address = parse_address(query)
-            .ok()
-            .or_else(|| {
-                self.session
-                    .as_ref()?
+    /// The address an exact label, function, raw symbol or display name
+    /// denotes, in that order.
+    fn named_location(&self, info: &BinaryInfo, name: &str) -> Option<u64> {
+        self.session
+            .as_ref()
+            .and_then(|session| {
+                session
                     .annotations
                     .iter()
-                    .find(|(_, note)| !note.label.is_empty() && note.label == query)
+                    .find(|(_, note)| !note.label.is_empty() && note.label == name)
                     .map(|(&address, _)| address)
             })
             .or_else(|| {
                 info.functions
                     .iter()
-                    .find(|function| function.name == query)
+                    .find(|function| function.name == name)
                     .map(|function| function.address)
             })
             // Exact original symbol, then exact demangled display name.
-            .or_else(|| self.symbols()?.find(query))
-            .ok_or("Enter a hexadecimal address or an exact function/label name")?;
+            .or_else(|| self.symbols()?.find(name))
+    }
+
+    /// Resolves a Go query to a mapped address. The whole query is looked up
+    /// first, so names containing `+` or `-` keep resolving. Only when that
+    /// fails is the last `+`/`-` taken as one hexadecimal offset from a base
+    /// address or name. Mapping is checked after the arithmetic.
+    fn resolve_location(&self, query: &str) -> Result<u64, String> {
+        const UNKNOWN: &str = "Enter a hex address or exact name, optionally +/- hex offset";
+        let info = self.info.as_ref().ok_or("Open a binary first")?;
+        let query = query.trim();
+        let address = match parse_address(query)
+            .ok()
+            .or_else(|| self.named_location(info, query))
+        {
+            Some(address) => address,
+            None => {
+                let (base, negative, offset) = split_offset(query).ok_or(UNKNOWN)?;
+                let base = strict_hex(base)
+                    .or_else(|| self.named_location(info, base))
+                    .ok_or(UNKNOWN)?;
+                if negative {
+                    base.checked_sub(offset)
+                } else {
+                    base.checked_add(offset)
+                }
+                .ok_or("Offset leaves the address space")?
+            }
+        };
         if !info
             .sections
             .iter()
@@ -4992,6 +5018,30 @@ impl DesktopApp {
             return Err("Address is outside mapped program memory".into());
         }
         Ok(address)
+    }
+
+    /// Go To from the dialog or toolbar. Code opens only at a known entry or
+    /// an exactly observed instruction of its owner; any other mapped byte
+    /// opens in Hex, never in a guessed function. A rejected query changes
+    /// nothing. Graph stays Graph; other views switch to Listing for code.
+    fn go_to(&mut self, query: &str, context: &egui::Context) -> Result<(), String> {
+        let address = self.resolve_location(query)?;
+        let info = self.info.as_ref().ok_or("Open a binary first")?;
+        match crate::search_jobs::resolve(info, address, 1, |pc| self.observed_owner(pc))
+            .ok_or("Address is outside mapped program memory")?
+        {
+            Destination::Code { address, owner } => {
+                let graph = self.tab == Tab::Graph;
+                self.navigate_location(address, Some(owner), true, context);
+                if graph {
+                    self.tab = Tab::Graph;
+                }
+            }
+            Destination::Data { address, length } => {
+                self.open_search_data(address, length, context);
+            }
+        }
+        Ok(())
     }
 
     fn rename_at(
@@ -5139,8 +5189,9 @@ impl DesktopApp {
                 .desired_width(f32::INFINITY)
                 .show(ui);
             if matches!(dialog.kind, BrowserDialogKind::GoTo) {
-                egui::Response::clone(&output.response)
-                    .on_hover_text("Hex address or exact function/label name.");
+                egui::Response::clone(&output.response).on_hover_text(
+                    "Hex address or exact function/label name, optionally +/- hex offset.",
+                );
             }
             if dialog.focus {
                 output.response.request_focus();
@@ -5171,9 +5222,7 @@ impl DesktopApp {
                 BrowserDialogKind::RenameLocal { identity } => {
                     self.rename_local(identity, &dialog.text, context)
                 }
-                BrowserDialogKind::GoTo => self
-                    .resolve_location(&dialog.text)
-                    .map(|address| self.navigate(address, true, context)),
+                BrowserDialogKind::GoTo => self.go_to(&dialog.text, context),
             };
             match result {
                 Ok(()) => return,
@@ -5434,16 +5483,18 @@ impl DesktopApp {
             }
             let entry = ui.add(
                 TextEdit::singleline(&mut self.address)
+                    .id(egui::Id::unique("toolbar-go-to"))
                     .desired_width(130.0)
                     .hint_text("Go to address")
-                    .char_limit(18),
+                    .char_limit(512),
             );
             if ui.button("Go").clicked()
                 || (entry.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
             {
-                match parse_address(&self.address) {
-                    Ok(address) => self.navigate(address, true, &context),
-                    Err(error) => self.status = error,
+                // The typed query stays in place when it is rejected.
+                let query = self.address.clone();
+                if let Err(error) = self.go_to(&query, &context) {
+                    self.status = error;
                 }
             }
             ui.separator();
@@ -9760,6 +9811,31 @@ fn xref_menu_items(
     }
 }
 
+/// Hexadecimal digits in one Go arithmetic operand: a full 64-bit value.
+const MAX_OFFSET_DIGITS: usize = 16;
+
+/// Optional `0x`/`0X`, then 1–16 ASCII hexadecimal digits; no sign.
+fn strict_hex(text: &str) -> Option<u64> {
+    let digits = text
+        .strip_prefix("0x")
+        .or_else(|| text.strip_prefix("0X"))
+        .unwrap_or(text);
+    (!digits.is_empty()
+        && digits.len() <= MAX_OFFSET_DIGITS
+        && digits.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    .then(|| u64::from_str_radix(digits, 16).ok())
+    .flatten()
+}
+
+/// Splits `query` at its last `+` or `-` into a trimmed, non-empty base and
+/// one strict hexadecimal offset, with whether it is subtracted.
+fn split_offset(query: &str) -> Option<(&str, bool, u64)> {
+    let index = query.rfind(['+', '-'])?;
+    let base = query[..index].trim();
+    let offset = strict_hex(query[index + 1..].trim())?;
+    (!base.is_empty()).then_some((base, query.as_bytes()[index] == b'-', offset))
+}
+
 fn parse_address(text: &str) -> Result<u64, String> {
     let text = text.trim();
     u64::from_str_radix(
@@ -11559,6 +11635,440 @@ mod tests {
         );
         assert_eq!(app.comment_edit, "label lg; comment");
         assert!(app.browser_dialog.is_none());
+    }
+
+    /// `keyboard_app` with operator-like names and labels for Go queries.
+    fn go_app() -> DesktopApp {
+        let mut app = keyboard_app();
+        let functions = &mut app.info.as_mut().unwrap().functions;
+        for (address, name) in [
+            (0x1080, "operator+"),
+            (0x1090, "operator->"),
+            (0x10a0, "a-b"),
+            (0x10b0, "operator++"),
+        ] {
+            functions.push(FunctionInfo {
+                address,
+                name: name.into(),
+            });
+        }
+        let annotations = &mut app.session.as_mut().unwrap().annotations;
+        for (address, label) in [
+            (0x10c0, "-[Foo bar]"),
+            (0x10d0, "1040"),
+            // A whole-query match is final, even when it is unmapped.
+            (0x9000, "next-1"),
+        ] {
+            annotations.insert(
+                address,
+                Annotation {
+                    label: label.into(),
+                    ..Default::default()
+                },
+            );
+        }
+        app
+    }
+
+    #[test]
+    fn go_queries_try_whole_names_first_then_one_checked_hex_offset() {
+        let app = go_app();
+        let unknown =
+            Err("Enter a hex address or exact name, optionally +/- hex offset".to_string());
+        let outside = Err("Address is outside mapped program memory".to_string());
+        let overflow = Err("Offset leaves the address space".to_string());
+        for (query, expected) in [
+            // Existing whole-query behavior, including a leading `+`.
+            ("1040", Ok(0x1040)),
+            ("0X1040", Ok(0x1040)),
+            ("+1040", Ok(0x1040)),
+            ("next", Ok(0x1040)),
+            ("operator+", Ok(0x1080)),
+            ("operator->", Ok(0x1090)),
+            ("a-b", Ok(0x10a0)),
+            ("operator++", Ok(0x10b0)),
+            ("-[Foo bar]", Ok(0x10c0)),
+            ("next-1", outside.clone()),
+            ("0x10", outside.clone()),
+            // One offset after the last operator, from a strict hex or exact name.
+            ("next+0x20", Ok(0x1060)),
+            (" next + 20 ", Ok(0x1060)),
+            ("next\t-\t0X10", Ok(0x1030)),
+            ("0x1010-0x10", Ok(0x1000)),
+            ("1000+FF", Ok(0x10ff)),
+            ("operator++0x10", Ok(0x1090)),
+            ("operator->+4", Ok(0x1094)),
+            ("a-b-0xa0", Ok(0x1000)),
+            ("-[Foo bar]+0x4", Ok(0x10c4)),
+            ("1040+0", Ok(0x1040)),
+            ("next+000000000000000f", Ok(0x104f)),
+            // The base may lie outside mapped memory when the result does not.
+            ("0x2000-0xfc0", Ok(0x1040)),
+            ("next+0xc0", outside.clone()),
+            ("ffffffffffffffff+1", overflow.clone()),
+            ("0-1", overflow.clone()),
+            ("next-0x1041", overflow),
+            ("", unknown.clone()),
+            ("next+", unknown.clone()),
+            ("next+0x", unknown.clone()),
+            ("next+0xg", unknown.clone()),
+            ("next+1 2", unknown.clone()),
+            ("next+-10", unknown.clone()),
+            ("next-+10", unknown.clone()),
+            ("+0x10", unknown.clone()),
+            ("+1040+0x10", unknown.clone()),
+            ("0x+1040+0", unknown.clone()),
+            ("next+0x10+0x10", unknown.clone()),
+            ("next*2", unknown.clone()),
+            ("next+0x00000000000000001", unknown.clone()),
+            ("missing+10", unknown.clone()),
+        ] {
+            assert_eq!(app.resolve_location(query), expected, "{query:?}");
+        }
+        // A hex-like label never shadows the address it spells.
+        assert_eq!(app.resolve_location("1040+0x10"), Ok(0x1050));
+
+        // Raw symbols and display names are bases too.
+        let context = egui::Context::default();
+        let (mut app, table) = demangled_app();
+        let (pending, reply) = symbol_reply(&app, 0, table.page(0).unwrap());
+        app.receive(pending, reply, &context);
+        assert_eq!(app.resolve_location("_ZN4demo3fooEv+4"), Ok(0x1004));
+        assert_eq!(app.resolve_location("demo::foo + 0x10"), Ok(0x1010));
+        assert!(app.resolve_location("demo::fo+4").is_err());
+    }
+
+    #[test]
+    fn go_to_opens_exact_code_owners_or_hex_and_rejects_without_side_effects() {
+        let context = egui::Context::default();
+        let mut app = hex_app();
+        app.history = vec![crate::linkage_ui::Place::Code(0x1000)];
+        app.tab = Tab::Strings;
+        let functions = app.info.as_ref().unwrap().functions.clone();
+        let state = |app: &DesktopApp| {
+            (
+                app.selected,
+                app.history.clone(),
+                app.history_index,
+                app.tab,
+                app.data_location,
+                app.address.clone(),
+                app.view().map(|view| view.address),
+            )
+        };
+        let before = state(&app);
+        for query in [
+            "missing",
+            "entry+zz",
+            "0xfff",
+            "entry-1",
+            "entry+0x10000",
+            "ffffffffffffffff+1",
+        ] {
+            assert!(app.go_to(query, &context).is_err(), "{query}");
+            assert_eq!(state(&app), before, "{query}");
+        }
+
+        // An observed instruction of the displayed CFG opens in its owner.
+        app.go_to("entry+4", &context).unwrap();
+        assert_eq!((app.tab, app.selected), (Tab::Listing, Some(0x1004)));
+        assert_eq!(app.view().map(|view| view.address), Some(0x1000));
+        assert_eq!(
+            app.history.last(),
+            Some(&crate::linkage_ui::Place::Code(0x1004))
+        );
+        // Graph stays Graph for code.
+        app.tab = Tab::Graph;
+        app.go_to("entry+8", &context).unwrap();
+        assert_eq!((app.tab, app.selected), (Tab::Graph, Some(0x1008)));
+
+        // Executable bytes with no known entry or observed owner open in Hex,
+        // never in a guessed function.
+        app.go_to("entry+0x11", &context).unwrap();
+        assert_eq!(app.tab, Tab::Hex);
+        assert_eq!(app.data_location, Some((0x1011, 1)));
+        assert_eq!(app.view().map(|view| view.address), Some(0x1000));
+        assert_eq!(app.info.as_ref().unwrap().functions, functions);
+        // Initialized data and its zero-fill tail open in Hex too.
+        app.go_to("8004", &context).unwrap();
+        assert_eq!((app.tab, app.data_location), (Tab::Hex, Some((0x8004, 1))));
+        app.go_to("0x8000+0x40", &context).unwrap();
+        assert_eq!(app.data_location, Some((0x8040, 1)));
+
+        // A known entry opens its function; Hex switches to Listing.
+        app.go_to("next", &context).unwrap();
+        assert_eq!((app.tab, app.selected), (Tab::Listing, Some(0x1040)));
+        assert_eq!((app.data_location, app.result_scope), (None, Some(0x1040)));
+        assert!(app.view().is_none());
+
+        let place = |address| crate::linkage_ui::Place::Data { address, length: 1 };
+        assert_eq!(
+            app.history,
+            [
+                crate::linkage_ui::Place::Code(0x1000),
+                crate::linkage_ui::Place::Code(0x1004),
+                crate::linkage_ui::Place::Code(0x1008),
+                place(0x1011),
+                place(0x8004),
+                place(0x8040),
+                crate::linkage_ui::Place::Code(0x1040),
+            ]
+        );
+        app.history_step(false, &context);
+        assert_eq!((app.tab, app.data_location), (Tab::Hex, Some((0x8040, 1))));
+        app.history_step(false, &context);
+        assert_eq!(app.data_location, Some((0x8004, 1)));
+        app.history_step(true, &context);
+        app.history_step(true, &context);
+        assert_eq!((app.selected, app.data_location), (Some(0x1040), None));
+    }
+
+    #[test]
+    fn go_to_mapped_zero_opens_hex_and_returns_exactly() {
+        let context = egui::Context::default();
+        let mut app = keyboard_app();
+        app.history = vec![crate::linkage_ui::Place::Code(0x1000)];
+        app.info.as_mut().unwrap().sections.insert(
+            0,
+            SectionInfo {
+                name: ".bss".into(),
+                address: 0,
+                size: 0x10,
+                file_offset: 0,
+                file_size: 0,
+                executable: false,
+            },
+        );
+        app.go_to("8-8", &context).unwrap();
+        assert_eq!((app.tab, app.data_location), (Tab::Hex, Some((0, 1))));
+        assert_eq!(app.selected, Some(0));
+        app.go_to("entry", &context).unwrap();
+        assert_eq!((app.tab, app.selected), (Tab::Listing, Some(0x1000)));
+        app.history_step(false, &context);
+        assert_eq!((app.tab, app.data_location), (Tab::Hex, Some((0, 1))));
+        assert_eq!(app.selected, Some(0));
+        app.history_step(true, &context);
+        assert_eq!((app.selected, app.data_location), (Some(0x1000), None));
+    }
+
+    #[test]
+    fn go_to_supersedes_pending_function_replies() {
+        let context = egui::Context::default();
+        for query in ["next", "8004", "entry+0x11"] {
+            let mut app = hex_app();
+            app.auto_decompile = false;
+            let pending = |app: &DesktopApp, request| Pending {
+                id: 1,
+                request,
+                started: Instant::now(),
+                selection: app.selection_generation,
+                revision: app.revision,
+                byte_origin: (app.selected, app.tab),
+                bytes: None,
+                result: None,
+            };
+            let graph = pending(&app, Request::Graph { address: 0x1000 });
+            let code = pending(&app, Request::Decompile { address: 0x1000 });
+            app.go_to(query, &context).unwrap();
+            let destination = (
+                app.tab,
+                app.selected,
+                app.data_location,
+                app.history.clone(),
+            );
+            app.receive(
+                graph,
+                Response::Graph {
+                    view: FunctionView {
+                        address: 0x1000,
+                        blocks: Vec::new(),
+                        edges: Vec::new(),
+                        calls: Vec::new(),
+                        warnings: Vec::new(),
+                    },
+                },
+                &context,
+            );
+            app.settle_graph();
+            app.receive(
+                code,
+                Response::Decompiled {
+                    address: 0x1000,
+                    mappings: Vec::new(),
+                    semantics: Default::default(),
+                    text: "stale output".into(),
+                },
+                &context,
+            );
+            assert_eq!(
+                (
+                    app.tab,
+                    app.selected,
+                    app.data_location,
+                    app.history.clone()
+                ),
+                destination,
+                "late replies changed destination for {query}"
+            );
+            assert!(!app.decompiled().contains("stale output"));
+            if query == "next" {
+                assert!(app.view().is_none());
+                assert_eq!(app.result_scope, Some(0x1040));
+            } else {
+                assert_eq!(app.tab, Tab::Hex);
+                assert_eq!(app.view().map(|view| view.address), Some(0x1000));
+            }
+        }
+    }
+
+    #[test]
+    fn go_dialog_takes_offsets_keeps_errors_inline_and_drops_stale_drafts() {
+        let context = egui::Context::default();
+        let mut app = go_app();
+        let enter = || vec![key_event(egui::Key::Enter, egui::Modifiers::NONE)];
+        // G held across the end of a file job repeats; modified G is not Go.
+        let g = || key_event(egui::Key::G, egui::Modifiers::NONE);
+        let (_sender, receiver) = mpsc::sync_channel(1);
+        app.file_job = Some(receiver);
+        keyboard_frame(&context, &mut app, vec![g()]);
+        app.file_job = None;
+        keyboard_frame(&context, &mut app, vec![g()]);
+        assert!(app.browser_dialog.is_none());
+        let mut release = g();
+        if let egui::Event::Key { pressed, .. } = &mut release {
+            *pressed = false;
+        }
+        keyboard_frame(&context, &mut app, vec![release.clone()]);
+        keyboard_frame(
+            &context,
+            &mut app,
+            vec![
+                key_event(egui::Key::G, egui::Modifiers::CTRL),
+                release.clone(),
+            ],
+        );
+        assert!(app.browser_dialog.is_none());
+
+        keyboard_frame(&context, &mut app, vec![g(), release]);
+        keyboard_frame(&context, &mut app, vec![]);
+        // Shortcut characters are text while the field has focus.
+        let mut typed = Vec::new();
+        for (key, text) in [
+            (egui::Key::G, "g"),
+            (egui::Key::L, "l"),
+            (egui::Key::X, "x"),
+            (egui::Key::Semicolon, ";"),
+        ] {
+            typed.push(key_event(key, egui::Modifiers::NONE));
+            typed.push(egui::Event::Text(text.into()));
+        }
+        keyboard_frame(&context, &mut app, typed);
+        let dialog = app.browser_dialog.as_ref().unwrap();
+        assert_eq!(dialog.text, "glx;");
+        assert!(app.xref_target.is_none() && !app.annotations_open);
+        let before = (app.selected, app.history.clone(), app.tab);
+        keyboard_frame(&context, &mut app, enter());
+        let dialog = app.browser_dialog.as_ref().unwrap();
+        assert!(dialog.error.is_some());
+        assert_eq!((app.selected, app.history.clone(), app.tab), before);
+
+        app.browser_dialog.as_mut().unwrap().text = "operator++0x10".into();
+        keyboard_frame(&context, &mut app, enter());
+        assert!(app.browser_dialog.is_none());
+        assert_eq!(
+            (app.selected, app.result_scope),
+            (Some(0x1090), Some(0x1090))
+        );
+
+        // A draft opened for a replaced binary never applies.
+        keyboard_frame(&context, &mut app, vec![]);
+        app.begin_go_to();
+        app.browser_dialog.as_mut().unwrap().text = "next".into();
+        app.generation += 1;
+        keyboard_frame(&context, &mut app, enter());
+        assert!(app.browser_dialog.is_none());
+        assert_eq!(app.selected, Some(0x1090));
+    }
+
+    #[test]
+    fn toolbar_go_shares_resolution_and_keeps_rejected_text() {
+        let context = egui::Context::default();
+        theme::install(&context);
+        let mut app = go_app();
+        let field = egui::Id::unique("toolbar-go-to");
+        let frame = |app: &mut DesktopApp, events| {
+            let time = context.input(|input| input.time) + 0.1;
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1000.0, 700.0),
+                    )),
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ui| app.draw(ui),
+            );
+            output.textures_delta.clear();
+            output
+        };
+        let enter = || vec![key_event(egui::Key::Enter, egui::Modifiers::NONE)];
+        let focus = |app: &mut DesktopApp, text: &str| {
+            app.address = text.into();
+            context.memory_mut(|memory| memory.request_focus(field));
+        };
+
+        // Enter on blur resolves names with an offset. Typed shortcut
+        // characters stay in the field.
+        focus(&mut app, "next+");
+        frame(&mut app, vec![]);
+        frame(
+            &mut app,
+            vec![
+                key_event(egui::Key::G, egui::Modifiers::NONE),
+                egui::Event::Text("g".into()),
+            ],
+        );
+        assert!(app.browser_dialog.is_none());
+        assert!(app.address.contains('g'), "{}", app.address);
+        app.address = "next+0x4".into();
+        frame(&mut app, enter());
+        assert_eq!((app.tab, app.data_location), (Tab::Hex, Some((0x1044, 1))));
+        assert_eq!(app.address, "1044");
+
+        // A rejected query stays typed and reports status only.
+        let before = (
+            app.selected,
+            app.history.clone(),
+            app.tab,
+            app.data_location,
+        );
+        focus(&mut app, "next+0x10000");
+        frame(&mut app, vec![]);
+        frame(&mut app, enter());
+        assert_eq!(app.address, "next+0x10000");
+        assert_eq!(app.status, "Address is outside mapped program memory");
+        assert_eq!(
+            (
+                app.selected,
+                app.history.clone(),
+                app.tab,
+                app.data_location
+            ),
+            before
+        );
+
+        // The Go button uses the same resolver, including operator names.
+        app.address = "a-b".into();
+        let output = frame(&mut app, vec![]);
+        frame(&mut app, pointer_events(text_position(&output, "Go", 1)));
+        assert_eq!((app.tab, app.selected), (Tab::Listing, Some(0x10a0)));
+        assert_eq!(app.result_scope, Some(0x10a0));
+        assert_eq!(
+            app.history.last(),
+            Some(&crate::linkage_ui::Place::Code(0x10a0))
+        );
     }
 
     #[test]
