@@ -243,13 +243,20 @@ impl HexPanel {
         }
     }
 
-    #[cfg(test)]
+    /// The selected byte span of the current page target, as start and length.
     pub(crate) fn focused_span(&self) -> Option<(u64, u64)> {
         let range = self.selection_range()?;
         Some((
-            self.target?.address + range.start as u64,
+            self.target?.address.checked_add(range.start as u64)?,
             range.len() as u64,
         ))
+    }
+
+    /// The location shown: the selected span, else one byte at the start of
+    /// the current page target, including one still loading or failed.
+    pub(crate) fn location(&self) -> Option<(u64, u64)> {
+        self.focused_span()
+            .or_else(|| Some((self.target?.address, 1)))
     }
 
     fn turn_page(&mut self, address: u64, sections: &[SectionInfo]) -> Option<HexAction> {

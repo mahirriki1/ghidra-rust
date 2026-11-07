@@ -276,6 +276,137 @@ pub fn history_button(ui: &mut Ui, forward: bool, enabled: bool) -> egui::Respon
         .on_disabled_hover_text(tooltip)
 }
 
+/// One destination row of a history list.
+pub struct HistoryRow {
+    pub address: u64,
+    /// Display name, proportional; an address alone when unnamed.
+    pub name: Option<String>,
+    /// Opens in Hex rather than as code.
+    pub hex: bool,
+}
+
+/// Most history rows shown before the list scrolls.
+const HISTORY_ROWS: usize = 16;
+
+/// The dropdown beside a history button: `count` destinations, nearest
+/// first, of which only the visible rows are built by `row`. `key` names
+/// the listed entries; when it changes an open list closes rather than
+/// letting a row activate a different entry. Returns the chosen row.
+pub fn history_menu(
+    ui: &mut Ui,
+    forward: bool,
+    enabled: bool,
+    key: u64,
+    count: usize,
+    digits: usize,
+    mut row: impl FnMut(usize) -> HistoryRow,
+) -> Option<usize> {
+    let label = if forward {
+        "Forward history"
+    } else {
+        "Back history"
+    };
+    let button = ui.add_enabled(
+        enabled && count > 0,
+        egui::Button::new("")
+            .min_size(egui::vec2(12.0, 22.0))
+            .frame_when_inactive(false),
+    );
+    button.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, button.enabled(), label));
+    let popup_id = button.id.with("history-popup").with(key);
+    let open = egui::Popup::is_id_open(ui.ctx(), popup_id);
+    if ui.is_rect_visible(button.rect) {
+        let center = button.rect.center();
+        let color = if !button.enabled() {
+            MUTED.gamma_multiply(0.45)
+        } else if open {
+            TEXT
+        } else {
+            ui.style().interact(&button).fg_stroke.color
+        };
+        ui.painter().add(egui::Shape::convex_polygon(
+            vec![
+                center + egui::vec2(-3.5, -1.5),
+                center + egui::vec2(3.5, -1.5),
+                center + egui::vec2(0.0, 2.5),
+            ],
+            color,
+            Stroke::NONE,
+        ));
+    }
+    let button = button.on_hover_text(label);
+    if !button.enabled() {
+        if open {
+            egui::Popup::close_id(ui.ctx(), popup_id);
+        }
+        return None;
+    }
+    let shown = count.min(HISTORY_ROWS) as f32 * ROW_HEIGHT;
+    let room =
+        (ui.ctx().content_rect().bottom() - button.rect.bottom() - 16.0).max(ROW_HEIGHT * 3.0);
+    let height = shown.min(room);
+    let mono = FontId::monospace(13.0);
+    let address_width = digits as f32 * ui.fonts_mut(|fonts| fonts.glyph_width(&mono, '0')) + 12.0;
+    let mut chosen = None;
+    egui::Popup::menu(&button).id(popup_id).show(|ui| {
+        let width = 360.0;
+        ui.allocate_ui(egui::vec2(width, height), |ui| {
+            ui.set_min_size(egui::vec2(width, height));
+            // A short list must not keep the scroll area's default minimum.
+            let (picked, _) = rows_in(
+                ui,
+                egui::ScrollArea::vertical().min_scrolled_height(ROW_HEIGHT),
+                "history-rows",
+                count,
+                ROW_HEIGHT,
+                0.0,
+                None,
+                |ui, index, rect| {
+                    let entry = row(index);
+                    let response = row_response(ui, popup_id.with(index), rect, false, false);
+                    let address = egui::Rect::from_min_max(
+                        rect.min,
+                        egui::pos2(rect.left() + address_width, rect.bottom()),
+                    );
+                    cell_text(ui, address, format!("{:0digits$x}", entry.address), TEXT);
+                    let marker = if entry.hex { 32.0 } else { 0.0 };
+                    if let Some(name) = &entry.name {
+                        let cell = egui::Rect::from_min_max(
+                            egui::pos2(address.right(), rect.top()),
+                            egui::pos2(rect.right() - marker, rect.bottom()),
+                        );
+                        cell_text(
+                            ui,
+                            cell,
+                            RichText::new(name).text_style(TextStyle::Body),
+                            TEXT,
+                        );
+                    }
+                    if entry.hex {
+                        ui.painter().text(
+                            egui::pos2(rect.right() - 6.0, rect.center().y),
+                            egui::Align2::RIGHT_CENTER,
+                            "Hex",
+                            FontId::proportional(11.0),
+                            MUTED,
+                        );
+                    }
+                    let response = match &entry.name {
+                        Some(name) => response.on_hover_text(name.as_str()),
+                        None => response,
+                    };
+                    response.clicked().then_some(index)
+                },
+            );
+            if picked.is_some() {
+                chosen = picked;
+                ui.close();
+            }
+        });
+    });
+    chosen
+}
+
 /// A lone dock title with declared actions. Actions that do not fit move into
 /// a More actions menu; the caller dispatches the returned action afterwards.
 pub fn dock_header_actions<A: Copy>(
@@ -1272,6 +1403,30 @@ pub fn rows<R>(
     row_height: f32,
     content_width: f32,
     reveal: Option<usize>,
+    add_row: impl FnMut(&mut Ui, usize, egui::Rect) -> Option<R>,
+) -> (Option<R>, egui::scroll_area::ScrollAreaOutput<()>) {
+    rows_in(
+        ui,
+        egui::ScrollArea::new([content_width > 0.0, true]),
+        id_salt,
+        count,
+        row_height,
+        content_width,
+        reveal,
+        add_row,
+    )
+}
+
+/// [`rows`] in a caller-configured scroll area.
+#[allow(clippy::too_many_arguments)]
+fn rows_in<R>(
+    ui: &mut Ui,
+    area: egui::ScrollArea,
+    id_salt: impl std::hash::Hash + std::fmt::Debug,
+    count: usize,
+    row_height: f32,
+    content_width: f32,
+    reveal: Option<usize>,
     mut add_row: impl FnMut(&mut Ui, usize, egui::Rect) -> Option<R>,
 ) -> (Option<R>, egui::scroll_area::ScrollAreaOutput<()>) {
     let mut result = None;
@@ -1280,9 +1435,7 @@ pub fn rows<R>(
     let horizontal = content_width > 0.0;
     let pixels_per_point = ui.pixels_per_point();
     let pixel = 1.0 / pixels_per_point;
-    let mut area = egui::ScrollArea::new([horizontal, true])
-        .id_salt(salt)
-        .auto_shrink([false, false]);
+    let mut area = area.id_salt(salt).auto_shrink([false, false]);
     // Apply the reveal before showing so the row is in view on this frame.
     if let Some(row) = reveal.filter(|row| *row < count) {
         let offset = egui::scroll_area::State::load(ui.ctx(), id)

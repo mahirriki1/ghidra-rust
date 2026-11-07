@@ -195,6 +195,16 @@ impl super::DesktopApp {
     /// Whether keyboard commands must leave input to dialogs, text fields,
     /// popups and file operations.
     pub(super) fn navigation_shortcuts_blocked(&self, context: &egui::Context) -> bool {
+        self.navigation_commands_blocked()
+            || context.egui_wants_keyboard_input()
+            || egui::Popup::is_any_open(context)
+            || self.menu_owns_input(context)
+            || context.memory(|memory| memory.top_modal_layer().is_some())
+    }
+
+    /// The operation and dialog guards shared by the shortcuts and by menu
+    /// commands, which run from a popup and so omit input ownership.
+    pub(super) fn navigation_commands_blocked(&self) -> bool {
         self.opening.is_some()
             || self.file_job.is_some()
             || self.intent.is_some()
@@ -205,10 +215,6 @@ impl super::DesktopApp {
             || self.signature_editor.is_some()
             || self.signature_change.is_some()
             || self.search_dialog.is_some()
-            || context.egui_wants_keyboard_input()
-            || egui::Popup::is_any_open(context)
-            || self.menu_owns_input(context)
-            || context.memory(|memory| memory.top_modal_layer().is_some())
     }
 
     fn listing_view_key(&self) -> Option<ViewKey> {
