@@ -95,6 +95,14 @@ inspect the full instruction.
 
 Double-click a resolved call instruction or decompiler call-name token to
 open its target. Back / Forward returns to previous instruction selections.
+The small arrows beside Back and Forward list those destinations, nearest
+first; choosing one jumps straight to it without changing the list.
+**Navigation → Previous function** / **Next function** (`Ctrl+Up` /
+`Ctrl+Down`) open the nearest known function entry before or after the
+current location: the selected Hex bytes while Hex is shown, otherwise the
+selected address. Previous from inside a function opens its entry first.
+They follow address order, not the Functions table's sort or filter, stop at
+the first and last known entries, and keep the Function Graph tab open.
 
 Selecting an instruction highlights its mapped pseudocode; selecting mapped
 pseudocode selects the corresponding instructions. Links use genuine engine
@@ -176,6 +184,7 @@ but a stalled filesystem still delays further listings until it returns.
 | `Ctrl+F` | Search program text |
 | `Space` | Switch Listing / Function Graph |
 | `Alt+Left` / `Alt+Right` | Back / Forward |
+| `Ctrl+Up` / `Ctrl+Down` | Previous / next function entry |
 | `Ctrl+S` | Save project |
 | `Ctrl+Z` | Undo an annotation outside text editors |
 | `Up` / `Down` | Listing: previous / next instruction |

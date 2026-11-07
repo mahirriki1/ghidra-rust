@@ -13,6 +13,7 @@ pub(crate) const SHORTCUTS: &[(&str, &str)] = &[
     (FIND_KEYS, "Search program text"),
     ("Space", "Toggle Listing / Graph"),
     ("Alt+Left / Right", "Back / forward"),
+    ("Ctrl+Up / Down", "Previous / next function"),
     (SAVE_KEYS, "Save project"),
     (UNDO_KEYS, "Undo annotation"),
     ("Up / Down", "Listing: previous / next row"),

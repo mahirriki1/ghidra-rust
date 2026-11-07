@@ -529,3 +529,95 @@ fn truncated_listing_addresses_keep_the_distinguishing_low_digits() {
         }
     }
 }
+
+#[test]
+fn history_list_builds_only_visible_rows_and_closes_when_its_entries_change() {
+    let context = context(1.0);
+    let built = std::cell::Cell::new(0usize);
+    let button = std::cell::Cell::new(egui::Rect::NOTHING);
+    let draw = |key: u64, events| {
+        let mut chosen = None;
+        let output = frame(&context, 600.0, events, |ui| {
+            let line = ui.horizontal(|ui| {
+                chosen = history_menu(ui, false, true, key, 1000, 8, |row| {
+                    built.set(built.get() + 1);
+                    HistoryRow {
+                        address: 0x1000 + row as u64,
+                        name: (row == 2).then(|| "third".into()),
+                        hex: row == 3,
+                    }
+                });
+            });
+            button.set(line.response.rect);
+        });
+        (output, chosen)
+    };
+    draw(1, vec![]);
+    draw(1, click(button.get().center()));
+    assert!(egui::Popup::is_any_open(&context));
+    built.set(0);
+    let (output, _) = draw(1, vec![]);
+    assert!(built.get() > 0 && built.get() <= 20, "{}", built.get());
+    point(&output, "00001003");
+    point(&output, "Hex");
+    let row = point(&output, "third");
+
+    // Another key means other entries: the open list closes, and clicking
+    // where the old row was activates nothing.
+    draw(2, vec![]);
+    assert!(!egui::Popup::is_any_open(&context));
+    let (_, chosen) = draw(2, click(row));
+    assert_eq!(chosen, None);
+
+    draw(2, click(button.get().center()));
+    let (output, _) = draw(2, vec![]);
+    let (_, chosen) = draw(2, click(point(&output, "third")));
+    assert_eq!(chosen, Some(2));
+    draw(2, vec![]);
+    assert!(!egui::Popup::is_any_open(&context));
+}
+
+#[test]
+fn short_history_lists_fit_their_rows_without_spare_height() {
+    let context = context(1.0);
+    let button = std::cell::Cell::new(egui::Rect::NOTHING);
+    let height = |count: usize| {
+        let draw = |events| {
+            frame(&context, 600.0, events, |ui| {
+                let line = ui.horizontal(|ui| {
+                    history_menu(ui, false, true, count as u64, count, 8, |row| HistoryRow {
+                        address: 0x1000 + row as u64,
+                        name: None,
+                        hex: false,
+                    });
+                });
+                button.set(line.response.rect);
+            })
+        };
+        draw(vec![]);
+        draw(click(button.get().center()));
+        let output = draw(vec![]);
+        let row = point(&output, "00001000");
+        let layer = context.layer_id_at(row).expect("popup layer");
+        let rect = context.memory(|memory| memory.area_rect(layer.id));
+        rect.expect("popup rect").height()
+    };
+    let (one, two, three) = (height(1), height(2), height(3));
+    assert_eq!(two - one, ROW_HEIGHT);
+    assert_eq!(three - two, ROW_HEIGHT);
+}
+
+#[test]
+fn disabled_history_list_never_opens() {
+    let context = context(1.0);
+    let button = std::cell::Cell::new(egui::Rect::NOTHING);
+    for _ in 0..3 {
+        frame(&context, 600.0, click(button.get().center()), |ui| {
+            let line = ui.horizontal(|ui| {
+                history_menu(ui, true, false, 1, 4, 8, |_| unreachable!());
+            });
+            button.set(line.response.rect);
+        });
+    }
+    assert!(!egui::Popup::is_any_open(&context));
+}

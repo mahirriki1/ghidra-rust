@@ -111,6 +111,8 @@ enum Shortcut {
     ToggleGraph,
     Back,
     Forward,
+    PreviousFunction,
+    NextFunction,
     Save,
     Undo,
     Xrefs,
@@ -158,6 +160,14 @@ fn shortcut(event: &egui::Event) -> Option<Shortcut> {
             _ => None,
         };
     }
+    // Ctrl, not Command: on macOS Command+Up/Down keep their own meaning.
+    if modifiers.ctrl && !modifiers.alt && !modifiers.shift && !modifiers.mac_cmd {
+        match key {
+            egui::Key::ArrowUp => return Some(Shortcut::PreviousFunction),
+            egui::Key::ArrowDown => return Some(Shortcut::NextFunction),
+            _ => {}
+        }
+    }
     if (modifiers.command || modifiers.ctrl) && !modifiers.alt && !modifiers.shift {
         return match key {
             egui::Key::S => Some(Shortcut::Save),
@@ -187,6 +197,20 @@ fn start_address(info: &BinaryInfo) -> Option<u64> {
                 .filter(code)
                 .min()
         })
+}
+
+/// The greatest entry strictly below `address`, or the smallest strictly
+/// above it, in an inventory validated as strictly address-ordered.
+fn adjacent_entry(functions: &[FunctionInfo], address: u64, forward: bool) -> Option<u64> {
+    let function = if forward {
+        functions.get(functions.partition_point(|function| function.address <= address))
+    } else {
+        functions
+            .partition_point(|function| function.address < address)
+            .checked_sub(1)
+            .and_then(|index| functions.get(index))
+    };
+    function.map(|function| function.address)
 }
 
 fn info_without_functions(info: &BinaryInfo) -> BinaryInfo {
@@ -5091,14 +5115,29 @@ impl DesktopApp {
     }
 
     fn history_step(&mut self, forward: bool, context: &egui::Context) {
-        if forward && self.history_index + 1 < self.history.len() {
-            self.history_index += 1;
-        } else if !forward && self.history_index > 0 {
-            self.history_index -= 1;
+        let index = if forward {
+            self.history_index.checked_add(1)
         } else {
+            self.history_index.checked_sub(1)
+        };
+        if let Some(index) = index {
+            self.history_jump(index, context);
+        }
+    }
+
+    /// Revisits history entry `index` as recorded: data keeps its span, and
+    /// code opens in its observed owner (the open function first when it
+    /// also contains the address). Nothing is recorded, truncated or
+    /// resolved again; an invalid index does nothing.
+    fn history_jump(&mut self, index: usize, context: &egui::Context) {
+        if index == self.history_index {
             return;
         }
-        match self.history[self.history_index] {
+        let Some(&place) = self.history.get(index) else {
+            return;
+        };
+        self.history_index = index;
+        match place {
             crate::linkage_ui::Place::Code(address) => {
                 self.navigate_annotation(address, false, context)
             }
@@ -5106,6 +5145,150 @@ impl DesktopApp {
                 self.open_data(address, length, context)
             }
         }
+    }
+
+    /// Identifies the listed history and every input of its row names, so an
+    /// open history list closes instead of activating a changed entry.
+    fn history_key(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (
+            self.generation,
+            self.revision,
+            self.symbol_revision,
+            self.history_index,
+        )
+            .hash(&mut hasher);
+        for place in &self.history {
+            match *place {
+                crate::linkage_ui::Place::Code(address) => (0u8, address, 0).hash(&mut hasher),
+                crate::linkage_ui::Place::Data { address, length } => {
+                    (1u8, address, length).hash(&mut hasher)
+                }
+            }
+        }
+        hasher.finish()
+    }
+
+    /// The Back or Forward history list, nearest destination first.
+    fn history_menu(&mut self, ui: &mut egui::Ui, forward: bool, context: &egui::Context) {
+        let index = self.history_index;
+        let count = if forward {
+            self.history.len().saturating_sub(index + 1)
+        } else {
+            index.min(self.history.len())
+        };
+        let target = |row: usize| {
+            if forward {
+                index + 1 + row
+            } else {
+                index - 1 - row
+            }
+        };
+        let digits = theme::address_digits(
+            self.history
+                .iter()
+                .copied()
+                .map(crate::linkage_ui::Place::address)
+                .max()
+                .unwrap_or(0),
+        );
+        let chosen = theme::history_menu(
+            ui,
+            forward,
+            !self.navigation_commands_blocked(),
+            self.history_key(),
+            count,
+            digits,
+            |row| {
+                let place = self.history[target(row)];
+                theme::HistoryRow {
+                    address: place.address(),
+                    name: self.history_name(place),
+                    hex: matches!(place, crate::linkage_ui::Place::Data { .. }),
+                }
+            },
+        );
+        if let Some(row) = chosen {
+            self.history_jump(target(row), context);
+        }
+    }
+
+    /// A history row's name, resolved now: the exact label, else the
+    /// function or symbol at that address, else for code the observed
+    /// owner's name and offset. Neighboring symbols are never used.
+    fn history_name(&self, place: crate::linkage_ui::Place) -> Option<String> {
+        let address = place.address();
+        let session = self.session.as_ref();
+        if let Some(label) = session
+            .and_then(|session| session.annotations.get(&address))
+            .map(|note| note.label.as_str())
+            .filter(|label| !label.is_empty())
+        {
+            return Some(crop(label, MAX_HOVER_NAME));
+        }
+        let info = self.info.as_ref()?;
+        let symbols = self.symbols();
+        if let Some(function) = function_at(&info.functions, address) {
+            return Some(crop(
+                function_display(session, symbols, function).0,
+                MAX_HOVER_NAME,
+            ));
+        }
+        if let Some(record) = symbols.and_then(|symbols| symbols.get(address)) {
+            return Some(crop(
+                record.display.as_deref().unwrap_or(&record.raw),
+                MAX_HOVER_NAME,
+            ));
+        }
+        let crate::linkage_ui::Place::Code(_) = place else {
+            return None;
+        };
+        let owner = self.observed_owner(address)?;
+        let function = function_at(&info.functions, owner)?;
+        let name = crop(
+            function_display(session, symbols, function).0,
+            MAX_HOVER_NAME,
+        );
+        Some(match address.checked_sub(owner) {
+            Some(offset) => format!("{name}+{offset:#x}"),
+            None => format!("{name}-{:#x}", owner - address),
+        })
+    }
+
+    /// The address Previous/Next function steps from: the selected Hex span
+    /// or page while Hex is shown, else the selection, which already holds a
+    /// pending navigation's destination. Toolbar drafts never count.
+    fn function_step_origin(&self) -> Option<u64> {
+        if self.tab == Tab::Hex
+            && let Some((address, _)) = self.hex.location()
+        {
+            return Some(address);
+        }
+        self.selected
+    }
+
+    /// The nearest adopted function entry strictly before or after the
+    /// current location, in the address-ordered inventory. Never wraps.
+    fn adjacent_function(&self, forward: bool) -> Option<u64> {
+        let functions = &self.info.as_ref()?.functions;
+        adjacent_entry(functions, self.function_step_origin()?, forward)
+    }
+
+    /// Opens the previous/next function entry, recording the exact departure
+    /// (including a Hex span) for Back. Graph stays Graph; other views
+    /// switch to Listing. Does nothing at either end of the inventory.
+    fn step_function(&mut self, forward: bool, context: &egui::Context) {
+        let Some(entry) = self.adjacent_function(forward) else {
+            return;
+        };
+        let departure = (self.tab == Tab::Hex)
+            .then(|| self.hex.location())
+            .flatten()
+            .map(|(address, length)| crate::linkage_ui::Place::Data { address, length });
+        self.record_departure(departure, crate::linkage_ui::Place::Code(entry), entry);
+        // Not recording here keeps Graph and Listing as they are.
+        self.navigate_location(entry, Some(entry), false, context);
     }
 
     fn handle_shortcuts(&mut self, context: &egui::Context) {
@@ -5137,6 +5320,8 @@ impl DesktopApp {
             }
             Some(Shortcut::Back) => self.history_step(false, context),
             Some(Shortcut::Forward) => self.history_step(true, context),
+            Some(Shortcut::PreviousFunction) => self.step_function(false, context),
+            Some(Shortcut::NextFunction) => self.step_function(true, context),
             Some(Shortcut::Save) => self.save_project(false, context),
             Some(Shortcut::Undo) => self.undo(context),
             Some(Shortcut::Xrefs) => self.show_selection_xrefs(),
@@ -5341,6 +5526,23 @@ impl DesktopApp {
                     self.history_step(true, &context);
                     ui.close();
                 }
+                ui.separator();
+                let blocked = self.navigation_commands_blocked();
+                for (forward, label, keys) in [
+                    (false, "Previous function", "Ctrl+Up"),
+                    (true, "Next function", "Ctrl+Down"),
+                ] {
+                    if ui
+                        .add_enabled(
+                            !blocked && self.adjacent_function(forward).is_some(),
+                            egui::Button::new(label).shortcut_text(keys),
+                        )
+                        .clicked()
+                    {
+                        self.step_function(forward, &context);
+                        ui.close();
+                    }
+                }
             });
             ui.menu_button("Search", |ui| {
                 let enabled = self.search_available();
@@ -5463,6 +5665,7 @@ impl DesktopApp {
         });
         ui.separator();
         ui.horizontal(|ui| {
+            let spacing = ui.spacing().item_spacing.x;
             if ui.button("Open…").clicked() {
                 self.request_intent(Intent::OpenDialog, &context);
             }
@@ -5473,14 +5676,21 @@ impl DesktopApp {
                 self.save_project(false, &context);
             }
             ui.separator();
+            // Each history list arrow sits flush against its button.
             if theme::history_button(ui, false, self.history_index > 0).clicked() {
                 self.history_step(false, &context);
             }
+            ui.spacing_mut().item_spacing.x = 0.0;
+            self.history_menu(ui, false, &context);
+            ui.spacing_mut().item_spacing.x = spacing;
             if theme::history_button(ui, true, self.history_index + 1 < self.history.len())
                 .clicked()
             {
                 self.history_step(true, &context);
             }
+            ui.spacing_mut().item_spacing.x = 0.0;
+            self.history_menu(ui, true, &context);
+            ui.spacing_mut().item_spacing.x = spacing;
             let entry = ui.add(
                 TextEdit::singleline(&mut self.address)
                     .id(egui::Id::unique("toolbar-go-to"))
@@ -6153,7 +6363,27 @@ impl DesktopApp {
     }
 
     fn record_destination(&mut self, destination: crate::linkage_ui::Place, owner: u64) {
+        self.record_departure(None, destination, owner);
+    }
+
+    /// Like [`Self::record_destination`], but `departure`, when given,
+    /// replaces the selection as the place being left.
+    fn record_departure(
+        &mut self,
+        departure: Option<crate::linkage_ui::Place>,
+        destination: crate::linkage_ui::Place,
+        owner: u64,
+    ) {
         let address = destination.address();
+        if let Some(departure) = departure {
+            match self.history.get_mut(self.history_index) {
+                Some(previous) => *previous = departure,
+                None => {
+                    self.history.push(departure);
+                    self.history_index = 0;
+                }
+            }
+        }
         if let Some(selected) = self.selected {
             if let Some(view) = graph_view(&self.graph)
                 && (selected == view.address
@@ -6166,7 +6396,9 @@ impl DesktopApp {
             {
                 self.comment_owners.insert(selected, view.address);
             }
-            if let Some(previous) = self.history.get_mut(self.history_index) {
+            if departure.is_none()
+                && let Some(previous) = self.history.get_mut(self.history_index)
+            {
                 *previous = self.data_location.map_or(
                     crate::linkage_ui::Place::Code(selected),
                     |(address, length)| crate::linkage_ui::Place::Data { address, length },
@@ -11919,6 +12151,402 @@ mod tests {
                 assert_eq!(app.view().map(|view| view.address), Some(0x1000));
             }
         }
+    }
+
+    #[test]
+    fn function_steps_follow_entry_order_from_the_selection_without_wrapping() {
+        let context = egui::Context::default();
+        let mut app = go_app();
+        let code = crate::linkage_ui::Place::Code;
+        app.history = vec![code(0x1004)];
+        app.selected = Some(0x1004);
+        app.tab = Tab::Strings;
+        // The Functions table's filter and sort are irrelevant.
+        app.function_filter = "operator".into();
+        app.rebuild_filter();
+        app.table_sorts.functions.click(1);
+        app.table_sorts.functions.click(1);
+        // A typed toolbar draft is never the origin.
+        app.address = "10b0".into();
+
+        // Previous from inside a function opens its entry; Listing replaces
+        // other tabs.
+        assert_eq!(app.adjacent_function(true), Some(0x1040));
+        app.step_function(false, &context);
+        assert_eq!((app.tab, app.selected), (Tab::Listing, Some(0x1000)));
+        assert_eq!(app.result_scope, Some(0x1000));
+        let state = |app: &DesktopApp| {
+            (
+                app.tab,
+                app.selected,
+                app.history.clone(),
+                app.history_index,
+            )
+        };
+        let first = state(&app);
+        assert_eq!(app.adjacent_function(false), None);
+        app.step_function(false, &context);
+        assert_eq!(state(&app), first, "no wrap at the first entry");
+
+        // Graph stays Graph while stepping through every later entry.
+        app.tab = Tab::Graph;
+        for entry in [0x1040, 0x1080, 0x1090, 0x10a0, 0x10b0] {
+            app.step_function(true, &context);
+            assert_eq!((app.tab, app.selected), (Tab::Graph, Some(entry)));
+            assert_eq!(app.result_scope, Some(entry));
+        }
+        let last = state(&app);
+        app.step_function(true, &context);
+        assert_eq!(state(&app), last, "no wrap at the last entry");
+        assert_eq!(
+            app.history,
+            [0x1004, 0x1000, 0x1040, 0x1080, 0x1090, 0x10a0, 0x10b0].map(code)
+        );
+
+        // An entry adopted between commands is used by the next one.
+        let functions = &mut app.info.as_mut().unwrap().functions;
+        let at = functions.partition_point(|function| function.address < 0x10a8);
+        functions.insert(
+            at,
+            FunctionInfo {
+                address: 0x10a8,
+                name: "adopted".into(),
+            },
+        );
+        app.step_function(false, &context);
+        assert_eq!(app.selected, Some(0x10a8));
+
+        // No location and an empty inventory disable both directions.
+        app.selected = None;
+        app.tab = Tab::Listing;
+        assert_eq!(
+            (app.adjacent_function(false), app.adjacent_function(true)),
+            (None, None)
+        );
+        app.selected = Some(0x1080);
+        app.info.as_mut().unwrap().functions.clear();
+        let before = state(&app);
+        app.step_function(true, &context);
+        app.step_function(false, &context);
+        assert_eq!(state(&app), before);
+    }
+
+    #[test]
+    fn function_steps_from_hex_start_at_its_selection_and_return_to_it() {
+        let context = egui::Context::default();
+        let mut app = hex_app();
+        app.go_to("entry+0x11", &context).unwrap();
+        assert_eq!(app.data_location, Some((0x1011, 1)));
+        // A Hex click changes only the panel's selection.
+        let sections = app.info.as_ref().unwrap().sections.clone();
+        app.hex.go_to_span(0x1050, 4, &sections);
+        assert_eq!(app.selected, Some(0x1011));
+        assert_eq!(app.adjacent_function(false), Some(0x1040));
+        app.step_function(true, &context);
+        assert_eq!(app.tab, Tab::Hex, "no entry after 0x1050");
+        app.step_function(false, &context);
+        assert_eq!((app.tab, app.selected), (Tab::Listing, Some(0x1040)));
+        assert_eq!(
+            app.history[app.history_index - 1],
+            crate::linkage_ui::Place::Data {
+                address: 0x1050,
+                length: 4,
+            }
+        );
+        app.history_step(false, &context);
+        assert_eq!((app.tab, app.data_location), (Tab::Hex, Some((0x1050, 4))));
+        assert_eq!(app.hex.focused_span(), Some((0x1050, 4)));
+
+        // A page without a selected byte steps from the page start.
+        app.hex.open_section(1, &sections);
+        assert_eq!(app.hex.location(), Some((0x8000, 1)));
+        app.step_function(false, &context);
+        assert_eq!(app.selected, Some(0x1040));
+        app.history_step(false, &context);
+        assert_eq!((app.tab, app.data_location), (Tab::Hex, Some((0x8000, 1))));
+    }
+
+    #[test]
+    fn function_steps_supersede_pending_function_replies() {
+        let context = egui::Context::default();
+        let mut app = hex_app();
+        app.auto_decompile = false;
+        let pending = |app: &DesktopApp, request| Pending {
+            id: 1,
+            request,
+            started: Instant::now(),
+            selection: app.selection_generation,
+            revision: app.revision,
+            byte_origin: (app.selected, app.tab),
+            bytes: None,
+            result: None,
+        };
+        let graph = pending(&app, Request::Graph { address: 0x1000 });
+        let code = pending(&app, Request::Decompile { address: 0x1000 });
+        app.tab = Tab::Graph;
+        app.step_function(true, &context);
+        let destination = (app.tab, app.selected, app.history.clone());
+        assert_eq!(destination.0, Tab::Graph);
+        assert_eq!(destination.1, Some(0x1040));
+        app.receive(
+            graph,
+            Response::Graph {
+                view: FunctionView {
+                    address: 0x1000,
+                    blocks: Vec::new(),
+                    edges: Vec::new(),
+                    calls: Vec::new(),
+                    warnings: Vec::new(),
+                },
+            },
+            &context,
+        );
+        app.settle_graph();
+        app.receive(
+            code,
+            Response::Decompiled {
+                address: 0x1000,
+                mappings: Vec::new(),
+                semantics: Default::default(),
+                text: "stale output".into(),
+            },
+            &context,
+        );
+        assert_eq!((app.tab, app.selected, app.history.clone()), destination);
+        assert!(app.view().is_none());
+        assert_eq!(app.result_scope, Some(0x1040));
+        assert!(!app.decompiled().contains("stale output"));
+        // The pending destination is the next origin.
+        assert_eq!(app.adjacent_function(false), Some(0x1000));
+    }
+
+    #[test]
+    fn function_step_keys_need_plain_ctrl_fresh_presses_and_free_input() {
+        let context = egui::Context::default();
+        let mut app = go_app();
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            command: !cfg!(target_os = "macos"),
+            ..Default::default()
+        };
+        let down = |modifiers| key_event(egui::Key::ArrowDown, modifiers);
+        keyboard_frame(&context, &mut app, vec![down(ctrl)]);
+        assert_eq!(app.selected, Some(0x1040));
+        keyboard_frame(&context, &mut app, vec![]);
+        let mut repeat = down(ctrl);
+        if let egui::Event::Key { repeat: r, .. } = &mut repeat {
+            *r = true;
+        }
+        for event in [
+            repeat,
+            down(ctrl | egui::Modifiers::SHIFT),
+            down(ctrl | egui::Modifiers::ALT),
+            down(egui::Modifiers::NONE),
+            key_event(egui::Key::ArrowRight, ctrl),
+        ] {
+            keyboard_frame(&context, &mut app, vec![event]);
+            assert_eq!(app.selected, Some(0x1040));
+        }
+        let (_sender, receiver) = mpsc::sync_channel(1);
+        app.file_job = Some(receiver);
+        keyboard_frame(&context, &mut app, vec![down(ctrl)]);
+        assert_eq!(app.selected, Some(0x1040));
+        app.file_job = None;
+        // An open dialog owns its keys.
+        app.begin_go_to();
+        keyboard_frame(&context, &mut app, vec![down(ctrl)]);
+        keyboard_frame(&context, &mut app, vec![down(ctrl)]);
+        assert_eq!(app.selected, Some(0x1040));
+        app.browser_dialog = None;
+        keyboard_frame(&context, &mut app, vec![]);
+        keyboard_frame(
+            &context,
+            &mut app,
+            vec![key_event(egui::Key::ArrowUp, ctrl)],
+        );
+        assert_eq!(app.selected, Some(0x1000));
+        // Alt+Left still steps history.
+        keyboard_frame(
+            &context,
+            &mut app,
+            vec![key_event(egui::Key::ArrowLeft, egui::Modifiers::ALT)],
+        );
+        assert_eq!(app.selected, Some(0x1040));
+    }
+
+    #[test]
+    fn history_jumps_revisit_exact_entries_without_rewriting_history() {
+        let context = egui::Context::default();
+        let mut app = hex_app();
+        app.go_to("entry+4", &context).unwrap();
+        app.go_to("8004", &context).unwrap();
+        app.open_search_data(0x8000, 16, &context);
+        app.go_to("next", &context).unwrap();
+        let code = crate::linkage_ui::Place::Code;
+        let data = |address, length| crate::linkage_ui::Place::Data { address, length };
+        let recorded = vec![
+            code(0x1000),
+            code(0x1004),
+            data(0x8004, 1),
+            data(0x8000, 16),
+            code(0x1040),
+        ];
+        assert_eq!(app.history, recorded);
+        assert!(app.view().is_none());
+
+        // Code inside a function returns within its recorded owner.
+        app.history_jump(1, &context);
+        assert_eq!((app.history_index, app.selected), (1, Some(0x1004)));
+        assert_eq!((app.tab, app.result_scope), (Tab::Listing, Some(0x1000)));
+        app.history_jump(3, &context);
+        assert_eq!((app.tab, app.data_location), (Tab::Hex, Some((0x8000, 16))));
+        assert_eq!(app.hex.focused_span(), Some((0x8000, 16)));
+        for index in [3, 5, usize::MAX] {
+            app.history_jump(index, &context);
+            assert_eq!(app.history_index, 3);
+        }
+        assert_eq!(app.history, recorded);
+
+        // New navigation still discards the forward branch.
+        app.go_to("entry", &context).unwrap();
+        assert_eq!(app.history, [&recorded[..4], &[code(0x1000)]].concat());
+
+        // The cap still evicts the oldest entries, and a jump never grows it.
+        for step in 0..300 {
+            let address = if step % 2 == 0 { 0x1040 } else { 0x1000 };
+            app.navigate(address, true, &context);
+        }
+        assert_eq!(app.history.len(), 256);
+        app.history_jump(0, &context);
+        assert_eq!((app.history.len(), app.history_index), (256, 0));
+        app.navigate(0x1080, true, &context);
+        assert_eq!((app.history.len(), app.history_index), (2, 1));
+    }
+
+    #[test]
+    fn history_list_rows_open_their_own_entries_nearest_first() {
+        fn frame(
+            context: &egui::Context,
+            app: &mut DesktopApp,
+            forward: bool,
+            events: Vec<egui::Event>,
+            button: &mut egui::Rect,
+        ) -> egui::FullOutput {
+            let time = context.input(|input| input.time) + 0.1;
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800.0, 600.0),
+                    )),
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    let ctx = ui.ctx().clone();
+                    let line = ui.horizontal(|ui| app.history_menu(ui, forward, &ctx));
+                    *button = line.response.rect;
+                },
+            );
+            output.textures_delta.clear();
+            output
+        }
+        fn click(pos: egui::Pos2) -> Vec<egui::Event> {
+            let press = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            vec![egui::Event::PointerMoved(pos), press(true), press(false)]
+        }
+        // The address cell of the row for `address`, whatever its padding.
+        fn row(output: &egui::FullOutput, address: u64) -> egui::Pos2 {
+            output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text)
+                        if u64::from_str_radix(text.galley.text(), 16).ok() == Some(address) =>
+                    {
+                        Some(text.galley.rect.translate(text.pos.to_vec2()).center())
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no row for {address:#x}"))
+        }
+        // Opens the list, then picks the row showing `address`.
+        fn pick(app: &mut DesktopApp, forward: bool, address: u64) {
+            let context = egui::Context::default();
+            crate::theme::install(&context);
+            context.all_styles_mut(|style| style.animation_time = 0.0);
+            let mut button = egui::Rect::NOTHING;
+            frame(&context, app, forward, vec![], &mut button);
+            let at = button.center();
+            frame(&context, app, forward, click(at), &mut button);
+            let output = frame(&context, app, forward, vec![], &mut button);
+            let at = row(&output, address);
+            frame(&context, app, forward, click(at), &mut button);
+        }
+
+        let context = egui::Context::default();
+        let mut app = hex_app();
+        app.go_to("entry+4", &context).unwrap();
+        app.go_to("8004", &context).unwrap();
+        app.open_search_data(0x8000, 16, &context);
+        app.go_to("next", &context).unwrap();
+        let recorded = app.history.clone();
+        assert_eq!(recorded.len(), 5);
+
+        // From the middle, each list's farthest row reaches its own end of
+        // history, and its nearest row the adjacent entry.
+        app.history_jump(2, &context);
+        pick(&mut app, false, 0x1000);
+        assert_eq!((app.history_index, app.selected), (0, Some(0x1000)));
+        app.history_jump(2, &context);
+        pick(&mut app, false, 0x1004);
+        assert_eq!((app.history_index, app.selected), (1, Some(0x1004)));
+        app.history_jump(2, &context);
+        pick(&mut app, true, 0x8000);
+        assert_eq!(app.history_index, 3);
+        assert_eq!(app.data_location, Some((0x8000, 16)));
+        app.history_jump(2, &context);
+        pick(&mut app, true, 0x1040);
+        assert_eq!((app.history_index, app.selected), (4, Some(0x1040)));
+        assert_eq!(app.history, recorded);
+    }
+
+    #[test]
+    fn history_rows_name_exact_addresses_and_their_list_closes_on_changes() {
+        let context = egui::Context::default();
+        let mut app = hex_app();
+        app.go_to("entry+4", &context).unwrap();
+        app.go_to("8004", &context).unwrap();
+        app.go_to("next", &context).unwrap();
+        let code = crate::linkage_ui::Place::Code;
+        assert_eq!(app.history_name(code(0x1040)).as_deref(), Some("next"));
+        // Observed owner evidence names code inside a function.
+        assert_eq!(app.history_name(code(0x1004)).as_deref(), Some("entry+0x4"));
+        // Without exact evidence, neighbors never lend a name.
+        assert_eq!(app.history_name(code(0x1044)), None);
+        let data = crate::linkage_ui::Place::Data {
+            address: 0x8004,
+            length: 1,
+        };
+        assert_eq!(app.history_name(data), None);
+
+        let key = app.history_key();
+        assert_eq!(app.history_key(), key, "stable while nothing changes");
+        app.rename_at(0x1004, "spot", &context).unwrap();
+        assert_eq!(app.history_name(code(0x1004)).as_deref(), Some("spot"));
+        let renamed = app.history_key();
+        assert_ne!(renamed, key);
+        app.history_step(false, &context);
+        let stepped = app.history_key();
+        assert_ne!(stepped, renamed);
+        app.generation += 1;
+        assert_ne!(app.history_key(), stepped);
     }
 
     #[test]
