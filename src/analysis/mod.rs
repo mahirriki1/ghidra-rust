@@ -34,6 +34,40 @@ const MAX_STRING_PREVIEW: usize = 512;
 /// Largest executable the worker opens.
 pub const MAX_IMAGE_BYTES: u64 = 128 * 1024 * 1024;
 
+/// Shared limits of one Program-listing request; tests narrow them.
+#[derive(Clone, Copy)]
+struct ListingLimits {
+    decode_attempts: usize,
+    reply_bytes: usize,
+    elapsed: std::time::Duration,
+    /// Engine switch-recovery time after which no recovery starts.
+    switches: std::time::Duration,
+}
+
+impl Default for ListingLimits {
+    fn default() -> Self {
+        Self {
+            decode_attempts: MAX_ANALYSIS_INSTRUCTIONS,
+            reply_bytes: crate::model::MAX_LISTING_REPLY_BYTES,
+            elapsed: crate::model::LISTING_ALLOWANCE,
+            switches: crate::model::LISTING_ALLOWANCE,
+        }
+    }
+}
+
+/// Counts encoded bytes without retaining them.
+struct EncodedLength(usize);
+
+impl std::io::Write for EncodedLength {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(bytes.len());
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 pub struct LoadedProgram {
     program: Program,
     target: crate::architecture::Target,
@@ -464,11 +498,22 @@ impl LoadedProgram {
     /// The displayed CFG. Known functions of unpacked images also resolve
     /// switch tables; other addresses keep raw instruction flow.
     fn graph(&mut self, address: u64) -> Result<FunctionView, String> {
+        let mut remaining = MAX_INSTRUCTIONS;
+        self.graph_budgeted(address, &mut remaining, &mut SwitchBudget::new())
+    }
+
+    /// [`Self::graph`] charging decode attempts and engine switch recoveries
+    /// to budgets a caller may share between functions.
+    fn graph_budgeted(
+        &mut self,
+        address: u64,
+        remaining: &mut usize,
+        switches: &mut SwitchBudget,
+    ) -> Result<FunctionView, String> {
         let functions = &self.info.functions;
         if !functions.is_sorted_by_key(|function| function.address) {
             return Err("Function inventory is not ordered by address".into());
         }
-        let mut remaining = MAX_INSTRUCTIONS;
         let is_function = |candidate| function_at(functions, candidate).is_some();
         let recovered = if self.upx_packed || !is_function(address) {
             recover_graph_budgeted(
@@ -480,7 +525,7 @@ impl LoadedProgram {
                     pe_ranges: &self.pe_ranges,
                 },
                 address,
-                &mut remaining,
+                remaining,
                 &self.no_return,
                 None,
             )?
@@ -494,13 +539,69 @@ impl LoadedProgram {
                     pe_ranges: &self.pe_ranges,
                 },
                 address,
-                &mut remaining,
-                &mut SwitchBudget::new(),
+                remaining,
+                switches,
                 &self.no_return,
                 None,
             )?
         };
         Ok(recovered.view)
+    }
+
+    /// Graph-path views of `entries` for the Program listing, an examined
+    /// prefix within shared limits: decode attempts, one switch budget capped
+    /// at the listing allowance, an elapsed allowance and an encoded-size
+    /// estimate. Every function receives the full per-graph walk limit; the
+    /// first entry is always examined. No function starts after the
+    /// allowance, and none starts a switch recovery once recoveries have
+    /// spent it, so a batch takes at most the allowance plus one function's
+    /// walk and one engine recovery.
+    ///
+    /// A view whose switch recovery the allowance skipped would differ from
+    /// its Graph reply. Such a function ends the prefix unexamined, so a
+    /// later batch retries it first; as the first entry it has no view.
+    fn listing(
+        &mut self,
+        entries: &[u64],
+        limits: ListingLimits,
+    ) -> Result<Vec<crate::model::ListingOutcome>, String> {
+        crate::model::validate_listing_entries(entries)?;
+        let started = std::time::Instant::now();
+        let mut switches = SwitchBudget::within(limits.switches);
+        let mut decoded = 0usize;
+        let mut encoded = 0usize;
+        let mut outcomes = Vec::with_capacity(entries.len());
+        for &entry in entries {
+            if !outcomes.is_empty()
+                && (limits.decode_attempts.saturating_sub(decoded) < MAX_INSTRUCTIONS
+                    || encoded >= limits.reply_bytes
+                    || started.elapsed() >= limits.elapsed)
+            {
+                break;
+            }
+            let mut remaining = MAX_INSTRUCTIONS;
+            let mut view = self
+                .graph_budgeted(entry, &mut remaining, &mut switches)
+                .ok();
+            decoded = decoded.saturating_add(MAX_INSTRUCTIONS - remaining);
+            if view
+                .as_ref()
+                .is_some_and(|view| view.warnings.iter().any(|w| w == SWITCH_SKIPPED))
+            {
+                if !outcomes.is_empty() {
+                    break;
+                }
+                view = None;
+            }
+            if let Some(view) = &view {
+                let mut counter = EncodedLength(0);
+                serde_json::to_writer(&mut counter, view)
+                    .map_err(|error| format!("Listing view encoding failed: {error}"))?;
+                encoded = encoded.saturating_add(counter.0);
+            }
+            outcomes.push(crate::model::ListingOutcome { entry, view });
+        }
+        Ok(outcomes)
     }
 
     pub(crate) fn handle_with_progress(
@@ -511,6 +612,7 @@ impl LoadedProgram {
         if matches!(
             request,
             Request::Graph { .. }
+                | Request::Listing { .. }
                 | Request::Decompile { .. }
                 | Request::DecompileWithLocals { .. }
                 | Request::Discover
@@ -520,6 +622,10 @@ impl LoadedProgram {
         }
         match request {
             request @ Request::SearchMemory { .. } => self.search_memory(request),
+            Request::Listing { binding, entries } => Ok(Response::Listing {
+                binding,
+                outcomes: self.listing(&entries, ListingLimits::default())?,
+            }),
             Request::Graph { address } => Ok(Response::Graph {
                 view: self.graph(address)?,
             }),
@@ -3330,5 +3436,116 @@ pub(crate) mod tests {
         assert_eq!(strings[0].address, 0x1000);
         assert!(strings[0].text.len() <= MAX_STRING_PREVIEW + 3);
         assert!(strings[0].text.ends_with('…'));
+    }
+
+    #[test]
+    fn listing_views_equal_graph_replies_within_budget_prefixes() {
+        let path = std::env::temp_dir().join(format!("ghidra-rust-listing-{}", std::process::id()));
+        std::fs::write(&path, elf_fixture()).unwrap();
+        let mut loaded = LoadedProgram::open(path.to_str().unwrap()).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        // A known function, a raw entry, and bytes outside executable code.
+        let entries = [0x401000, 0x40100a, 0x402000];
+        let Response::Listing { binding, outcomes } = loaded
+            .handle(Request::Listing {
+                binding: crate::model::ListingBinding {
+                    generation: 7,
+                    token: 9,
+                },
+                entries: entries.to_vec(),
+            })
+            .unwrap()
+        else {
+            panic!("Expected a listing reply");
+        };
+        assert_eq!((binding.generation, binding.token), (7, 9));
+        assert_eq!(
+            outcomes.iter().map(|o| o.entry).collect::<Vec<_>>(),
+            entries
+        );
+        for outcome in &outcomes[..2] {
+            let Response::Graph { view } = loaded
+                .handle(Request::Graph {
+                    address: outcome.entry,
+                })
+                .unwrap()
+            else {
+                panic!("Expected a graph");
+            };
+            assert_eq!(
+                serde_json::to_string(outcome.view.as_ref().unwrap()).unwrap(),
+                serde_json::to_string(&view).unwrap(),
+                "Listing runs the Graph path"
+            );
+        }
+        assert!(outcomes[2].view.is_none(), "non-code is a failed outcome");
+        // Each shared limit stops later functions from starting, never the first.
+        let narrowed = [
+            ListingLimits {
+                decode_attempts: MAX_INSTRUCTIONS,
+                ..Default::default()
+            },
+            ListingLimits {
+                reply_bytes: 1,
+                ..Default::default()
+            },
+            ListingLimits {
+                elapsed: std::time::Duration::ZERO,
+                ..Default::default()
+            },
+        ];
+        for limits in narrowed {
+            let outcomes = loaded.listing(&entries, limits).unwrap();
+            assert_eq!(outcomes.len(), 1);
+            assert_eq!(outcomes[0].entry, 0x401000);
+            assert!(outcomes[0].view.is_some());
+        }
+        // A view the switch allowance would degrade is never returned.
+        // Two functions, each `jmp rax`, need an engine switch recovery.
+        let mut raw = raw_x86(vec![0xff, 0xe0, 0xc3, 0xc3, 0xff, 0xe0, 0xc3, 0xc3]);
+        raw.info.functions = [0x1000, 0x1004]
+            .map(|address| crate::model::FunctionInfo {
+                address,
+                name: format!("f{address:x}"),
+            })
+            .to_vec();
+        let cut = ListingLimits {
+            switches: std::time::Duration::ZERO,
+            ..Default::default()
+        };
+        let outcomes = raw.listing(&[0x1000, 0x1004], cut).unwrap();
+        assert_eq!(outcomes.len(), 1, "a skipped recovery ends the prefix");
+        assert!(outcomes[0].view.is_none());
+        let outcomes = raw
+            .listing(&[0x1000, 0x1004], ListingLimits::default())
+            .unwrap();
+        assert_eq!(outcomes.len(), 2);
+        for outcome in &outcomes {
+            let view = outcome.view.as_ref().unwrap();
+            assert!(!view.warnings.iter().any(|w| w == SWITCH_SKIPPED));
+            let Response::Graph { view: graph } = raw
+                .handle(Request::Graph {
+                    address: outcome.entry,
+                })
+                .unwrap()
+            else {
+                panic!("Expected a graph");
+            };
+            assert_eq!(
+                serde_json::to_string(view).unwrap(),
+                serde_json::to_string(&graph).unwrap()
+            );
+        }
+        for invalid in [vec![], vec![0x40100a, 0x401000], vec![0x401000, 0x401000]] {
+            assert!(loaded.listing(&invalid, ListingLimits::default()).is_err());
+        }
+        let oversized = format!(
+            "{{\"kind\":\"listing\",\"binding\":{{\"generation\":1,\"token\":1}},\"entries\":[{}]}}",
+            (0..=crate::model::MAX_LISTING_FUNCTIONS)
+                .map(|i| (0x401000 + i).to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert!(serde_json::from_str::<Request>(&oversized).is_err());
     }
 }

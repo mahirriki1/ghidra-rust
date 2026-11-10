@@ -36,6 +36,22 @@ impl ListingIndex {
         rows.dedup_by_key(|row| row.0);
         Self(rows.into_iter().map(|(_, b, i)| (b, i)).collect())
     }
+
+    /// The listing of `view`, which must be the view this index was built from.
+    pub fn listing<'a>(&'a self, view: &'a FunctionView) -> Listing<'a> {
+        Listing {
+            view,
+            index: &self.0,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 /// The listing of one prepared graph.
@@ -196,7 +212,7 @@ impl Retained for PreparedGraph {
 }
 
 /// Allocation capacity owned by a function view, excluding itself.
-fn view_bytes(view: &FunctionView) -> Option<usize> {
+pub fn view_bytes(view: &FunctionView) -> Option<usize> {
     let mut bytes = Bytes::of::<()>()
         .slots::<crate::model::BasicBlock>(view.blocks.capacity())
         .slots::<crate::model::Edge>(view.edges.capacity())

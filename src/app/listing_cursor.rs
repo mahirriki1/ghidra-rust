@@ -13,22 +13,53 @@ use crate::result_store::Stored;
 use crate::theme;
 
 /// The displayed listing a cursor and its metrics belong to. Function
-/// address alone is insufficient after a refresh or another binary.
+/// address alone is insufficient after a refresh or another binary. The
+/// Program scope shows every function, so its activation survives function
+/// changes within one binary.
 #[derive(Clone, Debug)]
-pub(super) struct ViewKey {
-    generation: u64,
-    selection: u64,
-    entry: u64,
-    /// Held weakly, so the address cannot be reused while it is compared.
-    graph: Weak<Stored<PreparedGraph>>,
+pub(super) enum ViewKey {
+    Function {
+        generation: u64,
+        selection: u64,
+        entry: u64,
+        /// Held weakly, so the address cannot be reused while it is compared.
+        graph: Weak<Stored<PreparedGraph>>,
+    },
+    Program {
+        generation: u64,
+    },
 }
 
 impl PartialEq for ViewKey {
     fn eq(&self, other: &Self) -> bool {
-        self.generation == other.generation
-            && self.selection == other.selection
-            && self.entry == other.entry
-            && Weak::ptr_eq(&self.graph, &other.graph)
+        match (self, other) {
+            (
+                Self::Function {
+                    generation,
+                    selection,
+                    entry,
+                    graph,
+                },
+                Self::Function {
+                    generation: other_generation,
+                    selection: other_selection,
+                    entry: other_entry,
+                    graph: other_graph,
+                },
+            ) => {
+                generation == other_generation
+                    && selection == other_selection
+                    && entry == other_entry
+                    && Weak::ptr_eq(graph, other_graph)
+            }
+            (
+                Self::Program { generation },
+                Self::Program {
+                    generation: other_generation,
+                },
+            ) => generation == other_generation,
+            _ => false,
+        }
     }
 }
 
@@ -52,10 +83,13 @@ pub(super) struct ListingCursor {
     held: u8,
     drawn_frame: Option<u64>,
     available: f32,
+    /// The displayed graph held keys apply to in the Program scope; a held
+    /// key never carries into another function.
+    held_graph: Option<Weak<Stored<PreparedGraph>>>,
 }
 
 impl ListingCursor {
-    fn deactivate(&mut self) {
+    pub(super) fn deactivate(&mut self) {
         self.active = None;
         self.held = 0;
     }
@@ -218,8 +252,13 @@ impl super::DesktopApp {
     }
 
     fn listing_view_key(&self) -> Option<ViewKey> {
+        if self.program_scope() {
+            return Some(ViewKey::Program {
+                generation: self.generation,
+            });
+        }
         let graph = self.graph.as_ref()?;
-        Some(ViewKey {
+        Some(ViewKey::Function {
             generation: self.generation,
             selection: self.selection_generation,
             entry: graph.address(),
@@ -290,6 +329,19 @@ impl super::DesktopApp {
         if self.navigation_shortcuts_blocked(&context) || self.info.is_none() {
             self.listing_cursor.held = 0;
             return;
+        }
+        if self.program_scope() {
+            let graph = self.graph.as_ref().map(Arc::downgrade);
+            let cursor = &mut self.listing_cursor;
+            let same = match (&cursor.held_graph, &graph) {
+                (Some(held), Some(shown)) => Weak::ptr_eq(held, shown),
+                (None, None) => true,
+                _ => false,
+            };
+            if !same {
+                cursor.held = 0;
+                cursor.held_graph = graph;
+            }
         }
         let page = page_rows(self.listing_cursor.available - viewport.chrome);
         let loaded = self.info.is_some();

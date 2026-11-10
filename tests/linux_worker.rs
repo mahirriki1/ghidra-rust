@@ -1510,3 +1510,66 @@ fn sandboxed_memory_search_validates_pages_and_immutable_markers() {
     std::fs::write(&binary, b"changed only this private fixture after Open").unwrap();
     verify_search_fixture(&info, &original, |query| request(&mut worker, query));
 }
+
+// The Program listing must show exactly the graphs a Function view shows.
+#[test]
+fn program_listing_views_equal_graph_replies_in_the_sandbox() {
+    use ghidra_rust::model::{ListingBinding, MAX_LISTING_FUNCTIONS};
+    let directory = tempfile::tempdir().unwrap();
+    let source = Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/sample.c"
+    ));
+    let binary = compile(
+        directory.path(),
+        "listing",
+        source,
+        &["-O0", "-fno-pie", "-no-pie", "-fno-inline"],
+        false,
+    );
+    let (mut worker, info) = open(&binary);
+    let mut entries: Vec<u64> = info.functions.iter().map(|f| f.address).collect();
+    entries.truncate(MAX_LISTING_FUNCTIONS);
+    assert!(entries.len() >= 3, "fixture has several functions");
+    let binding = ListingBinding {
+        generation: 3,
+        token: 11,
+    };
+    let Response::Listing {
+        binding: replied,
+        outcomes,
+    } = request(
+        &mut worker,
+        Request::Listing {
+            binding,
+            entries: entries.clone(),
+        },
+    )
+    else {
+        panic!("Sandboxed worker did not answer the listing request");
+    };
+    assert_eq!(replied, binding);
+    assert!(!outcomes.is_empty() && outcomes.len() <= entries.len());
+    for (outcome, entry) in outcomes.iter().zip(&entries) {
+        assert_eq!(outcome.entry, *entry, "an ordered prefix");
+        let Response::Graph { view } = request(&mut worker, Request::Graph { address: *entry })
+        else {
+            panic!("Graph {entry:#x} failed");
+        };
+        let listed = outcome.view.as_ref().expect("known functions decode");
+        assert_eq!(
+            serde_json::to_string(listed).unwrap(),
+            serde_json::to_string(&view).unwrap(),
+            "{entry:#x}"
+        );
+    }
+    let Response::Error { .. } = request(
+        &mut worker,
+        Request::Listing {
+            binding,
+            entries: vec![entries[1], entries[0]],
+        },
+    ) else {
+        panic!("Unordered entries must be rejected");
+    };
+}

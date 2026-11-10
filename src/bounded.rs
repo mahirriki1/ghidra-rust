@@ -139,6 +139,11 @@ fn reply_nodes(kind: &str) -> Option<usize> {
     const DATA: usize = 13;
     const ADDRESS: usize = 9;
     const INSTRUCTION: usize = 9 + MAX_INSTRUCTION_BYTES;
+    const GRAPH: usize = 5 * MAX_GRAPH_BLOCKS
+        + INSTRUCTION * MAX_GRAPH_INSTRUCTIONS
+        + 7 * MAX_GRAPH_EDGES
+        + 5 * MAX_GRAPH_CALLS
+        + MAX_WARNINGS;
     let nodes = match kind {
         "opened" => FUNCTION * MAX_FUNCTIONS + SECTION * MAX_SECTIONS + MAX_WARNINGS + 8,
         "functions" | "discovery_batch" => {
@@ -149,12 +154,14 @@ fn reply_nodes(kind: &str) -> Option<usize> {
                 + 5 * MAX_ANALYSIS_FUNCTIONS
                 + 16
         }
-        "graph" => {
-            5 * MAX_GRAPH_BLOCKS
-                + INSTRUCTION * MAX_GRAPH_INSTRUCTIONS
-                + 7 * MAX_GRAPH_EDGES
-                + 5 * MAX_GRAPH_CALLS
-                + MAX_WARNINGS
+        "graph" => GRAPH,
+        // The worker starts no view once earlier views reach the reply-size
+        // allowance, and each JSON node costs at least two bytes: views
+        // before the last stay below half that many nodes.
+        "listing" => {
+            crate::model::MAX_LISTING_REPLY_BYTES / 2
+                + GRAPH
+                + 8 * crate::model::MAX_LISTING_FUNCTIONS
         }
         "decompiled" => {
             8 * MAX_CODE_MAPPINGS
@@ -370,6 +377,53 @@ mod tests {
             vec!["0"; 1000].join(",")
         );
         assert!(check_reply(progress.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn largest_listing_reply_the_worker_can_send_fits_reply_preflight() {
+        use crate::model::*;
+        let view = |entry: u64| FunctionView {
+            address: entry,
+            blocks: vec![BasicBlock {
+                address: entry,
+                instructions: (0..MAX_GRAPH_INSTRUCTIONS as u64)
+                    .map(|i| Instruction {
+                        address: u64::MAX - i,
+                        bytes: vec![0; MAX_INSTRUCTION_BYTES],
+                        mnemonic: String::new(),
+                        operands: String::new(),
+                    })
+                    .collect(),
+            }],
+            edges: vec![],
+            calls: vec![],
+            warnings: vec![],
+        };
+        // Views are added while the earlier ones stay below the allowance.
+        let mut outcomes = Vec::new();
+        let mut encoded = 0;
+        while encoded < MAX_LISTING_REPLY_BYTES && outcomes.len() < MAX_LISTING_FUNCTIONS {
+            let view = view(outcomes.len() as u64);
+            encoded += serde_json::to_vec(&view).unwrap().len();
+            outcomes.push(ListingOutcome {
+                entry: outcomes.len() as u64,
+                view: Some(view),
+            });
+        }
+        assert!(outcomes.len() > 1);
+        let reply = WorkerResponse {
+            id: u64::MAX,
+            response: Response::Listing {
+                binding: ListingBinding {
+                    generation: u64::MAX,
+                    token: u64::MAX,
+                },
+                outcomes,
+            },
+        };
+        let encoded = serde_json::to_vec(&reply).unwrap();
+        assert!(encoded.len() < MAX_REPLY_BYTES);
+        assert_eq!(check_reply(&encoded).unwrap().kind, "listing");
     }
 
     #[test]

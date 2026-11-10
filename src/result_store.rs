@@ -295,10 +295,12 @@ pub enum MetadataOwner {
     LocalNames,
     /// The adopted import/export table and its Symbol Tree presentation.
     Linkage,
+    /// Function views cached for the Program-scope Listing.
+    Listing,
 }
 
 impl MetadataOwner {
-    const COUNT: usize = 2;
+    const COUNT: usize = 3;
 }
 
 pub struct ResultStore<G, D> {

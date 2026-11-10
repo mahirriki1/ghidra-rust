@@ -457,6 +457,21 @@ impl FunctionResults {
         self.store.set_metadata_bytes(MetadataOwner::Linkage, bytes)
     }
 
+    /// Charges the Program-listing view cache beside the other metadata.
+    /// Returns whether it fits; a refused charge keeps the previous one.
+    pub fn set_listing_bytes(&mut self, bytes: usize) -> bool {
+        self.store.set_metadata_bytes(MetadataOwner::Listing, bytes)
+    }
+
+    /// The program context requests are bound to now, if one is published
+    /// and no input change is being prepared.
+    pub fn current_context(&self) -> Option<&Arc<crate::result_store::ProgramContext>> {
+        if self.preparing() || self.input_failed {
+            return None;
+        }
+        self.store.context()
+    }
+
     /// Before a text job shares the adopted linkage table, retain its existing
     /// metadata charge through the last Arc, including binary replacement.
     pub fn share_linkage_charge(&mut self, linkage: &Arc<crate::linkage::Linkage>) -> bool {

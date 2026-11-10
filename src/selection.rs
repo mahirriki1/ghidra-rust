@@ -41,6 +41,16 @@ impl ExecutableRanges {
         self.contains_with(address, || {})
     }
 
+    /// Whether every byte of `[address, address + length)` is executable and
+    /// file-backed; an empty span needs only its address.
+    pub(crate) fn contains_span(&self, address: u64, length: u64) -> bool {
+        let index = self.0.partition_point(|(start, _)| *start <= address);
+        index > 0
+            && address
+                .checked_add(length.max(1))
+                .is_some_and(|end| address >= self.0[index - 1].0 && end <= self.0[index - 1].1)
+    }
+
     fn contains_with(&self, address: u64, mut probe: impl FnMut()) -> bool {
         let index = self.0.partition_point(|(start, _)| {
             probe();

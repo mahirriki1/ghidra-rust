@@ -9,9 +9,10 @@ use std::sync::{Arc, Weak};
 
 use eframe::egui;
 
-use super::{DesktopApp, Tab, code_lines, graph_view, hex, listing_of, semantics_of};
+use super::{DesktopApp, Tab, code_lines, graph_view, hex, semantics_of};
 use crate::function_presentation::{PreparedDecompilation, PreparedGraph};
 use crate::model::{BinaryInfo, Instruction, StringEntry, function_at};
+use crate::program_listing::CachedBody;
 use crate::result_store::Stored;
 use crate::semantic::{SemanticToken, TokenKind};
 use crate::table_sort::{bounded_text, tsv_row};
@@ -78,6 +79,8 @@ struct MenuBinding {
     tab: Option<Tab>,
     graph: Option<Weak<Stored<PreparedGraph>>>,
     code: Option<Weak<Stored<PreparedDecompilation>>>,
+    /// The cached view of a Program-listing row outside the displayed graph.
+    listing: Option<Weak<CachedBody>>,
 }
 
 fn same<T>(a: &Option<Weak<T>>, b: &Option<Weak<T>>) -> bool {
@@ -98,6 +101,7 @@ impl PartialEq for MenuBinding {
             && self.tab == other.tab
             && same(&self.graph, &other.graph)
             && same(&self.code, &other.code)
+            && same(&self.listing, &other.listing)
     }
 }
 
@@ -222,6 +226,7 @@ impl DesktopApp {
             tab: None,
             graph: None,
             code: None,
+            listing: None,
         };
         let functions = (self.source_epochs.inventory, self.table_sorts.function_rows);
         let strings = (self.source_epochs.strings, self.table_sorts.string_rows);
@@ -230,8 +235,16 @@ impl DesktopApp {
                 if self.tab != Tab::Listing {
                     return None;
                 }
-                let graph = self.graph.as_ref().filter(|g| g.address() == entry)?;
-                binding.graph = Some(Arc::downgrade(graph));
+                match self.graph.as_ref().filter(|g| g.address() == entry) {
+                    Some(graph) => binding.graph = Some(Arc::downgrade(graph)),
+                    None => {
+                        let body = self
+                            .program_scope()
+                            .then(|| self.program.cache.get(entry))
+                            .flatten()?;
+                        binding.listing = Some(Arc::downgrade(body));
+                    }
+                }
                 binding.tab = Some(Tab::Listing);
             }
             MenuSource::Code { entry, .. } => {
@@ -406,17 +419,23 @@ impl DesktopApp {
             }
             MenuCommand::GoTo => self.menu_go_to(source, context),
             MenuCommand::ShowGraph => {
-                if let MenuSource::Instruction { pc, .. } = source {
-                    self.select_instruction(pc);
-                    self.tab = Tab::Graph;
-                    if let Some(canvas) = &mut self.canvas {
-                        canvas.reveal_instruction(pc);
+                if let MenuSource::Instruction { entry, pc } = source {
+                    if self.view().is_some_and(|view| view.address == entry) {
+                        self.select_instruction(pc);
+                        self.tab = Tab::Graph;
+                        if let Some(canvas) = &mut self.canvas {
+                            canvas.reveal_instruction(pc);
+                        }
+                    } else {
+                        // A Program-listing row of another function opens it.
+                        self.navigate_location(pc, Some(entry), false, context);
+                        self.tab = Tab::Graph;
                     }
                 }
             }
             MenuCommand::ShowHex => match source {
-                MenuSource::Instruction { pc, .. } => {
-                    if let Some(instruction) = self.menu_instruction(pc) {
+                MenuSource::Instruction { entry, pc } => {
+                    if let Some(instruction) = self.menu_instruction(entry, pc) {
                         let length = instruction.bytes.len() as u64;
                         self.navigate_data(pc, length, context);
                     }
@@ -436,8 +455,8 @@ impl DesktopApp {
                 _ => {}
             },
             MenuCommand::Decode => {
-                if let MenuSource::Instruction { pc, .. } = source
-                    && let Some(bytes) = self.menu_instruction(pc).map(|i| i.bytes.clone())
+                if let MenuSource::Instruction { entry, pc } = source
+                    && let Some(bytes) = self.menu_instruction(entry, pc).map(|i| i.bytes.clone())
                 {
                     self.decode_loaded_bytes(pc, bytes);
                 }
@@ -447,9 +466,9 @@ impl DesktopApp {
 
     fn menu_go_to(&mut self, source: MenuSource, context: &egui::Context) {
         match source {
-            MenuSource::Instruction { pc, .. } => {
-                if let Some(target) = self.listing_follow_target(pc) {
-                    self.follow_listing_target(target, context);
+            MenuSource::Instruction { entry, pc } => {
+                if let Some(target) = self.row_follow_target(entry, pc) {
+                    self.follow_row_target(entry, target, context);
                 }
             }
             MenuSource::Code { .. } => {
@@ -495,8 +514,9 @@ impl DesktopApp {
         }
     }
 
-    fn menu_instruction(&self, pc: u64) -> Option<&Instruction> {
-        let listing = listing_of(&self.graph);
+    /// The instruction at exactly `pc` in the view rows of `entry` come from.
+    fn menu_instruction(&self, entry: u64, pc: u64) -> Option<&Instruction> {
+        let (_, listing) = self.row_view(entry)?;
         listing.position(pc).and_then(|row| listing.get(row))
     }
 
@@ -537,12 +557,13 @@ impl DesktopApp {
         };
         match source {
             MenuSource::Instruction { entry, pc } => {
-                let (Some(view), Some(instruction)) =
-                    (graph_view(&self.graph), self.menu_instruction(pc))
+                let (Some((view, _)), Some(instruction)) =
+                    (self.row_view(entry), self.menu_instruction(entry, pc))
                 else {
                     return groups;
                 };
-                if let Some(target) = self.listing_follow_target(pc) {
+                let displayed = self.view().is_some_and(|view| view.address == entry);
+                if let Some(target) = self.row_follow_target(entry, pc) {
                     navigation.push(
                         MenuItem::new(MenuCommand::GoTo, "Go to target")
                             .hover(format!("{target:x}")),
@@ -550,7 +571,7 @@ impl DesktopApp {
                 }
                 navigation.push(
                     MenuItem::new(MenuCommand::ShowGraph, "Show in Graph")
-                        .enabled(self.canvas.is_some(), "No graph"),
+                        .enabled(self.canvas.is_some() || !displayed, "No graph"),
                 );
                 let length = instruction.bytes.len() as u64;
                 let backed = length > 0 && info.sections.iter().any(|s| s.backs(pc, length));
@@ -695,11 +716,11 @@ impl DesktopApp {
         let info = self.info.as_ref()?;
         Some(match (source, command) {
             (MenuSource::Instruction { pc, .. }, MenuCommand::CopyAddress) => format!("{pc:#x}"),
-            (MenuSource::Instruction { pc, .. }, MenuCommand::CopyBytes) => {
-                hex(&self.menu_instruction(pc)?.bytes)
+            (MenuSource::Instruction { entry, pc }, MenuCommand::CopyBytes) => {
+                hex(&self.menu_instruction(entry, pc)?.bytes)
             }
-            (MenuSource::Instruction { pc, .. }, MenuCommand::CopyInstruction) => {
-                let instruction = self.menu_instruction(pc)?;
+            (MenuSource::Instruction { entry, pc }, MenuCommand::CopyInstruction) => {
+                let instruction = self.menu_instruction(entry, pc)?;
                 let operands = !instruction.operands.is_empty();
                 bounded_text([
                     instruction.mnemonic.as_str(),

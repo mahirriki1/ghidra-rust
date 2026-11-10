@@ -88,6 +88,46 @@ cursor keys, pseudocode selection and navigation to an instruction reveal its
 exact graph row, clear of that overview.
 **Legend** and graph warnings are in the graph toolbar.
 
+The Listing shows one function by default. Choose **Program** in its title
+row to list the whole program in address order instead: each section, each
+known function's name, the instructions of loaded functions, and one `??`
+row with its byte count for each run of bytes no loaded function decoded.
+Zero-filled section tails get their own dimmer row, and a function whose
+body has not loaded yet shows a muted `…` row. Bodies of the functions in
+view (and a few beyond, in the scroll direction) load in small batches from
+the same analysis as the Function Graph, so nothing is disassembled linearly
+or guessed. Batches have the lowest priority: they wait for the selected
+function's graph and pseudocode, searches, symbol and import table pages and
+automatic analysis. While discovery runs, each committed discovery batch is
+followed by at most one batch for the bodies in view (nothing beyond them);
+discovery waits for it at most a few seconds, and not at all when nothing in
+view needs a body. A batch starts no new function after about 250 ms and no
+further switch-table recovery once those recoveries have taken 250 ms, so a
+click waits at most that long plus one function's analysis. A function that
+failed to load is requested again only after discovery, a rename, a
+signature change or a switch to **Function** and back; opening it shows its
+full body. If a batch stops or times out the analysis worker, its
+functions are retried one per request, and only one whose own request fails
+is skipped for that binary; after eight such failures the binary's Program
+listing loads no more bodies. These failures never use up discovery's worker
+restarts, and outside discovery they never reopen the worker. Instructions decoded only from a function whose entry
+lies elsewhere stay `??` until that function loads, an instruction that
+overlaps another function's instruction with different bounds appears only
+in its own function, and a function with an incomplete graph shows its name
+in the warning color (hover for details). Scroll with the wheel or drag the
+address bar at the right edge, which spans all sections. Clicking an
+instruction opens its function in the Graph and Decompiler, and right-click
+menus work on the instructions of any loaded function. Highlights linked to
+the pseudocode still come only from the displayed function. Function, Go,
+history and pseudocode navigation scroll the Program listing to the
+destination once, and it keeps its place on screen while bodies above it
+load until you scroll; discovery, renames and signature edits keep both the view
+and the selected instruction. Non-code destinations
+still open in Hex. Listing keys move within the displayed function. The
+scope, position and loaded bodies last for the session only; loaded bodies
+are released when you switch back to **Function**, and projects do not store
+any of them.
+
 Narrow dock headers keep the active tab visible and put additional tabs in **»**.
 Decompiler controls that do not fit move into **⋯**. The Listing keeps code
 columns in view by reducing the bytes column first; hover shortened fields to
@@ -196,8 +236,9 @@ On macOS, Save, Undo and program-text search use Command. Shortcuts pause while
 typing, in dialogs, and during file operations.
 
 Listing keys apply after clicking the Listing and stay within the current
-function; clicking elsewhere, focusing a text field or switching tabs releases
-them. Enter and Listing double-click follow a resolved call or a single taken
+function, in both scopes; clicking elsewhere, focusing a text field or
+switching tabs releases them. In the Program scope a click on another
+function keeps them active. Enter and Listing double-click follow a resolved call or a single taken
 branch target; ambiguous, unresolved or switch-table destinations, and a jump
 to the next instruction, are not followed.
 
