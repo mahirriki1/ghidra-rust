@@ -194,21 +194,32 @@ pub(super) fn recover_walk_switched(
 pub(crate) struct SwitchBudget {
     pub(super) invocations: usize,
     pub(super) spent: Duration,
+    limit: Duration,
 }
+
+/// The warning a walk records when its request's switch allowance is spent.
+pub(super) const SWITCH_SKIPPED: &str =
+    "Switch recovery was skipped by this request's work allowance.";
 
 impl SwitchBudget {
     const MAX_INVOCATIONS: usize = 32;
     const MAX_ELAPSED: Duration = Duration::from_secs(5);
 
     pub(crate) fn new() -> Self {
+        Self::within(Self::MAX_ELAPSED)
+    }
+
+    /// A budget whose recoveries stop starting once `limit` is spent.
+    pub(crate) fn within(limit: Duration) -> Self {
         Self {
             invocations: 0,
             spent: Duration::ZERO,
+            limit: limit.min(Self::MAX_ELAPSED),
         }
     }
 
     pub(super) fn available(&self) -> bool {
-        self.invocations < Self::MAX_INVOCATIONS && self.spent < Self::MAX_ELAPSED
+        self.invocations < Self::MAX_INVOCATIONS && self.spent < self.limit
     }
 }
 
@@ -457,10 +468,7 @@ impl Walk {
             return false;
         }
         if !budget.available() {
-            warning(
-                &mut self.warnings,
-                "Switch recovery was skipped by this request's work allowance.",
-            );
+            warning(&mut self.warnings, SWITCH_SKIPPED);
             return false;
         }
         budget.invocations += 1;

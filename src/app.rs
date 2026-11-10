@@ -55,6 +55,7 @@ mod context_menu;
 #[path = "app/graph_preparation.rs"]
 mod graph_preparation;
 mod listing_cursor;
+mod program_listing;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Tab {
@@ -578,6 +579,7 @@ fn request_task(request: &Request) -> &'static str {
         Request::SymbolNames { .. } => "Reading symbol names",
         Request::Linkage { .. } => "Reading imports and exports",
         Request::SearchMemory { .. } => "Searching memory",
+        Request::Listing { .. } => "Loading listing",
     }
 }
 
@@ -758,6 +760,8 @@ pub struct DesktopApp {
     pending_comment_scroll: Option<u64>,
     pending_listing_scroll: Option<usize>,
     listing_cursor: listing_cursor::ListingCursor,
+    /// The Listing's opt-in Program scope and its session-only view cache.
+    program: program_listing::ProgramPane,
     menus: context_menu::ContextMenus,
     /// Automatic discovery resumes since the last committed batch.
     discovery_resumes: u8,
@@ -921,6 +925,7 @@ impl DesktopApp {
             pending_comment_scroll: None,
             pending_listing_scroll: None,
             listing_cursor: Default::default(),
+            program: Default::default(),
             menus: Default::default(),
             discovery_resumes: 0,
             code_chars: 0,
@@ -1149,6 +1154,8 @@ impl DesktopApp {
         self.pending_comment_scroll = None;
         self.pending_listing_scroll = None;
         self.listing_cursor = Default::default();
+        self.program.reset();
+        self.results.set_listing_bytes(0);
         self.saved_analysis = false;
         self.cached_graph = false;
         self.cached_functions = false;
@@ -1197,16 +1204,22 @@ impl DesktopApp {
         let resume = resumable
             && self.discovery_running
             && self.signature_change.is_none()
-            && self.discovery_resumes < MAX_DISCOVERY_RESUMES;
+            && (self.discovery_resumes < MAX_DISCOVERY_RESUMES || self.program.free_resume);
         if resume && let Some(path) = self.binary_path.clone() {
             self.stop_worker_transport();
             self.discovery_resumes += 1;
+            if std::mem::take(&mut self.program.free_resume) {
+                // A failed Program-listing view is isolated and capped on
+                // its own; it never spends discovery's resumes.
+                self.discovery_resumes -= 1;
+            }
             self.start_open(path, true, None, context);
             self.discovery_running = self.client.is_some();
             self.update_discovery_summary();
         } else {
             self.stop_worker();
         }
+        self.program.free_resume = false;
     }
 
     fn stop_worker(&mut self) {
@@ -1364,6 +1377,15 @@ impl DesktopApp {
                 self.results
                     .binding(*address, self.local_override_state(*address))
             }
+            // Listing views carry no local-name state; the binding is the
+            // program context they are cached under.
+            Request::Listing { entries, .. }
+                if self.signature_change.is_none() && self.signature_replay.is_none() =>
+            {
+                entries
+                    .first()
+                    .and_then(|&entry| self.results.binding(entry, String::new()))
+            }
             _ => None,
         };
         let Some(client) = &mut self.client else {
@@ -1509,6 +1531,7 @@ impl DesktopApp {
                         | Request::SymbolNames { .. }
                         | Request::Linkage { .. }
                         | Request::SearchMemory { .. }
+                        | Request::Listing { .. }
                 )
             })
         {
@@ -1785,7 +1808,13 @@ impl DesktopApp {
         self.clear_decompilation();
         self.pending_listing_scroll = None;
         self.saved_analysis = false;
+        self.remember_displayed();
         self.graph = None;
+        self.program.graph_context = None;
+        self.program.reveal = Some(match focus {
+            Some(pc) => program_listing::Reveal::Address(pc),
+            None => program_listing::Reveal::Entry(address),
+        });
         self.cached_graph = false;
         self.canvas = None;
         self.graph_preparation.cancel();
@@ -1889,6 +1918,12 @@ impl DesktopApp {
         self.canvas = Some(GraphCanvas::with_geometry(graph.view(), graph.geometry()));
         self.cached_graph = origin == ResultOrigin::Saved;
         self.graph = Some(graph);
+        // Saved or staged-signature results are shown, never cached as current.
+        self.program.graph_context = (origin == ResultOrigin::Computed
+            && self.signature_change.is_none()
+            && self.signature_replay.is_none())
+        .then(|| self.results.current_context().cloned())
+        .flatten();
         self.result_scope = Some(address);
         if let Some((function, pc)) = self.signature_restore_pc.take()
             && function == address
@@ -1902,6 +1937,7 @@ impl DesktopApp {
             self.address = format!("{pc:x}");
             self.select_instruction(pc);
             self.pending_listing_scroll = self.listing().position(pc);
+            self.note_restore_scroll();
         }
         self.comment_rows_key = None;
         self.status = format!("Function {address:#x} ready");
@@ -1911,6 +1947,7 @@ impl DesktopApp {
             self.select_instruction(pc);
             if let Some(row) = self.listing().position(pc) {
                 self.pending_listing_scroll = Some(row);
+                self.note_focus_scroll();
                 if let Some(canvas) = &mut self.canvas {
                     canvas.reveal_instruction(pc);
                 }
@@ -2289,14 +2326,16 @@ impl DesktopApp {
                     self.rebuild_filter();
                 }
                 self.status = "Discovery batch committed".into();
+                self.grant_listing_turn();
             }
             Ok(None) if update.budget_exhausted => {
                 self.inventory_synced = false;
                 self.worker_inventory = None;
                 self.status =
                     "Function-start pattern work budget exhausted; discovery is partial".into();
+                self.grant_listing_turn();
             }
-            Ok(None) => {}
+            Ok(None) => self.grant_listing_turn(),
             Err(error) => {
                 self.stop_worker();
                 self.status = format!("Invalid discovery batch: {error}");
@@ -2314,6 +2353,7 @@ impl DesktopApp {
 
     fn pump_discovery(&mut self, _context: &egui::Context) {
         if !self.discovery_running
+            || self.listing_turn_outstanding()
             || self.signature_replay.is_some()
             || self.discovery_job.is_some()
             || self.deferred_discovery.is_some()
@@ -2450,7 +2490,7 @@ impl DesktopApp {
         {
             // Re-resolving the displayed function keeps a selected tree row.
             let linkage_focus = self.linkage_focus;
-            self.navigate_to(address, self.selected, false, context);
+            self.reresolve_displayed(address, self.selected, context);
             self.linkage_focus = linkage_focus;
         }
         if !self.results.preparing()
@@ -2487,6 +2527,7 @@ impl DesktopApp {
                 .is_some_and(|pending| resumes_discovery(&pending.request));
             self.fail_pending_linkage();
             self.fail_pending_search();
+            self.fail_pending_listing();
             self.stop_after_failure(resumable, context);
             self.status =
                 "Analysis exceeded 30 seconds and was stopped. Choose an action to restart.".into();
@@ -2506,6 +2547,7 @@ impl DesktopApp {
                         .is_some_and(|pending| resumes_discovery(&pending.request));
                     self.fail_pending_linkage();
                     self.fail_pending_search();
+                    self.fail_pending_listing();
                     self.stop_after_failure(resumable, context);
                     if signature_failure {
                         self.signature_error = Some(format!("Signature change failed: {error}"));
@@ -2521,6 +2563,16 @@ impl DesktopApp {
         // Whole-image automatic scans wait until a memory search ends.
         if !self.searches.memory_searching() {
             self.pump_analysis(context);
+        }
+        // Program-listing views take the worker only when nothing else,
+        // including maintenance, wants it. During discovery an outstanding
+        // turn holds the next batch, so the turn goes between batches.
+        let had_turn = self.listing_turn_outstanding();
+        self.dispatch_listing();
+        if had_turn && !self.listing_turn_outstanding() && self.pending.is_none() {
+            // A turn dropped without a request releases discovery now,
+            // not on the next 100 ms poll.
+            context.request_repaint();
         }
         if self.pending.is_some()
             || self.discovery_job.is_some()
@@ -2616,6 +2668,9 @@ impl DesktopApp {
                 self.dispatch_queued(context);
                 return;
             }
+            // Not retried under this context; the worker still stops, as
+            // after any failed analysis request.
+            self.fail_listing(&pending);
             if matches!(pending.request, Request::SymbolNames { .. })
                 && let Some(fetch) = self.symbol_fetch.take()
             {
@@ -3227,7 +3282,7 @@ impl DesktopApp {
                 if self.queue.is_empty()
                     && let Some(current) = self.view().map(|view| view.address)
                 {
-                    self.navigate(current, false, context);
+                    self.reopen_after_rename(current, context);
                 }
             }
             (
@@ -3266,6 +3321,9 @@ impl DesktopApp {
             }
             (Request::SearchMemory { binding, .. }, Response::MemorySearch(page)) => {
                 self.receive_memory_page(binding, page);
+            }
+            (request @ Request::Listing { .. }, Response::Listing { binding, outcomes }) => {
+                self.receive_listing(&request, pending.result.as_ref(), binding, outcomes);
             }
             (Request::Crypto, Response::Crypto { matches, truncated }) => {
                 self.result_revision = self.result_revision.wrapping_add(1);
@@ -3359,6 +3417,25 @@ impl DesktopApp {
                 validate_strings(strings, MAX_STRING_RESULTS, &ranges()?)
             }
             Response::Crypto { matches, .. } => validate_crypto(matches, &ranges()?),
+            Response::Listing { outcomes, .. } => {
+                let info = self.info.as_ref().ok_or("No binary is open")?;
+                let (mapped, executable) = (
+                    ranges()?,
+                    crate::selection::ExecutableRanges::new(&info.sections)?,
+                );
+                for view in outcomes.iter().filter_map(|outcome| outcome.view.as_ref()) {
+                    validate_view(view, &mapped, info)?;
+                    let instructions = view.blocks.iter().flat_map(|block| &block.instructions);
+                    for instruction in instructions {
+                        if !executable
+                            .contains_span(instruction.address, instruction.bytes.len() as u64)
+                        {
+                            return Err("Listing instruction outside executable bytes".into());
+                        }
+                    }
+                }
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
@@ -4666,6 +4743,7 @@ impl DesktopApp {
     /// immutable byte scans and exact inventory; every engine result is rebuilt.
     fn invalidate_signature_analysis(&mut self) {
         self.selection_generation = self.selection_generation.wrapping_add(1);
+        self.keep_for_signature_restore();
         self.graph = None;
         self.canvas = None;
         self.graph_preparation.cancel();
@@ -4731,6 +4809,7 @@ impl DesktopApp {
         // Clear the displayed function while keeping committed store/publication
         // state until the worker acknowledges the complete new signature state.
         self.selection_generation = self.selection_generation.wrapping_add(1);
+        self.keep_for_signature_restore();
         self.graph = None;
         self.canvas = None;
         self.graph_preparation.cancel();
@@ -8303,22 +8382,46 @@ impl DesktopApp {
                     });
                     return;
                 }
+                let program = self.program_scope();
+                let mut scope = self.program.scope;
+                ui.horizontal(|ui| {
+                    theme::segmented(
+                        ui,
+                        &mut scope,
+                        &[
+                            (program_listing::ListingScope::Function, "Function"),
+                            (program_listing::ListingScope::Program, "Program"),
+                        ],
+                    );
+                    let Some(view) = graph_view(&self.graph).filter(|_| !program) else {
+                        return;
+                    };
+                    let entry = view.address;
+                    let (name, raw) = self.function_names(entry).unwrap_or(("function", None));
+                    function_title(ui, name, raw, entry).context_menu(|ui| {
+                        if ui.button("Xrefs to this function").clicked() {
+                            listing_xrefs = Some(XrefTarget {
+                                address: entry,
+                                kind: TargetKind::Function,
+                            });
+                            ui.close();
+                        }
+                    });
+                });
+                if let Some(target) = listing_xrefs.take() {
+                    self.open_xrefs(target);
+                }
+                self.set_listing_scope(scope);
+                if self.program_scope() {
+                    self.program_listing_pane(ui, &context);
+                    return;
+                }
                 let Some(view) = graph_view(&self.graph) else {
                     theme::empty_state(ui, "Select a function");
                     return;
                 };
                 let listing = listing_of(&self.graph);
                 let entry = view.address;
-                let (name, raw) = self.function_names(entry).unwrap_or(("function", None));
-                function_title(ui, name, raw, entry).context_menu(|ui| {
-                    if ui.button("Xrefs to this function").clicked() {
-                        listing_xrefs = Some(XrefTarget {
-                            address: entry,
-                            kind: TargetKind::Function,
-                        });
-                        ui.close();
-                    }
-                });
                 let digits = theme::address_digits(listing.last().map_or(0, |i| i.address));
                 let glyph = theme::glyph_width(ui);
                 let (header, _) = ui.allocate_exact_size(
@@ -9792,6 +9895,11 @@ impl DesktopApp {
             })
             .map(|view| view.address)
             .or_else(|| self.comment_owners.get(&pc).copied())
+            .or_else(|| {
+                self.program_scope()
+                    .then(|| self.program.cache.owner_of(pc))
+                    .flatten()
+            })
     }
 
     /// The adopted linkage table when it is still the one `text` searched.

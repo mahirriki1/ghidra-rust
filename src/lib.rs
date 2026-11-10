@@ -38,6 +38,7 @@ mod pe;
 mod pe_symbols;
 pub mod performance;
 mod pointer_discovery;
+pub mod program_listing;
 pub mod project;
 pub mod result_store;
 pub mod search;

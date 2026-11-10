@@ -412,6 +412,7 @@ pub fn operation(request: &crate::model::Request) -> &'static str {
         SymbolNames { .. } => "symbol_names",
         Linkage { .. } => "linkage",
         SearchMemory { .. } => "search_memory",
+        Listing { .. } => "listing",
     }
 }
 

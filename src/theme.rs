@@ -1239,6 +1239,60 @@ pub struct ListingElided {
     pub code: bool,
 }
 
+/// Paint one Listing cell: a single line clipped to `range` of `rect`,
+/// ellipsized. Returns whether content was lost to the cell.
+fn paint_listing_cell(
+    ui: &Ui,
+    rect: egui::Rect,
+    range: egui::Rangef,
+    mut job: egui::text::LayoutJob,
+) -> bool {
+    let slack = 1.0 / ui.pixels_per_point();
+    let cell = egui::Rect::from_x_y_ranges(
+        egui::Rangef::new(rect.left() + range.min, rect.left() + range.max),
+        rect.y_range(),
+    );
+    if cell.width() <= 0.0 {
+        return !job.text.is_empty();
+    }
+    job.wrap = egui::text::TextWrapping::truncate_at_width(cell.width());
+    let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+    let truncated = galley.elided;
+    ui.painter()
+        .with_clip_rect(
+            cell.expand2(egui::vec2(slack, 0.0))
+                .intersect(rect)
+                .intersect(ui.clip_rect()),
+        )
+        .galley(
+            egui::pos2(cell.left(), cell.center().y - galley.size().y / 2.0),
+            galley,
+            TEXT,
+        );
+    truncated
+}
+
+/// `address` for the address cell; keeps the changing low digits visible
+/// when a wide address must shorten. Returns the text and whether it shortened.
+fn listing_address(
+    ui: &Ui,
+    columns: &ListingColumns,
+    address: u64,
+    digits: usize,
+) -> (String, bool) {
+    let slack = 1.0 / ui.pixels_per_point();
+    let mut text = format!("{address:0digits$x}");
+    let font = FontId::monospace(13.0);
+    let shortened = text_width(ui, &text, &font) > columns.address.span() + slack;
+    if shortened {
+        let digits = ((columns.address.span() - text_width(ui, "…", &font)) / glyph_width(ui))
+            .max(0.0)
+            .floor() as usize;
+        text = format!("…{}", &text[text.len() - digits.min(text.len())..]);
+    }
+    (text, shortened)
+}
+
 /// Paint a Listing row as independent single-line cells, each clipped to its
 /// column and ellipsized rather than pushing the next one aside.
 pub fn listing_cells(
@@ -1255,43 +1309,11 @@ pub fn listing_cells(
     if !ui.is_rect_visible(rect) {
         return elided;
     }
-    let slack = 1.0 / ui.pixels_per_point();
-    let paint = |range: egui::Rangef, mut job: egui::text::LayoutJob| {
-        let cell = egui::Rect::from_x_y_ranges(
-            egui::Rangef::new(rect.left() + range.min, rect.left() + range.max),
-            rect.y_range(),
-        );
-        if cell.width() <= 0.0 {
-            return !job.text.is_empty();
-        }
-        job.wrap = egui::text::TextWrapping::truncate_at_width(cell.width());
-        let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
-        let truncated = galley.elided;
-        ui.painter()
-            .with_clip_rect(
-                cell.expand2(egui::vec2(slack, 0.0))
-                    .intersect(rect)
-                    .intersect(ui.clip_rect()),
-            )
-            .galley(
-                egui::pos2(cell.left(), cell.center().y - galley.size().y / 2.0),
-                galley,
-                TEXT,
-            );
-        truncated
-    };
+    let paint =
+        |range: egui::Rangef, job: egui::text::LayoutJob| paint_listing_cell(ui, rect, range, job);
     let mono =
         |text: String, color| egui::text::LayoutJob::single_section(text, mono_format(color));
-    let mut address = format!("{:0digits$x}", row.address, digits = row.address_digits);
-    let font = FontId::monospace(13.0);
-    // Keep the changing low digits visible when a wide address must shorten.
-    let shortened = text_width(ui, &address, &font) > columns.address.span() + slack;
-    if shortened {
-        let digits = ((columns.address.span() - text_width(ui, "…", &font)) / glyph_width(ui))
-            .max(0.0)
-            .floor() as usize;
-        address = format!("…{}", &address[address.len() - digits.min(address.len())..]);
-    }
+    let (address, shortened) = listing_address(ui, columns, row.address, row.address_digits);
     let clipped = paint(columns.address, mono(address, ADDRESS));
     elided.address = shortened || clipped;
     if let Some(range) = columns.bytes {
@@ -1316,6 +1338,89 @@ pub fn listing_cells(
     }
     elided.code |= paint(columns.operands, code);
     elided
+}
+
+/// A Program-listing row that is not a decoded instruction.
+#[derive(Clone, Copy, Debug)]
+pub enum ListingMark<'a> {
+    /// A section start: its name, then its address range.
+    Section { name: &'a str, end: u64 },
+    /// A function entry: its name; `partial` marks an incomplete view.
+    Function { name: &'a str, partial: bool },
+    /// Undefined file-backed bytes collapsed to one row.
+    Undefined { length: u64 },
+    /// Zero-filled bytes beyond a section's file-backed part.
+    ZeroFill { length: u64 },
+    /// A function body that has not loaded yet.
+    Pending,
+}
+
+/// Paint a [`ListingMark`] row aligned with [`listing_cells`]. Names are
+/// proportional; addresses and byte counts monospace. Returns whether
+/// content was elided.
+pub fn listing_mark(
+    ui: &Ui,
+    rect: egui::Rect,
+    columns: &ListingColumns,
+    address: u64,
+    digits: usize,
+    mark: ListingMark<'_>,
+) -> bool {
+    if !ui.is_rect_visible(rect) {
+        return false;
+    }
+    let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+    let mono =
+        |text: String, color| egui::text::LayoutJob::single_section(text, mono_format(color));
+    let heading = |name: &str, color: Color32, detail: String| {
+        let mut job = egui::text::LayoutJob::single_section(
+            name.to_owned(),
+            egui::TextFormat {
+                font_id: FontId::proportional(13.0),
+                color,
+                valign: egui::Align::Center,
+                ..Default::default()
+            },
+        );
+        job.append(&detail, 0.0, mono_format(MUTED));
+        let full = egui::Rangef::new(columns.address.min, rect.width() - LISTING_END);
+        paint_listing_cell(ui, rect, full, job)
+    };
+    match mark {
+        ListingMark::Section { name, end } => {
+            painter.rect_filled(rect, 0, HEADER);
+            heading(name, TEXT, format!("  {address:0digits$x}–{end:0digits$x}"))
+        }
+        ListingMark::Function { name, partial } => {
+            painter.hline(rect.x_range(), rect.top() + 0.5, Stroke::new(1.0, BORDER));
+            let color = if partial { WARNING } else { SYNTAX_FUNCTION };
+            heading(name, color, format!("  {address:0digits$x}"))
+        }
+        ListingMark::Undefined { length } | ListingMark::ZeroFill { length } => {
+            let color = if matches!(mark, ListingMark::ZeroFill { .. }) {
+                BYTES
+            } else {
+                MUTED
+            };
+            let (text, shortened) = listing_address(ui, columns, address, digits);
+            let mut elided =
+                shortened | paint_listing_cell(ui, rect, columns.address, mono(text, ADDRESS));
+            elided |= paint_listing_cell(ui, rect, columns.mnemonic, mono("??".into(), color));
+            elided |= paint_listing_cell(
+                ui,
+                rect,
+                columns.operands,
+                mono(format!("{length:x}h"), color),
+            );
+            elided
+        }
+        ListingMark::Pending => {
+            let (text, shortened) = listing_address(ui, columns, address, digits);
+            shortened
+                | paint_listing_cell(ui, rect, columns.address, mono(text, BYTES))
+                | paint_listing_cell(ui, rect, columns.mnemonic, mono("…".into(), BYTES))
+        }
+    }
 }
 
 /// The Listing's column headings, aligned with `listing_cells` and clipped to
@@ -1522,6 +1627,174 @@ pub fn row_response(
         }
     }
     response
+}
+
+/// A compact choice between `choices` in a pane's title row, one row high.
+/// Returns whether `current` changed.
+pub fn segmented<T: PartialEq + Copy>(ui: &mut Ui, current: &mut T, choices: &[(T, &str)]) -> bool {
+    let mut changed = false;
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.x = 1.0;
+        for (value, label) in choices {
+            let selected = *current == *value;
+            let response = ui.add(
+                egui::Button::new(RichText::new(*label).size(12.0).color(if selected {
+                    TEXT
+                } else {
+                    MUTED
+                }))
+                .fill(if selected { SELECTION } else { HOVER })
+                .min_size(egui::vec2(0.0, ROW_HEIGHT)),
+            );
+            if response.clicked() && !selected {
+                *current = *value;
+                changed = true;
+            }
+        }
+    });
+    changed
+}
+
+/// The result of [`anchored_rows`]: the new top row of the window, its
+/// device-pixel-snapped offset, and the rows painted fully inside the body.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Anchored {
+    pub top: usize,
+    pub offset: f32,
+    pub full: std::ops::Range<usize>,
+    /// Wheel input over the body moved the rows this frame.
+    pub scrolled: bool,
+}
+
+/// Fixed-height rows positioned from an anchor rather than a global row
+/// count. `window` holds consecutive rows around the anchor `top`, which is
+/// scrolled up by `offset` points; `at_end` says whether the window's last
+/// row is also the model's. Wheel input over `body` is consumed like
+/// the graph canvas's and moves the anchor within the window; the caller
+/// re-anchors the model at the returned row. Offsets snap to device pixels,
+/// so rows stay crisp at fractional scales.
+pub fn anchored_rows<P>(
+    ui: &mut Ui,
+    body: egui::Rect,
+    window: &[P],
+    top: usize,
+    offset: f32,
+    at_end: bool,
+    mut add_row: impl FnMut(&mut Ui, usize, &P, egui::Rect),
+) -> Anchored {
+    let ppp = ui.pixels_per_point();
+    let snap = |x: f32| (x * ppp).round() / ppp;
+    ui.allocate_rect(body, egui::Sense::hover());
+    let delta = if ui.rect_contains_pointer(body) {
+        ui.input_mut(|input| std::mem::take(&mut input.smooth_scroll_delta.y))
+    } else {
+        0.0
+    };
+    if window.is_empty() {
+        return Anchored {
+            top: 0,
+            offset: 0.0,
+            full: 0..0,
+            scrolled: false,
+        };
+    }
+    let top = top.min(window.len() - 1);
+    let last = if at_end {
+        (window.len() as f32 * ROW_HEIGHT - body.height()).max(0.0)
+    } else {
+        (window.len() - 1) as f32 * ROW_HEIGHT
+    };
+    // Beyond the window's first row the caller re-anchors next frame; the
+    // window extends far enough past the anchor for any single wheel step.
+    let position = (top as f32 * ROW_HEIGHT + offset - delta).clamp(0.0, last.max(0.0));
+    let mut top = ((position / ROW_HEIGHT).floor().max(0.0) as usize).min(window.len() - 1);
+    let mut offset = snap(position - top as f32 * ROW_HEIGHT).max(0.0);
+    if offset >= ROW_HEIGHT && top + 1 < window.len() {
+        top += 1;
+        offset = 0.0;
+    }
+    let origin = snap(body.top()) - offset;
+    let clip = body.intersect(ui.clip_rect());
+    let mut full = top..top;
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(body));
+    child.set_clip_rect(clip);
+    for (index, row) in window.iter().enumerate().skip(top) {
+        let y = origin + (index - top) as f32 * ROW_HEIGHT;
+        if y >= body.bottom() {
+            break;
+        }
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(body.left(), y),
+            egui::vec2(body.width(), ROW_HEIGHT),
+        );
+        if rect.top() >= body.top() - 0.01 && rect.bottom() <= body.bottom() + 0.01 {
+            if full.is_empty() {
+                full = index..index + 1;
+            } else {
+                full.end = index + 1;
+            }
+        }
+        add_row(&mut child, index, row, rect);
+    }
+    Anchored {
+        top,
+        offset,
+        full,
+        scrolled: delta != 0.0,
+    }
+}
+
+/// A vertical overview of the whole address space beside a Program listing.
+/// `thumb` is the visible extent as fractions of the bar. Returns the
+/// fraction a click or drag asks to show at the top of the view.
+pub fn address_bar(ui: &mut Ui, rect: egui::Rect, id: egui::Id, thumb: (f32, f32)) -> Option<f32> {
+    let response = ui.interact(rect, id, egui::Sense::click_and_drag());
+    let height = rect.height().max(1.0);
+    let minimum = 12.0_f32.min(height);
+    let top = rect.top() + thumb.0.clamp(0.0, 1.0) * height;
+    let length = ((thumb.1 - thumb.0).clamp(0.0, 1.0) * height).max(minimum);
+    let top = top.min(rect.bottom() - length);
+    let ppp = ui.pixels_per_point();
+    let snap = |x: f32| (x * ppp).round() / ppp;
+    let handle = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + 2.0, snap(top)),
+        egui::pos2(rect.right() - 2.0, snap(top + length)),
+    );
+    let grab_id = id.with("grab");
+    if response.drag_started()
+        && let Some(pointer) = response.interact_pointer_pos()
+    {
+        let grab = if handle.contains(pointer) {
+            pointer.y - handle.top()
+        } else {
+            length / 2.0
+        };
+        ui.data_mut(|data| data.insert_temp(grab_id, grab));
+    }
+    let mut target = None;
+    if let Some(pointer) = response.interact_pointer_pos()
+        && (response.dragged() || response.clicked())
+    {
+        let grab = if response.dragged() {
+            ui.data(|data| data.get_temp::<f32>(grab_id))
+                .unwrap_or(length / 2.0)
+        } else {
+            length / 2.0
+        };
+        target = Some(((pointer.y - grab - rect.top()) / height).clamp(0.0, 1.0));
+    }
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+        painter.rect_filled(rect, 0, CHROME);
+        painter.vline(rect.left() + 0.5, rect.y_range(), Stroke::new(1.0, BORDER));
+        let fill = if response.dragged() || response.hovered() {
+            MUTED
+        } else {
+            CURRENT_LINE
+        };
+        painter.rect_filled(handle, 2, fill);
+    }
+    target
 }
 
 /// Paint one line of text in a row cell, vertically centered and clipped to

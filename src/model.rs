@@ -75,6 +75,13 @@ pub const MAX_DISCOVERY_SYNC_FUNCTIONS: usize = 1024;
 /// envelope below the 60 KiB request limit.
 pub const MAX_SYNC_FUNCTION_BYTES: usize = 48 * 1024;
 pub const MAX_ANALYSIS_INSTRUCTIONS: usize = 16_384;
+/// Functions one Program-listing request may name; each runs the Graph path.
+pub const MAX_LISTING_FUNCTIONS: usize = 32;
+/// Once a Program-listing reply's encoded views reach this size, no further
+/// function starts. The first entry is always examined.
+pub const MAX_LISTING_REPLY_BYTES: usize = 4 * 1024 * 1024;
+/// Elapsed allowance after which no further Program-listing function starts.
+pub const LISTING_ALLOWANCE: std::time::Duration = std::time::Duration::from_millis(250);
 /// Executable bytes inspected by one function-start pattern request.
 pub const MAX_PATTERN_SCAN_BYTES: u64 = 1024 * 1024;
 /// Pattern matching is chunked so a match flood has a local bound.
@@ -849,6 +856,37 @@ pub struct FunctionView {
     pub warnings: Vec<String>,
 }
 
+/// Identity of one Program-listing request: the binary generation and a
+/// desktop token that changes for every request sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListingBinding {
+    pub generation: u64,
+    pub token: u64,
+}
+
+/// One examined Program-listing entry; `view` is absent when its walk failed.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListingOutcome {
+    pub entry: u64,
+    pub view: Option<FunctionView>,
+}
+
+/// Entries of a Program-listing request: non-empty, strictly increasing and
+/// within [`MAX_LISTING_FUNCTIONS`].
+pub fn validate_listing_entries(entries: &[u64]) -> Result<(), String> {
+    if entries.is_empty() || entries.len() > MAX_LISTING_FUNCTIONS {
+        return Err(format!(
+            "A listing request names 1 to {MAX_LISTING_FUNCTIONS} functions"
+        ));
+    }
+    if !entries.is_sorted_by(|a, b| a < b) {
+        return Err("Listing entries are not strictly increasing".into());
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StringEntry {
     pub address: u64,
@@ -942,6 +980,12 @@ pub enum Request {
         #[serde(default)]
         digest: Option<String>,
     },
+    /// Graph-path views of several known functions for the Program listing.
+    Listing {
+        binding: ListingBinding,
+        #[serde(deserialize_with = "crate::bounded::vec::<_, _, { MAX_LISTING_FUNCTIONS }>")]
+        entries: Vec<u64>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1020,6 +1064,12 @@ pub enum Response {
         page: crate::linkage::LinkagePage,
     },
     MemorySearch(crate::search::MemorySearchPage),
+    /// An examined, ordered prefix of the request's entries.
+    Listing {
+        binding: ListingBinding,
+        #[serde(deserialize_with = "crate::bounded::vec::<_, _, { MAX_LISTING_FUNCTIONS }>")]
+        outcomes: Vec<ListingOutcome>,
+    },
     Error {
         message: String,
     },
