@@ -767,6 +767,16 @@ pub struct BinaryInfo {
     pub warnings: Vec<String>,
 }
 
+/// Legacy Mach-O section membership computed only by the parsing worker.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MachoLegacySections {
+    /// Strictly increasing indices into the fresh section list avoid duplicating it.
+    #[serde(deserialize_with = "crate::bounded::vec::<_, _, { MAX_SECTIONS }>")]
+    pub indices: Vec<usize>,
+    pub entry: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Instruction {
     pub address: u64,
@@ -1000,6 +1010,8 @@ pub struct SignatureStatus {
 pub enum Response {
     Opened {
         info: BinaryInfo,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        macho_legacy: Option<MachoLegacySections>,
         /// Absent from workers that derive no symbol-name table.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         symbols: Option<SymbolNameSummary>,

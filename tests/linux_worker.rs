@@ -1106,6 +1106,7 @@ fn open_with_names(
     let Response::Opened {
         info,
         symbols: Some(summary),
+        ..
     } = response
     else {
         panic!(
@@ -1384,6 +1385,31 @@ fn plt_stubs_link_to_their_imports_in_classic_and_ibt_layouts() {
             .find(|section| (section.address()..section.address() + section.size()).contains(&stub))
             .unwrap();
         assert_eq!(section.name().unwrap(), plt, "{name}");
+        let Response::Graph { view } = request(&mut worker, Request::Graph { address: stub })
+        else {
+            panic!("Graph for {name} PLT stub");
+        };
+        let protection = ghidra_rust::session::BinaryProtection::open(&binary)
+            .unwrap()
+            .bind_snapshot(&info)
+            .unwrap();
+        let project = ProjectData {
+            session: Session::new(info.sha256.clone()),
+            info,
+            view: Some(view),
+            semantics: Default::default(),
+            decompiled: None,
+            mappings: vec![],
+            strings: vec![],
+            strings_truncated: false,
+            crypto: vec![],
+            crypto_truncated: false,
+            selected_address: Some(stub),
+            discovery: None,
+        };
+        let path = directory.path().join(format!("{name}.grproj"));
+        project.save(&path, &protection, true).unwrap();
+        assert!(ProjectData::load(&path).unwrap().cache_compatible);
     }
 }
 

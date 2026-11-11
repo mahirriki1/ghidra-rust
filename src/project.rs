@@ -24,7 +24,8 @@ use std::time::{Duration, Instant};
 const APPLICATION_ID: i64 = 0x4752504a; // GRPJ
 /// Version 4 adds signatures and their cache context; versions 1–3 still open.
 const VERSION: i64 = 4;
-pub const ENGINE_FINGERPRINT: &str = "ghidra-rust-project-v3-semantic-v1-mapping-v1-pe-v1-aarch64-v1-calls-v1-arm64pe-v1-inventory-v2-elfcrt-v1-switch-v1-noreturn-v1:268c3a406d8d964bc00ae2ead4d3e1e1373aaa27";
+const LEGACY_ENGINE_FINGERPRINT: &str = "ghidra-rust-project-v3-semantic-v1-mapping-v1-pe-v1-aarch64-v1-calls-v1-arm64pe-v1-inventory-v2-elfcrt-v1-switch-v1-noreturn-v1:268c3a406d8d964bc00ae2ead4d3e1e1373aaa27";
+pub const ENGINE_FINGERPRINT: &str = "ghidra-rust-project-v3-semantic-v1-mapping-v1-pe-v1-aarch64-v1-calls-v1-arm64pe-v1-inventory-v2-elfcrt-v1-switch-v1-noreturn-v1-macho-sections-v1:268c3a406d8d964bc00ae2ead4d3e1e1373aaa27";
 const MAX_BINARY: usize = 128 * 1024 * 1024;
 const MAX_BODY: usize = 48 * 1024 * 1024;
 const MAX_PROJECT: u64 = 224 * 1024 * 1024;
@@ -91,6 +92,73 @@ pub struct LoadedProject {
     /// Display-only. An external input must be explicitly selected by the user.
     pub source_hint: String,
     pub cache_compatible: bool,
+}
+
+impl LoadedProject {
+    /// Adopt only validated worker metadata; never parse binary bytes in the desktop.
+    pub fn accept_opened(
+        &mut self,
+        fresh: &BinaryInfo,
+        legacy: Option<&crate::model::MachoLegacySections>,
+    ) -> Result<(), String> {
+        if self.data.validate_against(fresh).is_ok() {
+            return Ok(());
+        }
+        let legacy = legacy
+            .filter(|_| fresh.format == "Mach-O" && self.data.info.format == "Mach-O")
+            .ok_or("Project metadata does not match the freshly analyzed binary")?;
+        validate_macho_legacy(fresh, legacy)?;
+        let mut old = fresh.clone();
+        old.sections = legacy
+            .indices
+            .iter()
+            .map(|&index| fresh.sections[index].clone())
+            .collect();
+        old.entry = legacy.entry;
+        self.data.validate_against(&old)?;
+        self.data.info.sections = fresh.sections.clone();
+        self.data.info.entry = fresh.entry;
+        self.data.view = None;
+        self.data.decompiled = None;
+        self.data.mappings.clear();
+        self.data.semantics = Default::default();
+        self.data.discovery = None;
+        self.data.strings.clear();
+        self.data.strings_truncated = false;
+        self.data.crypto.clear();
+        self.data.crypto_truncated = false;
+        self.cache_compatible = false;
+        self.data.validate_against(fresh)
+    }
+}
+
+/// Exact ordered subsequence: every old section is unchanged, and only
+/// worker-identified executable sections may have been added.
+pub(crate) fn validate_macho_legacy(
+    fresh: &BinaryInfo,
+    legacy: &crate::model::MachoLegacySections,
+) -> Result<(), String> {
+    if fresh.format != "Mach-O"
+        || legacy.indices.len() > fresh.sections.len()
+        || legacy.indices.windows(2).any(|pair| pair[0] >= pair[1])
+        || legacy
+            .indices
+            .last()
+            .is_some_and(|&index| index >= fresh.sections.len())
+    {
+        return Err("Invalid worker Mach-O legacy section inventory".into());
+    }
+    let mut old = legacy.indices.iter().peekable();
+    for (index, section) in fresh.sections.iter().enumerate() {
+        if old.peek().is_some_and(|&&previous| previous == index) {
+            old.next();
+        } else if !section.executable {
+            return Err(
+                "Mach-O Opened migration requires exact executable section additions".into(),
+            );
+        }
+    }
+    Ok(())
 }
 
 impl ProjectData {
@@ -304,7 +372,8 @@ impl ProjectData {
         } else {
             crate::signatures::state_digest(&session.signatures)
         };
-        let engine_compatible = body.engine == ENGINE_FINGERPRINT;
+        let engine_compatible = body.engine == ENGINE_FINGERPRINT
+            || body.info.format != "Mach-O" && body.engine == LEGACY_ENGINE_FINGERPRINT;
         let compatible =
             version >= 4
                 && engine_compatible
@@ -337,6 +406,8 @@ impl ProjectData {
         if !engine_compatible {
             data.strings.clear();
             data.crypto.clear();
+            data.strings_truncated = false;
+            data.crypto_truncated = false;
         }
         data.validate()?;
         // A different engine or discovery format discards only saved discovery.
@@ -408,12 +479,11 @@ impl ProjectData {
         // Legacy projects allowed 4 KiB names and no aggregate name budget.
         let ranges = validate_info(&self.info, 4096, false)?;
         self.session.validate_ranges_with(&ranges)?;
-        let executable = crate::selection::ExecutableRanges::new(&self.info.sections)?;
         if self
             .session
             .local_renames
             .iter()
-            .any(|r| !executable.contains(r.identity.function))
+            .any(|r| !crate::call_analysis::code_address(&self.info, r.identity.function))
         {
             return Err("Local rename function is not executable file-backed code".into());
         }
@@ -421,7 +491,7 @@ impl ProjectData {
             .session
             .signatures
             .iter()
-            .any(|s| !executable.contains(s.function))
+            .any(|s| !crate::call_analysis::code_address(&self.info, s.function))
         {
             return Err("Signature function is not executable file-backed code".into());
         }
@@ -707,7 +777,7 @@ pub(crate) fn validate_info(
     let ranges = MappedRanges::new(&info.sections)?;
     validate_functions(&info.functions, max_name_bytes, name_budget)?;
     for function in &info.functions {
-        mapped(&ranges, function.address)?;
+        require_code_address(info, function.address)?;
     }
     Ok(ranges)
 }
@@ -779,7 +849,8 @@ pub(crate) fn validate_view(
         .map(|b| b.instructions.len())
         .fold(0usize, usize::saturating_add);
     bounded(count, MAX_GRAPH_INSTRUCTIONS, "Instruction count")?;
-    mapped(ranges, view.address)?;
+    require_code_address(info, view.address)?;
+    let executable = crate::selection::ExecutableRanges::new(&info.sections)?;
     for warning in &view.warnings {
         bounded(warning.len(), 4096, "Graph warning text")?;
     }
@@ -789,7 +860,7 @@ pub(crate) fn validate_view(
         if !blocks.insert(block.address) {
             return Err("Graph has duplicate basic blocks".into());
         }
-        mapped(ranges, block.address)?;
+        require_code_address(info, block.address)?;
         if block
             .instructions
             .first()
@@ -809,6 +880,10 @@ pub(crate) fn validate_view(
             bounded(instruction.mnemonic.len(), 128, "Instruction mnemonic")?;
             bounded(instruction.operands.len(), 4096, "Instruction operands")?;
             mapped_range(ranges, instruction.address, instruction.bytes.len())?;
+            require_code_address(info, instruction.address)?;
+            if !executable.contains_span(instruction.address, instruction.bytes.len() as u64) {
+                return Err("Code instruction span is not executable file-backed bytes".into());
+            }
         }
     }
     if view.calls.iter().any(|call| call.no_return.is_some()) {
@@ -885,6 +960,16 @@ pub(crate) fn validate_view(
         }
     }
     Ok(())
+}
+
+fn require_code_address(info: &BinaryInfo, address: u64) -> Result<(), String> {
+    if crate::call_analysis::code_address(info, address) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Code entry {address:#x} is not aligned executable file-backed code (unmapped or non-code)"
+        ))
+    }
 }
 
 fn mapped_range(ranges: &MappedRanges, address: u64, length: usize) -> Result<(), String> {
@@ -2065,10 +2150,189 @@ mod tests {
     }
 
     #[test]
+    fn aarch64_instruction_and_annotation_keys_require_alignment() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut data, _) = sample(directory.path());
+        data.info.architecture = "AArch64".into();
+        data.decompiled = None;
+        data.mappings.clear();
+        data.view.as_mut().unwrap().blocks = vec![crate::model::BasicBlock {
+            address: 0x1000,
+            instructions: [0x1000, 0x1002]
+                .into_iter()
+                .map(|address| crate::model::Instruction {
+                    address,
+                    bytes: vec![0; 4],
+                    mnemonic: "nop".into(),
+                    operands: String::new(),
+                })
+                .collect(),
+        }];
+        assert!(data.validate().unwrap_err().contains("Code entry 0x1002"));
+        data.view.as_mut().unwrap().blocks[0].instructions[1].address = 0x1004;
+        data.validate().unwrap();
+        data.session.signatures = vec![signature(0x1002)];
+        data.session.upgrade_version();
+        assert!(data.validate().unwrap_err().contains("Signature function"));
+        assert!(
+            data.session
+                .validate_ranges(&data.info.sections, "AArch64")
+                .is_err()
+        );
+        data.session.signatures[0].function = 0x1004;
+        data.validate().unwrap();
+        data.session
+            .validate_ranges(&data.info.sections, "AArch64")
+            .unwrap();
+        data.session.local_renames.push(
+            serde_json::from_value(serde_json::json!({
+            "identity": {"function": 0x1002, "engine": crate::semantic::LOCAL_FINGERPRINT,
+                "storage": "stack", "offset": 0, "size": 4, "verification": "a".repeat(64)},
+            "name": "saved_local" }))
+            .unwrap(),
+        );
+        data.session.upgrade_version();
+        assert!(
+            data.validate()
+                .unwrap_err()
+                .contains("Local rename function")
+        );
+        assert!(
+            data.session
+                .validate_ranges(&data.info.sections, "AArch64")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn macho_legacy_reply_rejects_reordered_out_of_bounds_or_noncode_additions() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut data, _) = sample(directory.path());
+        data.info.format = "Mach-O".into();
+        let legacy = crate::model::MachoLegacySections {
+            indices: vec![0],
+            entry: data.info.entry,
+        };
+        let mut stub = data.info.sections[0].clone();
+        stub.name = "__stubs".into();
+        stub.address = 0x2000;
+        data.info.sections.push(stub);
+        validate_macho_legacy(&data.info, &legacy).unwrap();
+        data.info.sections[1].executable = false;
+        assert!(
+            validate_macho_legacy(&data.info, &legacy)
+                .unwrap_err()
+                .contains("exact executable section additions")
+        );
+        for indices in [vec![1, 0], vec![0, 0], vec![0, 2], vec![usize::MAX]] {
+            assert!(
+                validate_macho_legacy(
+                    &data.info,
+                    &crate::model::MachoLegacySections {
+                        indices,
+                        entry: data.info.entry
+                    }
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_engine_exception_is_pinned_to_the_reviewed_macho_only_bump() {
+        // A later engine bump MUST revisit/remove this narrowly scoped exception.
+        assert_eq!(
+            ENGINE_FINGERPRINT,
+            "ghidra-rust-project-v3-semantic-v1-mapping-v1-pe-v1-aarch64-v1-calls-v1-arm64pe-v1-inventory-v2-elfcrt-v1-switch-v1-noreturn-v1-macho-sections-v1:268c3a406d8d964bc00ae2ead4d3e1e1373aaa27"
+        );
+        assert_eq!(
+            ENGINE_FINGERPRINT.replace("-macho-sections-v1", ""),
+            LEGACY_ENGINE_FINGERPRINT
+        );
+    }
+
+    #[test]
+    fn previous_engine_fingerprint_keeps_elf_and_pe_caches() {
+        let directory = tempfile::tempdir().unwrap();
+        for format in ["ELF", "PE"] {
+            let (mut data, protection) = sample(directory.path());
+            data.info.format = format.into();
+            let path = directory.path().join("previous.grproj");
+            data.save(&path, &protection, true).unwrap();
+            let db = Connection::open(&path).unwrap();
+            rewrite_json(&db, "body", |body| {
+                body["engine"] = LEGACY_ENGINE_FINGERPRINT.into()
+            });
+            drop(db);
+            let loaded = ProjectData::load(&path).unwrap();
+            assert!(loaded.cache_compatible);
+            assert!(loaded.data.view.is_some() && loaded.data.decompiled.is_some());
+        }
+    }
+
+    #[test]
+    fn compatible_project_rejects_non_code_inventory_and_graph_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut data, protection) = sample(directory.path());
+        data.info.sections[0].size = 32;
+        data.info.sections.push(SectionInfo {
+            name: ".data".into(),
+            address: 0x2000,
+            size: 14,
+            file_offset: 0,
+            file_size: 14,
+            executable: false,
+        });
+        data.decompiled = None;
+        data.mappings.clear();
+        let path = directory.path().join("forged.grproj");
+        for address in [0x100e, 0x2000] {
+            for kind in ["function", "view", "block", "instruction", "span"] {
+                data.save(&path, &protection, true).unwrap();
+                let db = Connection::open(&path).unwrap();
+                rewrite_json(&db, "body", |body| match kind {
+                    "function" => body["info"]["functions"][0]["address"] = address.into(),
+                    "view" => body["view"]["address"] = address.into(),
+                    _ => {
+                        let (block, instruction, length) = match kind {
+                            "block" => (address, address, 1),
+                            "instruction" => (0x1000, 0x1000, 1),
+                            _ => (0x100c, 0x100c, 4),
+                        };
+                        body["view"]["blocks"] = serde_json::json!([{
+                            "address": block, "instructions": [{ "address": instruction,
+                                "bytes": vec![0; length], "mnemonic": "nop", "operands": "" }]
+                        }]);
+                        if kind == "instruction" {
+                            body["view"]["blocks"][0]["instructions"]
+                                .as_array_mut()
+                                .unwrap()
+                                .push(serde_json::json!({"address": address, "bytes": [0],
+                                    "mnemonic": "nop", "operands": ""}));
+                        }
+                    }
+                });
+                drop(db);
+                let error = ProjectData::load(&path).unwrap_err();
+                assert!(
+                    error.contains(if kind == "span" {
+                        "Code instruction span"
+                    } else {
+                        "Code entry"
+                    }),
+                    "{kind}: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn graph_budget_is_aggregate() {
         let directory = tempfile::tempdir().unwrap();
         let (mut data, _protection) = sample(directory.path());
-        data.info.sections[0].size = 0x4000;
+        data.info.sections[0].size = (MAX_GRAPH_INSTRUCTIONS as u64 + 4) * 2;
+        data.info.sections[0].file_size = data.info.sections[0].size;
+        data.info.file_len = data.info.sections[0].size;
         let ranges = MappedRanges::new(&data.info.sections).unwrap();
         let view = |sizes: &[usize]| {
             let mut address = 0x1000;

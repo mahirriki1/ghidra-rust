@@ -145,7 +145,7 @@ fn reply_nodes(kind: &str) -> Option<usize> {
         + 5 * MAX_GRAPH_CALLS
         + MAX_WARNINGS;
     let nodes = match kind {
-        "opened" => FUNCTION * MAX_FUNCTIONS + SECTION * MAX_SECTIONS + MAX_WARNINGS + 8,
+        "opened" => FUNCTION * MAX_FUNCTIONS + (SECTION + 1) * MAX_SECTIONS + MAX_WARNINGS + 12,
         "functions" | "discovery_batch" => {
             FUNCTION * MAX_FUNCTIONS
                 + CALL * MAX_CALL_REFERENCES

@@ -88,11 +88,17 @@ fingerprints, correctness tests, and upstream attribution in `NOTICE`.
   Keep byte/count/depth budgets and checked address arithmetic. Consult the
   constants in `model.rs`, `analysis/`, `project.rs`, and `session.rs` rather
   than duplicating limits that can drift.
-- Validate mapping bounds, UTF-8 boundaries, ordering, address counts, and
-  executable file-backed membership before displaying them. Avoid multiplying
+- Validate mapping bounds, UTF-8 boundaries, ordering, and address counts.
+  Admit function/view/block/instruction starts and signature/local-rename function
+  keys only as ABI-aligned executable file-backed code;
+  require every complete instruction span to stay in executable file-backed bytes
+  in worker Graph/Listing replies, inventories, discovery and project caches.
+  Imports/exports may describe data and are not automatically code entries. Avoid multiplying
   independent collection limits; use indexed interval lookups for repeated PCs.
 - Preserve immutable analyzed snapshots and retained opened-file identity.
   Never write to an input binary, including through renamed paths or aliases.
+- Verify the retained binary snapshot independently before exporting annotations,
+  off the GUI thread, just as for project saves.
 - Save complete new files with destination checks before creation and immediately
   before atomic publication. Carry every protected-file guard through the save.
 - Keep `.grproj` versioning, exact schema checks, bounded deserialization,
@@ -101,6 +107,8 @@ fingerprints, correctness tests, and upstream attribution in `NOTICE`.
 - A matching binary hash does not authenticate cached analysis. Keep saved-result
   provenance visible until each result class is recomputed. Preserve JSON
   annotation compatibility; treat format changes as migrations, not silent edits.
+- Keep binary parsing, including legacy Mach-O section classification, in the
+  worker. Project migrations in the desktop compare bounded worker metadata only.
 - Retain extracted-image ownership through worker termination and reaping.
   Preserve Linux bubblewrap isolation and resource limits. Windows jobs/watchdogs
   limit resources but provide no filesystem/network sandbox; do not describe

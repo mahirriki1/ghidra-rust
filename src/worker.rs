@@ -72,8 +72,13 @@ fn protocol(
                     let program = LoadedProgram::open(&path)?;
                     let info = program.info.clone();
                     let symbols = Some(program.symbol_names().clone());
+                    let macho_legacy = program.macho_legacy.clone();
                     loaded = Some(program);
-                    Ok(Response::Opened { info, symbols })
+                    Ok(Response::Opened {
+                        info,
+                        symbols,
+                        macho_legacy,
+                    })
                 }
                 request => loaded
                     .as_mut()
@@ -278,6 +283,10 @@ mod tests {
             executable: true,
         };
         assert!(reply(Response::Opened {
+            macho_legacy: Some(crate::model::MachoLegacySections {
+                indices: (0..crate::model::MAX_SECTIONS).collect(),
+                entry: u64::MAX,
+            }),
             info: BinaryInfo {
                 path: "\u{1}".repeat(32 * 1024),
                 architecture: "AArch64".into(),

@@ -122,7 +122,7 @@ impl BinaryProtection {
         let bytes = self.read_snapshot()?;
         if format!("{:x}", Sha256::digest(&bytes)) != expected {
             return Err(
-                "Input binary changed after analysis; reopen it before saving a project".into(),
+                "Input binary changed after analysis; reopen it before saving a project or annotations".into(),
             );
         }
         Ok(bytes)
@@ -312,21 +312,25 @@ impl Session {
     /// Validate decoded source spans against the current immutable image's
     /// mapped regions. Like virtual byte reads, spans may cross contiguous
     /// sections and include mapped zero-filled tails, but never unmapped gaps.
-    pub fn validate_ranges(&self, sections: &[SectionInfo]) -> Result<(), String> {
+    pub fn validate_ranges(
+        &self,
+        sections: &[SectionInfo],
+        architecture: &str,
+    ) -> Result<(), String> {
         self.validate_ranges_with(&crate::selection::MappedRanges::new(sections)?)?;
-        let executable = crate::selection::ExecutableRanges::new(sections)?;
-        if self
-            .local_renames
-            .iter()
-            .any(|r| !executable.contains(r.identity.function))
-        {
+
+        if self.local_renames.iter().any(|r| {
+            !crate::call_analysis::code_address_in_sections(
+                sections,
+                architecture,
+                r.identity.function,
+            )
+        }) {
             return Err("Local rename function is not executable file-backed code".into());
         }
-        if self
-            .signatures
-            .iter()
-            .any(|s| !executable.contains(s.function))
-        {
+        if self.signatures.iter().any(|s| {
+            !crate::call_analysis::code_address_in_sections(sections, architecture, s.function)
+        }) {
             return Err("Signature function is not executable file-backed code".into());
         }
         Ok(())
@@ -394,6 +398,7 @@ impl Session {
         if protection.snapshot_sha256.as_deref() != Some(self.binary_sha256.as_str()) {
             return Err("Session is not bound to the protected binary snapshot".into());
         }
+        protection.verify_current_snapshot()?;
         // Cap output while serializing, before allocating an unbounded JSON copy.
         // In particular, JSON escaping can expand otherwise valid field contents.
         let mut output = CappedOutput(Vec::new());
@@ -785,6 +790,10 @@ pub fn fingerprint(path: &Path) -> Result<String, String> {
 mod tests {
     use super::*;
 
+    fn fixture_hash() -> String {
+        format!("{:x}", Sha256::digest(b"\x7fELFexample program"))
+    }
+
     fn signature(function: u64) -> crate::signatures::FunctionSignature {
         use crate::signatures::{
             FunctionSignature, SignatureBase, SignatureParameter, SignatureType,
@@ -819,10 +828,39 @@ mod tests {
     }
 
     #[test]
+    fn annotation_export_verifies_retained_bytes_before_writing() {
+        let directory = TestDirectory::new();
+        let binary = directory.binary();
+        let path = directory.path("annotations.json");
+        let forged = "b".repeat(64);
+        let protection = protect(&binary, &forged);
+        assert!(
+            Session::new(forged)
+                .save(&path, &protection)
+                .unwrap_err()
+                .contains("Input binary changed")
+        );
+        assert!(!path.exists());
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
+        let hash = fingerprint(&binary).unwrap();
+        let protection = protect(&binary, &hash);
+        Session::new(hash.clone()).save(&path, &protection).unwrap();
+        Session::load(&path, &hash).unwrap();
+        let saved = fs::read(&path).unwrap();
+        let forged = "b".repeat(64);
+        assert!(
+            Session::new(forged.clone())
+                .save(&path, &protect(&binary, &forged))
+                .is_err()
+        );
+        assert_eq!(fs::read(&path).unwrap(), saved);
+    }
+
+    #[test]
     fn signatures_round_trip_and_versions_preserve_pending_annotations() {
         let directory = TestDirectory::new();
         let path = directory.path("signatures.json");
-        let hash = "a".repeat(64);
+        let hash = fixture_hash();
         let mut session = Session::new(hash.clone());
         assert_eq!(session.needed_version(), 1);
         session
@@ -861,7 +899,7 @@ mod tests {
     fn signatures_and_context_local_identities_cannot_use_legacy_versions() {
         let directory = TestDirectory::new();
         let path = directory.path("misversioned.json");
-        let hash = "a".repeat(64);
+        let hash = fixture_hash();
         for version in [1, 2] {
             let mut session = Session::new(hash.clone());
             session.version = version;
@@ -883,7 +921,7 @@ mod tests {
 
     #[test]
     fn signature_json_bounds_apply_before_accepting_a_session() {
-        let mut session = Session::new("a".repeat(64));
+        let mut session = Session::new(fixture_hash());
         session.version = 3;
         session.signatures = (0..=crate::signatures::MAX_SIGNATURES)
             .map(|i| signature(0x1000 + i as u64))
@@ -914,7 +952,7 @@ mod tests {
 
     #[test]
     fn signatures_require_exact_executable_file_backed_addresses() {
-        let mut session = Session::new("a".repeat(64));
+        let mut session = Session::new(fixture_hash());
         session.version = 3;
         session.signatures.push(signature(0x1000));
         let sections = vec![SectionInfo {
@@ -925,17 +963,20 @@ mod tests {
             file_size: 8,
             executable: true,
         }];
-        session.validate_ranges(&sections).unwrap();
+        session.validate_ranges(&sections, "x86-64").unwrap();
         session.signatures[0].function = 0x1007;
-        session.validate_ranges(&sections).unwrap();
+        session.validate_ranges(&sections, "x86-64").unwrap();
         for function in [0xfff, 0x1008, 0x1010, u64::MAX] {
             session.signatures[0].function = function;
-            assert!(session.validate_ranges(&sections).is_err(), "{function:#x}");
+            assert!(
+                session.validate_ranges(&sections, "x86-64").is_err(),
+                "{function:#x}"
+            );
         }
         session.signatures[0].function = 0x1000;
         let mut sections = sections;
         sections[0].executable = false;
-        assert!(session.validate_ranges(&sections).is_err());
+        assert!(session.validate_ranges(&sections, "x86-64").is_err());
     }
 
     #[test]
@@ -974,7 +1015,7 @@ mod tests {
             self.0.join(name)
         }
         fn protection(&self) -> BinaryProtection {
-            protect(&self.binary(), &"a".repeat(64))
+            protect(&self.binary(), &fixture_hash())
         }
         fn binary(&self) -> PathBuf {
             let path = self.path("program.bin");
@@ -1113,7 +1154,7 @@ mod tests {
         const CHILD_PATH: &str = "GHIDRA_RUST_SESSION_FIFO_TEST";
         if let Some(path) = std::env::var_os(CHILD_PATH) {
             assert!(
-                Session::load(Path::new(&path), &"a".repeat(64))
+                Session::load(Path::new(&path), &fixture_hash())
                     .unwrap_err()
                     .contains("regular file")
             );
@@ -1161,13 +1202,13 @@ mod tests {
         let directory = TestDirectory::new();
         let sidecar = directory.path("annotations.json");
         let link = directory.path("link.json");
-        Session::new("a".repeat(64))
+        Session::new(fixture_hash())
             .save(&sidecar, &directory.protection())
             .unwrap();
         symlink(&sidecar, &link).unwrap();
         for path in [&directory.0, &link, Path::new("/dev/null")] {
             assert!(
-                Session::load(path, &"a".repeat(64))
+                Session::load(path, &fixture_hash())
                     .unwrap_err()
                     .contains("regular file")
             );
@@ -1178,7 +1219,7 @@ mod tests {
     fn session_collection_limits_reject_before_parsing_excess_values() {
         let directory = TestDirectory::new();
         let path = directory.path("over-limit.json");
-        let hash = "a".repeat(64);
+        let hash = fixture_hash();
         let annotation = serde_json::to_string(&Annotation::default()).unwrap();
         for duplicate_keys in [false, true] {
             let mut json = format!(r#"{{"version":1,"binary_sha256":"{hash}","annotations":{{"#);
@@ -1226,7 +1267,7 @@ mod tests {
         // Sections are intentionally out of order; neither iteration order nor
         // file-backed lengths determine virtual address coverage.
         let sections = [section(0x1008, 8, 0), section(0x1000, 8, 4)];
-        let mut session = populated_session("a".repeat(64));
+        let mut session = populated_session(fixture_hash());
         let set_range = |session: &mut Session, address, length| {
             let decoded = &mut session.annotations.get_mut(&0x401000).unwrap().decoded[0];
             decoded.source_address = address;
@@ -1234,7 +1275,7 @@ mod tests {
         };
         for (address, length) in [(0x1000, 16), (0x1002, 12), (0x100f, 1)] {
             set_range(&mut session, address, length);
-            session.validate_ranges(&sections).unwrap();
+            session.validate_ranges(&sections, "x86-64").unwrap();
         }
         for (address, length, error) in [
             (0x0fff, 1, "unmapped"),
@@ -1246,7 +1287,7 @@ mod tests {
             set_range(&mut session, address, length);
             assert!(
                 session
-                    .validate_ranges(&sections)
+                    .validate_ranges(&sections, "x86-64")
                     .unwrap_err()
                     .contains(error)
             );
@@ -1255,18 +1296,20 @@ mod tests {
         let gap = [section(0x1000, 8, 8), section(0x1009, 8, 8)];
         assert!(
             session
-                .validate_ranges(&gap)
+                .validate_ranges(&gap, "x86-64")
                 .unwrap_err()
                 .contains("unmapped")
         );
         set_range(&mut session, u64::MAX - 1, 1);
         assert!(
             session
-                .validate_ranges(&[section(u64::MAX - 2, 8, 0)])
+                .validate_ranges(&[section(u64::MAX - 2, 8, 0)], "x86-64")
                 .unwrap_err()
                 .contains("section range overflows")
         );
-        Session::new("a".repeat(64)).validate_ranges(&[]).unwrap();
+        Session::new(fixture_hash())
+            .validate_ranges(&[], "x86-64")
+            .unwrap();
     }
 
     #[test]
@@ -1302,7 +1345,7 @@ mod tests {
     fn rejects_mismatched_binary_malformed_json_and_schema() {
         let directory = TestDirectory::new();
         let path = directory.path("session.json");
-        let hash = "a".repeat(64);
+        let hash = fixture_hash();
         Session::new(hash.clone())
             .save(&path, &directory.protection())
             .unwrap();
@@ -1343,7 +1386,7 @@ mod tests {
         // fixture's writable handle so this reaches the size-limit check.
         drop(file);
         assert!(
-            Session::load(&path, &"a".repeat(64))
+            Session::load(&path, &fixture_hash())
                 .unwrap_err()
                 .contains("size limit")
         );
@@ -1366,7 +1409,7 @@ mod tests {
     fn replaces_complete_session_and_preserves_destination_on_validation_error() {
         let directory = TestDirectory::new();
         let path = directory.path("session.json");
-        let hash = "a".repeat(64);
+        let hash = fixture_hash();
         Session::new(hash.clone())
             .save(&path, &directory.protection())
             .unwrap();
@@ -1390,7 +1433,7 @@ mod tests {
         fs::create_dir(&destination).unwrap();
         fs::write(destination.join("keep"), b"untouched").unwrap();
         assert!(
-            Session::new("a".repeat(64))
+            Session::new(fixture_hash())
                 .save(&destination, &directory.protection())
                 .is_err()
         );
@@ -1402,7 +1445,7 @@ mod tests {
     fn refuses_oversized_serialization_and_overflowing_decoded_ranges() {
         let directory = TestDirectory::new();
         let path = directory.path("session.json");
-        let mut session = populated_session("a".repeat(64));
+        let mut session = populated_session(fixture_hash());
         session.annotations.get_mut(&0x401000).unwrap().comment =
             "x".repeat(MAX_SESSION_BYTES as usize);
         assert!(
@@ -1503,7 +1546,7 @@ mod tests {
     fn loaded_sessions_reject_excessive_counts_and_fields() {
         let directory = TestDirectory::new();
         let path = directory.path("malicious.json");
-        let hash = "a".repeat(64);
+        let hash = fixture_hash();
         let check = |session: &Session, expected: &str| {
             let bytes = serde_json::to_vec(session).unwrap();
             assert!(bytes.len() < MAX_SESSION_BYTES as usize);

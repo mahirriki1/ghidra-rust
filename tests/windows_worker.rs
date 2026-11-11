@@ -501,6 +501,7 @@ fn open_names(
     let Response::Opened {
         info,
         symbols: Some(summary),
+        ..
     } = response
     else {
         panic!(

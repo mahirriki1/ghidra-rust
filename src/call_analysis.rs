@@ -51,15 +51,22 @@ impl CallAnalysis {
 /// An aligned instruction start inside a file-backed executable section, using
 /// indexed checked lookups. Discovery seed admission uses the same rule.
 pub fn code_address(info: &BinaryInfo, address: u64) -> bool {
-    let Some((_, alignment)) = crate::architecture::properties(&info.architecture) else {
+    code_address_in_sections(&info.sections, &info.architecture, address)
+}
+
+pub(crate) fn code_address_in_sections(
+    sections: &[crate::model::SectionInfo],
+    architecture: &str,
+    address: u64,
+) -> bool {
+    let Some((_, alignment)) = crate::architecture::properties(architecture) else {
         return false;
     };
     address.is_multiple_of(alignment)
-        && info
-            .sections
+        && sections
             .partition_point(|section| section.address <= address)
             .checked_sub(1)
-            .and_then(|index| info.sections.get(index))
+            .and_then(|index| sections.get(index))
             .is_some_and(|section| section.executable && section.backs(address, alignment))
 }
 
