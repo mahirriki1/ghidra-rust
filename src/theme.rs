@@ -39,6 +39,8 @@ pub const ROW_HEIGHT: f32 = 20.0;
 pub const LISTING_BYTES: usize = 8;
 const ADDRESS: Color32 = MUTED;
 const BYTES: Color32 = Color32::from_rgb(92, 99, 112);
+/// A byte whose page could not be read: a muted error tone.
+pub const BYTES_FAILED: Color32 = Color32::from_rgb(150, 86, 92);
 const MNEMONIC: Color32 = SYNTAX_KEYWORD;
 const HOVER: Color32 = Color32::from_rgb(44, 46, 51);
 const INPUT: Color32 = Color32::from_rgb(18, 19, 21);
@@ -1353,6 +1355,9 @@ pub enum ListingMark<'a> {
     ZeroFill { length: u64 },
     /// A function body that has not loaded yet.
     Pending,
+    /// One undefined byte of an expanded gap; `None` until its page loads,
+    /// or for good when its page `failed`.
+    Byte { value: Option<u8>, failed: bool },
 }
 
 /// Paint a [`ListingMark`] row aligned with [`listing_cells`], as the
@@ -1426,7 +1431,86 @@ pub fn listing_mark(
                 | paint_listing_cell(ui, rect, columns.address, mono(text, BYTES))
                 | paint_listing_cell(ui, rect, columns.mnemonic, mono("…".into(), BYTES))
         }
+        ListingMark::Byte { value, failed } => {
+            let (text, shortened) = listing_address(ui, columns, address, digits);
+            let mut elided =
+                shortened | paint_listing_cell(ui, rect, columns.address, mono(text, ADDRESS));
+            let unknown = if failed && value.is_none() {
+                BYTES_FAILED
+            } else {
+                MUTED
+            };
+            elided |= paint_listing_cell(ui, rect, columns.mnemonic, mono("??".into(), unknown));
+            if let Some(value) = value {
+                if let Some(range) = columns.bytes {
+                    elided |=
+                        paint_listing_cell(ui, rect, range, mono(listing_bytes(&[value]), BYTES));
+                }
+                let mut operands = mono(format!("{value:02x}h"), TEXT);
+                if value.is_ascii_graphic() || value == b' ' {
+                    operands.append(
+                        &format!("  '{}'", char::from(value)),
+                        0.0,
+                        mono_format(MUTED),
+                    );
+                }
+                elided |= paint_listing_cell(ui, rect, columns.operands, operands);
+            }
+            elided
+        }
     }
+}
+
+/// Half the width of the painted disclosure triangle.
+const DISCLOSURE: f32 = 3.5;
+
+/// A painted disclosure triangle in the gap before a Listing row's mnemonic,
+/// pointing right when collapsed and down when `expanded`. Its click area
+/// covers that gap at full row height, above the row's own response, and
+/// returns whether it was clicked. A gap too narrow to paint the triangle
+/// has no click area.
+pub fn listing_disclosure(
+    ui: &mut Ui,
+    id: egui::Id,
+    rect: egui::Rect,
+    columns: &ListingColumns,
+    expanded: bool,
+) -> bool {
+    let before = columns.bytes.unwrap_or(columns.address).max;
+    let area = egui::Rect::from_x_y_ranges(
+        egui::Rangef::new(rect.left() + before, rect.left() + columns.mnemonic.min),
+        rect.y_range(),
+    );
+    // Too narrow to paint: no invisible toggle either.
+    if area.width() < 2.0 * DISCLOSURE {
+        return false;
+    }
+    let response = ui.interact(area, id, egui::Sense::click());
+    if !ui.is_rect_visible(area) {
+        return response.clicked();
+    }
+    let ppp = ui.pixels_per_point();
+    let snap = |x: f32| (x * ppp).round() / ppp;
+    let center = egui::pos2(snap(area.center().x), snap(area.center().y));
+    let (a, b) = (DISCLOSURE, DISCLOSURE * 0.6);
+    let points = if expanded {
+        vec![
+            center + egui::vec2(-a, -b),
+            center + egui::vec2(a, -b),
+            center + egui::vec2(0.0, b + 1.0),
+        ]
+    } else {
+        vec![
+            center + egui::vec2(-b, -a),
+            center + egui::vec2(b + 1.0, 0.0),
+            center + egui::vec2(-b, a),
+        ]
+    };
+    let color = if response.hovered() { TEXT } else { MUTED };
+    ui.painter()
+        .with_clip_rect(rect.intersect(ui.clip_rect()))
+        .add(egui::Shape::convex_polygon(points, color, Stroke::NONE));
+    response.clicked()
 }
 
 /// The Listing's column headings, aligned with `listing_cells` and clipped to

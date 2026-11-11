@@ -1,10 +1,12 @@
 //! The Program-scope Listing cursor. Every Program row is a stop: section
 //! and function headers, instructions, `??` gaps, zero-filled tails and
-//! pending bodies. Up/Down and PageUp/PageDown cross functions and gaps;
-//! Home/End stay within the cursor's function (or, on a header or gap
-//! without one, its section); Ctrl+Home/End reach the program's first and
-//! last rows. `DesktopApp.selected` stays the cursor's address; the row's
-//! rank only tells rows sharing that address apart.
+//! pending bodies, and the byte rows of expanded gaps. Up/Down and
+//! PageUp/PageDown cross functions and gaps; Home/End stay within the
+//! cursor's function, expanded byte run or (on a header or gap without
+//! one) section; Ctrl+Home/End reach the program's first and last rows.
+//! Enter follows an instruction's target, or expands a `??` row and
+//! collapses a byte row's run. `DesktopApp.selected` stays the cursor's
+//! address; the row's rank only tells rows sharing that address apart.
 //!
 //! Once the cursor rests in a function other than the displayed one, the
 //! Decompiler and Function Graph follow it: [`FOLLOW_REST`] after the last
@@ -20,7 +22,6 @@ use eframe::egui;
 use super::listing_cursor::{Command, filter_keys};
 use super::program_listing::Reveal;
 use super::{DesktopApp, Tab};
-use crate::model::Request;
 use crate::program_listing::{Layout, Position, Rank, Row};
 
 /// Seconds of cursor rest before the displayed function follows it.
@@ -37,9 +38,9 @@ pub(super) struct Follow {
 }
 
 impl DesktopApp {
-    fn program_layout(&self) -> Option<Layout<'_>> {
+    pub(super) fn program_layout(&self) -> Option<Layout<'_>> {
         let rows = self.program.current_rows(self.generation)?;
-        Some(rows.layout(&self.info.as_ref()?.functions))
+        Some(rows.layout(&self.info.as_ref()?.functions, &self.program.expanded))
     }
 
     /// The row the cursor stands on: exactly a row starting at `selected`,
@@ -67,19 +68,25 @@ impl DesktopApp {
         let mut row = layout.and_then(|layout| self.program_cursor(&layout));
         let mut moved = false;
         let mut follow = None;
+        let mut toggle = None;
         let held = context.input_mut(|input| {
             filter_keys(&mut input.events, held, command, true, |action| {
                 let Some(layout) = layout else {
                     return false;
                 };
                 if action == Command::Enter {
-                    follow = match row {
-                        Some(Row::Instruction { owner, start, .. }) => self
-                            .row_follow_target(owner, start)
-                            .map(|target| (owner, target)),
-                        _ => None,
-                    };
-                    return follow.is_some();
+                    match row {
+                        Some(Row::Instruction { owner, start, .. }) => {
+                            follow = self
+                                .row_follow_target(owner, start)
+                                .map(|target| (owner, target));
+                        }
+                        Some(row @ (Row::Undefined { .. } | Row::Byte { .. })) => {
+                            toggle = Some(row);
+                        }
+                        _ => {}
+                    }
+                    return follow.is_some() || toggle.is_some();
                 }
                 if let Some(next) = self.program_step(&layout, row, action, page) {
                     row = Some(next);
@@ -90,6 +97,10 @@ impl DesktopApp {
         });
         if moved && let Some(row) = row {
             self.move_program_cursor(row, context);
+            context.request_repaint();
+        }
+        if let Some(row) = toggle {
+            self.toggle_bytes(row);
             context.request_repaint();
         }
         if let Some((owner, target)) = follow {
@@ -151,10 +162,15 @@ impl DesktopApp {
     }
 
     /// The rows Home and End reach from `row`: its function's first and
-    /// last decoded instructions; a section's first and last rows from a
-    /// section header, gap or zero-filled tail.
+    /// last decoded instructions; an expanded run's first and last bytes
+    /// from a byte row; a section's first and last rows from a section
+    /// header, gap or zero-filled tail.
     fn row_extent(&self, layout: &Layout<'_>, row: Row) -> Option<(Row, Row)> {
         match row {
+            Row::Byte { address } => {
+                let (start, end) = layout.byte_run(address)?;
+                Some((Row::Byte { address: start }, Row::Byte { address: end - 1 }))
+            }
             Row::Function { entry }
             | Row::Pending { entry, .. }
             | Row::Instruction { owner: entry, .. } => self.function_extent(layout, entry),
@@ -192,7 +208,7 @@ impl DesktopApp {
     /// row belongs to a function other than the displayed (or loading) one.
     /// Rows of the displayed function select as a click would; others clear
     /// the pseudocode highlight, which only the displayed mappings provide.
-    fn move_program_cursor(&mut self, row: Row, context: &egui::Context) {
+    pub(super) fn move_program_cursor(&mut self, row: Row, context: &egui::Context) {
         let position = row.position();
         let address = position.address;
         let owner = row.function();
@@ -253,21 +269,9 @@ impl DesktopApp {
     /// unsent function requests are retired by the follow's own navigation.
     fn follow_may_send(&self) -> bool {
         use super::graph_preparation::Continuation;
-        // The requests a navigation queues behind instead of restarting.
-        let behind = |request: &Request| {
-            matches!(
-                request,
-                Request::DiscoverBatch { .. }
-                    | Request::SyncFunctions { .. }
-                    | Request::SymbolNames { .. }
-                    | Request::Linkage { .. }
-                    | Request::SearchMemory { .. }
-                    | Request::Listing { .. }
-            )
-        };
         self.follow_worker()
             && self.opening.is_none()
-            && self.pending.as_ref().is_none_or(|p| behind(&p.request))
+            && self.pending.as_ref().is_none_or(super::queues_behind)
             && !self.graph_preparation.awaits(|continuation| {
                 matches!(
                     continuation,
@@ -341,7 +345,7 @@ mod tests {
     use super::*;
     use crate::model::{
         BasicBlock, FunctionInfo, FunctionView, Instruction, ListingBinding, ListingOutcome,
-        Response, SectionInfo,
+        Request, Response, SectionInfo,
     };
     use crate::theme;
 
@@ -567,6 +571,31 @@ mod tests {
         fn cursor(&self) -> Option<Row> {
             let layout = self.app.program_layout()?;
             self.app.program_cursor(&layout)
+        }
+
+        /// The painted disclosure triangle of the row at `address`.
+        fn disclosure(&mut self, address: u64) -> egui::Pos2 {
+            let row = self.point(address);
+            let output = self.frame(vec![]);
+            output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Text(text)
+                        if text.galley.text() == "??"
+                            && (text.pos.y + text.galley.rect.center().y - row.y).abs() < 2.0 =>
+                    {
+                        Some(egui::pos2(text.pos.x - 4.0, row.y))
+                    }
+                    _ => None,
+                })
+                .expect("the row's mnemonic")
+        }
+
+        fn double_click(&mut self, point: egui::Pos2) {
+            self.frame(fixture::pointer_events(point));
+            self.time -= self.step - 0.1;
+            self.frame(fixture::pointer_events(point));
         }
 
         fn graph_requests(&self) -> usize {
@@ -897,6 +926,23 @@ mod tests {
     }
 
     #[test]
+    fn back_to_an_instruction_of_a_cached_function_opens_its_owner() {
+        let context = egui::Context::default();
+        let mut app = program_app();
+        // `next`'s second instruction, known only from its cached body.
+        let code = crate::linkage_ui::Place::Code;
+        app.history = vec![code(0x1044), code(0x1000)];
+        app.history_index = 1;
+        app.history_jump(0, &context);
+        assert_eq!(
+            app.result_scope,
+            Some(0x1040),
+            "its proved owner, never a function guessed at the address"
+        );
+        assert_eq!(app.selected, Some(0x1044));
+    }
+
+    #[test]
     fn a_cursor_on_no_row_starts_at_the_viewport_edge() {
         let mut h = Harness::new(program_app());
         h.click(0x1000);
@@ -1146,5 +1192,170 @@ mod tests {
             }),
             "back at the instruction, not the section header"
         );
+    }
+
+    #[test]
+    fn enter_toggles_gaps_in_place_without_navigating() {
+        let none = egui::Modifiers::NONE;
+        let mut h = Harness::new(program_app());
+        // Gap rows are clickable cursor stops without an owner to follow.
+        let before = (
+            h.app.selection_generation,
+            h.app.history.clone(),
+            h.app.result_scope,
+        );
+        h.click(0x1010);
+        let gap = Row::Undefined {
+            start: 0x1010,
+            end: 0x1040,
+        };
+        assert_eq!(h.cursor(), Some(gap));
+        assert!(h.app.program.follow.is_none());
+        let y = h.point(0x1010).y;
+        h.tap(egui::Key::Enter, none);
+        assert_eq!(h.cursor(), Some(Row::Byte { address: 0x1010 }));
+        assert_eq!(h.point(0x1010).y, y, "the toggled row stays put");
+        assert_eq!(h.point(0x1011).y, y + theme::ROW_HEIGHT);
+        // Byte rows are stops; Home/End reach the run's first and last bytes.
+        h.tap(egui::Key::ArrowDown, none);
+        assert_eq!(h.cursor(), Some(Row::Byte { address: 0x1011 }));
+        h.tap(egui::Key::End, none);
+        assert_eq!(h.cursor(), Some(Row::Byte { address: 0x103f }));
+        h.tap(egui::Key::ArrowDown, none);
+        assert_eq!(h.cursor(), Some(Row::Function { entry: 0x1040 }));
+        h.tap(egui::Key::ArrowUp, none);
+        h.tap(egui::Key::Home, none);
+        assert_eq!(h.cursor(), Some(Row::Byte { address: 0x1010 }));
+        assert_eq!(h.app.program.expanded.len(), 1);
+        // Collapsing from inside a run scrolled partly above the view: the
+        // collapsed row takes the toggled row's place and gets the cursor.
+        // (`.data`'s bytes keep enough rows below to avoid the end clamp.)
+        h.app.program.expanded.expand(0x1088, 0x1100, None);
+        h.app.program.expanded.expand(0x2000, 0x2040, None);
+        h.app.program.pin = None;
+        h.app.program.top = Some(Position::new(0x10a0, Rank::Body));
+        h.frame(vec![]);
+        h.click(0x10a2);
+        assert_eq!(h.cursor(), Some(Row::Byte { address: 0x10a2 }));
+        let y = h.point(0x10a2).y;
+        h.tap(egui::Key::Enter, none);
+        assert_eq!(
+            h.cursor(),
+            Some(Row::Undefined {
+                start: 0x1088,
+                end: 0x1100
+            })
+        );
+        assert_eq!(h.app.selected, Some(0x1088));
+        assert_eq!(h.point(0x1088).y, y);
+        assert!(h.app.program.expanded.covering(0x10a2).is_none());
+        // Nothing of this navigated, re-selected or recorded history.
+        assert_eq!(
+            (
+                h.app.selection_generation,
+                h.app.history.clone(),
+                h.app.result_scope
+            ),
+            before
+        );
+        assert!(h.app.program.follow.is_none());
+        assert!(h.graph_requests() == 0);
+    }
+
+    #[test]
+    fn a_collapse_joining_the_collapsed_part_before_it_keeps_the_cursor() {
+        let mut h = Harness::new(program_app());
+        // Only the end of the gap is expanded: `??` 0x1010–0x1020, then bytes.
+        h.app.program.expanded.expand(0x1020, 0x1040, None);
+        h.click(0x1025);
+        assert_eq!(h.cursor(), Some(Row::Byte { address: 0x1025 }));
+        let y = h.point(0x1020).y;
+        h.tap(egui::Key::Enter, egui::Modifiers::NONE);
+        let joined = Row::Undefined {
+            start: 0x1010,
+            end: 0x1040,
+        };
+        assert_eq!(h.cursor(), Some(joined), "on the joined row, not lost");
+        assert_eq!(h.app.selected, Some(0x1010));
+        assert_eq!(h.app.program.pin.map(|(at, _)| at), Some(joined.position()));
+        // The joined row is drawn where the run's former `??` part was.
+        assert_eq!(h.point(0x1010).y, y - theme::ROW_HEIGHT);
+    }
+
+    #[test]
+    fn double_click_and_the_disclosure_triangle_toggle_gaps() {
+        let mut h = Harness::new(program_app());
+        h.step = 0.5;
+        let point = h.point(0x1048);
+        h.double_click(point);
+        assert_eq!(h.cursor(), Some(Row::Byte { address: 0x1048 }));
+        assert!(h.app.program.expanded.covering(0x107f).is_some());
+        // A double-click inside the run collapses it; the cursor moves to
+        // its start.
+        let point = h.point(0x104c);
+        h.double_click(point);
+        assert_eq!(
+            h.cursor(),
+            Some(Row::Undefined {
+                start: 0x1048,
+                end: 0x1080
+            })
+        );
+        assert!(h.app.program.expanded.is_empty());
+        // The triangle toggles without moving the cursor.
+        let triangle = h.disclosure(0x1010);
+        h.frame(fixture::pointer_events(triangle));
+        assert!(h.app.program.expanded.covering(0x1010).is_some());
+        assert_eq!(h.app.selected, Some(0x1048));
+        let triangle = h.disclosure(0x1010);
+        h.frame(fixture::pointer_events(triangle));
+        assert!(h.app.program.expanded.is_empty());
+        // Zero-filled tails never expand.
+        let mut app = program_app();
+        let info = app.info.as_mut().unwrap();
+        info.sections[1].file_size = 0x20;
+        let mut h = Harness::new(app);
+        let point = h.point(0x2020);
+        h.double_click(point);
+        assert!(matches!(h.cursor(), Some(Row::ZeroFill { .. })));
+        h.tap(egui::Key::Enter, egui::Modifiers::NONE);
+        assert!(h.app.program.expanded.is_empty());
+    }
+
+    #[test]
+    fn enter_toggles_only_with_the_keys_owned_and_never_repeats() {
+        let none = egui::Modifiers::NONE;
+        // A focused text field owns Enter.
+        let mut h = Harness::new(program_app());
+        h.click(0x1010);
+        h.editor = true;
+        h.frame(vec![]);
+        h.tap(egui::Key::Enter, none);
+        assert!(h.app.program.expanded.is_empty());
+        // A modal dialog leaves Enter to itself.
+        let mut h = Harness::new(program_app());
+        h.click(0x1010);
+        h.app.help_dialog = Some(crate::help::HelpDialog::Shortcuts);
+        h.tap(egui::Key::Enter, none);
+        assert!(h.app.program.expanded.is_empty());
+        assert!(h.left_over(egui::Key::Enter));
+        h.app.help_dialog = None;
+        // A held Enter toggles once.
+        h.frame(vec![press(egui::Key::Enter)]);
+        for _ in 0..3 {
+            h.frame(vec![key(egui::Key::Enter, true, none)]);
+        }
+        h.frame(vec![release(egui::Key::Enter)]);
+        assert_eq!(h.cursor(), Some(Row::Byte { address: 0x1010 }));
+        assert_eq!(h.app.program.expanded.len(), 1);
+        // Headers do not toggle.
+        h.tap(egui::Key::Home, egui::Modifiers::CTRL);
+        h.tap(egui::Key::Enter, none);
+        assert_eq!(h.app.program.expanded.len(), 1);
+        // Without a click on the Listing, the keys are not its own.
+        let mut h = Harness::new(program_app());
+        h.app.select_instruction(0x1010);
+        h.tap(egui::Key::Enter, none);
+        assert!(h.app.program.expanded.is_empty(), "not clicked");
     }
 }

@@ -402,7 +402,14 @@ struct DiscoveryUpdate {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ByteDestination {
     Decode,
-    HexPage { token: u64 },
+    HexPage {
+        token: u64,
+    },
+    /// A page of the Program listing's byte rows, bound to the binary and
+    /// a Program-listing token only.
+    Listing {
+        token: u64,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -422,6 +429,41 @@ struct Pending {
     bytes: Option<ByteBinding>,
     /// Store identity captured when a function request was sent.
     result: Option<ResultBinding>,
+}
+
+/// Whether a user request arriving while `pending` runs queues behind it
+/// instead of restarting the worker: bounded background work, including the
+/// Program listing's bodies and byte pages.
+fn queues_behind(pending: &Pending) -> bool {
+    matches!(
+        pending.request,
+        Request::DiscoverBatch { .. }
+            | Request::SyncFunctions { .. }
+            | Request::SymbolNames { .. }
+            | Request::Linkage { .. }
+            | Request::SearchMemory { .. }
+            | Request::Listing { .. }
+    ) || is_listing_bytes(pending)
+}
+
+/// Whether `pending` reads a page for the Program listing's byte rows.
+fn is_listing_bytes(pending: &Pending) -> bool {
+    matches!(
+        pending.bytes,
+        Some(ByteBinding {
+            destination: ByteDestination::Listing { .. },
+            ..
+        })
+    )
+}
+
+/// The status-bar task of `pending`.
+fn pending_task(pending: &Pending) -> &'static str {
+    if is_listing_bytes(pending) {
+        "Loading listing"
+    } else {
+        request_task(&pending.request)
+    }
 }
 
 struct Opening {
@@ -1523,19 +1565,7 @@ impl DesktopApp {
             self.status = crate::packing::UPX_ANALYSIS_ERROR.into();
             return;
         }
-        if self.discovery_job.is_some()
-            || self.pending.as_ref().is_some_and(|pending| {
-                matches!(
-                    pending.request,
-                    Request::DiscoverBatch { .. }
-                        | Request::SyncFunctions { .. }
-                        | Request::SymbolNames { .. }
-                        | Request::Linkage { .. }
-                        | Request::SearchMemory { .. }
-                        | Request::Listing { .. }
-                )
-            })
-        {
+        if self.discovery_job.is_some() || self.pending.as_ref().is_some_and(queues_behind) {
             // Interactive work runs between bounded batches. Keep only the
             // newest navigation requests, and bound queued user actions.
             if matches!(request, Request::Graph { .. }) {
@@ -1658,6 +1688,9 @@ impl DesktopApp {
         let (Request::Bytes { address, length }, Some(binding)) = (request, origin.bytes) else {
             return false;
         };
+        if let ByteDestination::Listing { token } = binding.destination {
+            return binding.generation == self.generation && token == self.program.token;
+        }
         binding.generation == self.generation
             && binding.intent == self.byte_intent
             && origin.selection == self.selection_generation
@@ -1666,6 +1699,7 @@ impl DesktopApp {
             && match binding.destination {
                 ByteDestination::Decode => true,
                 ByteDestination::HexPage { token } => self.hex.expects(token, *address, *length),
+                ByteDestination::Listing { .. } => false,
             }
     }
 
@@ -1683,6 +1717,19 @@ impl DesktopApp {
     }
 
     fn fail_byte_request(&mut self, request: &Request, origin: RequestOrigin, message: &str) {
+        if let Some(ByteBinding {
+            destination: ByteDestination::Listing { .. },
+            ..
+        }) = origin.bytes
+        {
+            // A Program-listing page: not requested again, and no status.
+            if self.byte_request_current(request, origin)
+                && let Request::Bytes { address, .. } = request
+            {
+                self.program.bytes.fail(*address);
+            }
+            return;
+        }
         if !self.byte_request_current(request, origin) {
             self.retire_byte_request(request, origin);
             return;
@@ -1801,6 +1848,9 @@ impl DesktopApp {
         crate::performance::navigation_begin(self.selection_generation);
         if record {
             self.record_location(address, address);
+            // An explicitly opened function, also one outside the inventory
+            // (a call target), is code when history returns to it.
+            self.comment_owners.insert(address, address);
         }
         self.data_location = None;
         // An explicit selection; a quiet re-resolution restores the row.
@@ -2737,6 +2787,10 @@ impl DesktopApp {
                         self.tab = Tab::Decode;
                     }
                     self.status = "Bytes loaded into decoder".into();
+                }
+                ByteDestination::Listing { .. } => {
+                    self.receive_listing_page(address, *length, bytes);
+                    context.request_repaint();
                 }
                 ByteDestination::HexPage { token } => {
                     if bytes.len() != *length {
@@ -5244,12 +5298,39 @@ impl DesktopApp {
         };
         self.history_index = index;
         match place {
-            crate::linkage_ui::Place::Code(address) => {
-                self.navigate_annotation(address, false, context)
-            }
+            crate::linkage_ui::Place::Code(address) => self.restore_code_place(address, context),
             crate::linkage_ui::Place::Data { address, length } => {
                 self.open_data(address, length, context)
             }
+        }
+    }
+
+    /// Revisits a recorded code location only where Go To would open code:
+    /// a known entry or an exactly observed instruction. Any other address,
+    /// such as a `??` or byte row the Program cursor left, puts the cursor
+    /// back on the Program row starting there, else opens Hex; no function
+    /// is guessed and nothing is requested for it.
+    fn restore_code_place(&mut self, address: u64, context: &egui::Context) {
+        let Some(info) = self.info.as_ref() else {
+            return;
+        };
+        let destination =
+            crate::search_jobs::resolve(info, address, 1, |pc| self.observed_owner(pc));
+        if let Some(Destination::Code { owner, .. }) = destination {
+            // The owner the resolver proved, never the address itself.
+            self.navigate_location(address, Some(owner), false, context);
+            return;
+        }
+        let row = self
+            .program_scope()
+            .then(|| self.program_layout()?.cursor(address, None))
+            .flatten();
+        if let Some(row) = row {
+            self.data_location = None;
+            self.tab = Tab::Listing;
+            self.move_program_cursor(row, context);
+        } else if destination.is_some() {
+            self.open_data(address, 1, context);
         }
     }
 
@@ -8954,7 +9035,7 @@ impl DesktopApp {
                     AnalysisStage::Calls => "Analyzing references",
                     AnalysisStage::Publish => "Publishing results",
                 })
-                .unwrap_or_else(|| request_task(&pending.request));
+                .unwrap_or_else(|| pending_task(pending));
             return Some(display);
         }
         if let Some(pending) = pending
@@ -8966,6 +9047,7 @@ impl DesktopApp {
                     | Request::Bytes { .. }
                     | Request::Rename { .. }
             )
+            && !is_listing_bytes(pending)
         {
             display.phase = if discovery.is_some() {
                 "Discovery waiting"
@@ -12681,6 +12763,36 @@ mod tests {
         assert_eq!((app.history.len(), app.history_index), (256, 0));
         app.navigate(0x1080, true, &context);
         assert_eq!((app.history.len(), app.history_index), (2, 1));
+    }
+
+    #[test]
+    fn history_opens_code_only_where_go_to_would() {
+        let context = egui::Context::default();
+        let mut app = hex_app();
+        // A function opened explicitly outside the inventory (a call
+        // target) stays code for history.
+        app.navigate(0x3000, true, &context);
+        app.navigate(0x1000, true, &context);
+        let code = crate::linkage_ui::Place::Code;
+        app.history = vec![code(0x2000), code(0x8004), code(0x3000), code(0x1000)];
+        app.history_index = 3;
+        // Function scope has no row at a non-entry executable byte or a data
+        // byte: both open Hex, as Go To does, never a guessed function or a
+        // Decode read.
+        app.history_jump(0, &context);
+        assert_eq!(
+            (app.tab, app.data_location, app.result_scope),
+            (Tab::Hex, Some((0x2000, 1)), Some(0x1000))
+        );
+        app.history_jump(1, &context);
+        assert_eq!((app.tab, app.data_location), (Tab::Hex, Some((0x8004, 1))));
+        assert_eq!(app.result_scope, Some(0x1000));
+        app.history_jump(2, &context);
+        assert_eq!(
+            (app.tab, app.selected, app.result_scope),
+            (Tab::Listing, Some(0x3000), Some(0x3000))
+        );
+        assert!(app.data_location.is_none());
     }
 
     #[test]
