@@ -345,9 +345,18 @@ binary and verifies its SHA-256; saved source paths are display hints only.
 Reopened results are labeled **Saved analysis** until recomputed.
 Use **Analysis → Refresh function** for listing/graph and pseudocode, and
 **Analysis → Discover functions** for fresh references. A matching binary hash
-does not authenticate cached analysis.
+does not authenticate cached analysis. Function, view, block and instruction
+starts must be ABI-aligned executable file-backed code; complete instruction
+spans must stay in executable file-backed bytes. Invalid function inventories
+reject loading regardless of cache compatibility; incompatible result caches
+are discarded. Older Mach-O section lists migrate only on an exact match to
+the worker-reported previous loader rules, retaining annotations and refreshing
+analysis. Migration compares bounded metadata in `Opened`; binary parsing stays
+in the worker.
 
 **Export annotations (JSON)…** and **Open annotations…** preserve JSON sidecars.
+Export independently hashes the retained binary off the GUI thread and refuses
+to save if it differs from the analyzed snapshot.
 There is no autosave or Ghidra/IDA project import. The app does not patch inputs.
 
 **Open projects only from trusted sources:** SQLite parses `.grproj` files

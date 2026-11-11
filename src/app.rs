@@ -2758,7 +2758,14 @@ impl DesktopApp {
             return;
         }
         match (pending.request, response) {
-            (Request::Open { .. }, Response::Opened { mut info, symbols }) => {
+            (
+                Request::Open { .. },
+                Response::Opened {
+                    mut info,
+                    symbols,
+                    macho_legacy,
+                },
+            ) => {
                 let Some(opening) = self.opening.take() else {
                     return;
                 };
@@ -2800,13 +2807,18 @@ impl DesktopApp {
                     self.status = "Binary changed on disk. Existing notes were retained; save them, then reopen explicitly.".into();
                     return;
                 }
-                let project = self.opening_project.take();
-                if let Some(project) = &project
-                    && let Err(error) = project.project.data.validate_against(&info)
+                let mut project = self.opening_project.take();
+                if let Some(project) = &mut project
+                    && let Err(error) = project.project.accept_opened(&info, macho_legacy.as_ref())
                 {
                     self.stop_worker();
                     self.status = error;
                     return;
+                }
+                if let Some(project) = &mut project
+                    && !project.project.cache_compatible
+                {
+                    project.discovery_index = None;
                 }
                 if !opening.preserve {
                     self.generation = self.generation.wrapping_add(1);
@@ -3414,8 +3426,14 @@ impl DesktopApp {
             crate::selection::MappedRanges::new(&info.sections)
         };
         match response {
-            Response::Opened { info, .. } => {
-                validate_info(info, MAX_FUNCTION_NAME_BYTES, true).map(|_| ())
+            Response::Opened {
+                info, macho_legacy, ..
+            } => {
+                validate_info(info, MAX_FUNCTION_NAME_BYTES, true)?;
+                if let Some(legacy) = macho_legacy {
+                    crate::project::validate_macho_legacy(info, legacy)?;
+                }
+                Ok(())
             }
             Response::Graph { view } => validate_view(
                 view,
@@ -3428,19 +3446,13 @@ impl DesktopApp {
             Response::Crypto { matches, .. } => validate_crypto(matches, &ranges()?),
             Response::Listing { outcomes, .. } => {
                 let info = self.info.as_ref().ok_or("No binary is open")?;
-                let (mapped, executable) = (
-                    ranges()?,
-                    crate::selection::ExecutableRanges::new(&info.sections)?,
-                );
-                for view in outcomes.iter().filter_map(|outcome| outcome.view.as_ref()) {
-                    validate_view(view, &mapped, info)?;
-                    let instructions = view.blocks.iter().flat_map(|block| &block.instructions);
-                    for instruction in instructions {
-                        if !executable
-                            .contains_span(instruction.address, instruction.bytes.len() as u64)
-                        {
-                            return Err("Listing instruction outside executable bytes".into());
-                        }
+                let mapped = ranges()?;
+                for outcome in outcomes {
+                    if !crate::call_analysis::code_address(info, outcome.entry) {
+                        return Err("Listing entry is not executable file-backed code".into());
+                    }
+                    if let Some(view) = &outcome.view {
+                        validate_view(view, &mapped, info)?;
                     }
                 }
                 Ok(())
@@ -4155,11 +4167,6 @@ impl DesktopApp {
         self.file_task(context, move || {
             let result = (|| {
                 let project = ProjectData::load(&project_path)?;
-                let discovery_index = project.data.discovery.as_ref().map(|saved| {
-                    Arc::new(crate::call_analysis::CallIndex::from_snapshot(
-                        saved.clone(),
-                    ))
-                });
                 let binary_path = if let Some(binary) = &project.binary {
                     binary.path().to_owned()
                 } else {
@@ -4171,6 +4178,11 @@ impl DesktopApp {
                     BinaryProtection::open(&path)?.verify_sha256(&project.data.info.sha256)?;
                     path
                 };
+                let discovery_index = project.data.discovery.as_ref().map(|saved| {
+                    Arc::new(crate::call_analysis::CallIndex::from_snapshot(
+                        saved.clone(),
+                    ))
+                });
                 Ok(Some(Box::new(ProjectOpen {
                     project,
                     project_path,
@@ -4257,6 +4269,11 @@ impl DesktopApp {
             .as_ref()
             .map(|info| info.sections.clone())
             .unwrap_or_default();
+        let architecture = self
+            .info
+            .as_ref()
+            .map(|info| info.architecture.clone())
+            .unwrap_or_default();
         let sender = self.file_dialogs.sender();
         let initial_dir = self.dialog_directory();
         self.file_task(context, move || {
@@ -4264,7 +4281,7 @@ impl DesktopApp {
             let result = path
                 .map(|path| {
                     let session = Session::load(&path, &hash)?;
-                    session.validate_ranges(&sections)?;
+                    session.validate_ranges(&sections, &architecture)?;
                     Ok((session, path))
                 })
                 .transpose();
@@ -10971,6 +10988,117 @@ mod tests {
         app.address = "1000".into();
         app.rebuild_filter();
         app
+    }
+
+    #[test]
+    fn code_replies_reject_data_and_zero_fill_but_accept_executable_stubs() {
+        for name in [".plt", ".plt.sec", "__stubs", "__auth_stubs", ".text"] {
+            for architecture in ["x86-64", "AArch64"] {
+                let mut app = keyboard_app();
+                let info = app.info.as_mut().unwrap();
+                info.architecture = architecture.into();
+                info.sections[0].name = name.into();
+                info.sections[0].size = 512;
+                info.sections.push(SectionInfo {
+                    name: ".data".into(),
+                    address: 0x2000,
+                    size: 256,
+                    file_offset: 0,
+                    file_size: 256,
+                    executable: false,
+                });
+                let info = info.clone();
+                app.validate_reply(&Response::Opened {
+                    macho_legacy: None,
+                    info: info.clone(),
+                    symbols: None,
+                })
+                .unwrap();
+                let view = |entry, block, instruction, length| FunctionView {
+                    address: entry,
+                    blocks: vec![BasicBlock {
+                        address: block,
+                        instructions: vec![Instruction {
+                            address: instruction,
+                            bytes: vec![0; length],
+                            mnemonic: "nop".into(),
+                            operands: String::new(),
+                        }],
+                    }],
+                    edges: vec![],
+                    calls: vec![],
+                    warnings: vec![],
+                };
+                app.validate_reply(&Response::Graph {
+                    view: view(0x1000, 0x1000, 0x1000, 4),
+                })
+                .unwrap();
+                for bad in [0x1100, 0x2000] {
+                    let mut forged = info.clone();
+                    forged.functions[0].address = bad;
+                    forged.functions.truncate(1);
+                    assert!(
+                        app.validate_reply(&Response::Opened {
+                            macho_legacy: None,
+                            info: forged,
+                            symbols: None
+                        })
+                        .is_err()
+                    );
+                    let mut bad_instruction = view(0x1000, 0x1000, 0x1000, 4);
+                    bad_instruction.blocks[0].instructions.push(Instruction {
+                        address: bad,
+                        bytes: vec![0; 4],
+                        mnemonic: "nop".into(),
+                        operands: String::new(),
+                    });
+                    assert!(
+                        app.validate_reply(&Response::Graph {
+                            view: bad_instruction
+                        })
+                        .unwrap_err()
+                        .contains("Code entry")
+                    );
+                    for graph in [
+                        view(bad, 0x1000, 0x1000, 4),
+                        view(0x1000, bad, bad, 4),
+                        view(0x1000, 0x1000, bad, 4),
+                        view(0x1000, 0x10fc, 0x10fc, 8),
+                    ] {
+                        assert!(
+                            app.validate_reply(&Response::Graph {
+                                view: graph.clone()
+                            })
+                            .is_err()
+                        );
+                        assert!(
+                            app.validate_reply(&Response::Listing {
+                                binding: crate::model::ListingBinding {
+                                    generation: 0,
+                                    token: 0
+                                },
+                                outcomes: vec![crate::model::ListingOutcome {
+                                    entry: 0x1000,
+                                    view: Some(graph)
+                                }],
+                            })
+                            .is_err()
+                        );
+                    }
+                    assert!(
+                        crate::call_analysis::validate_inventory(
+                            &info,
+                            &[FunctionInfo {
+                                address: bad,
+                                name: "forged".into()
+                            }],
+                            false
+                        )
+                        .is_err()
+                    );
+                }
+            }
+        }
     }
 
     fn symbol_reply(
@@ -18361,6 +18489,159 @@ mod tests {
                     .flat_items(Table::Imports)
                     .unwrap()
                     .contains(&LinkageItem::Import(0))
+            );
+        }
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn opened_migrates_embedded_and_external_macho_projects_without_desktop_parsing() {
+        let directory = tempfile::tempdir().unwrap();
+        let (bytes, base) = crate::architecture::fixtures::macho_with_stubs();
+        let binary = directory.path().join("legacy-macho");
+        std::fs::write(&binary, bytes).unwrap();
+        let executable = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(if cfg!(windows) {
+                "ghidra-rust.exe"
+            } else {
+                "ghidra-rust"
+            });
+        let context = egui::Context::default();
+        let start = |app: &mut DesktopApp, path: &std::path::Path| {
+            let mut client =
+                WorkerClient::start_using_executable(context.clone(), path, &executable).unwrap();
+            if let Some(image) = app
+                .opening_project
+                .as_ref()
+                .and_then(|project| project.project.binary.as_ref())
+            {
+                client.retain_source(Arc::new(image.clone()));
+            }
+            app.client = Some(client);
+            app.worker_epoch += 1;
+            app.opening = Some(Opening {
+                path: path.to_owned(),
+                preserve: false,
+                follow: None,
+                revision: app.revision,
+                follow_origin: app.request_origin(),
+            });
+            app.send_direct(Request::Open {
+                path: path.to_string_lossy().into_owned(),
+            });
+        };
+        let settle = |app: &mut DesktopApp| {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while app.info.is_none()
+                || app.pending.is_some()
+                || !app.queue.is_empty()
+                || app.results.preparing()
+                || app.graph_preparation.awaits(|_| true)
+            {
+                app.poll_graph_preparation();
+                app.poll_worker(&context);
+                assert!(Instant::now() < deadline, "{}", app.status);
+                assert!(app.client.is_some(), "{}", app.status);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        let mut original = DesktopApp::empty(None);
+        start(&mut original, &binary);
+        settle(&mut original);
+        let mut info = original.info.clone().unwrap();
+        info.sections.retain(|section| section.name != "__stubs");
+        let mut session = Session::new(info.sha256.clone());
+        session.annotations.insert(
+            base,
+            Annotation {
+                label: "migrated_note".into(),
+                ..Default::default()
+            },
+        );
+        let data = ProjectData {
+            info,
+            session,
+            view: Some(FunctionView {
+                address: base,
+                blocks: vec![],
+                edges: vec![],
+                calls: vec![],
+                warnings: vec![],
+            }),
+            semantics: Default::default(),
+            decompiled: None,
+            mappings: vec![],
+            strings: vec![],
+            strings_truncated: false,
+            crypto: vec![],
+            crypto_truncated: false,
+            selected_address: Some(base),
+            discovery: None,
+        };
+        for embedded in [true, false] {
+            let path = directory.path().join("legacy.grproj");
+            data.save(
+                &path,
+                original.binary_protection.as_ref().unwrap(),
+                embedded,
+            )
+            .unwrap();
+            let db = rusqlite::Connection::open(&path).unwrap();
+            let body: Vec<u8> = db
+                .query_row(
+                    "SELECT value FROM project_data WHERE key='body'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let mut body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            body["engine"] = crate::project::ENGINE_FINGERPRINT
+                .replace("-macho-sections-v1", "")
+                .into();
+            db.execute(
+                "UPDATE project_data SET value=?1 WHERE key='body'",
+                [serde_json::to_vec(&body).unwrap()],
+            )
+            .unwrap();
+            drop(db);
+            let loaded = ProjectData::load(&path).unwrap();
+            let selected = loaded
+                .binary
+                .as_ref()
+                .map_or(binary.as_path(), |image| image.path())
+                .to_owned();
+            let mut app = DesktopApp::empty(None);
+            app.opening_project = Some(Box::new(ProjectOpen {
+                project: loaded,
+                project_path: path.clone(),
+                binary_path: selected.clone(),
+                discovery_index: None,
+            }));
+            start(&mut app, &selected);
+            settle(&mut app);
+            assert_eq!(app.project_path, Some(path));
+            assert_eq!(
+                app.session.as_ref().unwrap().annotations[&base].label,
+                "migrated_note"
+            );
+            assert!(
+                app.info
+                    .as_ref()
+                    .unwrap()
+                    .sections
+                    .iter()
+                    .any(|section| section.name == "__stubs")
+            );
+            assert!(
+                !app.cached_functions
+                    && !app.saved_references
+                    && !app.cached_strings
+                    && !app.cached_crypto
             );
         }
     }

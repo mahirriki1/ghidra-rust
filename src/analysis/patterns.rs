@@ -213,6 +213,7 @@ mod tests {
     fn x86_section(name: &str, bytes: Vec<u8>) -> LoadedProgram {
         let size = bytes.len() as u64;
         LoadedProgram {
+            macho_legacy: None,
             program: Program::from_raw_bytes(bytes.clone(), "x86:LE:64:default:gcc", 0x1000)
                 .unwrap(),
             target: crate::architecture::Target {

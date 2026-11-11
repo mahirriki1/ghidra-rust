@@ -674,8 +674,35 @@ replaces session discovery. Saved queues, retries, worker bindings, and admissio
 witnesses are not persisted; unfinished batch seeds remain pending.
 
 Loading validates exact schema, bounded collections, ordered unique addresses,
-executable membership, mapping bounds, source ownership, targets, and consistency
-of partial/status/counter data. This checks structure, not instruction truth.
+mapping bounds, source ownership, targets, and consistency of partial/status/counter
+data. Function, view, block and instruction starts, plus signature and local-rename
+function keys, must be ABI-aligned executable file-backed code. Every complete
+instruction span must fit executable file-backed bytes, using checked arithmetic.
+Graph and Listing replies, opened/discovered inventories and project-cache restore
+use this rule. Executable PLT, stubs and veneers qualify regardless of section
+name; data imports/exports remain metadata and do not become function entries.
+Invalid function inventories reject loading regardless of the cache fingerprint.
+Compatible graphs are also validated and reject loading on failure. Incompatible
+view/decompilation/discovery caches are discarded before their current-format
+validation; incompatible engine fingerprints also discard strings and crypto. This
+checks structure against section metadata, not instruction truth or authenticity
+of worker-reported section flags.
+Mach-O code sections additionally require containment in a segment with execute
+permission in `initprot`. The `macho-sections-v1` cache fingerprint refreshes
+previous Mach-O analysis. Binary parsing, including legacy section classification,
+occurs only in the worker. Its bounded `Opened` reply carries fresh sections plus
+legacy section membership. The desktop compares the lists: every saved section
+must match the legacy list exactly and appear unchanged in fresh order; only
+worker-identified executable code sections may be added. On this exact match,
+fresh sections/entry are adopted and annotations retained; view, decompilation,
+mappings, semantics, discovery, strings and crypto caches are discarded. Other
+metadata differences still reject loading. No migration binary read, hash or
+parse runs in the desktop. ELF/PE projects with the immediately previous engine
+fingerprint keep compatible caches, avoiding unnecessary recomputation. A pinning
+test forces that one-version exception to be revisited on the next fingerprint bump.
+Mach-O segment ranges are indexed once, with a 4,096-segment budget. At most
+4,096 nonempty allocated section candidates receive containment lookups; section
+and segment range arithmetic is checked.
 Unmapped graph exits and call targets save as unresolved.
 Engine or discovery-format fingerprint mismatches discard incompatible caches
 while keeping annotations. A matching binary hash does not authenticate analysis.
@@ -684,6 +711,11 @@ discovery fingerprint, without a project-schema change: discovery saved by an
 earlier release is discarded and recomputed by Discover, and earlier releases
 discard discovery saved by this one. Saved address rows keep **Saved analysis**
 provenance until rediscovered.
+
+Annotation export independently verifies the retained binary descriptor against
+the analyzed SHA-256 before creating output, in the background file job. A forged
+worker hash or changed retained binary refuses export and preserves any existing
+sidecar. Project saves perform the same snapshot verification.
 
 Saves publish complete new files atomically after destination checks, retaining
 all protected-input guards through replacement. They never patch the binary,

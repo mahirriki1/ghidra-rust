@@ -85,7 +85,7 @@ pub(crate) fn instruction_alignment(language: &str) -> u64 {
 
 #[cfg(test)]
 #[path = "../tests/common/mod.rs"]
-mod fixtures;
+pub(crate) mod fixtures;
 
 #[cfg(test)]
 mod tests {

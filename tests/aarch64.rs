@@ -42,6 +42,231 @@ fn graph(worker: &mut WorkerClient, address: u64) -> FunctionView {
 }
 
 #[test]
+fn legacy_macho_projects_migrate_exact_stub_additions_and_keep_annotations() {
+    let (bytes, base) = common::macho_with_stubs();
+    let directory = tempfile::tempdir().unwrap();
+    let binary = directory.path().join("legacy-macho");
+    std::fs::write(&binary, bytes).unwrap();
+    let mut worker = WorkerClient::start_using_executable(
+        eframe::egui::Context::default(),
+        &binary,
+        Path::new(env!("CARGO_BIN_EXE_ghidra-rust")),
+    )
+    .unwrap();
+    let Response::Opened { info, .. } = request(
+        &mut worker,
+        Request::Open {
+            path: binary.to_string_lossy().into_owned(),
+        },
+    ) else {
+        panic!("open")
+    };
+    let protection = ghidra_rust::session::BinaryProtection::open(&binary)
+        .unwrap()
+        .bind_snapshot(&info)
+        .unwrap();
+    let mut session = Session::new(info.sha256.clone());
+    session.annotations.insert(
+        base,
+        Annotation {
+            label: "retained".into(),
+            ..Default::default()
+        },
+    );
+    let mut old = info.clone();
+    old.sections.retain(|section| section.name != "__stubs");
+    assert_eq!(info.sections.len(), old.sections.len() + 1);
+    let project = ProjectData {
+        info: old,
+        session,
+        view: Some(graph(&mut worker, base + 48)),
+        semantics: Default::default(),
+        decompiled: None,
+        mappings: vec![],
+        strings: vec![ghidra_rust::model::StringEntry {
+            address: base,
+            text: "cached".into(),
+            encoding: "ASCII".into(),
+        }],
+        strings_truncated: false,
+        crypto: vec![ghidra_rust::model::CryptoMatch {
+            address: base,
+            algorithm: "test".into(),
+            signature: "cached".into(),
+            length: 4,
+        }],
+        crypto_truncated: false,
+        selected_address: Some(base),
+        discovery: None,
+    };
+    for embedded in [true, false] {
+        let path = directory.path().join("old.grproj");
+        project.save(&path, &protection, embedded).unwrap();
+        let db = rusqlite::Connection::open(&path).unwrap();
+        let body: Vec<u8> = db
+            .query_row(
+                "SELECT value FROM project_data WHERE key='body'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        body["engine"] = ghidra_rust::project::ENGINE_FINGERPRINT
+            .replace("-macho-sections-v1", "")
+            .into();
+        db.execute(
+            "UPDATE project_data SET value=?1 WHERE key='body'",
+            [serde_json::to_vec(&body).unwrap()],
+        )
+        .unwrap();
+        drop(db);
+        let mut loaded = ProjectData::load(&path).unwrap();
+        let selected = loaded
+            .binary
+            .as_ref()
+            .map_or(binary.as_path(), |image| image.path());
+        let retained = ghidra_rust::session::BinaryProtection::open(selected).unwrap();
+        retained.verify_sha256(&loaded.data.info.sha256).unwrap();
+        let mut reopened_worker = WorkerClient::start_using_executable(
+            eframe::egui::Context::default(),
+            selected,
+            Path::new(env!("CARGO_BIN_EXE_ghidra-rust")),
+        )
+        .unwrap();
+        if let Some(image) = &loaded.binary {
+            reopened_worker.retain_source(Arc::new(image.clone()));
+        }
+        let Response::Opened {
+            info: reopened,
+            macho_legacy,
+            ..
+        } = request(
+            &mut reopened_worker,
+            Request::Open {
+                path: selected.to_string_lossy().into_owned(),
+            },
+        )
+        else {
+            panic!("project reopen")
+        };
+        loaded
+            .accept_opened(&reopened, macho_legacy.as_ref())
+            .unwrap();
+        loaded.data.validate_against(&info).unwrap();
+        assert_eq!(loaded.data.session.annotations[&base].label, "retained");
+        assert!(!loaded.cache_compatible && loaded.data.view.is_none());
+        assert!(loaded.data.decompiled.is_none() && loaded.data.discovery.is_none());
+        assert!(loaded.data.strings.is_empty() && loaded.data.crypto.is_empty());
+        for corruption in ["size", "executable", "missing"] {
+            let mut forged = ProjectData::load(&path).unwrap();
+            match corruption {
+                "size" => forged.data.info.sections[0].size -= 4,
+                "executable" => forged.data.info.sections[0].executable = false,
+                _ => forged.data.info.sections.clear(),
+            }
+            assert!(
+                forged
+                    .accept_opened(&reopened, macho_legacy.as_ref())
+                    .is_err(),
+                "{corruption}"
+            );
+        }
+    }
+}
+
+#[test]
+fn macho_instruction_attributes_cannot_override_non_executable_segment() {
+    let (mut bytes, base) = common::macho_with_stubs();
+    // The containing segment remains readable/writable, without execute permission.
+    bytes[88..92].copy_from_slice(&3_u32.to_le_bytes());
+    bytes[92..96].copy_from_slice(&3_u32.to_le_bytes());
+    for offset in [40, 120, 200] {
+        bytes[offset..offset + 16].fill(0);
+        bytes[offset..offset + 6].copy_from_slice(b"__DATA");
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let binary = directory.path().join("nonexec-macho");
+    std::fs::write(&binary, bytes).unwrap();
+    let mut worker = WorkerClient::start_using_executable(
+        eframe::egui::Context::default(),
+        &binary,
+        Path::new(env!("CARGO_BIN_EXE_ghidra-rust")),
+    )
+    .unwrap();
+    let response = request(
+        &mut worker,
+        Request::Open {
+            path: binary.to_string_lossy().into_owned(),
+        },
+    );
+    assert!(
+        matches!(response, Response::Error { .. }),
+        "non-executable segment admitted at {base:#x}: {response:?}"
+    );
+}
+
+#[test]
+fn macho_instruction_and_stub_sections_survive_worker_and_project_validation() {
+    for (name, flags) in [
+        ("__stubs", 0x80000408_u32),
+        ("__auth_stubs", 8),
+        ("__stub_helper", 0x80000400),
+        ("__objc_stubs", 0x80000400),
+        ("__custom_code", 0x80000000),
+    ] {
+        let (mut bytes, base) = common::macho();
+        // Rename the original executable section, preserving its code/symbols.
+        bytes[104..120].fill(0);
+        bytes[104..104 + name.len()].copy_from_slice(name.as_bytes());
+        bytes[168..172].copy_from_slice(&flags.to_le_bytes());
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("macho-stub");
+        std::fs::write(&binary, bytes).unwrap();
+        let mut worker = WorkerClient::start_using_executable(
+            eframe::egui::Context::default(),
+            &binary,
+            Path::new(env!("CARGO_BIN_EXE_ghidra-rust")),
+        )
+        .unwrap();
+        let Response::Opened { info, .. } = request(
+            &mut worker,
+            Request::Open {
+                path: binary.to_string_lossy().into_owned(),
+            },
+        ) else {
+            panic!("open {name}")
+        };
+        assert!(
+            info.sections
+                .iter()
+                .any(|section| section.name == name && section.executable)
+        );
+        let view = graph(&mut worker, base + 48);
+        let protection = ghidra_rust::session::BinaryProtection::open(&binary)
+            .unwrap()
+            .bind_snapshot(&info)
+            .unwrap();
+        let project = ProjectData {
+            session: Session::new(info.sha256.clone()),
+            info,
+            view: Some(view),
+            semantics: Default::default(),
+            decompiled: None,
+            mappings: vec![],
+            strings: vec![],
+            strings_truncated: false,
+            crypto: vec![],
+            crypto_truncated: false,
+            selected_address: Some(base + 48),
+            discovery: None,
+        };
+        let path = directory.path().join("stubs.grproj");
+        project.save(&path, &protection, true).unwrap();
+        assert!(ProjectData::load(&path).unwrap().cache_compatible);
+    }
+}
+
+#[test]
 fn contained_data_accesses_use_literal_reads_and_block_local_propagation() {
     let source = include_str!("fixtures/aarch64-data.S");
     let words: Vec<_> = source

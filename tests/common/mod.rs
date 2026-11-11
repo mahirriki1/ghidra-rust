@@ -269,3 +269,24 @@ pub fn macho() -> (Vec<u8>, u64) {
     }
     (b, base)
 }
+
+/// The baseline linked arm64 Mach-O plus an instruction-marked symbol-stub section.
+#[allow(dead_code)] // Shared fixture module is also included by non-Mach-O test targets.
+pub fn macho_with_stubs() -> (Vec<u8>, u64) {
+    let (mut bytes, base) = macho();
+    bytes.copy_within(184..232, 264);
+    bytes[184..264].fill(0);
+    p32(&mut bytes, 20, 280);
+    p32(&mut bytes, 36, 232);
+    p32(&mut bytes, 96, 2);
+    name(&mut bytes, 184, "__stubs");
+    name(&mut bytes, 200, "__TEXT");
+    p64(&mut bytes, 216, base + 0x180);
+    p64(&mut bytes, 224, 4);
+    p32(&mut bytes, 232, 0x1180);
+    p32(&mut bytes, 236, 2);
+    p32(&mut bytes, 248, 0x80000408);
+    p32(&mut bytes, 256, 4);
+    bytes[0x1180..0x1184].copy_from_slice(&0xd65f03c0_u32.to_le_bytes());
+    (bytes, base)
+}

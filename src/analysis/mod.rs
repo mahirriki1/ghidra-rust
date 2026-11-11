@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use ghidra_decompiler::address::Address;
 use ghidra_decompiler::program::Program;
-use object::{Object, ObjectSection, SectionFlags, SectionKind};
+use object::{Object, ObjectSection, ObjectSegment, SectionFlags, SectionKind, SegmentFlags};
 use sha2::{Digest, Sha256};
 
 use crate::model::*;
@@ -79,6 +79,7 @@ pub struct LoadedProgram {
     pe_imports: BTreeMap<u64, String>,
     upx_packed: bool,
     pub info: BinaryInfo,
+    pub(crate) macho_legacy: Option<MachoLegacySections>,
     inventory: crate::inventory::Inventory,
     /// Instructions decoded from established functions in this worker.
     coverage: Coverage,
@@ -132,10 +133,78 @@ fn metadata(path: &Path, bytes: &[u8]) -> Result<BinaryInfo, String> {
     metadata_with_target(path, bytes).map(|(info, _)| info)
 }
 
+#[cfg(test)]
 fn metadata_with_target(
     path: &Path,
     bytes: &[u8],
 ) -> Result<(BinaryInfo, crate::architecture::Target), String> {
+    metadata_with_migration(path, bytes).map(|(info, target, _)| (info, target))
+}
+
+/// Built once per Mach-O parse. Prefix maxima answer containment without
+/// merging adjacent segments into a fictitious larger containing segment.
+#[derive(Default)]
+struct MachoExecutableSegments(BTreeMap<Vec<u8>, Vec<(u64, u64)>>);
+
+impl MachoExecutableSegments {
+    fn new(object: &object::File<'_>) -> Result<Self, String> {
+        let mut result = Self::default();
+        for (count, segment) in object.segments().enumerate() {
+            if count >= MAX_SECTIONS {
+                return Err("Mach-O exceeds the 4096-segment budget".into());
+            }
+            if !matches!(segment.flags(), SegmentFlags::MachO { initprot, .. }
+                if initprot & object::macho::VM_PROT_EXECUTE != 0)
+            {
+                continue;
+            }
+            let Some(name) = segment.name_bytes().map_err(|e| e.to_string())? else {
+                continue;
+            };
+            let end = segment
+                .address()
+                .checked_add(segment.size())
+                .ok_or("Mach-O segment address overflows")?;
+            result
+                .0
+                .entry(name.to_vec())
+                .or_default()
+                .push((segment.address(), end));
+        }
+        for ranges in result.0.values_mut() {
+            ranges.sort_unstable();
+            let mut maximum = 0;
+            for (_, end) in ranges {
+                maximum = maximum.max(*end);
+                *end = maximum;
+            }
+        }
+        Ok(result)
+    }
+
+    fn contains(&self, name: &[u8], address: u64, size: u64) -> bool {
+        let Some(ranges) = self.0.get(name) else {
+            return false;
+        };
+        let index = ranges.partition_point(|(start, _)| *start <= address);
+        index > 0
+            && address
+                .checked_add(size)
+                .is_some_and(|end| end <= ranges[index - 1].1)
+    }
+}
+
+fn metadata_with_migration(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<
+    (
+        BinaryInfo,
+        crate::architecture::Target,
+        Option<MachoLegacySections>,
+    ),
+    String,
+> {
     let object = object::File::parse(bytes).map_err(|e| format!("Cannot parse executable: {e}"))?;
     let format = match object.format() {
         object::BinaryFormat::Elf => "ELF",
@@ -154,7 +223,16 @@ fn metadata_with_target(
         return Err("Only linked executables and shared libraries are supported; relocatable object files are not supported yet.".into());
     }
     let target = crate::architecture::Target::for_image(&object)?;
+    let macho = object.format() == object::BinaryFormat::MachO;
+    let executable_segments = if macho {
+        MachoExecutableSegments::new(&object)?
+    } else {
+        Default::default()
+    };
+    let mut legacy_sections = Vec::new();
+    let mut legacy_possible = true;
     let mut sections = Vec::new();
+    let mut candidates = 0;
     for section in object.sections() {
         let kind = section.kind();
         let (allocated, executable) = match section.flags() {
@@ -166,6 +244,15 @@ fn metadata_with_target(
                 characteristics & object::pe::IMAGE_SCN_MEM_DISCARDABLE == 0,
                 characteristics & object::pe::IMAGE_SCN_MEM_EXECUTE != 0,
             ),
+            SectionFlags::MachO { flags } => {
+                let code = kind == SectionKind::Text
+                    || flags
+                        & (object::macho::S_ATTR_PURE_INSTRUCTIONS
+                            | object::macho::S_ATTR_SOME_INSTRUCTIONS)
+                        != 0
+                    || flags & object::macho::SECTION_TYPE == object::macho::S_SYMBOL_STUBS;
+                (code || legacy_allocated(kind), code)
+            }
             _ => (
                 matches!(
                     kind,
@@ -184,10 +271,24 @@ fn metadata_with_target(
         if !allocated || section.size() == 0 {
             continue;
         }
-        if sections.len() >= 4096 {
+        if candidates >= MAX_SECTIONS {
             return Err(
                 "Executables with more than 4096 mapped sections are not supported yet.".into(),
             );
+        }
+        candidates += 1;
+        // Only non-empty allocated candidates within the cap need a lookup.
+        let executable = executable
+            && (!macho
+                || section
+                    .segment_name_bytes()
+                    .ok()
+                    .flatten()
+                    .is_some_and(|name| {
+                        executable_segments.contains(name, section.address(), section.size())
+                    }));
+        if macho && !executable && !legacy_allocated(kind) {
+            continue;
         }
         section
             .address()
@@ -203,7 +304,7 @@ fn metadata_with_target(
                 section.name().unwrap_or("?")
             ));
         }
-        sections.push(SectionInfo {
+        let published = SectionInfo {
             name: section
                 .name()
                 .unwrap_or("<unnamed>")
@@ -215,8 +316,16 @@ fn metadata_with_target(
             file_offset,
             file_size: file_size.min(section.size()),
             executable,
-        });
+        };
+        if macho && legacy_allocated(kind) {
+            let mut legacy = published.clone();
+            legacy.executable = kind == SectionKind::Text;
+            legacy_possible &= legacy.executable == published.executable;
+            legacy_sections.push(legacy);
+        }
+        sections.push(published);
     }
+    legacy_sections.sort_by_key(|section| section.address);
     sections.sort_by_key(|section| section.address);
     if !sections.iter().any(|s| s.executable && s.file_size > 0) {
         return Err("No supported executable sections found; sectionless executables are not supported yet.".into());
@@ -230,26 +339,7 @@ fn metadata_with_target(
     // Translate only through validated file-backed executable sections. A Mach-O
     // without a supported LC_MAIN entry remains navigable by symbols/address.
     let entry = if object.format() == object::BinaryFormat::MachO {
-        let offset = object.entry();
-        let mut entry = None;
-        // A zero value also means no LC_MAIN in object 0.37. Do not invent an
-        // entry for legacy LC_UNIXTHREAD images or file-offset aliases.
-        if offset != 0 {
-            for section in &sections {
-                let Some(relative) = offset.checked_sub(section.file_offset) else {
-                    continue;
-                };
-                if section.executable && relative < section.file_size {
-                    if entry.is_some() {
-                        return Err(
-                            "Mach-O entry file offset has ambiguous executable mappings.".into(),
-                        );
-                    }
-                    entry = section.address.checked_add(relative);
-                }
-            }
-        }
-        entry.unwrap_or(0)
+        macho_entry(object.entry(), &sections)?
     } else {
         object.entry()
     };
@@ -269,7 +359,56 @@ fn metadata_with_target(
     if crate::packing::detect_upx_pe(&info.format, info.entry, &info.sections, bytes) {
         warning(&mut info.warnings, crate::packing::UPX_PACKED_WARNING);
     }
-    Ok((info, target))
+    let macho_legacy = if macho && legacy_possible {
+        Some(MachoLegacySections {
+            entry: macho_entry(object.entry(), &legacy_sections)?,
+            indices: legacy_sections
+                .iter()
+                .map(|section| {
+                    info.sections
+                        .binary_search_by_key(&section.address, |fresh| fresh.address)
+                        .map_err(|_| "Missing worker legacy section".to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        })
+    } else {
+        None
+    };
+    Ok((info, target, macho_legacy))
+}
+
+fn legacy_allocated(kind: SectionKind) -> bool {
+    matches!(
+        kind,
+        SectionKind::Text
+            | SectionKind::Data
+            | SectionKind::ReadOnlyData
+            | SectionKind::ReadOnlyDataWithRel
+            | SectionKind::ReadOnlyString
+            | SectionKind::UninitializedData
+            | SectionKind::Tls
+            | SectionKind::UninitializedTls
+    )
+}
+
+fn macho_entry(offset: u64, sections: &[SectionInfo]) -> Result<u64, String> {
+    let mut entry = None;
+    if offset != 0 {
+        for section in sections {
+            if let Some(relative) = offset.checked_sub(section.file_offset)
+                && section.executable
+                && relative < section.file_size
+            {
+                if entry.is_some() {
+                    return Err(
+                        "Mach-O entry file offset has ambiguous executable mappings.".into(),
+                    );
+                }
+                entry = section.address.checked_add(relative);
+            }
+        }
+    }
+    Ok(entry.unwrap_or(0))
 }
 
 impl LoadedProgram {
@@ -307,7 +446,7 @@ impl LoadedProgram {
         }
         reading.finish(bytes.len() as u64);
         let metadata_time = crate::performance::span("open_metadata_hash");
-        let (mut info, target) = metadata_with_target(path, &bytes)?;
+        let (mut info, target, macho_legacy) = metadata_with_migration(path, &bytes)?;
         metadata_time.finish(0);
         // This flag comes only from the freshly parsed immutable image, never a
         // saved project's warnings or cached analysis.
@@ -418,6 +557,7 @@ impl LoadedProgram {
             info.warnings.push("The binary entry point is not a supported aligned file-backed instruction address; select a function from the list.".into());
         }
         Ok(Self {
+            macho_legacy,
             program,
             target,
             snapshot,
@@ -1803,6 +1943,60 @@ pub(crate) mod tests {
     use ghidra_decompiler::opcodes::OpCode;
     use ghidra_decompiler::program::InstructionPcode;
 
+    #[test]
+    fn many_macho_segments_and_sections_use_bounded_indexed_containment() {
+        fn image(count: usize) -> Vec<u8> {
+            let offset = 32 + count * 152;
+            let mut bytes = vec![0; offset + count * 4];
+            let p32 =
+                |b: &mut [u8], at, value: u32| b[at..at + 4].copy_from_slice(&value.to_le_bytes());
+            let p64 =
+                |b: &mut [u8], at, value: u64| b[at..at + 8].copy_from_slice(&value.to_le_bytes());
+            p32(&mut bytes, 0, 0xfeedfacf);
+            p32(&mut bytes, 4, 0x100000c);
+            p32(&mut bytes, 12, 2);
+            p32(&mut bytes, 16, count as u32);
+            p32(&mut bytes, 20, (count * 152) as u32);
+            for index in 0..count {
+                let at = 32 + index * 152;
+                let address = 0x100001000 + index as u64 * 4;
+                p32(&mut bytes, at, 0x19);
+                p32(&mut bytes, at + 4, 152);
+                bytes[at + 8..at + 14].copy_from_slice(b"__TEXT");
+                p64(&mut bytes, at + 24, address);
+                p64(&mut bytes, at + 32, 4);
+                p64(&mut bytes, at + 40, (offset + index * 4) as u64);
+                p64(&mut bytes, at + 48, 4);
+                p32(&mut bytes, at + 56, 5);
+                p32(&mut bytes, at + 60, 5);
+                p32(&mut bytes, at + 64, 1);
+                bytes[at + 72..at + 79].copy_from_slice(b"__stubs");
+                bytes[at + 88..at + 94].copy_from_slice(b"__TEXT");
+                p64(&mut bytes, at + 104, address);
+                p64(&mut bytes, at + 112, 4);
+                p32(&mut bytes, at + 120, (offset + index * 4) as u32);
+                p32(&mut bytes, at + 136, 0x80000408);
+                p32(&mut bytes, at + 144, 4);
+            }
+            bytes
+        }
+        let bytes = image(MAX_SECTIONS);
+        let started = std::time::Instant::now();
+        let info = metadata(Path::new("many-macho"), &bytes).unwrap();
+        assert_eq!(info.sections.len(), MAX_SECTIONS);
+        assert!(info.sections.iter().all(|section| section.executable));
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert!(
+            metadata(Path::new("over-budget-macho"), &image(MAX_SECTIONS + 1))
+                .unwrap_err()
+                .contains("4096-segment budget")
+        );
+        // Adjacent segments are not a single containing segment.
+        let object = object::File::parse(bytes.as_slice()).unwrap();
+        let segments = MachoExecutableSegments::new(&object).unwrap();
+        assert!(!segments.contains(b"__TEXT", 0x100001000, 8));
+    }
+
     fn raw_aarch64(bytes: Vec<u8>) -> LoadedProgram {
         let mut image = elf_fixture();
         image[18..20].copy_from_slice(&183u16.to_le_bytes());
@@ -1817,6 +2011,7 @@ pub(crate) mod tests {
             executable: true,
         }];
         LoadedProgram {
+            macho_legacy: None,
             program: Program::from_raw_bytes(bytes.clone(), target.language, 0x1000).unwrap(),
             target,
             snapshot: Arc::from(bytes),
@@ -2836,6 +3031,7 @@ pub(crate) mod tests {
         };
         info.functions = function_list(&program, &mut info, &BTreeSet::new()).unwrap();
         let mut loaded = LoadedProgram {
+            macho_legacy: None,
             target: crate::architecture::Target::for_image(
                 &object::File::parse(elf_fixture().as_slice()).unwrap(),
             )
