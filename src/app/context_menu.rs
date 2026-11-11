@@ -47,6 +47,12 @@ pub(super) enum MenuSource {
         address: u64,
     },
     TreeSection(usize),
+    /// A Program-listing `??`, byte or zero-fill row covering
+    /// `[address, address + length)`.
+    Span {
+        address: u64,
+        length: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,6 +70,8 @@ pub(super) enum MenuCommand {
     CopyLine,
     CopyRow,
     Decode,
+    Expand,
+    Collapse,
 }
 
 /// The state a capture was resolved against. Snapshots are held weakly, so
@@ -268,6 +276,14 @@ impl DesktopApp {
             }
             MenuSource::TreeString { .. } => binding.rows = strings,
             MenuSource::TreeLabel(_) | MenuSource::TreeSection(_) => {}
+            MenuSource::Span { .. } => {
+                if self.tab != Tab::Listing || self.span_row(source).is_none() {
+                    return None;
+                }
+                binding.tab = Some(Tab::Listing);
+                // Rows the expansions or loaded bodies change are new targets.
+                binding.rows = (self.program.expanded.epoch(), self.program.cache.epoch());
+            }
         }
         Some(binding)
     }
@@ -441,8 +457,16 @@ impl DesktopApp {
                     }
                 }
                 MenuSource::TreeSection(index) => self.open_hex_section(index, context),
+                MenuSource::Span { address, length } => {
+                    self.navigate_data(address, length, context);
+                }
                 _ => {}
             },
+            MenuCommand::Expand | MenuCommand::Collapse => {
+                if let Some(row) = self.span_row(source) {
+                    self.toggle_bytes(row);
+                }
+            }
             MenuCommand::Rename => self.menu_rename(source),
             MenuCommand::Comment => match source {
                 MenuSource::Instruction { pc, .. } => self.open_comment(pc),
@@ -487,8 +511,34 @@ impl DesktopApp {
                 }
             }
             MenuSource::TreeLabel(address) => self.navigate_annotation(address, true, context),
-            MenuSource::TreeSection(_) => {}
+            MenuSource::TreeSection(_) | MenuSource::Span { .. } => {}
         }
+    }
+
+    /// The Program-listing row a span menu was opened on, while one still
+    /// covers exactly that span.
+    fn span_row(&self, source: MenuSource) -> Option<crate::program_listing::Row> {
+        use crate::program_listing::{Position, Rank, Row};
+        let MenuSource::Span { address, length } = source else {
+            return None;
+        };
+        if !self.program_scope() {
+            return None;
+        }
+        let row = self
+            .program_layout()?
+            .exact(Position::new(address, Rank::Body))?;
+        (matches!(
+            row,
+            Row::Undefined { .. } | Row::ZeroFill { .. } | Row::Byte { .. }
+        ) && row.span() == address.checked_add(length).map(|end| (address, end)))
+        .then_some(row)
+    }
+
+    /// The cached bytes of a span menu's row, when all are loaded.
+    fn span_bytes(&self, source: MenuSource) -> Option<Vec<u8>> {
+        let (start, end) = self.span_row(source)?.span()?;
+        self.program.bytes.span(start, end)
     }
 
     /// Opens the rename for the captured identity. Drafts stay bound to the
@@ -698,6 +748,35 @@ impl DesktopApp {
                 navigation.push(MenuItem::new(MenuCommand::ShowHex, "Show in Hex"));
                 copy.push(MenuItem::new(MenuCommand::CopyRow, "Copy row"));
             }
+            MenuSource::Span { address, length } => {
+                use crate::program_listing::Row;
+                let Some(row) = self.span_row(source) else {
+                    return groups;
+                };
+                let backed = length > 0 && info.sections.iter().any(|s| s.backs(address, length));
+                navigation.push(
+                    MenuItem::new(MenuCommand::ShowHex, "Show in Hex")
+                        .enabled(backed, "No file-backed bytes"),
+                );
+                match row {
+                    Row::Undefined { .. } => {
+                        navigation.push(MenuItem::new(MenuCommand::Expand, "Expand"));
+                    }
+                    Row::Byte { .. } => {
+                        navigation.push(MenuItem::new(MenuCommand::Collapse, "Collapse"));
+                    }
+                    _ => {}
+                }
+                let targets = TargetSet::single(XrefTarget {
+                    address,
+                    kind: TargetKind::Address,
+                });
+                xref_items(edit, &targets, None);
+                copy.push(MenuItem::new(MenuCommand::CopyAddress, "Copy address"));
+                if self.span_bytes(source).is_some() {
+                    copy.push(MenuItem::new(MenuCommand::CopyBytes, "Copy bytes"));
+                }
+            }
         }
         groups
     }
@@ -767,6 +846,10 @@ impl DesktopApp {
             (MenuSource::TreeLabel(address), MenuCommand::CopyRow) => {
                 tsv_row([self.menu_label(address)?])
             }
+            (MenuSource::Span { address, .. }, MenuCommand::CopyAddress) => {
+                format!("{address:#x}")
+            }
+            (MenuSource::Span { .. }, MenuCommand::CopyBytes) => hex(&self.span_bytes(source)?),
             (MenuSource::TreeSection(index), MenuCommand::CopyRow) => {
                 let section = info.sections.get(index)?;
                 let address = format!("{:x}", section.address);
@@ -1552,5 +1635,155 @@ mod tests {
             .unwrap();
         assert!(copied.len() <= 16 * 1024 && copied.ends_with('…'));
         assert!(line.starts_with(copied.trim_end_matches('…')));
+    }
+
+    /// The menu view in the Program scope, with a `.data` section whose
+    /// second half is zero-filled. Rows: `.text`, `entry`, three
+    /// instructions, `??` 0x1008–0x1040, `next` and its pending body,
+    /// `.data`, `??` 0x2000–0x2020 and a zero-filled tail.
+    fn span_app() -> DesktopApp {
+        let mut app = menu_app();
+        let info = app.info.as_mut().unwrap();
+        info.sections.push(crate::model::SectionInfo {
+            name: ".data".into(),
+            address: 0x2000,
+            size: 0x40,
+            file_offset: 0x100,
+            file_size: 0x20,
+            executable: false,
+        });
+        info.file_len = 0x120;
+        app.result_scope = Some(0x1000);
+        app.tab = Tab::Listing;
+        app.set_listing_scope(super::super::program_listing::ListingScope::Program);
+        app
+    }
+
+    #[test]
+    fn span_menus_show_hex_expand_and_copy_from_byte_rows() {
+        let mut desk = Desk::new(span_app());
+        // Zero-filled bytes have nothing to show in Hex or expand.
+        let menu = desk.open(Pane::Listing, "00002020", 1);
+        assert!(shows(&menu, "Show in Hex") && shows(&menu, "Copy address"));
+        assert!(!shows(&menu, "Expand"));
+        desk.choose(Pane::Listing, &menu, "Show in Hex");
+        assert_eq!(desk.app.tab, Tab::Listing, "disabled");
+        // From a `??` row with the cursor on it: its exact span.
+        let output = desk.frame(Pane::Listing, vec![]);
+        let point = fixture::text_position(&output, "00001008", 1);
+        desk.frame(Pane::Listing, fixture::pointer_events(point));
+        assert_eq!(desk.app.selected, Some(0x1008));
+        let menu = desk.open(Pane::Listing, "00001008", 1);
+        for item in [
+            "Show in Hex",
+            "Expand",
+            "Xrefs to address 1008",
+            "Copy address",
+        ] {
+            assert!(shows(&menu, item), "{item}");
+        }
+        assert!(!shows(&menu, "Copy bytes") && !shows(&menu, "Collapse"));
+        desk.choose(Pane::Listing, &menu, "Show in Hex");
+        assert_eq!(desk.app.tab, Tab::Hex);
+        assert_eq!(desk.app.data_location, Some((0x1008, 0x38)));
+        assert_eq!(desk.app.hex.focused_span(), Some((0x1008, 0x38)));
+        assert_eq!(
+            desk.app.history,
+            [
+                Place::Code(0x1008),
+                Place::Data {
+                    address: 0x1008,
+                    length: 0x38
+                }
+            ]
+        );
+        // Back returns the cursor to the `??` row it left: no function is
+        // guessed at a non-entry executable address and nothing is sent.
+        // Press and release, so the next press is not a repeat.
+        let step = |desk: &mut Desk, key: egui::Key| {
+            let release = egui::Event::Key {
+                key,
+                physical_key: Some(key),
+                pressed: false,
+                repeat: false,
+                modifiers: egui::Modifiers::ALT,
+            };
+            desk.frame(
+                Pane::Listing,
+                vec![fixture::key_event(key, egui::Modifiers::ALT), release],
+            );
+        };
+        let back = |desk: &mut Desk| step(desk, egui::Key::ArrowLeft);
+        let cursor = |desk: &Desk| {
+            let layout = desk.app.program_layout().unwrap();
+            desk.app.program_cursor(&layout)
+        };
+        back(&mut desk);
+        assert_eq!((desk.app.tab, desk.app.history_index), (Tab::Listing, 0));
+        assert_eq!(desk.app.selected, Some(0x1008));
+        assert_eq!(desk.app.result_scope, Some(0x1000), "nothing re-resolved");
+        assert!(desk.app.queue.is_empty() && desk.app.pending.is_none());
+        assert!(desk.app.data_location.is_none() && desk.app.program.follow.is_none());
+        assert!(matches!(
+            cursor(&desk),
+            Some(crate::program_listing::Row::Undefined { start: 0x1008, .. })
+        ));
+        // Forward opens the recorded span again.
+        step(&mut desk, egui::Key::ArrowRight);
+        assert_eq!(desk.app.hex.focused_span(), Some((0x1008, 0x38)));
+        // A `.data` row: Back returns to it too, without a Decode read.
+        desk.app.tab = Tab::Listing;
+        // Its row is just above the zero-filled tail's; the section header
+        // also prints 00002000.
+        let output = desk.frame(Pane::Listing, vec![]);
+        let point =
+            fixture::text_position(&output, "00002020", 1) - egui::vec2(0.0, theme::ROW_HEIGHT);
+        desk.frame(Pane::Listing, fixture::pointer_events(point));
+        assert_eq!(desk.app.selected, Some(0x2000));
+        desk.frame(Pane::Listing, fixture::secondary_events(point));
+        let menu = desk.frame(
+            Pane::Listing,
+            vec![egui::Event::PointerMoved(egui::pos2(2.0, 2.0))],
+        );
+        desk.choose(Pane::Listing, &menu, "Show in Hex");
+        assert_eq!(desk.app.hex.focused_span(), Some((0x2000, 0x20)));
+        back(&mut desk);
+        assert_eq!(
+            (desk.app.tab, desk.app.selected),
+            (Tab::Listing, Some(0x2000))
+        );
+        assert!(desk.app.discovery_bytes.is_none() && desk.app.pending.is_none());
+        assert!(matches!(
+            cursor(&desk),
+            Some(crate::program_listing::Row::Undefined { start: 0x2000, .. })
+        ));
+        assert_eq!(desk.app.result_scope, Some(0x1000));
+        // Expand from the menu; then a byte row's own menu.
+        let history = desk.app.history.clone();
+        let menu = desk.open(Pane::Listing, "00001008", 1);
+        desk.choose(Pane::Listing, &menu, "Expand");
+        assert_eq!(
+            desk.app.program.expanded.covering(0x1008),
+            Some((0x1008, 0x1040))
+        );
+        assert_eq!(desk.app.history, history, "no history");
+        let menu = desk.open(Pane::Listing, "00001009", 1);
+        assert!(shows(&menu, "Collapse") && !shows(&menu, "Copy bytes"));
+        assert!(shows(&menu, "Xrefs to address 1009"));
+        // Once the page is loaded, its bytes copy.
+        desk.app
+            .program
+            .bytes
+            .accept(0x1000, vec![0xcc; 0x100], 0x1000, &[]);
+        let menu = desk.open(Pane::Listing, "00001009", 1);
+        let copied = desk.choose(Pane::Listing, &menu, "Copy bytes");
+        assert_eq!(copies(&copied), [hex(&[0xcc])]);
+        let menu = desk.open(Pane::Listing, "00001009", 1);
+        desk.choose(Pane::Listing, &menu, "Show in Hex");
+        assert_eq!(desk.app.hex.focused_span(), Some((0x1009, 1)));
+        desk.app.tab = Tab::Listing;
+        let menu = desk.open(Pane::Listing, "00001009", 1);
+        desk.choose(Pane::Listing, &menu, "Collapse");
+        assert!(desk.app.program.expanded.is_empty());
     }
 }

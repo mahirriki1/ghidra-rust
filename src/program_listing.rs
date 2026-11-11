@@ -4,12 +4,25 @@
 //! sources: the ordered sections, the ordered function inventory and the
 //! decoded instruction runs of loaded function views. Bytes no loaded view
 //! decoded stay undefined; nothing is linearly disassembled or guessed.
+//!
+//! A [`Layout`] also borrows the session's [`Expansions`]: undefined bytes
+//! inside an expanded address interval are one [`Row::Byte`] each, and the
+//! collapsed `??` rows around them are clipped to the intervals. Decoded
+//! instructions, pending bodies and zero-filled tails ignore expansions.
+//!
+//! Body rows are derived in two steps. `Layout::unexpanded` finds the row
+//! covering an address from decoded runs, entries and section bounds; an
+//! undefined zone it returns is then split by `Layout::undefined` into byte
+//! rows and the collapsed parts between intervals. Further evidence (data
+//! rows, split marks) belongs in the first step, clipping the undefined zone
+//! as entries do; because expanded intervals override data rows, a data row
+//! overlapping an interval falls back to its undefined zone there.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::function_presentation::{Listing, ListingIndex};
-use crate::model::{FunctionInfo, FunctionView, SectionInfo, function_at};
+use crate::model::{FunctionInfo, FunctionView, MAX_BYTE_READ, SectionInfo, function_at};
 use crate::result_store::{Bytes, ProgramContext, RESULT_STORE_BUDGET};
 
 /// Order of rows sharing one address.
@@ -65,6 +78,10 @@ pub enum Row {
         start: u64,
         end: u64,
     },
+    /// One undefined file-backed byte inside an expanded interval.
+    Byte {
+        address: u64,
+    },
 }
 
 impl Row {
@@ -75,7 +92,8 @@ impl Row {
             Self::Instruction { start, .. }
             | Self::Undefined { start, .. }
             | Self::ZeroFill { start, .. }
-            | Self::Pending { start, .. } => Position::new(start, Rank::Body),
+            | Self::Pending { start, .. }
+            | Self::Byte { address: start } => Position::new(start, Rank::Body),
         }
     }
 
@@ -87,6 +105,7 @@ impl Row {
             | Self::Undefined { start, end }
             | Self::ZeroFill { start, end }
             | Self::Pending { start, end, .. } => Some((start, end)),
+            Self::Byte { address } => Some((address, address + 1)),
         }
     }
 
@@ -196,13 +215,31 @@ impl ProgramRows {
         rows
     }
 
-    /// Navigation over these rows and the current inventory, which must be
-    /// ordered by address.
-    pub fn layout<'a>(&'a self, functions: &'a [FunctionInfo]) -> Layout<'a> {
+    /// Navigation over these rows, the current inventory, which must be
+    /// ordered by address, and the expanded byte intervals.
+    pub fn layout<'a>(
+        &'a self,
+        functions: &'a [FunctionInfo],
+        expansions: &'a Expansions,
+    ) -> Layout<'a> {
         Layout {
             rows: self,
             functions,
+            expansions,
         }
+    }
+
+    /// The byte page holding file-backed `address`: aligned to
+    /// [`BYTE_PAGE`] from its section's start and clipped to the section's
+    /// file-backed end, so one read never leaves one section's bytes.
+    pub fn byte_page(&self, address: u64) -> Option<(u64, usize)> {
+        let span = self
+            .span_at(address)
+            .filter(|span| address < span.file_end)?;
+        let page = BYTE_PAGE as u64;
+        let start = span.start + (address - span.start) / page * page;
+        let length = (span.file_end - start).min(page);
+        Some((start, length as usize))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -224,6 +261,7 @@ impl ProgramRows {
 pub struct Layout<'a> {
     rows: &'a ProgramRows,
     functions: &'a [FunctionInfo],
+    expansions: &'a Expansions,
 }
 
 impl Layout<'_> {
@@ -247,6 +285,31 @@ impl Layout<'_> {
 
     /// The body row covering `address`, which lies in `span`.
     fn body(&self, span: &Span, address: u64) -> Row {
+        match self.unexpanded(span, address) {
+            Row::Undefined { start, end } => self.undefined(address, start, end),
+            row => row,
+        }
+    }
+
+    /// An undefined zone `[start, end)` holding `address`, under the
+    /// expansions: a byte row inside an interval, else the collapsed part
+    /// between the neighbouring intervals.
+    fn undefined(&self, address: u64, start: u64, end: u64) -> Row {
+        let expansions = &self.expansions.ranges;
+        let before = expansions.range(..=address).next_back();
+        if before.is_some_and(|(_, &interval_end)| interval_end > address) {
+            return Row::Byte { address };
+        }
+        let start = before.map_or(start, |(_, &interval_end)| start.max(interval_end));
+        let end = expansions
+            .range(address + 1..)
+            .next()
+            .map_or(end, |(&interval_start, _)| end.min(interval_start));
+        Row::Undefined { start, end }
+    }
+
+    /// The body row covering `address` without expansions.
+    fn unexpanded(&self, span: &Span, address: u64) -> Row {
         let runs = &self.rows.runs;
         if let Some((&start, &(end, owner))) = runs.range(..=address).next_back()
             && end > address
@@ -428,6 +491,22 @@ impl Layout<'_> {
         ))
     }
 
+    /// See [`ProgramRows::byte_page`].
+    pub fn byte_page(&self, address: u64) -> Option<(u64, usize)> {
+        self.rows.byte_page(address)
+    }
+
+    /// The expanded run holding the byte row at `address`: its undefined
+    /// zone intersected with the covering interval.
+    pub fn byte_run(&self, address: u64) -> Option<(u64, u64)> {
+        let span = self.rows.span_at(address)?;
+        let Row::Undefined { start, end } = self.unexpanded(span, address) else {
+            return None;
+        };
+        let (interval_start, interval_end) = self.expansions.covering(address)?;
+        Some((start.max(interval_start), end.min(interval_end)))
+    }
+
     /// Where a reveal of `address` lands: an entry's header, else the body
     /// row covering it.
     pub fn reveal(&self, address: u64) -> Option<Row> {
@@ -436,6 +515,224 @@ impl Layout<'_> {
             return Some(Row::Function { entry: address });
         }
         self.resolve(Position::new(address, Rank::Body))
+    }
+}
+
+/// Bytes one expand action shows as byte rows; the rest of the gap stays one
+/// collapsed `??` row.
+pub const EXPAND_STEP: u64 = MAX_BYTE_READ as u64;
+/// Expanded intervals one session keeps; more evict the farthest.
+pub const MAX_EXPANSIONS: usize = 64;
+
+/// Session-only expanded address intervals: sorted, disjoint, with
+/// adjacent intervals merged. Keyed by address, not by gap, because gap
+/// bounds move as bodies load; only undefined bytes inside an interval
+/// become byte rows.
+#[derive(Default)]
+pub struct Expansions {
+    ranges: BTreeMap<u64, u64>,
+    /// Advances on every change, invalidating materialized rows.
+    epoch: u64,
+}
+
+impl Expansions {
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    pub fn len(&self) -> usize {
+        self.ranges.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+
+    /// The interval holding `address`.
+    pub fn covering(&self, address: u64) -> Option<(u64, u64)> {
+        self.ranges
+            .range(..=address)
+            .next_back()
+            .filter(|(_, end)| **end > address)
+            .map(|(&start, &end)| (start, end))
+    }
+
+    /// Expands `[start, end)`, merging it with overlapping or adjacent
+    /// intervals. Beyond [`MAX_EXPANSIONS`] the interval farthest from the
+    /// new one goes first, never the new one or one holding `keep`.
+    pub fn expand(&mut self, start: u64, end: u64, keep: Option<u64>) {
+        if start >= end {
+            return;
+        }
+        let (mut start, mut end) = (start, end);
+        let touching: Vec<(u64, u64)> = self
+            .ranges
+            .range(..=end)
+            .rev()
+            .take_while(|(_, other_end)| **other_end >= start)
+            .map(|(&s, &e)| (s, e))
+            .collect();
+        for (other_start, other_end) in touching {
+            self.ranges.remove(&other_start);
+            start = start.min(other_start);
+            end = end.max(other_end);
+        }
+        self.ranges.insert(start, end);
+        while self.ranges.len() > MAX_EXPANSIONS {
+            let distance = |s: u64, e: u64| {
+                if e <= start {
+                    start - e
+                } else {
+                    s.saturating_sub(end)
+                }
+            };
+            let victim = self
+                .ranges
+                .iter()
+                .filter(|&(&s, &e)| s != start && keep.is_none_or(|k| k < s || k >= e))
+                .max_by_key(|&(&s, &e)| distance(s, e))
+                .map(|(&s, _)| s);
+            match victim {
+                Some(victim) => {
+                    self.ranges.remove(&victim);
+                }
+                None => break,
+            }
+        }
+        self.epoch = self.epoch.wrapping_add(1);
+    }
+
+    /// Collapses `[start, end)`; intervals around it keep their other parts.
+    pub fn collapse(&mut self, start: u64, end: u64) {
+        let overlapping: Vec<(u64, u64)> = self
+            .ranges
+            .range(..end)
+            .rev()
+            .take_while(|(_, other_end)| **other_end > start)
+            .map(|(&s, &e)| (s, e))
+            .collect();
+        if overlapping.is_empty() {
+            return;
+        }
+        for (other_start, other_end) in overlapping {
+            self.ranges.remove(&other_start);
+            if other_start < start {
+                self.ranges.insert(other_start, start);
+            }
+            if other_end > end {
+                self.ranges.insert(end, other_end);
+            }
+        }
+        self.epoch = self.epoch.wrapping_add(1);
+    }
+}
+
+/// The interval one expand action on `row` adds: up to [`EXPAND_STEP`]
+/// bytes from the start of a collapsed `??` row. Other rows never expand.
+pub fn expand_interval(row: &Row) -> Option<(u64, u64)> {
+    match *row {
+        Row::Undefined { start, end } => Some((start, end.min(start.saturating_add(EXPAND_STEP)))),
+        _ => None,
+    }
+}
+
+/// Bytes one Listing byte read requests: the Hex page size.
+pub const BYTE_PAGE: usize = crate::hex_ui::PAGE_BYTES;
+/// Pages the Program listing keeps: 16 KiB, not charged to the store.
+pub const MAX_BYTE_PAGES: usize = 4;
+/// Pages whose read failed; once this many failed, none are requested.
+pub const MAX_FAILED_PAGES: usize = 64;
+
+/// The bytes byte rows show: at most [`MAX_BYTE_PAGES`] pages, as
+/// [`ProgramRows::byte_page`] lays them out. A page is shown only when its
+/// read returned every byte.
+#[derive(Default)]
+pub struct ByteCache {
+    pages: BTreeMap<u64, Vec<u8>>,
+    failed: BTreeSet<u64>,
+}
+
+impl ByteCache {
+    pub fn len(&self) -> usize {
+        self.pages.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pages.is_empty()
+    }
+
+    pub fn contains(&self, page: u64) -> bool {
+        self.pages.contains_key(&page)
+    }
+
+    pub fn is_failed(&self, page: u64) -> bool {
+        self.failed.contains(&page)
+    }
+
+    /// The cached byte at `address`.
+    pub fn byte(&self, address: u64) -> Option<u8> {
+        let (&start, bytes) = self.pages.range(..=address).next_back()?;
+        bytes.get(usize::try_from(address - start).ok()?).copied()
+    }
+
+    /// Every byte of `[start, end)`, when all of them are cached.
+    pub fn span(&self, start: u64, end: u64) -> Option<Vec<u8>> {
+        let length = usize::try_from(end.checked_sub(start)?).ok()?;
+        if length == 0 || length > MAX_BYTE_PAGES * BYTE_PAGE {
+            return None;
+        }
+        (start..end).map(|address| self.byte(address)).collect()
+    }
+
+    /// The first of `wanted` pages (top first) worth reading now: not
+    /// cached, not failed, and with room for it without evicting a page of
+    /// `visible`. Nothing once [`MAX_FAILED_PAGES`] reads failed.
+    pub fn next(&self, wanted: &[(u64, usize)], visible: &[u64]) -> Option<(u64, usize)> {
+        if self.failed.len() >= MAX_FAILED_PAGES {
+            return None;
+        }
+        let full = self.pages.len() >= MAX_BYTE_PAGES
+            && self.pages.keys().all(|page| visible.contains(page));
+        if full {
+            return None;
+        }
+        wanted
+            .iter()
+            .copied()
+            .find(|(page, _)| !self.contains(*page) && !self.is_failed(*page))
+    }
+
+    /// Keeps a complete page, evicting the page farthest from `top` that
+    /// is not `visible`. Returns false, changing nothing, when every cached
+    /// page is visible.
+    pub fn accept(&mut self, page: u64, bytes: Vec<u8>, top: u64, visible: &[u64]) -> bool {
+        if self.pages.len() >= MAX_BYTE_PAGES && !self.pages.contains_key(&page) {
+            let victim = self
+                .pages
+                .keys()
+                .copied()
+                .filter(|cached| !visible.contains(cached))
+                .max_by_key(|cached| cached.abs_diff(top));
+            let Some(victim) = victim else {
+                return false;
+            };
+            self.pages.remove(&victim);
+        }
+        self.failed.remove(&page);
+        self.pages.insert(page, bytes);
+        true
+    }
+
+    /// The read of `page` failed; it is not requested again this session.
+    pub fn fail(&mut self, page: u64) {
+        if self.failed.len() < MAX_FAILED_PAGES {
+            self.failed.insert(page);
+        }
+    }
+
+    /// Releases every page; failures stay recorded.
+    pub fn release(&mut self) {
+        self.pages.clear();
     }
 }
 
@@ -709,6 +1006,11 @@ mod tests {
     use super::*;
     use crate::model::{BasicBlock, Instruction};
 
+    static NONE: Expansions = Expansions {
+        ranges: BTreeMap::new(),
+        epoch: 0,
+    };
+
     fn section(address: u64, size: u64, file_size: u64) -> SectionInfo {
         SectionInfo {
             name: format!("s{address:x}"),
@@ -873,7 +1175,7 @@ mod tests {
         for (sections, views, entries, failed) in synthetic_layouts() {
             let program = rows(&sections, &views, &failed);
             let inventory = functions(&entries);
-            let layout = program.layout(&inventory);
+            let layout = program.layout(&inventory, &NONE);
             let all = forward(&layout);
             check_partition(&sections, &all);
             assert_eq!(backward(&layout), all, "backward = reverse of forward");
@@ -895,7 +1197,7 @@ mod tests {
         let (sections, views, entries, _) = synthetic_layouts().remove(0);
         let program = rows(&sections, &views, &[]);
         let inventory = functions(&entries);
-        let layout = program.layout(&inventory);
+        let layout = program.layout(&inventory, &NONE);
         let all = forward(&layout);
         assert_eq!(
             all[..6],
@@ -942,7 +1244,7 @@ mod tests {
         }));
         // A failed entry is undefined, not pending.
         let failed = rows(&sections, &views, &[0x1060]);
-        let layout = failed.layout(&inventory);
+        let layout = failed.layout(&inventory, &NONE);
         assert!(forward(&layout).contains(&Row::Undefined {
             start: 0x1060,
             end: 0x1080
@@ -952,7 +1254,7 @@ mod tests {
         let (sections, views, entries, failed) = synthetic_layouts().remove(1);
         let program = rows(&sections, &views, &failed);
         let inventory = functions(&entries);
-        let all = forward(&program.layout(&inventory));
+        let all = forward(&program.layout(&inventory, &NONE));
         assert!(all.contains(&Row::Instruction {
             owner: 0x4000,
             start: 0x4004,
@@ -967,7 +1269,7 @@ mod tests {
         let program = rows(&sections, &views, &failed);
         let inventory = functions(&entries);
         assert!(
-            !forward(&program.layout(&inventory))
+            !forward(&program.layout(&inventory, &NONE))
                 .iter()
                 .any(|row| matches!(row, Row::Instruction { .. }))
         );
@@ -978,7 +1280,7 @@ mod tests {
         for (sections, views, entries, failed) in synthetic_layouts() {
             let program = rows(&sections, &views, &failed);
             let inventory = functions(&entries);
-            let layout = program.layout(&inventory);
+            let layout = program.layout(&inventory, &NONE);
             let all = forward(&layout);
             assert_eq!(layout.first(), all.first().copied());
             assert_eq!(layout.last(), all.last().copied());
@@ -1031,7 +1333,10 @@ mod tests {
         let (sections, views, entries, _) = synthetic_layouts().remove(0);
         let program = rows(&sections, &views, &[]);
         let inventory = functions(&entries);
-        assert_eq!(program.layout(&inventory).section_bounds(0x1800), None);
+        assert_eq!(
+            program.layout(&inventory, &NONE).section_bounds(0x1800),
+            None
+        );
     }
 
     #[test]
@@ -1122,5 +1427,236 @@ mod tests {
         let far = CachedBody::new(view(0x9000, &[(0x9000, 1)]), Some(context)).unwrap();
         assert!(!cache.insert(0x9000, far, 0x1100, |bytes| bytes == 0));
         assert!(cache.is_empty() && cache.bytes() == 0);
+    }
+
+    /// A small deterministic generator for reproducible random layouts.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn below(&mut self, bound: u64) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 33) % bound.max(1)
+        }
+    }
+
+    #[test]
+    fn random_expansions_partition_bytes_once_and_reverse_exactly() {
+        let mut random = Lcg(7);
+        for (sections, views, entries, failed) in synthetic_layouts() {
+            let program = rows(&sections, &views, &failed);
+            let inventory = functions(&entries);
+            for _ in 0..24 {
+                let mut expansions = Expansions::default();
+                for _ in 0..random.below(6) + 1 {
+                    let section = &sections[random.below(sections.len() as u64) as usize];
+                    let reach = section.size.min(0x180);
+                    let start = section.address + random.below(reach);
+                    let end = start.saturating_add(random.below(0x60) + 1);
+                    if random.below(4) == 0 {
+                        expansions.collapse(start, end);
+                    } else {
+                        expansions.expand(start, end, None);
+                    }
+                }
+                let layout = program.layout(&inventory, &expansions);
+                let all = forward(&layout);
+                check_partition(&sections, &all);
+                assert_eq!(backward(&layout), all, "backward = reverse of forward");
+                for (index, row) in all.iter().enumerate() {
+                    assert_eq!(layout.resolve(row.position()), Some(*row));
+                    if index > 0 {
+                        assert_eq!(layout.previous(row), Some(all[index - 1]));
+                    }
+                    match *row {
+                        Row::Byte { address } => {
+                            let (start, end) = layout.byte_run(address).expect("a run");
+                            assert!(start <= address && address < end);
+                            assert!(expansions.covering(address).is_some());
+                            // The run is exactly the consecutive byte rows.
+                            let first = all.iter().position(|r| *r == Row::Byte { address: start });
+                            let last = all
+                                .iter()
+                                .position(|r| *r == Row::Byte { address: end - 1 });
+                            assert_eq!(last.unwrap() - first.unwrap(), (end - start - 1) as usize);
+                        }
+                        Row::Undefined { start, end } => {
+                            assert!(
+                                (start..end).all(|a| expansions.covering(a).is_none()),
+                                "{row:?} is collapsed"
+                            );
+                        }
+                        Row::ZeroFill { .. } | Row::Pending { .. } | Row::Instruction { .. } => {
+                            let (start, _) = row.span().unwrap();
+                            assert_eq!(layout.byte_run(start), None);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn one_expansion_shows_at_most_64_kib_and_leaves_the_rest_collapsed() {
+        let sections = [section(0x10000, 0x30000, 0x30000)];
+        let program = rows(&sections, &[], &[]);
+        let gap = Row::Undefined {
+            start: 0x10000,
+            end: 0x40000,
+        };
+        assert_eq!(
+            program
+                .layout(&[], &NONE)
+                .first()
+                .and_then(|first| { program.layout(&[], &NONE).next(&first) }),
+            Some(gap)
+        );
+        let (start, end) = expand_interval(&gap).unwrap();
+        assert_eq!((start, end), (0x10000, 0x10000 + EXPAND_STEP));
+        let mut expansions = Expansions::default();
+        expansions.expand(start, end, None);
+        let layout = program.layout(&[], &expansions);
+        let last = Row::Byte { address: end - 1 };
+        let remainder = Row::Undefined {
+            start: end,
+            end: 0x40000,
+        };
+        assert_eq!(layout.next(&last), Some(remainder));
+        assert_eq!(layout.previous(&remainder), Some(last));
+        assert_eq!(layout.byte_run(end - 1), Some((start, end)));
+        // Expanding the remainder joins the same run.
+        let (more_start, more_end) = expand_interval(&remainder).unwrap();
+        expansions.expand(more_start, more_end, None);
+        assert_eq!(expansions.len(), 1);
+        assert_eq!(
+            program.layout(&[], &expansions).byte_run(start),
+            Some((start, start + 2 * EXPAND_STEP))
+        );
+        // Zero-filled and decoded rows never expand.
+        assert_eq!(
+            expand_interval(&Row::ZeroFill {
+                start: 0,
+                end: 0x10
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn bodies_loaded_inside_an_interval_win_over_byte_rows() {
+        let sections = [section(0x1000, 0x100, 0x100)];
+        let mut expansions = Expansions::default();
+        expansions.expand(0x1000, 0x1040, None);
+        let empty = rows(&sections, &[], &[]);
+        let layout = empty.layout(&[], &expansions);
+        assert_eq!(
+            layout.resolve(Position::new(0x1010, Rank::Body)),
+            Some(Row::Byte { address: 0x1010 })
+        );
+        // A body loads over part of the interval; an unloaded entry also
+        // lies in it.
+        let loaded = rows(&sections, &[view(0x1010, &[(0x1010, 4), (0x1014, 4)])], &[]);
+        let inventory = functions(&[0x1010, 0x1030]);
+        let layout = loaded.layout(&inventory, &expansions);
+        let all = forward(&layout);
+        check_partition(&sections, &all);
+        assert!(all.contains(&Row::Instruction {
+            owner: 0x1010,
+            start: 0x1014,
+            end: 0x1018
+        }));
+        assert!(!all.contains(&Row::Byte { address: 0x1014 }));
+        assert!(all.contains(&Row::Pending {
+            entry: 0x1030,
+            start: 0x1030,
+            end: 0x1100
+        }));
+        assert_eq!(layout.byte_run(0x1000), Some((0x1000, 0x1010)));
+        assert_eq!(layout.byte_run(0x1020), Some((0x1018, 0x1030)));
+        assert_eq!(layout.byte_run(0x1030), None);
+        // The interval is untouched: an unloaded body would show bytes again.
+        assert_eq!(expansions.covering(0x1014), Some((0x1000, 0x1040)));
+    }
+
+    #[test]
+    fn the_65th_interval_evicts_the_farthest_but_never_the_selected_one() {
+        let interval = |index: u64| (index * 0x100, index * 0x100 + 0x10);
+        let mut expansions = Expansions::default();
+        for index in 0..MAX_EXPANSIONS as u64 {
+            let (start, end) = interval(index);
+            expansions.expand(start, end, None);
+        }
+        assert_eq!(expansions.len(), MAX_EXPANSIONS);
+        // Adjacent to an existing interval: merged, nothing evicted.
+        expansions.expand(0x10, 0x20, None);
+        assert_eq!(expansions.len(), MAX_EXPANSIONS);
+        assert_eq!(expansions.covering(0x1f), Some((0, 0x20)));
+        let epoch = expansions.epoch();
+        expansions.expand(0x10000, 0x10010, None);
+        assert_ne!(expansions.epoch(), epoch);
+        assert_eq!(expansions.len(), MAX_EXPANSIONS);
+        assert_eq!(expansions.covering(0), None, "the farthest went");
+        assert!(expansions.covering(0x10000).is_some(), "the new one stays");
+        // The farthest holds the selection: the next farthest goes instead.
+        expansions.expand(0x20000, 0x20010, Some(0x105));
+        assert_eq!(expansions.covering(0x105), Some((0x100, 0x110)));
+        assert_eq!(expansions.covering(0x205), None);
+        assert_eq!(expansions.len(), MAX_EXPANSIONS);
+        // Collapsing the middle of an interval keeps its two sides.
+        expansions.collapse(0x104, 0x108);
+        assert_eq!(expansions.covering(0x103), Some((0x100, 0x104)));
+        assert_eq!(expansions.covering(0x108), Some((0x108, 0x110)));
+        assert_eq!(expansions.covering(0x105), None);
+    }
+
+    #[test]
+    fn byte_pages_are_section_aligned_bounded_and_keep_visible_pages() {
+        // A section not aligned to the page size, with a short file part.
+        let sections = [
+            section(0x1010, 0x3000, 0x2100),
+            section(0x8000, 0x100, 0x100),
+        ];
+        let program = rows(&sections, &[], &[]);
+        assert_eq!(program.byte_page(0x1010), Some((0x1010, BYTE_PAGE)));
+        assert_eq!(program.byte_page(0x2020), Some((0x2010, BYTE_PAGE)));
+        assert_eq!(program.byte_page(0x3100), Some((0x3010, 0x100)), "file end");
+        assert_eq!(program.byte_page(0x3110), None, "zero-filled");
+        assert_eq!(program.byte_page(0x8050), Some((0x8000, 0x100)));
+        assert_eq!(program.byte_page(0x7000), None, "unmapped");
+        let mut cache = ByteCache::default();
+        let page = |start: u64| (start, 0x10);
+        let wanted = [page(0x100), page(0x200)];
+        assert_eq!(cache.next(&wanted, &[]), Some(page(0x100)));
+        assert!(cache.accept(0x100, vec![0xab; 0x10], 0x100, &[]));
+        assert_eq!(cache.byte(0x10f), Some(0xab));
+        assert_eq!(cache.byte(0x110), None);
+        assert_eq!(cache.span(0x100, 0x104), Some(vec![0xab; 4]));
+        assert_eq!(cache.span(0x10e, 0x112), None, "partly cached");
+        assert_eq!(cache.next(&wanted, &[]), Some(page(0x200)));
+        cache.fail(0x200);
+        assert_eq!(cache.next(&wanted, &[]), None, "failures are not retried");
+        for start in [0x300, 0x400, 0x500] {
+            assert!(cache.accept(start, vec![1; 0x10], 0x100, &[]));
+        }
+        assert_eq!(cache.len(), MAX_BYTE_PAGES);
+        // A fifth page evicts the one farthest from the top, but not a
+        // visible one.
+        assert!(cache.accept(0x600, vec![2; 0x10], 0x100, &[0x500]));
+        assert!(cache.contains(0x500) && !cache.contains(0x400));
+        assert_eq!(cache.len(), MAX_BYTE_PAGES);
+        // With all four visible, no fifth is requested or kept.
+        let visible = [0x100, 0x300, 0x500, 0x600];
+        assert_eq!(cache.next(&[page(0x700)], &visible), None);
+        assert!(!cache.accept(0x700, vec![3; 0x10], 0x100, &visible));
+        assert!(!cache.contains(0x700));
+        assert_eq!(cache.next(&[page(0x700)], &visible[..3]), Some(page(0x700)));
+        // After enough failures nothing more is requested.
+        for start in 0..MAX_FAILED_PAGES as u64 {
+            cache.fail(0x10000 + start * 0x1000);
+        }
+        assert_eq!(cache.next(&[page(0x700)], &[]), None);
     }
 }

@@ -16,7 +16,8 @@ use crate::model::{
     FunctionView, ListingBinding, ListingOutcome, MAX_LISTING_FUNCTIONS, Request, function_at,
 };
 use crate::program_listing::{
-    AddressScale, BodySource, CachedBody, ListingCache, Position, ProgramRows, Rank, Row,
+    AddressScale, BodySource, ByteCache, CachedBody, Expansions, ListingCache, Position,
+    ProgramRows, Rank, Row,
 };
 use crate::result_store::{ProgramContext, Stored};
 use crate::theme;
@@ -87,6 +88,7 @@ impl PartialEq for RowsKey {
 struct WindowKey {
     rows: u64,
     inventory: (u64, usize, usize, u64, u64),
+    expansions: u64,
     after: usize,
 }
 
@@ -152,6 +154,14 @@ pub(super) struct ProgramPane {
     pub(super) cursor: Option<Position>,
     /// A follow of the cursor's function, armed by a cursor move.
     pub(super) follow: Option<super::program_cursor::Follow>,
+    /// Expanded byte intervals; session-only, cleared with the binary.
+    pub(super) expanded: Expansions,
+    /// Bytes shown by byte rows.
+    pub(super) bytes: ByteCache,
+    /// Pages of byte rows in view lacking bytes (top first), and the pages
+    /// of every byte row in view, as of the last pane frame.
+    byte_wanted: Vec<(u64, usize)>,
+    byte_visible: Vec<u64>,
     /// Tests without a worker process let follows send as if one ran.
     #[cfg(test)]
     pub(super) assume_worker: bool,
@@ -180,6 +190,15 @@ impl ProgramPane {
             ..Default::default()
         };
     }
+
+    /// Where `position` was drawn last frame, in points below the view's
+    /// top, when it was in the materialized window.
+    fn drawn_distance(&self, position: Position) -> Option<f32> {
+        let rows = &self.window.as_ref()?.rows;
+        let find = |at: Position| rows.binary_search_by_key(&at, Row::position).ok();
+        let below = find(position)?.checked_sub(find(self.top?)?)?;
+        Some(below as f32 * theme::ROW_HEIGHT - self.offset)
+    }
 }
 
 impl DesktopApp {
@@ -207,6 +226,9 @@ impl DesktopApp {
             self.program.window = None;
             self.program.wanted.clear();
             self.program.prefetch.clear();
+            self.program.bytes.release();
+            self.program.byte_wanted.clear();
+            self.program.byte_visible.clear();
         }
         if scope == ListingScope::Program {
             self.program.window = None;
@@ -385,7 +407,7 @@ impl DesktopApp {
             theme::empty_state(ui, "No sections");
             return;
         }
-        let layout = rows.layout(&info.functions);
+        let layout = rows.layout(&info.functions, &self.program.expanded);
         // One-shot reveal: center only a row that is not fully shown, then
         // pin it where it is on screen.
         if let Some(reveal) = self.program.reveal.take() {
@@ -409,15 +431,9 @@ impl DesktopApp {
                     .program
                     .shown
                     .is_some_and(|(first, last)| first <= position && position <= last);
+                // Measured in last frame's rows from its top.
                 let distance = shown
-                    .then(|| {
-                        // Measured in last frame's rows from its top.
-                        let rows = &self.program.window.as_ref()?.rows;
-                        let find =
-                            |at: Position| rows.binary_search_by_key(&at, Row::position).ok();
-                        let below = find(position)?.checked_sub(find(self.program.top?)?)?;
-                        Some(below as f32 * theme::ROW_HEIGHT - self.program.offset)
-                    })
+                    .then(|| self.program.drawn_distance(position))
                     .flatten();
                 let distance = distance.unwrap_or_else(|| {
                     let mut row = target;
@@ -466,6 +482,7 @@ impl DesktopApp {
                 self.source_epochs.inventory,
                 functions.last().map_or(0, |f| f.address),
             ),
+            expansions: self.program.expanded.epoch(),
             after: (page + WINDOW_BEFORE).min(WINDOW_ROWS - WINDOW_BEFORE - 1),
         };
         let reused = self.program.window.as_mut().is_some_and(|window| {
@@ -540,6 +557,9 @@ impl DesktopApp {
         let mut menu_opened = None;
         let mut menu_chosen = None;
         let mut header_xrefs = None;
+        let mut stop = None;
+        let mut toggled = None;
+        let bytes = &self.program.bytes;
         let anchored = theme::anchored_rows(
             ui,
             body,
@@ -704,19 +724,94 @@ impl DesktopApp {
                 }
                 Row::Undefined { start, end } | Row::ZeroFill { start, end } => {
                     let length = end - start;
-                    let mark = if matches!(row, Row::ZeroFill { .. }) {
+                    let zero = matches!(row, Row::ZeroFill { .. });
+                    let mark = if zero {
                         theme::ListingMark::ZeroFill { length }
                     } else {
                         theme::ListingMark::Undefined { length }
                     };
+                    let response = theme::row_response(
+                        ui,
+                        ui.scope_id().with(("program-gap", start)),
+                        rect,
+                        false,
+                        false,
+                    );
                     let selected = cursor == Some(row.position());
                     theme::listing_mark(ui, rect, &columns, start, digits, mark, selected);
-                    ui.interact(
+                    let response =
+                        response.on_hover_text(format!("{start:#x}–{end:#x}  ({length:#x})"));
+                    if !zero
+                        && theme::listing_disclosure(
+                            ui,
+                            ui.scope_id().with(("program-disclosure", start)),
+                            rect,
+                            &columns,
+                            false,
+                        )
+                    {
+                        toggled = Some(*row);
+                    }
+                    if response.clicked() {
+                        stop = Some(*row);
+                    }
+                    if response.double_clicked() && !zero {
+                        toggled = Some(*row);
+                    }
+                    let source = super::MenuSource::Span {
+                        address: start,
+                        length,
+                    };
+                    if let Some(source) = self.menu_shown(&response, source, &mut menu_opened) {
+                        response.context_menu(|ui| self.menu_body(ui, source, &mut menu_chosen));
+                    }
+                }
+                Row::Byte { address } => {
+                    let response = theme::row_response(
+                        ui,
+                        ui.scope_id().with(("program-byte", address)),
                         rect,
-                        ui.scope_id().with(("program-gap", start)),
-                        egui::Sense::hover(),
-                    )
-                    .on_hover_text(format!("{start:#x}–{end:#x}  ({length:#x})"));
+                        false,
+                        false,
+                    );
+                    theme::listing_mark(
+                        ui,
+                        rect,
+                        &columns,
+                        address,
+                        digits,
+                        theme::ListingMark::Byte {
+                            value: bytes.byte(address),
+                            failed: layout
+                                .byte_page(address)
+                                .is_some_and(|(page, _)| bytes.is_failed(page)),
+                        },
+                        cursor == Some(row.position()),
+                    );
+                    let first = layout
+                        .byte_run(address)
+                        .is_some_and(|(start, _)| start == address);
+                    if first
+                        && theme::listing_disclosure(
+                            ui,
+                            ui.scope_id().with(("program-disclosure", address)),
+                            rect,
+                            &columns,
+                            true,
+                        )
+                    {
+                        toggled = Some(*row);
+                    }
+                    if response.clicked() {
+                        stop = Some(*row);
+                    }
+                    if response.double_clicked() {
+                        toggled = Some(*row);
+                    }
+                    let source = super::MenuSource::Span { address, length: 1 };
+                    if let Some(source) = self.menu_shown(&response, source, &mut menu_opened) {
+                        response.context_menu(|ui| self.menu_body(ui, source, &mut menu_chosen));
+                    }
                 }
                 Row::Pending { start, end, .. } => {
                     theme::listing_mark(
@@ -810,6 +905,26 @@ impl DesktopApp {
                 );
             }
         }
+        // Pages of the byte rows in view, top first; those lacking bytes
+        // are wanted.
+        let mut byte_wanted: Vec<(u64, usize)> = Vec::new();
+        let mut byte_visible: Vec<u64> = Vec::new();
+        for row in shown {
+            let Row::Byte { address } = *row else {
+                continue;
+            };
+            let Some(page) = layout.byte_page(address) else {
+                continue;
+            };
+            if !byte_visible.contains(&page.0) {
+                byte_visible.push(page.0);
+            }
+            if bytes.byte(address).is_none() && !byte_wanted.contains(&page) {
+                byte_wanted.push(page);
+            }
+        }
+        self.program.byte_wanted = byte_wanted;
+        self.program.byte_visible = byte_visible;
         self.program.wanted = wanted;
         self.program.wanted_context = self.results.current_context().cloned();
         self.program.drawn_empty = false;
@@ -820,10 +935,21 @@ impl DesktopApp {
             self.program.offset = 0.0;
             context.request_repaint();
         }
+        if self.listing_page_wanted().is_some() {
+            // The next frame's worker poll sends it.
+            context.request_repaint();
+        }
         self.listing_cursor_drawn(ui, body);
         if let Some((owner, position)) = clicked {
             self.navigate_location(position.address, Some(owner), false, context);
             self.program.cursor = Some(position);
+        }
+        if let Some(row) = stop {
+            self.move_program_cursor(row, context);
+        }
+        if let Some(row) = toggled {
+            self.toggle_bytes(row);
+            context.request_repaint();
         }
         if let Some((owner, target)) = follow {
             self.follow_row_target(owner, target, context);
@@ -949,6 +1075,11 @@ impl DesktopApp {
             self.program.discovery_turn = None;
             return;
         }
+        if let Some((address, length)) = self.next_listing_page() {
+            let origin = self.listing_page_origin();
+            self.send_direct_at(Request::Bytes { address, length }, origin);
+            return;
+        }
         let Some(entries) = self.next_listing_entries() else {
             return;
         };
@@ -958,6 +1089,135 @@ impl DesktopApp {
             token: self.program.token,
         };
         self.send_direct(Request::Listing { binding, entries });
+    }
+
+    /// Whether a worker is running; tests may assume one.
+    fn listing_worker(&self) -> bool {
+        #[cfg(test)]
+        if self.program.assume_worker {
+            return true;
+        }
+        self.client.is_some()
+    }
+
+    /// The byte page of rows in view that may be read now, at the Program
+    /// listing's priority: only when [`Self::listing_may_dispatch`], with a
+    /// worker, below the failure cap and, during discovery, within a
+    /// granted turn.
+    fn listing_page_wanted(&self) -> Option<(u64, usize)> {
+        if !self.listing_worker()
+            || self.program.failures >= MAX_LISTING_FAILURES
+            || !self.listing_may_dispatch()
+        {
+            return None;
+        }
+        if self.discovery_running {
+            let turn = self.program.discovery_turn?;
+            if self.program.drawn_empty
+                || turn.granted.elapsed() > LISTING_TURN_CAP
+                || turn
+                    .ready
+                    .is_some_and(|ready| ready.elapsed() > LISTING_TURN_WAIT)
+            {
+                return None;
+            }
+        }
+        self.program
+            .bytes
+            .next(&self.program.byte_wanted, &self.program.byte_visible)
+    }
+
+    /// The byte page the next Listing request reads, if one may go now.
+    /// Pages go before function bodies; during discovery a page uses the
+    /// batch's whole turn.
+    pub(super) fn next_listing_page(&mut self) -> Option<(u64, usize)> {
+        let page = self.listing_page_wanted()?;
+        if self.discovery_running {
+            self.program.discovery_turn = None;
+        }
+        Some(page)
+    }
+
+    /// The origin of a new Listing byte read, under a new token. It is
+    /// bound to the binary and that token only, never to a byte intent, so
+    /// it neither cancels nor is cancelled by a user's Hex or Decode read.
+    fn listing_page_origin(&mut self) -> super::RequestOrigin {
+        self.program.token = self.program.token.wrapping_add(1);
+        let mut origin = self.request_origin();
+        origin.bytes = Some(super::ByteBinding {
+            generation: self.generation,
+            intent: self.byte_intent,
+            destination: super::ByteDestination::Listing {
+                token: self.program.token,
+            },
+        });
+        origin
+    }
+
+    /// Adopts a current Listing byte read: a complete page is cached, a
+    /// short one is not requested again. Nothing else changes.
+    pub(super) fn receive_listing_page(&mut self, address: u64, length: usize, bytes: Vec<u8>) {
+        if bytes.len() != length {
+            self.program.bytes.fail(address);
+            return;
+        }
+        let top = self.program.top.map_or(address, |top| top.address);
+        self.program
+            .bytes
+            .accept(address, bytes, top, &self.program.byte_visible);
+    }
+
+    /// Expands a collapsed `??` row by up to 64 KiB, or collapses the run
+    /// holding a byte row, keeping the toggled row where it was drawn. A
+    /// cursor inside a collapsed run moves to the run's start. Nothing is
+    /// navigated, selected anew or recorded in history.
+    pub(super) fn toggle_bytes(&mut self, row: Row) {
+        let Some(layout) = self.program_layout() else {
+            return;
+        };
+        let (start, end, expand) = match row {
+            Row::Undefined { .. } => {
+                let Some((start, end)) = crate::program_listing::expand_interval(&row) else {
+                    return;
+                };
+                (start, end, true)
+            }
+            Row::Byte { address } => {
+                let Some((start, end)) = layout.byte_run(address) else {
+                    return;
+                };
+                (start, end, false)
+            }
+            _ => return,
+        };
+        let mut pinned = Position::new(start, Rank::Body);
+        let distance = self.program.drawn_distance(row.position());
+        if expand {
+            self.program.expanded.expand(start, end, self.selected);
+        } else {
+            self.program.expanded.collapse(start, end);
+            // The collapsed run may join a collapsed part before it: the
+            // row now covering its start may begin earlier.
+            if let Some(collapsed) = self
+                .program_layout()
+                .and_then(|layout| layout.resolve(pinned))
+            {
+                pinned = collapsed.position();
+            }
+            if self
+                .selected
+                .is_some_and(|selected| start <= selected && selected < end)
+            {
+                self.data_location = None;
+                self.set_selected_address(pinned.address);
+                self.program.cursor = Some(pinned);
+            }
+        }
+        self.program.reveal = None;
+        match distance {
+            Some(distance) => self.program.pin = Some((pinned, distance.max(0.0))),
+            None => self.program.reveal = Some(Reveal::Row(pinned)),
+        }
     }
 
     /// A committed discovery batch grants the Program listing one turn before
@@ -1172,6 +1432,16 @@ impl DesktopApp {
     /// never cycle the worker indefinitely, and a failure during discovery
     /// resumes it without spending one of its own resumes.
     pub(super) fn fail_listing(&mut self, pending: &Pending) {
+        if let (Request::Bytes { address, .. }, Some(binding)) = (&pending.request, pending.bytes)
+            && matches!(binding.destination, super::ByteDestination::Listing { .. })
+        {
+            if binding.generation == self.generation {
+                self.program.failures = self.program.failures.saturating_add(1);
+                self.program.free_resume = self.program.failures <= MAX_LISTING_FAILURES;
+                self.program.bytes.fail(*address);
+            }
+            return;
+        }
         let Request::Listing { binding, entries } = &pending.request else {
             return;
         };
@@ -2091,5 +2361,233 @@ mod tests {
             h.frame(vec![]);
             assert_eq!(screen_row(&h), Some(drawn), "the header does not jump");
         }
+    }
+
+    /// Program scope with the end of the `??` gap after `entry` expanded
+    /// and drawn: its byte rows want `.text`'s one 0x100-byte page.
+    fn bytes_harness() -> Harness {
+        let mut app = program_app();
+        app.program.expanded.expand(0x1030, 0x1040, None);
+        let mut h = Harness::new(app);
+        h.height = 600.0;
+        h.frame(vec![]);
+        assert_eq!(h.app.program.byte_wanted, vec![PAGE]);
+        h
+    }
+
+    const PAGE: (u64, usize) = (0x1000, 0x100);
+
+    /// A Listing byte read of `PAGE` as `dispatch_listing` binds it.
+    fn page_pending(app: &mut DesktopApp) -> Pending {
+        let origin = app.listing_page_origin();
+        Pending {
+            id: 1,
+            request: Request::Bytes {
+                address: PAGE.0,
+                length: PAGE.1,
+            },
+            started: Instant::now(),
+            selection: origin.selection,
+            revision: origin.revision,
+            byte_origin: origin.byte_origin,
+            bytes: origin.bytes,
+            result: None,
+        }
+    }
+
+    #[test]
+    fn byte_pages_go_last_only_to_a_running_worker() {
+        let mut h = bytes_harness();
+        assert_eq!(h.app.next_listing_page(), None, "no worker");
+        h.app.dispatch_listing();
+        assert!(h.app.pending.is_none() && h.app.opening.is_none());
+        h.app.program.assume_worker = true;
+        assert_eq!(h.app.next_listing_page(), Some(PAGE));
+        // A graph the user awaits, the displayed function's decompilation
+        // and a user's byte read all go first.
+        h.app.pending = Some(function_pending(
+            &h.app,
+            Request::Graph { address: 0x1040 },
+            0x1040,
+        ));
+        assert_eq!(h.app.next_listing_page(), None);
+        h.app.pending = None;
+        h.app
+            .queue
+            .push_back(Request::Decompile { address: 0x1000 });
+        assert_eq!(h.app.next_listing_page(), None);
+        h.app.queue.clear();
+        h.app.discovery_bytes = Some((
+            Request::Bytes {
+                address: 0x2000,
+                length: 16,
+            },
+            h.app.request_origin(),
+        ));
+        assert_eq!(h.app.next_listing_page(), None);
+        h.app.discovery_bytes = None;
+        // Other tabs and the Function scope read nothing.
+        h.app.tab = Tab::Graph;
+        assert_eq!(h.app.next_listing_page(), None);
+        h.app.tab = Tab::Listing;
+        assert_eq!(h.app.next_listing_page(), Some(PAGE));
+        // During discovery, only a granted turn sends, and a page spends it.
+        h.app.discovery_running = true;
+        assert_eq!(h.app.next_listing_page(), None);
+        h.app.grant_listing_turn();
+        assert_eq!(h.app.next_listing_page(), Some(PAGE));
+        assert!(!h.app.listing_turn_outstanding(), "discovery continues");
+        assert_eq!(h.app.next_listing_page(), None, "one read per turn");
+        assert_eq!(h.app.next_listing_entries(), None, "the turn is spent");
+        h.app.discovery_running = false;
+        // After the failure cap, nothing more is read.
+        h.app.program.failures = MAX_LISTING_FAILURES;
+        assert_eq!(h.app.next_listing_page(), None);
+        h.app.program.failures = 0;
+        h.app.set_listing_scope(ListingScope::Function);
+        assert_eq!(h.app.next_listing_page(), None);
+    }
+
+    #[test]
+    fn a_click_during_a_byte_read_queues_and_user_reads_are_not_cancelled() {
+        let context = egui::Context::default();
+        let mut h = bytes_harness();
+        h.app.binary_path = Some("/nonexistent/ghidra-rust-listing".into());
+        h.app.worker_epoch = 17;
+        let pending = page_pending(&mut h.app);
+        h.app.pending = Some(pending);
+        let output = h.frame(vec![]);
+        let point = fixture::text_position(&output, "next  00001040", 1);
+        h.frame(fixture::pointer_events(point));
+        assert_eq!(h.app.result_scope, Some(0x1040));
+        assert_eq!(h.app.worker_epoch, 17, "the worker is not restarted");
+        assert!(h.app.opening.is_none());
+        assert!(matches!(
+            h.app.pending.as_ref().map(|p| &p.request),
+            Some(Request::Bytes { .. })
+        ));
+        assert!(
+            h.app
+                .queue
+                .iter()
+                .any(|request| matches!(request, Request::Graph { address: 0x1040 }))
+        );
+        // A Hex read the user starts meanwhile waits for the page and is
+        // dispatched still current once the page arrives.
+        h.app.queue.clear();
+        h.app.binary_path = None;
+        h.app.open_data(0x1020, 4, &context);
+        assert!(h.app.hex.is_loading());
+        let (request, origin) = h.app.discovery_bytes.clone().expect("waiting");
+        assert!(h.app.byte_request_current(&request, origin));
+        let pending = h.app.pending.take().unwrap();
+        h.app.receive(
+            pending,
+            Response::Bytes {
+                address: PAGE.0,
+                bytes: vec![0x41; PAGE.1],
+            },
+            &context,
+        );
+        assert_eq!(h.app.program.bytes.byte(0x1020), Some(0x41));
+        assert!(h.app.discovery_bytes.is_none(), "sent next");
+        // Without a worker or binary in this test it then fails for that
+        // reason; a replaced read would have been retired silently.
+        assert_eq!(
+            h.app.status,
+            "No binary is available. Reopen it, then Retry."
+        );
+    }
+
+    #[test]
+    fn page_replies_are_kept_only_when_current_and_complete() {
+        let context = egui::Context::default();
+        let deliver = |change: &dyn Fn(&mut DesktopApp, &mut Vec<u8>)| {
+            let mut h = bytes_harness();
+            h.app.program.assume_worker = true;
+            let pending = page_pending(&mut h.app);
+            let mut bytes = vec![0x41; PAGE.1];
+            change(&mut h.app, &mut bytes);
+            h.app.status = "before".into();
+            h.app.receive(
+                pending,
+                Response::Bytes {
+                    address: PAGE.0,
+                    bytes,
+                },
+                &context,
+            );
+            h
+        };
+        // Superseded by another token (a scope switch, another read) or
+        // binary: dropped, and requested again later.
+        for stale in [
+            &(|app: &mut DesktopApp| app.program.token += 1) as &dyn Fn(&mut DesktopApp),
+            &|app: &mut DesktopApp| app.generation += 1,
+        ] {
+            let h = deliver(&|app, _| stale(app));
+            assert!(h.app.program.bytes.is_empty());
+            assert!(!h.app.program.bytes.is_failed(PAGE.0));
+            assert_eq!(h.app.status, "before");
+        }
+        // A short reply is not shown and not requested again; its bytes
+        // keep `??` in the failed tone rather than the pending one.
+        let unknown = |output: &egui::FullOutput| -> Vec<egui::Color32> {
+            output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Text(text) if text.galley.text() == "??" => {
+                        Some(text.galley.job.sections[0].format.color)
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let pending = unknown(&bytes_harness().frame(vec![]));
+        assert!(!pending.contains(&theme::BYTES_FAILED));
+        let mut h = deliver(&|_, bytes| bytes.truncate(0x80));
+        assert!(h.app.program.bytes.is_empty());
+        assert!(h.app.program.bytes.is_failed(PAGE.0));
+        assert_eq!(h.app.next_listing_page(), None);
+        assert_eq!(h.app.status, "before");
+        let failed = unknown(&h.frame(vec![]));
+        assert_eq!(
+            failed.iter().filter(|c| **c == theme::BYTES_FAILED).count(),
+            0x10,
+            "the expanded bytes"
+        );
+        // An over-long one is malformed: the worker stops.
+        let h = deliver(&|_, bytes| bytes.push(0));
+        assert!(h.app.program.bytes.is_empty());
+        assert!(h.app.status.contains("worker stopped"), "{}", h.app.status);
+        // The current, complete answer is shown without a tab or status
+        // change.
+        let mut h = deliver(&|_, _| {});
+        assert_eq!(h.app.program.bytes.byte(0x10ff), Some(0x41));
+        assert_eq!((h.app.tab, h.app.status.as_str()), (Tab::Listing, "before"));
+        let text = fixture::rendered_text(&h.frame(vec![]));
+        for expected in ["00001030", "41", "41h  'A'"] {
+            assert!(text.iter().any(|t| t == expected), "{expected} in {text:?}");
+        }
+        assert!(h.app.program.byte_wanted.is_empty());
+        // An error answer, a deadline or a crash marks the page failed.
+        let mut h = bytes_harness();
+        let pending = page_pending(&mut h.app);
+        h.app.receive(
+            pending,
+            Response::Error {
+                message: "unreadable".into(),
+            },
+            &context,
+        );
+        assert!(h.app.program.bytes.is_failed(PAGE.0));
+        assert_eq!(h.app.program.failures, 0, "the worker answered");
+        let mut h = bytes_harness();
+        let pending = page_pending(&mut h.app);
+        h.app.pending = Some(pending);
+        h.app.fail_pending_listing();
+        assert!(h.app.program.bytes.is_failed(PAGE.0));
+        assert_eq!(h.app.program.failures, 1);
     }
 }

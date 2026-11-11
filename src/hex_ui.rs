@@ -12,7 +12,7 @@ use eframe::egui::{self, RichText, ScrollArea, TextEdit};
 use crate::model::{MAX_BYTE_READ, SectionInfo};
 use crate::theme;
 
-const PAGE_BYTES: usize = if MAX_BYTE_READ < 4096 {
+pub(crate) const PAGE_BYTES: usize = if MAX_BYTE_READ < 4096 {
     MAX_BYTE_READ
 } else {
     4096

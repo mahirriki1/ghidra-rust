@@ -114,7 +114,23 @@ restarts, and outside discovery they never reopen the worker. Instructions decod
 lies elsewhere stay `??` until that function loads, an instruction that
 overlaps another function's instruction with different bounds appears only
 in its own function, and a function with an incomplete graph shows its name
-in the warning color (hover for details). Scroll with the wheel or drag the
+in the warning color (hover for details). Expand a `??` row with Enter, a
+double-click, its triangle or **Expand** in its right-click menu to show up
+to 64 KiB of it as one row per byte (`??`, the byte's value in hex and, when
+printable, its character); the rest of the run stays one `??` row, and
+Enter, a double-click, the triangle or **Collapse** on any byte row collapses
+its run. Bytes are read in 4 KiB pages at the Program listing's lowest
+priority (at most four pages are kept); a byte shows `??` alone until its
+page loads. Zero-filled tails never expand. Expanding or collapsing keeps
+the row where it is on screen and adds no Back/Forward history; collapsing
+moves a cursor inside the run to its first byte. Up to 64 expanded runs are
+kept for the session; beyond that the one farthest away collapses (never
+the one holding the cursor). **Show in Hex** on a `??`, byte or zero-fill row
+selects exactly its file-backed bytes in Hex (zero-filled bytes have none).
+Back/Forward to an address that is neither a known function entry nor an
+instruction a loaded function decoded (such as a `??` or byte row the
+cursor left) returns the Program cursor to the row starting there, without
+opening a function; without such a row it opens Hex, as Go does. Scroll with the wheel or drag the
 address bar at the right edge, which spans all sections. Clicking an
 instruction opens its function in the Graph and Decompiler, and right-click
 menus work on the instructions of any loaded function. Highlights linked to
@@ -125,9 +141,9 @@ load until you scroll; discovery, renames and signature edits keep both the view
 and the selected instruction. Non-code destinations
 still open in Hex. Listing keys move through the whole program (see
 [Keyboard shortcuts](#keyboard-shortcuts)). The
-scope, position and loaded bodies last for the session only; loaded bodies
-are released when you switch back to **Function**, and projects do not store
-any of them.
+scope, position, expanded runs and loaded bodies and bytes last for the
+session only; loaded bodies and bytes are released when you switch back to
+**Function**, and projects do not store any of them.
 
 Narrow dock headers keep the active tab visible and put additional tabs in **»**.
 Decompiler controls that do not fit move into **⋯**. The Listing keeps code
@@ -230,9 +246,9 @@ but a stalled filesystem still delays further listings until it returns.
 | `Ctrl+Z` | Undo an annotation outside text editors |
 | `Up` / `Down` | Listing: previous / next row |
 | `PageUp` / `PageDown` | Listing: previous / next page |
-| `Home` / `End` | Listing: first / last instruction of the function (in the Program scope, of the section from a section, `??` or zero-fill row) |
+| `Home` / `End` | Listing: first / last instruction of the function (in the Program scope, first / last byte of the run from a byte row, and of the section from a section, `??` or zero-fill row) |
 | `Ctrl+Home` / `Ctrl+End` | Program listing: first / last row of the program |
-| `Enter` | Listing: follow the selected call or branch target |
+| `Enter` | Listing: follow the selected call or branch target (in the Program scope, also expand a `??` row or collapse a byte row's run) |
 
 On macOS, Save, Undo and program-text search use Command. Shortcuts pause while
 typing, in dialogs, and during file operations.
@@ -240,17 +256,18 @@ typing, in dialogs, and during file operations.
 Listing keys apply after clicking the Listing; clicking elsewhere, focusing a
 text field or switching tabs releases them. In the **Function** scope they stay
 within the displayed function. In the **Program** scope every row is a cursor
-stop: section and function headers, instructions, `??` and zero-fill rows and
-pending `…` rows. Up/Down and PageUp/PageDown cross functions and gaps, and the
+stop: section and function headers, instructions, `??`, byte and zero-fill
+rows and pending `…` rows, and clicking a `??`, byte or zero-fill row puts the
+cursor there. Up/Down and PageUp/PageDown cross functions and gaps, and the
 selection becomes the row's address (a header's entry or section start, a
-gap's first byte). When the cursor rests (about 200 ms, no key held) on a row
+gap's first byte, a byte row's byte). When the cursor rests (about 200 ms, no key held) on a row
 of a function other than the displayed one, the Graph and Decompiler switch to
 that function without moving the listing; holding a key across many functions
 loads only the last one. The switch waits while a dialog, text field or menu
 is open and while any non-background request (a graph, pseudocode, string or
 FindCrypt scan, byte read or rename) is running, and never restarts or
 preempts the analysis worker (after a cancel or failure, resting switches
-nothing). Section headers, `??` and zero-fill rows
+nothing). Section headers, `??`, byte and zero-fill rows
 belong to no function, so nothing follows there. Cursor travel adds no
 Back/Forward history. From the Listing, `Space` starts a waiting switch at
 once when the worker is free and then shows the Graph, which may still be
