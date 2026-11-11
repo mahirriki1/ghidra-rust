@@ -55,6 +55,7 @@ mod context_menu;
 #[path = "app/graph_preparation.rs"]
 mod graph_preparation;
 mod listing_cursor;
+mod program_cursor;
 mod program_listing;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1802,6 +1803,8 @@ impl DesktopApp {
             self.record_location(address, address);
         }
         self.data_location = None;
+        // An explicit selection; a quiet re-resolution restores the row.
+        self.program.cursor = None;
         self.selected = Some(address);
         self.address = format!("{address:x}");
         self.editor_address = None;
@@ -1815,6 +1818,7 @@ impl DesktopApp {
             Some(pc) => program_listing::Reveal::Address(pc),
             None => program_listing::Reveal::Entry(address),
         });
+        self.program.follow = None;
         self.cached_graph = false;
         self.canvas = None;
         self.graph_preparation.cancel();
@@ -2020,6 +2024,10 @@ impl DesktopApp {
         self.pending_code_scroll = None;
         self.selected_local = None;
         self.decompiler_rename_context = false;
+        if self.selected != Some(address) {
+            // The Program row kind belongs to the previous address.
+            self.program.cursor = None;
+        }
         self.selected = Some(address);
         self.address = format!("{address:x}");
         self.editor_address = None;
@@ -2049,6 +2057,7 @@ impl DesktopApp {
             self.status = "This source location has no machine instruction mapping".into();
             return;
         };
+        self.program.cursor = None;
         self.selected = Some(primary);
         self.address = format!("{primary:x}");
         self.editor_address = None;
@@ -3893,6 +3902,7 @@ impl DesktopApp {
         self.adopt_graph(graph, ResultOrigin::Saved);
         self.history.push(crate::linkage_ui::Place::Code(address));
         self.history_index = 0;
+        self.program.cursor = None;
         self.selected = restore.selected;
         self.address = format!("{:x}", restore.selected.unwrap_or(address));
         if let Some(pc) = restore.selected {
@@ -5391,6 +5401,8 @@ impl DesktopApp {
                 self.focus_comment = true;
             }
             Some(Shortcut::ToggleGraph) => {
+                // The Graph shows the function the Program cursor is in.
+                self.flush_cursor_follow(context);
                 self.tab = match self.tab {
                     Tab::Listing => Tab::Graph,
                     Tab::Graph => Tab::Listing,
@@ -6375,6 +6387,8 @@ impl DesktopApp {
         context: &egui::Context,
     ) {
         self.update_comment_rows();
+        // Explicit: a Program row click sets its row kind afterwards.
+        self.program.cursor = None;
         let explicit = owner.is_some();
         let current_owner = self
             .view()
@@ -8210,6 +8224,10 @@ impl DesktopApp {
     }
 
     fn main_panel(&mut self, ui: &mut egui::Ui) {
+        self.main_tabs(ui);
+    }
+
+    fn main_tabs(&mut self, ui: &mut egui::Ui) {
         self.update_comment_rows();
         let saved_search = self.tab == Tab::Search
             && matches!(
@@ -8352,7 +8370,10 @@ impl DesktopApp {
                             menu,
                         ) {
                             match action {
-                                GraphAction::Select(address) => self.select_instruction(address),
+                                GraphAction::Select(address) => {
+                                    self.program.cursor = None;
+                                    self.select_instruction(address);
+                                }
                                 GraphAction::Navigate(target) => navigate = Some(target),
                             }
                         }
@@ -9197,6 +9218,9 @@ impl DesktopApp {
         }
         self.release_menu(&context);
         self.handle_shortcuts(&context);
+        // After every click, window and shortcut of this frame: one that
+        // navigates drops the follow instead of racing it.
+        self.poll_cursor_follow(&context);
         crate::window_chrome::resize_borders(ui);
     }
 }

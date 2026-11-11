@@ -1355,9 +1355,9 @@ pub enum ListingMark<'a> {
     Pending,
 }
 
-/// Paint a [`ListingMark`] row aligned with [`listing_cells`]. Names are
-/// proportional; addresses and byte counts monospace. Returns whether
-/// content was elided.
+/// Paint a [`ListingMark`] row aligned with [`listing_cells`], as the
+/// cursor row when `selected`. Names are proportional; addresses and byte
+/// counts monospace. Returns whether content was elided.
 pub fn listing_mark(
     ui: &Ui,
     rect: egui::Rect,
@@ -1365,9 +1365,13 @@ pub fn listing_mark(
     address: u64,
     digits: usize,
     mark: ListingMark<'_>,
+    selected: bool,
 ) -> bool {
     if !ui.is_rect_visible(rect) {
         return false;
+    }
+    if selected {
+        paint_row_selection(ui, rect);
     }
     let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
     let mono =
@@ -1388,7 +1392,9 @@ pub fn listing_mark(
     };
     match mark {
         ListingMark::Section { name, end } => {
-            painter.rect_filled(rect, 0, HEADER);
+            if !selected {
+                painter.rect_filled(rect, 0, HEADER);
+            }
             heading(name, TEXT, format!("  {address:0digits$x}–{end:0digits$x}"))
         }
         ListingMark::Function { name, partial } => {
@@ -1605,10 +1611,10 @@ pub fn row_response(
     related: bool,
 ) -> egui::Response {
     let response = ui.interact(rect, id, egui::Sense::click());
-    if ui.is_rect_visible(rect) {
-        let fill = if selected {
-            Some(SELECTION)
-        } else if related {
+    if selected {
+        paint_row_selection(ui, rect);
+    } else if ui.is_rect_visible(rect) {
+        let fill = if related {
             Some(RELATED)
         } else if response.hovered() {
             Some(HOVER)
@@ -1618,15 +1624,20 @@ pub fn row_response(
         if let Some(fill) = fill {
             ui.painter().rect_filled(rect, 0, fill);
         }
-        if selected {
-            ui.painter().rect_filled(
-                egui::Rect::from_min_size(rect.min, egui::vec2(2.0, rect.height())),
-                0,
-                ACCENT,
-            );
-        }
     }
     response
+}
+
+/// The selected-row fill and accent edge of [`row_response`].
+pub fn paint_row_selection(ui: &Ui, rect: egui::Rect) {
+    if ui.is_rect_visible(rect) {
+        ui.painter().rect_filled(rect, 0, SELECTION);
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(rect.min, egui::vec2(2.0, rect.height())),
+            0,
+            ACCENT,
+        );
+    }
 }
 
 /// A compact choice between `choices` in a pane's title row, one row high.

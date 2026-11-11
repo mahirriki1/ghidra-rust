@@ -18,7 +18,8 @@ pub(crate) const SHORTCUTS: &[(&str, &str)] = &[
     (UNDO_KEYS, "Undo annotation"),
     ("Up / Down", "Listing: previous / next row"),
     ("PageUp / PageDown", "Listing: previous / next page"),
-    ("Home / End", "Listing: first / last row"),
+    ("Home / End", "Listing: first / last of function or section"),
+    ("Ctrl+Home / End", "Program listing: first / last row"),
     ("Enter", "Listing: follow target"),
 ];
 

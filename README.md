@@ -123,7 +123,8 @@ history and pseudocode navigation scroll the Program listing to the
 destination once, and it keeps its place on screen while bodies above it
 load until you scroll; discovery, renames and signature edits keep both the view
 and the selected instruction. Non-code destinations
-still open in Hex. Listing keys move within the displayed function. The
+still open in Hex. Listing keys move through the whole program (see
+[Keyboard shortcuts](#keyboard-shortcuts)). The
 scope, position and loaded bodies last for the session only; loaded bodies
 are released when you switch back to **Function**, and projects do not store
 any of them.
@@ -227,20 +228,37 @@ but a stalled filesystem still delays further listings until it returns.
 | `Ctrl+Up` / `Ctrl+Down` | Previous / next function entry |
 | `Ctrl+S` | Save project |
 | `Ctrl+Z` | Undo an annotation outside text editors |
-| `Up` / `Down` | Listing: previous / next instruction |
+| `Up` / `Down` | Listing: previous / next row |
 | `PageUp` / `PageDown` | Listing: previous / next page |
-| `Home` / `End` | Listing: first / last instruction of the function |
+| `Home` / `End` | Listing: first / last instruction of the function (in the Program scope, of the section from a section, `??` or zero-fill row) |
+| `Ctrl+Home` / `Ctrl+End` | Program listing: first / last row of the program |
 | `Enter` | Listing: follow the selected call or branch target |
 
 On macOS, Save, Undo and program-text search use Command. Shortcuts pause while
 typing, in dialogs, and during file operations.
 
-Listing keys apply after clicking the Listing and stay within the current
-function, in both scopes; clicking elsewhere, focusing a text field or
-switching tabs releases them. In the Program scope a click on another
-function keeps them active. Enter and Listing double-click follow a resolved call or a single taken
-branch target; ambiguous, unresolved or switch-table destinations, and a jump
-to the next instruction, are not followed.
+Listing keys apply after clicking the Listing; clicking elsewhere, focusing a
+text field or switching tabs releases them. In the **Function** scope they stay
+within the displayed function. In the **Program** scope every row is a cursor
+stop: section and function headers, instructions, `??` and zero-fill rows and
+pending `…` rows. Up/Down and PageUp/PageDown cross functions and gaps, and the
+selection becomes the row's address (a header's entry or section start, a
+gap's first byte). When the cursor rests (about 200 ms, no key held) on a row
+of a function other than the displayed one, the Graph and Decompiler switch to
+that function without moving the listing; holding a key across many functions
+loads only the last one. The switch waits while a dialog, text field or menu
+is open and while any non-background request (a graph, pseudocode, string or
+FindCrypt scan, byte read or rename) is running, and never restarts or
+preempts the analysis worker (after a cancel or failure, resting switches
+nothing). Section headers, `??` and zero-fill rows
+belong to no function, so nothing follows there. Cursor travel adds no
+Back/Forward history. From the Listing, `Space` starts a waiting switch at
+once when the worker is free and then shows the Graph, which may still be
+loading that function.
+Enter and Listing double-click follow a resolved call or a single taken
+branch target from the row's own function; ambiguous, unresolved or
+switch-table destinations, and a jump to the next instruction, are not
+followed.
 
 **Help → Keyboard shortcuts** opens the same reference as F1.
 **Help → About Ghidra Rust** shows the version and license/notice links.

@@ -1,7 +1,8 @@
 //! Listing keyboard cursor: Up/Down, PageUp/PageDown and Home/End move the
 //! selected instruction of the current function's Listing, and Enter follows
-//! an evidenced target. `DesktopApp.selected` stays the only cursor address;
-//! this state is transient and never saved.
+//! an evidenced target. The Program scope applies the same key filter to its
+//! own rows (`program_cursor`). `DesktopApp.selected` stays the only cursor
+//! address; this state is transient and never saved.
 
 use std::sync::{Arc, Weak};
 
@@ -80,12 +81,9 @@ pub(super) struct ListingCursor {
     active: Option<ViewKey>,
     viewport: Option<Viewport>,
     /// Keys whose accepted press has not been released; repeats need one.
-    held: u8,
+    held: u16,
     drawn_frame: Option<u64>,
     available: f32,
-    /// The displayed graph held keys apply to in the Program scope; a held
-    /// key never carries into another function.
-    held_graph: Option<Weak<Stored<PreparedGraph>>>,
 }
 
 impl ListingCursor {
@@ -96,7 +94,7 @@ impl ListingCursor {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Command {
+pub(super) enum Command {
     Up,
     Down,
     PageUp,
@@ -104,10 +102,24 @@ enum Command {
     Home,
     End,
     Enter,
+    /// Ctrl+Home / Ctrl+End, Program scope only.
+    First,
+    Last,
 }
 
 impl Command {
-    fn of(key: egui::Key) -> Option<Self> {
+    /// The command of an unmodified listing key; with `program`, also
+    /// Ctrl+Home / Ctrl+End. Every other modified key is left alone.
+    fn of(key: egui::Key, modifiers: egui::Modifiers, program: bool) -> Option<Self> {
+        if !modifiers.is_none() {
+            // Ctrl, not Command, as for Ctrl+Up/Down.
+            let ctrl = modifiers.ctrl && !modifiers.alt && !modifiers.shift && !modifiers.mac_cmd;
+            return match key {
+                egui::Key::Home if program && ctrl => Some(Self::First),
+                egui::Key::End if program && ctrl => Some(Self::Last),
+                _ => None,
+            };
+        }
         Some(match key {
             egui::Key::ArrowUp => Self::Up,
             egui::Key::ArrowDown => Self::Down,
@@ -120,8 +132,18 @@ impl Command {
         })
     }
 
-    fn bit(self) -> u8 {
-        1 << self as u8
+    /// Every command `key` can issue: its release ends all of them, even
+    /// when a modifier was released first.
+    fn key_bits(key: egui::Key) -> Option<u16> {
+        Some(match key {
+            egui::Key::Home => Self::Home.bit() | Self::First.bit(),
+            egui::Key::End => Self::End.bit() | Self::Last.bit(),
+            key => Self::of(key, egui::Modifiers::NONE, false)?.bit(),
+        })
+    }
+
+    fn bit(self) -> u16 {
+        1 << self as u16
     }
 
     /// Home, End and Enter follow the command policy: no OS repeats.
@@ -130,8 +152,56 @@ impl Command {
     }
 }
 
+/// Applies the accepted listing presses of `events` in order through
+/// `apply`, removing them, and returns the updated `held` mask. After a
+/// same-batch global `command`, or once `apply` returns true (a follow), the
+/// remaining listing presses are consumed without effect. A repeat needs its
+/// own accepted press; Home, End and Enter never repeat.
+pub(super) fn filter_keys(
+    events: &mut Vec<egui::Event>,
+    mut held: u16,
+    command: bool,
+    program: bool,
+    mut apply: impl FnMut(Command) -> bool,
+) -> u16 {
+    let mut stop = false;
+    events.retain(|event| {
+        let egui::Event::Key {
+            key,
+            pressed,
+            repeat,
+            modifiers,
+            ..
+        } = event
+        else {
+            return true;
+        };
+        let Some(bits) = Command::key_bits(*key) else {
+            return true;
+        };
+        if !pressed {
+            held &= !bits;
+            return true;
+        }
+        let Some(action) = Command::of(*key, *modifiers, program) else {
+            return true;
+        };
+        if command || stop {
+            return false;
+        }
+        if !repeat {
+            held |= action.bit();
+        } else if !action.repeats() || held & action.bit() == 0 {
+            return false;
+        }
+        stop = apply(action);
+        false
+    });
+    held
+}
+
 /// Rows per page in a body `height` points tall, keeping one row of overlap.
-fn page_rows(height: f32) -> usize {
+pub(super) fn page_rows(height: f32) -> usize {
     ((height / theme::ROW_HEIGHT).floor() as usize)
         .saturating_sub(1)
         .max(1)
@@ -149,6 +219,7 @@ fn step(index: Option<usize>, command: Command, len: usize, page: usize) -> Opti
         (Some(row), Command::PageUp) => row.saturating_sub(page),
         (Some(row), Command::PageDown) => row.saturating_add(page).min(last),
         (row, Command::Enter) => return row,
+        (_, Command::First | Command::Last) => return None,
     })
 }
 
@@ -330,19 +401,6 @@ impl super::DesktopApp {
             self.listing_cursor.held = 0;
             return;
         }
-        if self.program_scope() {
-            let graph = self.graph.as_ref().map(Arc::downgrade);
-            let cursor = &mut self.listing_cursor;
-            let same = match (&cursor.held_graph, &graph) {
-                (Some(held), Some(shown)) => Weak::ptr_eq(held, shown),
-                (None, None) => true,
-                _ => false,
-            };
-            if !same {
-                cursor.held = 0;
-                cursor.held_graph = graph;
-            }
-        }
         let page = page_rows(self.listing_cursor.available - viewport.chrome);
         let loaded = self.info.is_some();
         // A same-batch command (dialog, history, tab switch) wins.
@@ -352,44 +410,20 @@ impl super::DesktopApp {
                     .is_some_and(|action| loaded || matches!(action, super::Shortcut::Help))
             })
         });
+        let held = if command { 0 } else { self.listing_cursor.held };
+        if self.program_scope() {
+            self.listing_cursor.held = self.program_cursor_keys(&context, page, command, held);
+            return;
+        }
         let listing = super::listing_of(&self.graph);
         let start = self.selected.and_then(|pc| listing.position(pc));
         let mut index = start;
         let mut moved = false;
         let mut follow = None;
-        let mut held = if command { 0 } else { self.listing_cursor.held };
         let view = super::graph_view(&self.graph);
         let info = self.info.as_ref();
-        context.input_mut(|input| {
-            input.events.retain(|event| {
-                let egui::Event::Key {
-                    key,
-                    pressed,
-                    repeat,
-                    modifiers,
-                    ..
-                } = event
-                else {
-                    return true;
-                };
-                let Some(action) = Command::of(*key) else {
-                    return true;
-                };
-                if !pressed {
-                    held &= !action.bit();
-                    return true;
-                }
-                if !modifiers.is_none() {
-                    return true;
-                }
-                if command || follow.is_some() {
-                    return false;
-                }
-                if !repeat {
-                    held |= action.bit();
-                } else if !action.repeats() || held & action.bit() == 0 {
-                    return false;
-                }
+        let held = context.input_mut(|input| {
+            filter_keys(&mut input.events, held, command, false, |action| {
                 if action == Command::Enter {
                     follow = index
                         .and_then(|row| listing.get(row))
@@ -401,8 +435,8 @@ impl super::DesktopApp {
                     index = step(index, action, listing.len(), page);
                     moved = true;
                 }
-                false
-            });
+                follow.is_some()
+            })
         });
         self.listing_cursor.held = if follow.is_some() { 0 } else { held };
         if moved && let Some(row) = index {
@@ -413,6 +447,11 @@ impl super::DesktopApp {
             self.follow_listing_target(target, &context);
             context.request_repaint();
         }
+    }
+
+    /// Whether an accepted listing key press has not been released.
+    pub(super) fn listing_keys_held(&self) -> bool {
+        self.listing_cursor.held != 0
     }
 
     /// Records the drawn body and activates on a primary click inside it.
