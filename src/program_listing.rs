@@ -384,6 +384,50 @@ impl Layout<'_> {
         self.at_or_after(position).or_else(|| self.before(position))
     }
 
+    /// The row at exactly `position`, if one starts there.
+    pub fn exact(&self, position: Position) -> Option<Row> {
+        self.resolve(position)
+            .filter(|row| row.position() == position)
+    }
+
+    pub fn first(&self) -> Option<Row> {
+        self.at_or_after(Position::new(0, Rank::Section))
+    }
+
+    pub fn last(&self) -> Option<Row> {
+        self.before(Position::new(u64::MAX, Rank::Body))
+    }
+
+    /// The row a cursor at exactly `address` stands on: the row of `rank`
+    /// when one starts there, else the instruction starting there, else the
+    /// function header, else any other row starting there. An address no
+    /// row starts at has none; nothing nearby is substituted.
+    pub fn cursor(&self, address: u64, rank: Option<Rank>) -> Option<Row> {
+        if let Some(row) = rank.and_then(|rank| self.exact(Position::new(address, rank))) {
+            return Some(row);
+        }
+        let body = self.exact(Position::new(address, Rank::Body));
+        if let Some(row @ Row::Instruction { .. }) = body {
+            return Some(row);
+        }
+        self.exact(Position::new(address, Rank::Function))
+            .or(body)
+            .or_else(|| self.exact(Position::new(address, Rank::Section)))
+    }
+
+    /// The first and last rows of the section holding `address`.
+    pub fn section_bounds(&self, address: u64) -> Option<(Row, Row)> {
+        let span = self.rows.span_at(address)?;
+        let last = self.before(Position::new(span.end, Rank::Section))?;
+        Some((
+            Row::Section {
+                section: span.section,
+                start: span.start,
+            },
+            last,
+        ))
+    }
+
     /// Where a reveal of `address` lands: an entry's header, else the body
     /// row covering it.
     pub fn reveal(&self, address: u64) -> Option<Row> {
@@ -927,6 +971,67 @@ mod tests {
                 .iter()
                 .any(|row| matches!(row, Row::Instruction { .. }))
         );
+    }
+
+    #[test]
+    fn cursor_rows_are_exact_and_section_bounds_cover_each_section() {
+        for (sections, views, entries, failed) in synthetic_layouts() {
+            let program = rows(&sections, &views, &failed);
+            let inventory = functions(&entries);
+            let layout = program.layout(&inventory);
+            let all = forward(&layout);
+            assert_eq!(layout.first(), all.first().copied());
+            assert_eq!(layout.last(), all.last().copied());
+            for row in &all {
+                let position = row.position();
+                assert_eq!(
+                    layout.cursor(position.address, Some(position.rank)),
+                    Some(*row)
+                );
+                // Without a rank, an instruction wins over the header that
+                // shares its address, which wins over the section.
+                let rankless = layout.cursor(position.address, None).unwrap();
+                assert_eq!(rankless.position().address, position.address);
+                if all.iter().any(|other| {
+                    matches!(other, Row::Instruction { start, .. } if *start == position.address)
+                }) {
+                    assert!(matches!(rankless, Row::Instruction { .. }));
+                }
+                // Inside a row, never the nearest one.
+                if let Some((start, end)) = row.span()
+                    && end - start > 1
+                    && !all
+                        .iter()
+                        .any(|other| other.position().address == start + 1)
+                {
+                    assert_eq!(layout.cursor(start + 1, None), None, "{row:?}");
+                }
+            }
+            for (index, section) in sections.iter().enumerate().filter(|(_, s)| s.size > 0) {
+                let Some((first, last)) = layout.section_bounds(section.address + section.size - 1)
+                else {
+                    panic!("{index}: bounds");
+                };
+                assert_eq!(
+                    first,
+                    Row::Section {
+                        section: index,
+                        start: section.address
+                    }
+                );
+                let after = all.iter().position(|row| *row == last).unwrap() + 1;
+                assert!(
+                    all.get(after)
+                        .is_none_or(|next| matches!(next, Row::Section { .. })),
+                    "{last:?} ends its section"
+                );
+            }
+        }
+        // Unmapped addresses have no section.
+        let (sections, views, entries, _) = synthetic_layouts().remove(0);
+        let program = rows(&sections, &views, &[]);
+        let inventory = functions(&entries);
+        assert_eq!(program.layout(&inventory).section_bounds(0x1800), None);
     }
 
     #[test]

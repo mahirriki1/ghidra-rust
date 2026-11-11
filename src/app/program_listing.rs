@@ -57,6 +57,8 @@ pub(super) enum Reveal {
     Entry(u64),
     /// The body row covering an exact address.
     Address(u64),
+    /// Exactly this row, else the row covering its address.
+    Row(Position),
 }
 
 /// Inputs of the derived rows; any change rebuilds them.
@@ -107,14 +109,14 @@ pub(super) struct ProgramPane {
     rows: Option<(RowsKey, ProgramRows, AddressScale)>,
     rows_serial: u64,
     window: Option<Window>,
-    top: Option<Position>,
+    pub(super) top: Option<Position>,
     offset: f32,
     /// The last reveal's target and its distance in points below the view's
     /// top. While set, `top` is derived from it every frame, so rows loading
     /// or appearing above it never move it; the user scrolling clears it.
-    pin: Option<(Position, f32)>,
+    pub(super) pin: Option<(Position, f32)>,
     /// First and last rows fully shown last frame.
-    shown: Option<(Position, Position)>,
+    pub(super) shown: Option<(Position, Position)>,
     page: usize,
     /// Visible entries lacking a current view, then prefetch candidates.
     wanted: Vec<u64>,
@@ -145,9 +147,30 @@ pub(super) struct ProgramPane {
     pub(super) free_resume: bool,
     /// The context `wanted` was computed under.
     wanted_context: Option<Arc<ProgramContext>>,
+    /// The row the cursor stands on while `selected` is its address; it
+    /// tells rows sharing that address apart.
+    pub(super) cursor: Option<Position>,
+    /// A follow of the cursor's function, armed by a cursor move.
+    pub(super) follow: Option<super::program_cursor::Follow>,
+    /// Tests without a worker process let follows send as if one ran.
+    #[cfg(test)]
+    pub(super) assume_worker: bool,
 }
 
 impl ProgramPane {
+    /// The derived rows, when built for binary `generation`.
+    pub(super) fn current_rows(&self, generation: u64) -> Option<&ProgramRows> {
+        self.rows
+            .as_ref()
+            .filter(|(key, ..)| key.generation == generation)
+            .map(|(_, rows, _)| rows)
+    }
+
+    /// The first and last rows fully shown last frame, else the top row.
+    pub(super) fn edges(&self) -> Option<(Position, Position)> {
+        self.shown.or_else(|| self.top.map(|top| (top, top)))
+    }
+
     /// A new binary or closed one: everything but the scope and token.
     pub(super) fn reset(&mut self) {
         let (scope, token) = (self.scope, self.token);
@@ -171,6 +194,8 @@ impl DesktopApp {
         self.program.scope = scope;
         self.listing_cursor.deactivate();
         self.program.quiet_scroll = None;
+        self.program.follow = None;
+        self.program.cursor = None;
         if scope == ListingScope::Function {
             // Function scope never reads the cache; release its charge, and
             // drop any reply in flight.
@@ -376,6 +401,7 @@ impl DesktopApp {
                     layout.resolve(Position::new(address, Rank::Body)),
                     Position::new(address, Rank::Body),
                 ),
+                Reveal::Row(position) => (layout.resolve(position), position),
             };
             if let Some(target) = target {
                 let position = target.position();
@@ -508,6 +534,7 @@ impl DesktopApp {
         let columns = theme::listing_columns(body.width(), glyph, digits, ppp);
         theme::paint_listing_header(ui, header, &columns);
         let displayed = self.view().map(|view| view.address);
+        let cursor = self.program_cursor(&layout).map(|row| row.position());
         let mut clicked = None;
         let mut follow = None;
         let mut menu_opened = None;
@@ -536,6 +563,7 @@ impl DesktopApp {
                             name: &crop(&section.name, 120),
                             end,
                         },
+                        cursor == Some(row.position()),
                     );
                     ui.interact(
                         rect,
@@ -571,12 +599,13 @@ impl DesktopApp {
                             name: &crop(name, 120),
                             partial: !warnings.is_empty(),
                         },
+                        cursor == Some(row.position()),
                     );
                     let mut hover = vec![name_hover(name, raw)];
                     hover.extend(warnings.iter().take(8).map(|w| crop(w, 400)));
                     let response = response.on_hover_text(hover.join("\n\n"));
                     if response.clicked() {
-                        clicked = Some((entry, entry));
+                        clicked = Some((entry, row.position()));
                     }
                     response.context_menu(|ui| {
                         if ui.button("Xrefs to this function").clicked() {
@@ -600,7 +629,7 @@ impl DesktopApp {
                         ui,
                         ui.scope_id().with(("program-row", start)),
                         rect,
-                        self.selected == Some(start),
+                        cursor == Some(row.position()),
                         displayed == Some(owner) && self.semantic.addresses.contains(&start),
                     );
                     let call = view.calls.iter().find(|call| call.address == start);
@@ -660,7 +689,7 @@ impl DesktopApp {
                         response.on_hover_text(hover.join("\n\n"))
                     };
                     if response.clicked() {
-                        clicked = Some((owner, start));
+                        clicked = Some((owner, row.position()));
                     }
                     if response.double_clicked() {
                         follow = self.row_follow_target(owner, start).map(|t| (owner, t));
@@ -680,7 +709,8 @@ impl DesktopApp {
                     } else {
                         theme::ListingMark::Undefined { length }
                     };
-                    theme::listing_mark(ui, rect, &columns, start, digits, mark);
+                    let selected = cursor == Some(row.position());
+                    theme::listing_mark(ui, rect, &columns, start, digits, mark, selected);
                     ui.interact(
                         rect,
                         ui.scope_id().with(("program-gap", start)),
@@ -696,6 +726,7 @@ impl DesktopApp {
                         start,
                         digits,
                         theme::ListingMark::Pending,
+                        cursor == Some(row.position()),
                     );
                     ui.interact(
                         rect,
@@ -790,8 +821,9 @@ impl DesktopApp {
             context.request_repaint();
         }
         self.listing_cursor_drawn(ui, body);
-        if let Some((owner, pc)) = clicked {
-            self.navigate_location(pc, Some(owner), false, context);
+        if let Some((owner, position)) = clicked {
+            self.navigate_location(position.address, Some(owner), false, context);
+            self.program.cursor = Some(position);
         }
         if let Some((owner, target)) = follow {
             self.follow_row_target(owner, target, context);
@@ -841,31 +873,49 @@ impl DesktopApp {
     }
 
     /// Re-resolves the displayed function after a result-input change
-    /// (discovery, renames, signatures) without moving the Program view.
+    /// (discovery, renames, signatures), or opens the function the Program
+    /// cursor rests in, without moving the Program view. A Program cursor
+    /// outside `address` (on another function's row or a gap) stays where
+    /// it is, is not reported as outside the graph, and keeps its follow.
     pub(super) fn reresolve_displayed(
         &mut self,
         address: u64,
         focus: Option<u64>,
         context: &egui::Context,
     ) {
-        let reveal = self.program.reveal;
+        let outside = self.program_scope()
+            && focus.is_some_and(|pc| {
+                pc != address
+                    && !self
+                        .row_view(address)
+                        .is_some_and(|(_, listing)| listing.contains(pc))
+            });
+        let (reveal, follow, cursor) = (
+            self.program.reveal,
+            self.program.follow,
+            self.program.cursor,
+        );
+        let undisplayed = self.undisplayed_call;
         self.program.quiet = Some(self.selection_generation.wrapping_add(1));
         self.navigate_to(address, focus, false, context);
         self.program.reveal = reveal;
+        self.program.follow = follow;
+        self.program.cursor = cursor;
+        if outside {
+            self.reference_focus = None;
+            self.undisplayed_call = undisplayed;
+        }
     }
 
     /// After a rename of the displayed function. Function scope reopens it
-    /// at its entry as before; the Program scope keeps the view and the
-    /// selected instruction.
+    /// at its entry as before; the Program scope keeps the view, the cursor
+    /// (also on another function's row) and any follow it armed.
     pub(super) fn reopen_after_rename(&mut self, address: u64, context: &egui::Context) {
         if !self.program_scope() {
             self.navigate(address, false, context);
             return;
         }
-        let focus = self
-            .selected
-            .filter(|&pc| pc == address || self.listing().contains(pc));
-        self.reresolve_displayed(address, focus, context);
+        self.reresolve_displayed(address, self.selected, context);
     }
 
     /// A signature edit is about to drop the displayed graph: keep its
