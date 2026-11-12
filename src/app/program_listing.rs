@@ -3,6 +3,15 @@
 //! bodies come only from genuine views: the displayed graph, else views a
 //! bounded `Request::Listing` returned. Everything else stays undefined.
 //! Scope, scroll position and cached views are session-only.
+//!
+//! Undefined gaps also show the session's listing evidence: import slots,
+//! absolute pointer-table witnesses and string candidates as `??` data rows,
+//! and split marks at reference targets, data exports and annotations. The
+//! index is built once per input change (binary, linkage, strings, reference
+//! report, wholesale annotation replacement) and whenever the Program scope is
+//! shown again, and updated in place as discovery commits witnesses and as
+//! labels or comments change. Witnesses are session-only:
+//! after a project reopen they return only once discovery runs again.
 
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
@@ -12,6 +21,7 @@ use eframe::egui;
 use super::{DesktopApp, MAX_HOVER_NAME, Pending, Tab, crop, hex, name_hover};
 use crate::function_presentation::{Listing, PreparedGraph};
 use crate::function_results::ResultBinding;
+use crate::listing_evidence::{EvidenceKind, ListingEvidence};
 use crate::model::{
     FunctionView, ListingBinding, ListingOutcome, MAX_LISTING_FUNCTIONS, Request, function_at,
 };
@@ -89,7 +99,37 @@ struct WindowKey {
     rows: u64,
     inventory: (u64, usize, usize, u64, u64),
     expansions: u64,
+    evidence: u64,
     after: usize,
+}
+
+/// Inputs the evidence index was built from; any change rebuilds it.
+/// Discovery witnesses and the same run's extended references update it in
+/// place and move the key along; single label or comment edits update it in
+/// place without touching the key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EvidenceKey {
+    generation: u64,
+    linkage: u64,
+    strings: u64,
+    references: u64,
+    annotations: u64,
+}
+
+/// The session's listing evidence, empty until the Program scope shows it.
+#[derive(Default)]
+pub(super) struct Evidence {
+    key: Option<EvidenceKey>,
+    pub(super) index: ListingEvidence,
+    /// Data exports by address, for the names their split marks show.
+    exports: std::collections::BTreeMap<u64, u32>,
+    /// Advances when the session's annotations are replaced wholesale.
+    annotations: u64,
+    /// Advances on every change, invalidating materialized rows.
+    pub(super) epoch: u64,
+    /// Full builds this session, for tests of the incremental paths.
+    #[cfg(test)]
+    pub(super) builds: u64,
 }
 
 struct Window {
@@ -162,9 +202,18 @@ pub(super) struct ProgramPane {
     /// of every byte row in view, as of the last pane frame.
     byte_wanted: Vec<(u64, usize)>,
     byte_visible: Vec<u64>,
+    /// Data rows and split marks; session-only, cleared with the binary.
+    pub(super) evidence: Evidence,
     /// Tests without a worker process let follows send as if one ran.
     #[cfg(test)]
     pub(super) assume_worker: bool,
+}
+
+impl Evidence {
+    /// The session's annotations were replaced as a whole: rebuild.
+    pub(super) fn replace_annotations(&mut self) {
+        self.annotations = self.annotations.wrapping_add(1);
+    }
 }
 
 impl ProgramPane {
@@ -229,6 +278,7 @@ impl DesktopApp {
             self.program.bytes.release();
             self.program.byte_wanted.clear();
             self.program.byte_visible.clear();
+            self.release_evidence();
         }
         if scope == ListingScope::Program {
             self.program.window = None;
@@ -353,6 +403,265 @@ impl DesktopApp {
         self.program.rows_serial = self.program.rows_serial.wrapping_add(1);
     }
 
+    fn evidence_key(&self) -> EvidenceKey {
+        EvidenceKey {
+            generation: self.generation,
+            linkage: self.source_epochs.linkage,
+            strings: self.source_epochs.strings,
+            references: self.reference_revision,
+            annotations: self.program.evidence.annotations,
+        }
+    }
+
+    /// Frees the index; the Program scope rebuilds it when shown again.
+    fn release_evidence(&mut self) {
+        let evidence = &mut self.program.evidence;
+        evidence.key = None;
+        evidence.index = ListingEvidence::default();
+        evidence.exports.clear();
+        evidence.epoch = evidence.epoch.wrapping_add(1);
+    }
+
+    /// Builds the evidence index when an input it came from changed: the
+    /// binary, the adopted linkage table, the strings, the reference report
+    /// or the session (beyond the edits applied in place). Invalid section
+    /// metadata leaves no evidence at all.
+    pub(super) fn program_evidence_sync(&mut self) {
+        let key = self.evidence_key();
+        if self.program.evidence.key == Some(key) {
+            return;
+        }
+        let _build = crate::performance::span("gui_listing_evidence_build");
+        let index = self.info.as_ref().and_then(|info| {
+            let admissions = self
+                .discovery
+                .iter()
+                .flat_map(|state| state.pointer_recovery.admissions.values().copied());
+            ListingEvidence::build(
+                info,
+                self.linkage.prepared().map(|prepared| prepared.linkage()),
+                admissions,
+                &self.strings,
+                self.call_index.as_deref(),
+                self.session.as_ref(),
+            )
+            .ok()
+        });
+        let exports = self
+            .linkage
+            .prepared()
+            .into_iter()
+            .flat_map(|prepared| {
+                prepared
+                    .linkage()
+                    .exports
+                    .iter()
+                    .take(crate::linkage::MAX_EXPORTS)
+            })
+            .filter_map(|export| match export.target {
+                crate::linkage::ExportTarget::Data { address } => Some((address, export.id)),
+                _ => None,
+            })
+            .collect();
+        let evidence = &mut self.program.evidence;
+        evidence.index = index.unwrap_or_default();
+        evidence.exports = exports;
+        evidence.key = Some(key);
+        evidence.epoch = evidence.epoch.wrapping_add(1);
+        #[cfg(test)]
+        {
+            evidence.builds += 1;
+        }
+    }
+
+    /// Whether the evidence index is built from exactly the current inputs.
+    pub(super) fn program_evidence_current(&self) -> bool {
+        self.program.evidence.key == Some(self.evidence_key())
+    }
+
+    /// A discovery commit extended this run: adds every committed witness
+    /// and the extended reference index's targets in place. All of them, not
+    /// only this batch's: a rebuild while the discovery state was away in its
+    /// background commit saw none, and repeated witnesses are no-ops.
+    /// `current` is whether the index matched every input before the commit;
+    /// otherwise it stays stale and is rebuilt from all committed witnesses.
+    pub(super) fn program_evidence_commit(&mut self, current: bool) {
+        if !current {
+            return;
+        }
+        let admissions = self
+            .discovery
+            .iter()
+            .flat_map(|state| state.pointer_recovery.admissions.values().copied());
+        let references = self.reference_revision;
+        let evidence = &mut self.program.evidence;
+        let Some(key) = &mut evidence.key else {
+            return;
+        };
+        if key.references != references {
+            if let Some(calls) = self.call_index.as_deref() {
+                evidence.index.add_reference_marks(calls);
+            }
+            key.references = references;
+        }
+        evidence.index.add_witnesses(admissions);
+        evidence.epoch = evidence.epoch.wrapping_add(1);
+    }
+
+    /// The label or comment at `address` changed. A current index updates
+    /// the address's mark in place; a stale one is rebuilt anyway.
+    pub(super) fn program_evidence_annotation(&mut self, address: u64) {
+        if !self.program_evidence_current() {
+            return;
+        }
+        let marked = self
+            .session
+            .as_ref()
+            .and_then(|session| session.annotations.get(&address))
+            .is_some_and(|note| !note.label.is_empty() || !note.comment.is_empty());
+        let evidence = &mut self.program.evidence;
+        if marked {
+            evidence.index.add_mark(address);
+        } else {
+            evidence.index.remove_mark(address);
+        }
+        evidence.epoch = evidence.epoch.wrapping_add(1);
+    }
+
+    /// Data and address references to exactly `address` in the current
+    /// report: the references that make it a split mark.
+    fn xref_count(&self, address: u64) -> usize {
+        self.call_index.as_deref().map_or(0, |calls| {
+            calls.data_incoming.get(&address).map_or(0, Vec::len)
+                + calls.address_incoming.get(&address).map_or(0, Vec::len)
+        })
+    }
+
+    /// What a split mark at `address` shows on the row starting there: the
+    /// analyst's label, else a data export's name.
+    fn listing_note(&self, address: u64) -> theme::ListingNote<'_> {
+        let annotation = self
+            .session
+            .as_ref()
+            .and_then(|session| session.annotations.get(&address));
+        let export = || {
+            let id = *self.program.evidence.exports.get(&address)?;
+            let export = self
+                .linkage
+                .prepared()?
+                .linkage()
+                .exports
+                .get(id as usize)?;
+            export.display.as_deref().or(export.raw.as_deref())
+        };
+        theme::ListingNote {
+            label: annotation
+                .map(|note| note.label.as_str())
+                .filter(|label| !label.is_empty())
+                .or_else(export),
+            xrefs: self.xref_count(address),
+            comment: self
+                .annotation_browser
+                .comments
+                .get(&address)
+                .map(String::as_str),
+        }
+    }
+
+    /// One hover line for the split mark at `address`.
+    fn mark_hover(&self, address: u64) -> String {
+        let note = self.listing_note(address);
+        let mut line = format!("{address:#x}");
+        if let Some(label) = note.label {
+            line.push_str("  ");
+            line.push_str(&crop(label, MAX_HOVER_NAME));
+        }
+        if note.xrefs > 0 {
+            line.push_str(&format!("  XREF[{}]", note.xrefs));
+        }
+        if let Some(comment) = note.comment {
+            line.push_str("  ; ");
+            line.push_str(&crop(comment, 120));
+        }
+        line
+    }
+
+    /// The operands evidence and hover provenance of a data row.
+    fn data_row_text(&self, start: u64, end: u64, kind: EvidenceKind) -> (Option<String>, String) {
+        let length = end - start;
+        match kind {
+            EvidenceKind::ImportSlot(id) => {
+                let linkage = self.linkage.prepared().map(|prepared| prepared.linkage());
+                let import = linkage.and_then(|linkage| linkage.imports.get(id as usize));
+                let Some((linkage, import)) = linkage.zip(import) else {
+                    return (None, format!("Import slot · {length:#x}"));
+                };
+                let name = crate::linkage_ui::shown_name(
+                    None,
+                    &import.raw,
+                    &import.display,
+                    import.ordinal,
+                );
+                let library = match (import.library, import.scope) {
+                    (Some(library), _) => linkage
+                        .libraries
+                        .get(library as usize)
+                        .map_or("Unknown library", |library| library.name.as_str()),
+                    (None, Some(scope)) => scope.label(),
+                    (None, None) => "Unknown library",
+                };
+                let mut facts = vec![crop(library, MAX_HOVER_NAME)];
+                facts.push(match import.kind {
+                    crate::linkage::ImportKind::Normal => "import slot".into(),
+                    crate::linkage::ImportKind::Delay => "delay-load slot".into(),
+                });
+                if import.weak {
+                    facts.push("weak".into());
+                }
+                let name = crop(&name, MAX_HOVER_NAME);
+                (Some(name.clone()), format!("{name}\n{}", facts.join(" · ")))
+            }
+            EvidenceKind::Pointer { entry, .. } => {
+                let names = self.function_names(entry);
+                let mut hover = names.map_or_else(
+                    || format!("{entry:#x}"),
+                    |(name, raw)| name_hover(name, raw),
+                );
+                if let Some(admission) = self
+                    .discovery
+                    .as_ref()
+                    .and_then(|state| state.admission(entry))
+                {
+                    hover.push_str("\n\n");
+                    hover.push_str(&admission.hover_text());
+                }
+                (names.map(|(name, _)| crop(name, 120)), hover)
+            }
+            EvidenceKind::String(index) => {
+                let string = self
+                    .strings
+                    .get(index as usize)
+                    .filter(|string| string.address == start);
+                let Some(string) = string else {
+                    return (None, format!("String · {length:#x}"));
+                };
+                let origin = if self.cached_strings {
+                    "saved"
+                } else {
+                    "scanned"
+                };
+                (
+                    Some(crop(&string.text, 120)),
+                    format!(
+                        "{}\n{} · {length:#x} · {origin}",
+                        crop(&string.text, 400),
+                        crop(&string.encoding, 64)
+                    ),
+                )
+            }
+        }
+    }
+
     /// Whether `entry` needs a Listing request now. A view computed under
     /// an older context is recomputed only while visible (`stale`).
     fn listing_needs(&self, entry: u64, context: &Arc<ProgramContext>, stale: bool) -> bool {
@@ -368,6 +677,7 @@ impl DesktopApp {
 
     pub(super) fn program_listing_pane(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
         self.program_rows_sync();
+        self.program_evidence_sync();
         // Until this frame reaches its rows, nothing is in view.
         self.program.drawn_empty = true;
         self.program.wanted.clear();
@@ -407,7 +717,9 @@ impl DesktopApp {
             theme::empty_state(ui, "No sections");
             return;
         }
-        let layout = rows.layout(&info.functions, &self.program.expanded);
+        let layout = rows
+            .layout(&info.functions, &self.program.expanded)
+            .with_evidence(&self.program.evidence.index);
         // One-shot reveal: center only a row that is not fully shown, then
         // pin it where it is on screen.
         if let Some(reveal) = self.program.reveal.take() {
@@ -483,6 +795,7 @@ impl DesktopApp {
                 functions.last().map_or(0, |f| f.address),
             ),
             expansions: self.program.expanded.epoch(),
+            evidence: self.program.evidence.epoch,
             after: (page + WINDOW_BEFORE).min(WINDOW_ROWS - WINDOW_BEFORE - 1),
         };
         let reused = self.program.window.as_mut().is_some_and(|window| {
@@ -559,7 +872,9 @@ impl DesktopApp {
         let mut header_xrefs = None;
         let mut stop = None;
         let mut toggled = None;
+        let mut witness = None;
         let bytes = &self.program.bytes;
+        let evidence = &self.program.evidence.index;
         let anchored = theme::anchored_rows(
             ui,
             body,
@@ -725,10 +1040,19 @@ impl DesktopApp {
                 Row::Undefined { start, end } | Row::ZeroFill { start, end } => {
                     let length = end - start;
                     let zero = matches!(row, Row::ZeroFill { .. });
-                    let mark = if zero {
-                        theme::ListingMark::ZeroFill { length }
+                    let marked = evidence
+                        .split_marks(start, start.saturating_add(1))
+                        .next()
+                        .is_some();
+                    let note = if marked {
+                        self.listing_note(start)
                     } else {
-                        theme::ListingMark::Undefined { length }
+                        theme::ListingNote::default()
+                    };
+                    let mark = if zero {
+                        theme::ListingMark::ZeroFill { length, note }
+                    } else {
+                        theme::ListingMark::Undefined { length, note }
                     };
                     let response = theme::row_response(
                         ui,
@@ -739,8 +1063,12 @@ impl DesktopApp {
                     );
                     let selected = cursor == Some(row.position());
                     theme::listing_mark(ui, rect, &columns, start, digits, mark, selected);
-                    let response =
-                        response.on_hover_text(format!("{start:#x}–{end:#x}  ({length:#x})"));
+                    let mut hover = format!("{start:#x}–{end:#x}  ({length:#x})");
+                    if marked {
+                        hover.push_str("\n\n");
+                        hover.push_str(&self.mark_hover(start));
+                    }
+                    let response = response.on_hover_text(hover);
                     if !zero
                         && theme::listing_disclosure(
                             ui,
@@ -809,6 +1137,74 @@ impl DesktopApp {
                         toggled = Some(*row);
                     }
                     let source = super::MenuSource::Span { address, length: 1 };
+                    if let Some(source) = self.menu_shown(&response, source, &mut menu_opened) {
+                        response.context_menu(|ui| self.menu_body(ui, source, &mut menu_chosen));
+                    }
+                }
+                Row::Data { start, end, kind } => {
+                    let response = theme::row_response(
+                        ui,
+                        ui.scope_id().with(("program-data", start)),
+                        rect,
+                        false,
+                        false,
+                    );
+                    let (shown, provenance) = self.data_row_text(start, end, kind);
+                    let data = match kind {
+                        EvidenceKind::ImportSlot(_) => theme::DataEvidence::Slot {
+                            name: shown.as_deref().unwrap_or("?"),
+                        },
+                        EvidenceKind::Pointer { entry, .. } => theme::DataEvidence::Pointer {
+                            target: entry,
+                            name: shown.as_deref(),
+                        },
+                        EvidenceKind::String(_) => theme::DataEvidence::String {
+                            preview: shown.as_deref().unwrap_or(""),
+                        },
+                    };
+                    let item = crate::listing_evidence::Evidence { start, end, kind };
+                    let marks: Vec<u64> = evidence.marks_within(&item).take(9).collect();
+                    let note = if marks.first() == Some(&start) {
+                        self.listing_note(start)
+                    } else {
+                        theme::ListingNote::default()
+                    };
+                    theme::listing_mark(
+                        ui,
+                        rect,
+                        &columns,
+                        start,
+                        digits,
+                        theme::ListingMark::Data {
+                            evidence: data,
+                            note,
+                        },
+                        cursor == Some(row.position()),
+                    );
+                    let mut hover = format!("{start:#x}–{end:#x}\n{provenance}");
+                    if !marks.is_empty() {
+                        hover.push('\n');
+                        for &mark in marks.iter().take(8) {
+                            hover.push('\n');
+                            hover.push_str(&self.mark_hover(mark));
+                        }
+                        if marks.len() > 8 {
+                            hover.push_str("\n…");
+                        }
+                    }
+                    let response = response.on_hover_text(hover);
+                    if response.clicked() {
+                        stop = Some(*row);
+                    }
+                    if response.double_clicked()
+                        && let EvidenceKind::Pointer { entry, .. } = kind
+                    {
+                        witness = Some(entry);
+                    }
+                    let source = super::MenuSource::Span {
+                        address: start,
+                        length: end - start,
+                    };
                     if let Some(source) = self.menu_shown(&response, source, &mut menu_opened) {
                         response.context_menu(|ui| self.menu_body(ui, source, &mut menu_chosen));
                     }
@@ -950,6 +1346,9 @@ impl DesktopApp {
         if let Some(row) = toggled {
             self.toggle_bytes(row);
             context.request_repaint();
+        }
+        if let Some(entry) = witness {
+            self.follow_witness(entry, context);
         }
         if let Some((owner, target)) = follow {
             self.follow_row_target(owner, target, context);
@@ -1165,6 +1564,13 @@ impl DesktopApp {
         self.program
             .bytes
             .accept(address, bytes, top, &self.program.byte_visible);
+    }
+
+    /// Opens the function a pointer-table witness row points at, recording
+    /// history as any explicit navigation does.
+    pub(super) fn follow_witness(&mut self, entry: u64, context: &egui::Context) {
+        self.program.follow = None;
+        self.navigate_location(entry, Some(entry), true, context);
     }
 
     /// Expands a collapsed `??` row by up to 64 KiB, or collapses the run

@@ -143,11 +143,39 @@ impl StringRun {
             }
             output.push(StringEntry {
                 address: self.start,
+                length: u32::try_from(self.count * if encoding == "UTF-16LE" { 2 } else { 1 }).ok(),
                 text,
                 encoding: encoding.into(),
             });
         }
         self.count = 0;
         self.text.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn byte_lengths_survive_preview_truncation_and_utf16() {
+        for (encoding, width) in [("ASCII", 1), ("UTF-16LE", 2)] {
+            let mut run = StringRun::new(4);
+            let mut output = Vec::new();
+            for offset in 0..(MAX_STRING_PREVIEW + 17) {
+                run.feed(
+                    Some('x'),
+                    0x1000 + (offset * width) as u64,
+                    encoding,
+                    &mut output,
+                );
+            }
+            run.flush(encoding, &mut output);
+            assert_eq!(
+                output[0].length,
+                Some(((MAX_STRING_PREVIEW + 17) * width) as u32)
+            );
+            assert!(output[0].text.ends_with('…'));
+        }
     }
 }

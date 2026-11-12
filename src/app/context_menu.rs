@@ -47,7 +47,7 @@ pub(super) enum MenuSource {
         address: u64,
     },
     TreeSection(usize),
-    /// A Program-listing `??`, byte or zero-fill row covering
+    /// A Program-listing `??`, byte, data or zero-fill row covering
     /// `[address, address + length)`.
     Span {
         address: u64,
@@ -193,9 +193,12 @@ fn xref_items(items: &mut Vec<MenuItem>, targets: &TargetSet, function: Option<u
     }
 }
 
-/// Bytes a string row selects, by its encoding; never zero.
+/// Bytes a string row selects: the scanned length when known, else the
+/// preview's size in its encoding; never zero.
 pub(super) fn string_span(string: &StringEntry) -> usize {
-    let length = if string.encoding.contains("16") {
+    let length = if let Some(length) = string.length {
+        usize::try_from(length).unwrap_or(usize::MAX)
+    } else if string.encoding.contains("16") {
         string.text.encode_utf16().count().saturating_mul(2)
     } else {
         string.text.len()
@@ -281,7 +284,8 @@ impl DesktopApp {
                     return None;
                 }
                 binding.tab = Some(Tab::Listing);
-                // Rows the expansions or loaded bodies change are new targets.
+                // Rows the expansions or loaded bodies change are new targets;
+                // evidence changes keep a menu while its exact span remains.
                 binding.rows = (self.program.expanded.epoch(), self.program.cache.epoch());
             }
         }
@@ -530,7 +534,7 @@ impl DesktopApp {
             .exact(Position::new(address, Rank::Body))?;
         (matches!(
             row,
-            Row::Undefined { .. } | Row::ZeroFill { .. } | Row::Byte { .. }
+            Row::Undefined { .. } | Row::ZeroFill { .. } | Row::Byte { .. } | Row::Data { .. }
         ) && row.span() == address.checked_add(length).map(|end| (address, end)))
         .then_some(row)
     }
@@ -1528,6 +1532,25 @@ mod tests {
     }
 
     #[test]
+    fn string_spans_use_the_scanned_length_beyond_a_truncated_preview() {
+        let entry = |length, text: &str, encoding: &str| StringEntry {
+            length,
+            address: 0x1000,
+            text: text.into(),
+            encoding: encoding.into(),
+        };
+        assert_eq!(string_span(&entry(Some(600), "abc…", "ASCII")), 600);
+        assert_eq!(string_span(&entry(Some(40), "ab…", "UTF-16LE")), 40);
+        // Older records size by their preview.
+        assert_eq!(string_span(&entry(None, "abcd", "ASCII")), 4);
+        assert_eq!(string_span(&entry(None, "abcd", "UTF-16LE")), 8);
+        assert_eq!(
+            string_span(&entry(Some(u32::MAX), "x…", "ASCII")),
+            crate::decode::MAX_INPUT
+        );
+    }
+
+    #[test]
     fn strings_menus_keep_source_identity_through_sorting_and_filtering() {
         let mut app = menu_app();
         app.strings = [
@@ -1537,6 +1560,7 @@ mod tests {
             (0x1040, "dup"),
         ]
         .map(|(address, text)| StringEntry {
+            length: None,
             address,
             text: text.into(),
             encoding: "utf-8".into(),

@@ -63,7 +63,10 @@ impl ExecutableRanges {
 /// Checked, merged virtual-address intervals of all mapped sections, including
 /// zero-filled tails. Spans may cross contiguous sections but never gaps, and
 /// each lookup is logarithmic in the section count.
-pub(crate) struct MappedRanges(Vec<(u64, u64)>);
+pub(crate) struct MappedRanges {
+    mapped: Vec<(u64, u64)>,
+    backed: Vec<(u64, u64)>,
+}
 
 impl MappedRanges {
     pub(crate) fn new(sections: &[SectionInfo]) -> Result<Self, String> {
@@ -88,7 +91,38 @@ impl MappedRanges {
                 merged.push((start, end));
             }
         }
-        Ok(Self(merged))
+        let mut backed: Vec<(u64, u64)> = Vec::new();
+        let mut file_ranges = sections
+            .iter()
+            .filter_map(|section| {
+                let length = section.size.min(section.file_size);
+                let end = section.address.checked_add(length)?;
+                (length != 0).then_some((section.address, end))
+            })
+            .collect::<Vec<_>>();
+        file_ranges.sort_unstable();
+        for (start, end) in file_ranges {
+            if let Some(last) = backed.last_mut()
+                && start <= last.1
+            {
+                last.1 = last.1.max(end);
+            } else {
+                backed.push((start, end));
+            }
+        }
+        Ok(Self {
+            mapped: merged,
+            backed,
+        })
+    }
+
+    pub(crate) fn backs_span(&self, address: u64, length: u64) -> bool {
+        let index = self.backed.partition_point(|(start, _)| *start <= address);
+        length != 0
+            && index > 0
+            && address
+                .checked_add(length)
+                .is_some_and(|end| end <= self.backed[index - 1].1)
     }
 
     pub(crate) fn contains(&self, address: u64) -> bool {
@@ -104,8 +138,8 @@ impl MappedRanges {
     }
 
     fn interval(&self, address: u64) -> Option<u64> {
-        let index = self.0.partition_point(|(start, _)| *start <= address);
-        let (_, end) = *self.0.get(index.checked_sub(1)?)?;
+        let index = self.mapped.partition_point(|(start, _)| *start <= address);
+        let (_, end) = *self.mapped.get(index.checked_sub(1)?)?;
         (address < end).then_some(end)
     }
 }
@@ -206,6 +240,36 @@ impl SemanticSelection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backed_spans_merge_adjacent_sections_but_reject_tails_gaps_and_overflow() {
+        let section = |address, size, file_size| SectionInfo {
+            name: String::new(),
+            address,
+            size,
+            file_size,
+            file_offset: 0,
+            executable: false,
+        };
+        let ranges = MappedRanges::new(&[
+            section(8, 8, 4),
+            section(0, 8, 8),
+            section(20, 4, 4),
+            section(u64::MAX - 8, 8, 8),
+        ])
+        .unwrap();
+        assert!(ranges.backs_span(0, 8));
+        assert!(ranges.backs_span(6, 6));
+        assert!(ranges.backs_span(8, 4));
+        assert!(!ranges.backs_span(11, 2));
+        assert!(!ranges.backs_span(12, 1));
+        assert!(!ranges.backs_span(23, 2));
+        assert!(!ranges.backs_span(0, 0));
+        assert!(ranges.backs_span(u64::MAX - 8, 8));
+        assert!(!ranges.backs_span(u64::MAX - 8, 9));
+        let gap = MappedRanges::new(&[section(0, 8, 8), section(9, 8, 8)]).unwrap();
+        assert!(!gap.backs_span(6, 4));
+    }
 
     #[test]
     fn mapped_ranges_cross_contiguous_sections_but_not_gaps() {

@@ -555,6 +555,19 @@ defaults to 6 characters, selectable from 4–64 before the result cap; filterin
 searches loaded results only. Increase the minimum and rescan to reduce noise.
 Partial scans are labeled; [scan limits](#resource-limits-and-trust-boundaries) apply.
 
+Scanned string records include an optional `StringEntry.length`: the full byte
+length of the scanned run (two bytes per scanned UTF-16LE character), even
+when the displayed preview is truncated. No terminator is required or counted.
+Known lengths must agree with untruncated previews, or exceed the content of
+truncated previews in the encoding’s byte units. Project and worker validation
+require known spans to remain within mapped, file-backed bytes. This is an additive v4
+project field: old records still load; older builds ignore it and drop it when
+saving again. Listing evidence can infer a missing length only from an
+untruncated ASCII preview; other old records supply an address split mark only.
+The bytes a string row reads when clicked, and the Hex span its **Go to**
+selects, use that length when it is known and the preview's size otherwise
+(at most 64 KiB).
+
 **Hex / Memory Map**, also opened from Program Tree sections, shows mapped sections
 and their exclusive virtual/file ranges. Browse section-relative 4 KiB pages
 using **Prev/Next** or **VA (hex)**. Invalid jumps preserve the page. File bytes
@@ -567,6 +580,45 @@ and annotations; pages/selections are transient. Reads wait for busy analysis;
 rapid paging retains the newest request only. Failed/canceled reads require
 **Retry**. Decoder behavior and constant-match caveats are in
 [coverage and provenance](crypto-signatures.md).
+
+### Listing evidence
+
+The Program listing shows evidence inside undefined gaps without defining
+anything: the mnemonic stays `??` and no data type is applied. Its index
+([listing_evidence.rs](../src/listing_evidence.rs)) holds three kinds of items:
+
+- validated import slots (primary and additional locations), pointer-width;
+- absolute pointer-table witnesses that discovery committed this session,
+  8 bytes, aligned, in non-executable file-backed bytes (relative, local-symbol
+  and direct admissions are not shown);
+- string candidates with a known or inferable length, wholly in one
+  file-backed section.
+
+Slots win over witnesses, which win over strings; among strings the longest
+wins, then the earliest. A losing item is omitted whole, never clipped. An item
+becomes a row only when its whole span lies in one collapsed undefined part of
+the current layout: decoded instructions, function entries (also of bodies not
+yet loaded) and expanded byte runs always win, and the item's bytes then stay
+`??`. No evidence row starts at a function entry, even one whose body failed
+to load; text-like bytes later inside such a body can still appear as a
+candidate string until it loads. Split marks at data exports, data and address
+reference targets, labels and comments divide undefined and zero-filled gaps outside admitted items, so
+`.bss` globals become addressable rows without reading bytes; marks inside an
+item never split it and are listed in its hover instead.
+
+The index is built on the GUI thread while the Program scope is shown: once
+per change of the binary, adopted linkage table, strings or reference report,
+or wholesale replacement of the session's annotations, and again each time the
+Program scope is shown after **Function** scope released it. A build takes
+O(n log n) time and O(n) space under the source caps (`MAX_IMPORTS +
+MAX_LINKAGE_LOCATIONS` slots, `MAX_FUNCTION_ADMISSIONS` witnesses,
+`MAX_PROJECT_STRINGS` strings). Each committed discovery batch adds every
+committed witness not yet present and its run's new reference targets in
+place, and label or comment edits (including undo) add or remove one mark;
+neither rebuilds it, and neither do signature or local-variable edits.
+Row queries are logarithmic lookups and never scan bytes. Witnesses are not
+saved in projects: after a reopen they appear again only once discovery
+runs.
 
 ## Search
 
