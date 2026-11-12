@@ -1,6 +1,6 @@
 //! Portable project snapshots. Cached analysis is data, never executable SQL or code.
 //!
-//! A project stores a bounded current-function cache, annotations, and optionally
+//! A project stores bounded per-function caches, annotations, and optionally
 //! the exact analyzed input. The decompiler's internal database is rebuilt on open.
 use crate::discovery::{DISCOVERY_FINGERPRINT, DiscoverySnapshot};
 use crate::model::{
@@ -22,8 +22,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 const APPLICATION_ID: i64 = 0x4752504a; // GRPJ
-/// Version 4 adds signatures and their cache context; versions 1–3 still open.
-const VERSION: i64 = 4;
+/// Version 5 adds bounded per-function results; versions 1–4 still open.
+const VERSION: i64 = 5;
+pub const MAX_SAVED_FUNCTIONS: usize = 128;
+const MAX_FUNCTION_RESULTS: usize = 16 * 1024 * 1024;
 const LEGACY_ENGINE_FINGERPRINT: &str = "ghidra-rust-project-v3-semantic-v1-mapping-v1-pe-v1-aarch64-v1-calls-v1-arm64pe-v1-inventory-v2-elfcrt-v1-switch-v1-noreturn-v1:268c3a406d8d964bc00ae2ead4d3e1e1373aaa27";
 pub const ENGINE_FINGERPRINT: &str = "ghidra-rust-project-v3-semantic-v1-mapping-v1-pe-v1-aarch64-v1-calls-v1-arm64pe-v1-inventory-v2-elfcrt-v1-switch-v1-noreturn-v1-macho-sections-v1:268c3a406d8d964bc00ae2ead4d3e1e1373aaa27";
 const MAX_BINARY: usize = 128 * 1024 * 1024;
@@ -48,6 +50,118 @@ pub struct ProjectData {
     pub selected_address: Option<u64>,
     /// Shared with the desktop so capturing a save never copies the evidence.
     pub discovery: Option<Arc<DiscoverySnapshot>>,
+    pub function_results: Vec<SavedFunction>,
+}
+
+/// Portable analysis for an additional function. Presentation caches are rebuilt
+/// off the GUI thread; stored bytes never authenticate engine output.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SavedFunction {
+    pub view: FunctionView,
+    pub decompiled: Option<String>,
+    #[serde(deserialize_with = "crate::bounded::vec::<_, _, { crate::model::MAX_CODE_MAPPINGS }>")]
+    pub mappings: Vec<CodeMapping>,
+    pub semantics: crate::semantic::SemanticInfo,
+}
+
+impl SavedFunction {
+    /// Called by the save job, never the GUI. The displayed function has its
+    /// own record; preserve most recent additional results within one byte cap.
+    pub fn capture(
+        hits: Vec<crate::function_results::FunctionHit>,
+        displayed: Option<u64>,
+        sections: &[SectionInfo],
+    ) -> Vec<Self> {
+        let mut results = Vec::new();
+        let mut bytes = 64usize;
+        for hit in hits {
+            let Some((graph, _)) = hit.graph else {
+                continue;
+            };
+            if Some(graph.address()) == displayed {
+                continue;
+            }
+            let code = hit.decompiled.map(|(code, _)| code);
+            let saved = Self {
+                view: persistable_view(graph.view(), sections),
+                decompiled: code.as_ref().map(|v| v.text().to_owned()),
+                mappings: code
+                    .as_ref()
+                    .map_or_else(Vec::new, |v| v.mappings().to_vec()),
+                semantics: code
+                    .as_ref()
+                    .map_or_else(Default::default, |v| v.semantics().clone()),
+            };
+            let Ok(encoded) = encode(&saved, MAX_FUNCTION_RESULTS.saturating_sub(bytes + 1)) else {
+                continue;
+            };
+            bytes += encoded.len() + 1;
+            results.push(saved);
+        }
+        results
+    }
+}
+
+/// Prepared on the file job, then admitted under the verified program context.
+pub struct PreparedFunction {
+    pub graph: crate::function_presentation::PreparedGraph,
+    pub code: Option<crate::function_presentation::PreparedDecompilation>,
+}
+
+/// Reconstruct bounded presentation data away from the GUI. Recent functions
+/// win; results which cannot fit are recomputed on demand after reopening.
+pub fn prepare_functions(data: &mut ProjectData) -> Vec<PreparedFunction> {
+    use crate::function_presentation::{PreparedDecompilation, PreparedGraph};
+    use crate::result_store::Retained;
+    let mut remaining = crate::result_store::RESULT_STORE_BUDGET / 2;
+    let mut prepared = Vec::new();
+    for saved in std::mem::take(&mut data.function_results) {
+        if PreparedGraph::estimated_bytes(&saved.view) > remaining {
+            continue;
+        }
+        let graph = PreparedGraph::new(saved.view);
+        let bytes = graph.retained_bytes().unwrap_or(usize::MAX);
+        if bytes > remaining {
+            continue;
+        }
+        remaining -= bytes;
+        let code = saved.decompiled.and_then(|text| {
+            let bytes =
+                PreparedDecompilation::estimated_bytes(&text, &saved.mappings, &saved.semantics);
+            if bytes > remaining {
+                return None;
+            }
+            let code = PreparedDecompilation::validate(
+                graph.address(),
+                text,
+                saved.mappings,
+                saved.semantics,
+                &data.info.sections,
+            )
+            .ok()?;
+            let bytes = code.retained_bytes().unwrap_or(usize::MAX);
+            if bytes > remaining {
+                return None;
+            }
+            remaining -= bytes;
+            Some(code)
+        });
+        prepared.push(PreparedFunction { graph, code });
+    }
+    prepared
+}
+
+#[derive(Serialize)]
+struct FunctionRecordsRef<'a> {
+    functions: &'a [SavedFunction],
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FunctionRecords {
+    #[serde(deserialize_with = "crate::bounded::vec::<_, _, { MAX_SAVED_FUNCTIONS }>")]
+    functions: Vec<SavedFunction>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -122,6 +236,7 @@ impl LoadedProject {
         self.data.validate_against(&old)?;
         self.data.info.sections = fresh.sections.clone();
         self.data.info.entry = fresh.entry;
+        self.data.function_results.clear();
         self.data.view = None;
         self.data.decompiled = None;
         self.data.mappings.clear();
@@ -211,6 +326,13 @@ impl ProjectData {
         if let Some(discovery) = &discovery {
             check_json_budget(discovery)?;
         }
+        let functions = encode(
+            &FunctionRecordsRef {
+                functions: &self.function_results,
+            },
+            MAX_FUNCTION_RESULTS,
+        )?;
+        check_function_json(&functions)?;
         let annotations = encode(&self.session, session::MAX_SESSION_BYTES as usize)?;
         let destination = session::safe_destination(path, protection)?;
         protect_binary_destination(&destination, &self.info)?;
@@ -252,6 +374,12 @@ impl ProjectData {
                     )
                     .map_err(sql_error)?;
             }
+            transaction
+                .execute(
+                    "INSERT INTO project_data (key,value) VALUES ('functions',?1)",
+                    params![functions],
+                )
+                .map_err(sql_error)?;
             if let Some(discovery) = &discovery {
                 transaction
                     .execute(
@@ -370,6 +498,19 @@ impl ProjectData {
             .map(String::from_utf8)
             .transpose()
             .map_err(|_| "Project decompilation is not UTF-8")?;
+        let function_results = if version >= 5 {
+            read_blob(&db, "functions", MAX_FUNCTION_RESULTS)?
+                .map(|bytes| {
+                    check_function_json(&bytes)?;
+                    serde_json::from_slice::<FunctionRecords>(&bytes)
+                        .map(|records| records.functions)
+                        .map_err(|e| format!("Invalid saved functions: {e}"))
+                })
+                .transpose()?
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let source_hint = body.info.path.clone();
         let displayed_entry = body.view.as_ref().map(|view| view.address);
         let local_context = if session.signatures.is_empty() {
@@ -399,10 +540,12 @@ impl ProjectData {
             crypto_truncated: body.crypto_truncated,
             selected_address: body.selected_address,
             discovery: None,
+            function_results,
         };
         // Incompatible cached semantics may use an older identity schema. Keep
         // annotations, but do not interpret those caches with current validators.
         if !compatible {
+            data.function_results.clear();
             data.view = None;
             data.decompiled = None;
             data.mappings.clear();
@@ -507,51 +650,52 @@ impl ProjectData {
         if let Some(address) = self.selected_address {
             mapped(&ranges, address)?;
         }
-        if self
-            .decompiled
-            .as_ref()
-            .is_some_and(|s| s.len() > MAX_DECOMPILED_BYTES)
-        {
-            return Err("Decompilation exceeds the 2 MiB size limit".into());
+        validate_function(
+            self.view.as_ref(),
+            &self.decompiled,
+            &self.mappings,
+            &self.semantics,
+            &self.info,
+            &ranges,
+        )?;
+        bounded(
+            self.function_results.len(),
+            MAX_SAVED_FUNCTIONS,
+            "Saved functions",
+        )?;
+        let mut addresses = std::collections::BTreeSet::new();
+        if let Some(view) = &self.view {
+            addresses.insert(view.address);
         }
-        if let Some(text) = &self.decompiled {
-            validate_mappings(text, &self.mappings, &self.info.sections)?;
-            self.semantics.validate(
-                text,
-                self.view
-                    .as_ref()
-                    .ok_or("Semantic cache has no function")?
-                    .address,
-                &self.info.sections,
+        let context = if self.session.signatures.is_empty() {
+            String::new()
+        } else {
+            crate::signatures::state_digest(&self.session.signatures)
+        };
+        let local_fingerprint = crate::semantic::local_fingerprint(&context);
+        for saved in &self.function_results {
+            if !addresses.insert(saved.view.address) {
+                return Err("Project has duplicate function results".into());
+            }
+            validate_function(
+                Some(&saved.view),
+                &saved.decompiled,
+                &saved.mappings,
+                &saved.semantics,
+                &self.info,
+                &ranges,
             )?;
-        } else if !self.mappings.is_empty()
-            || !self.semantics.tokens.is_empty()
-            || !self.semantics.locals.is_empty()
-            || !self.semantics.warnings.is_empty()
-            || self.semantics.prototype.is_some()
-        {
-            return Err("Decompiler mappings have no corresponding text".into());
-        }
-        if self.decompiled.is_some() && self.view.is_none() {
-            return Err("Decompilation has no corresponding function view".into());
+            if saved
+                .semantics
+                .locals
+                .iter()
+                .any(|v| v.identity.engine != local_fingerprint)
+            {
+                return Err("Saved function has incompatible semantic identities".into());
+            }
         }
         validate_strings(&self.strings, MAX_PROJECT_STRINGS, &ranges)?;
         validate_crypto(&self.crypto, &ranges)?;
-        if let Some(view) = &self.view {
-            validate_view(view, &ranges, &self.info)?;
-            // Saved graphs have always required mapped exits and call sites.
-            for edge in &view.edges {
-                if let Some(target) = edge.target {
-                    mapped(&ranges, target)?;
-                }
-            }
-            for call in &view.calls {
-                mapped(&ranges, call.address)?;
-                if let Some(target) = call.target {
-                    mapped(&ranges, target)?;
-                }
-            }
-        }
         Ok(())
     }
 
@@ -578,6 +722,56 @@ impl ProjectData {
         }
         Ok(())
     }
+}
+
+fn validate_function(
+    view: Option<&FunctionView>,
+    decompiled: &Option<String>,
+    mappings: &[CodeMapping],
+    semantics: &crate::semantic::SemanticInfo,
+    info: &BinaryInfo,
+    ranges: &MappedRanges,
+) -> Result<(), String> {
+    if decompiled
+        .as_ref()
+        .is_some_and(|s| s.len() > MAX_DECOMPILED_BYTES)
+    {
+        return Err("Decompilation exceeds the 2 MiB size limit".into());
+    }
+    if let Some(text) = decompiled {
+        validate_mappings(text, mappings, &info.sections)?;
+        semantics.validate(
+            text,
+            view.ok_or("Semantic cache has no function")?.address,
+            &info.sections,
+        )?;
+    } else if !mappings.is_empty()
+        || !semantics.tokens.is_empty()
+        || !semantics.locals.is_empty()
+        || !semantics.warnings.is_empty()
+        || semantics.prototype.is_some()
+    {
+        return Err("Decompiler mappings have no corresponding text".into());
+    }
+    if decompiled.is_some() && view.is_none() {
+        return Err("Decompilation has no corresponding function view".into());
+    }
+    if let Some(view) = view {
+        validate_view(view, ranges, info)?;
+        // Saved graphs have always required mapped exits and call sites.
+        for edge in &view.edges {
+            if let Some(target) = edge.target {
+                mapped(ranges, target)?;
+            }
+        }
+        for call in &view.calls {
+            mapped(ranges, call.address)?;
+            if let Some(target) = call.target {
+                mapped(ranges, target)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// An embedded project's live guard protects its private extracted image. Also
@@ -677,8 +871,14 @@ fn verify_database(db: &Connection) -> Result<i64, String> {
     // Read at most one key beyond the version's record limit. Check their type
     // and length inside SQL before any Rust String allocation or
     // DISTINCT/ordering over attacker-sized keys.
-    let records = if version >= 2 { 5 } else { 4 };
-    let mut statement=db.prepare("SELECT typeof(key),length(key),CASE WHEN typeof(key)='text' AND length(key)<=16 THEN key ELSE NULL END FROM project_data LIMIT 6").map_err(sql_error)?;
+    let records = if version >= 5 {
+        6
+    } else if version >= 2 {
+        5
+    } else {
+        4
+    };
+    let mut statement=db.prepare("SELECT typeof(key),length(key),CASE WHEN typeof(key)='text' AND length(key)<=16 THEN key ELSE NULL END FROM project_data LIMIT 7").map_err(sql_error)?;
     let mut rows = statement.query([]).map_err(sql_error)?;
     let mut keys = std::collections::BTreeSet::new();
     let mut count = 0;
@@ -697,6 +897,7 @@ fn verify_database(db: &Connection) -> Result<i64, String> {
             key.as_str(),
             "body" | "annotations" | "decompiled" | "binary"
         ) && !(version >= 2 && key == "discovery")
+            && !(version >= 5 && key == "functions")
         {
             return Err("Project contains unsupported records".into());
         }
@@ -1143,6 +1344,14 @@ fn encode<T: Serialize>(value: &T, maximum: usize) -> Result<Vec<u8>, String> {
     Ok(output.bytes)
 }
 
+/// Function records include pseudocode, whose string limit is larger than
+/// metadata. The byte cap bounds the aggregate rather than multiplying the
+/// independent per-function collection limits.
+fn check_function_json(bytes: &[u8]) -> Result<(), String> {
+    crate::bounded::check_json(bytes, MAX_FUNCTION_RESULTS / 2, MAX_DECOMPILED_BYTES)
+        .map_err(|e| format!("Invalid saved functions: {e}"))
+}
+
 /// Bound collection construction before materializing hostile cached DTOs.
 fn check_json_budget(bytes: &[u8]) -> Result<(), String> {
     crate::bounded::check_json(bytes, MAX_JSON_NODES, 256 * 1024)
@@ -1216,6 +1425,7 @@ mod tests {
             crypto_truncated: false,
             selected_address: Some(0x1000),
             discovery: None,
+            function_results: Vec::new(),
         };
         (data, protection.bind_snapshot(&info).unwrap())
     }
@@ -1262,6 +1472,152 @@ mod tests {
         .unwrap();
     }
 
+    fn additional_function() -> SavedFunction {
+        SavedFunction {
+            view: FunctionView {
+                address: 0x1008,
+                blocks: vec![crate::model::BasicBlock {
+                    address: 0x1008,
+                    instructions: vec![crate::model::Instruction {
+                        address: 0x1008,
+                        bytes: vec![0xc3],
+                        mnemonic: "ret".into(),
+                        operands: String::new(),
+                    }],
+                }],
+                edges: vec![],
+                calls: vec![],
+                warnings: vec![],
+            },
+            decompiled: Some("return;".into()),
+            mappings: vec![CodeMapping {
+                start: 0,
+                end: 6,
+                addresses: vec![0x1008],
+            }],
+            semantics: Default::default(),
+        }
+    }
+
+    #[test]
+    fn multiple_functions_roundtrip_and_old_v4_projects_still_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut data, protection) = sample(directory.path());
+        data.function_results.push(additional_function());
+        let path = directory.path().join("functions.grproj");
+        data.save(&path, &protection, true).unwrap();
+        let mut loaded = ProjectData::load(&path).unwrap();
+        assert_eq!(loaded.data.selected_address, Some(0x1000));
+        assert_eq!(loaded.data.function_results.len(), 1);
+        let prepared = prepare_functions(&mut loaded.data);
+        assert_eq!(prepared[0].graph.address(), 0x1008);
+        assert_eq!(prepared[0].graph.listing().get(0).unwrap().address, 0x1008);
+        let code = prepared[0].code.as_ref().unwrap();
+        assert_eq!(code.text(), "return;");
+        assert_eq!(code.mappings()[0].addresses, vec![0x1008]);
+        assert_eq!(loaded.data.decompiled, data.decompiled);
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("DELETE FROM project_data WHERE key='functions'; PRAGMA user_version=4")
+            .unwrap();
+        drop(db);
+        let mut loaded = ProjectData::load(&path).unwrap();
+        assert!(loaded.cache_compatible && loaded.data.function_results.is_empty());
+        assert_eq!(loaded.data.decompiled, data.decompiled);
+        loaded.data.info.source_identity = data.info.source_identity;
+        loaded.data.save(&path, &protection, true).unwrap();
+        assert_eq!(
+            verify_database(&Connection::open(&path).unwrap()).unwrap(),
+            5
+        );
+    }
+
+    #[test]
+    fn additional_pseudocode_uses_the_full_decompiler_string_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut data, protection) = sample(directory.path());
+        let mut saved = additional_function();
+        saved.decompiled = Some(format!("/*{}*/", "x".repeat(300_000)));
+        saved.mappings.clear();
+        data.function_results.push(saved);
+        let path = directory.path().join("long-pseudocode.grproj");
+        data.save(&path, &protection, true).unwrap();
+        let mut loaded = ProjectData::load(&path).unwrap();
+        let prepared = prepare_functions(&mut loaded.data);
+        assert_eq!(prepared[0].code.as_ref().unwrap().text().len(), 300_004);
+    }
+
+    #[test]
+    fn saved_functions_reject_duplicates_bad_mappings_and_aggregate_limits() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut data, protection) = sample(directory.path());
+        let path = directory.path().join("functions.grproj");
+        data.function_results.push(additional_function());
+        data.save(&path, &protection, true).unwrap();
+        let original = fs::read(&path).unwrap();
+        data.function_results.push(additional_function());
+        assert!(
+            data.save(&path, &protection, true)
+                .unwrap_err()
+                .contains("duplicate")
+        );
+        assert_eq!(fs::read(&path).unwrap(), original);
+        data.function_results.pop();
+        for mode in 0..4 {
+            data.save(&path, &protection, true).unwrap();
+            let db = Connection::open(&path).unwrap();
+            rewrite_json(&db, "functions", |value| {
+                let record = &mut value["functions"][0];
+                match mode {
+                    0 => record["mappings"][0]["end"] = 999.into(),
+                    1 => record["view"]["address"] = 0x9000.into(),
+                    2 => value["functions"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(serde_json::to_value(additional_function()).unwrap()),
+                    _ => {
+                        value["functions"] = serde_json::to_value(vec![
+                            additional_function();
+                            MAX_SAVED_FUNCTIONS + 1
+                        ])
+                        .unwrap()
+                    }
+                }
+            });
+            drop(db);
+            assert!(
+                ProjectData::load(&path).is_err(),
+                "forged functions mode {mode}"
+            );
+        }
+        data.save(&path, &protection, true).unwrap();
+        let db = Connection::open(&path).unwrap();
+        db.execute(
+            "UPDATE project_data SET value=zeroblob(?1) WHERE key='functions'",
+            [(MAX_FUNCTION_RESULTS + 1) as i64],
+        )
+        .unwrap();
+        drop(db);
+        assert!(ProjectData::load(&path).unwrap_err().contains("size limit"));
+    }
+
+    #[test]
+    fn incompatible_engine_discards_all_function_results_but_keeps_notes() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut data, protection) = sample(directory.path());
+        data.function_results.push(additional_function());
+        let path = directory.path().join("functions.grproj");
+        data.save(&path, &protection, true).unwrap();
+        let db = Connection::open(&path).unwrap();
+        rewrite_json(&db, "body", |value| value["engine"] = "incompatible".into());
+        drop(db);
+        let loaded = ProjectData::load(&path).unwrap();
+        assert!(!loaded.cache_compatible && loaded.data.function_results.is_empty());
+        assert_eq!(
+            loaded.data.session.annotations[&0x1000].comment,
+            "saved note"
+        );
+    }
+
     #[test]
     fn version_4_signature_context_round_trips_and_binds_every_signature_field() {
         let directory = tempfile::tempdir().unwrap();
@@ -1279,7 +1635,7 @@ mod tests {
         assert_eq!(
             db.pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
                 .unwrap(),
-            4
+            5
         );
         drop(db);
 
@@ -1427,7 +1783,8 @@ mod tests {
             v.as_object_mut().unwrap().remove("signature_context");
             v.as_object_mut().unwrap().remove("signature_fingerprint");
         });
-        db.execute_batch("PRAGMA user_version=3").unwrap();
+        db.execute_batch("DELETE FROM project_data WHERE key='functions'; PRAGMA user_version=3")
+            .unwrap();
         drop(db);
         let loaded = ProjectData::load(&path).unwrap();
         assert!(!loaded.cache_compatible);
@@ -1440,7 +1797,8 @@ mod tests {
         data.session.upgrade_version();
         data.save(&path, &protection, true).unwrap();
         let db = Connection::open(&path).unwrap();
-        db.execute_batch("PRAGMA user_version=3").unwrap();
+        db.execute_batch("DELETE FROM project_data WHERE key='functions'; PRAGMA user_version=3")
+            .unwrap();
         drop(db);
         assert!(ProjectData::load(&path).unwrap_err().contains("version 4"));
     }
@@ -1553,8 +1911,8 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(
-            version, 4,
-            "optional string lengths must not change the v4 project format"
+            version, 5,
+            "optional string lengths must not change the v5 project format"
         );
         for length in [0, 15, u32::MAX] {
             data.strings[0].length = Some(length);
@@ -1754,7 +2112,8 @@ mod tests {
             [serde_json::to_vec(&notes).unwrap()],
         )
         .unwrap();
-        db.execute_batch("PRAGMA user_version=2").unwrap();
+        db.execute_batch("DELETE FROM project_data WHERE key='functions'; PRAGMA user_version=2")
+            .unwrap();
         drop(db);
         let reopened = ProjectData::load(&path).unwrap();
         assert!(!reopened.cache_compatible);
@@ -1830,7 +2189,8 @@ mod tests {
             [serde_json::to_vec(&legacy).unwrap()],
         )
         .unwrap();
-        db.execute_batch("PRAGMA user_version=2").unwrap();
+        db.execute_batch("DELETE FROM project_data WHERE key='functions'; PRAGMA user_version=2")
+            .unwrap();
         drop(db);
         let reopened = ProjectData::load(&path).unwrap();
         assert!(reopened.data.discovery.is_none());
@@ -1838,7 +2198,7 @@ mod tests {
 
         // Existing version 1 files open without discovery.
         let db = Connection::open(&path).unwrap();
-        db.execute_batch("PRAGMA user_version=1; DELETE FROM project_data WHERE key='discovery'")
+        db.execute_batch("DELETE FROM project_data WHERE key='functions'; PRAGMA user_version=1; DELETE FROM project_data WHERE key='discovery'")
             .unwrap();
         drop(db);
         let reopened = ProjectData::load(&path).unwrap();
@@ -1938,9 +2298,9 @@ mod tests {
         let path = directory.path().join("test.grproj");
         for mutation in [
             "PRAGMA user_version=0",
-            "PRAGMA user_version=5",
+            "PRAGMA user_version=6",
             // Version 1 never had discovery records.
-            "PRAGMA user_version=1; INSERT INTO project_data VALUES ('discovery',x'7b7d')",
+            "DELETE FROM project_data WHERE key='functions'; PRAGMA user_version=1; INSERT INTO project_data VALUES ('discovery',x'7b7d')",
             "INSERT INTO project_data VALUES ('discovery',x'7b7d')",
             "INSERT INTO project_data VALUES ('discovery','{}')",
             // Metadata and discovery share one 48 MiB budget.

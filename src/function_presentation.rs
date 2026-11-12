@@ -266,6 +266,25 @@ impl PreparedDecompilation {
         Ok(Self::prepare(address, text, mappings, semantics))
     }
 
+    /// Conservative preparation bound, including worst-case syntax spans and
+    /// display rows. Call before constructing a batch of restored functions.
+    pub fn estimated_bytes(
+        text: &String,
+        mappings: &[CodeMapping],
+        semantics: &SemanticInfo,
+    ) -> usize {
+        let mut bytes = Bytes::of::<Self>()
+            .plus(text.capacity())
+            .slots::<CodeMapping>(mappings.len())
+            .slots::<(usize, usize)>(text.len().min(MAX_CODE_LINES))
+            .plus(HighlightedCode::estimated_bytes(text))
+            .add_total(semantic_bytes(semantics));
+        for mapping in mappings {
+            bytes = bytes.slots::<u64>(mapping.addresses.capacity());
+        }
+        bytes.total().unwrap_or(usize::MAX)
+    }
+
     /// Prepares already-validated output.
     pub(crate) fn prepare(
         address: u64,

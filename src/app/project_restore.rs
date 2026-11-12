@@ -193,6 +193,7 @@ mod tests {
         displayed_entry: Option<u64>,
     ) -> ProjectOpen {
         let data = ProjectData {
+            function_results: Vec::new(),
             info: app.info.clone().unwrap(),
             session: app.session.clone().unwrap(),
             view,
@@ -207,6 +208,7 @@ mod tests {
             discovery: None,
         };
         ProjectOpen {
+            function_results: Vec::new(),
             project: LoadedProject {
                 cache_compatible: data.view.is_some(),
                 data,

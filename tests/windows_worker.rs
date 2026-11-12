@@ -6,7 +6,7 @@ mod linkage;
 use ghidra_rust::client::{WorkerClient, WorkerEvent};
 use ghidra_rust::discovery::Discovery;
 use ghidra_rust::model::{FileIdentity, Request, Response};
-use ghidra_rust::project::ProjectData;
+use ghidra_rust::project::{ProjectData, SavedFunction};
 use ghidra_rust::semantic::{LocalRename, TokenKind};
 use ghidra_rust::session::{Annotation, BinaryProtection, Session};
 use object::Object;
@@ -278,6 +278,42 @@ fn real_windows_worker_and_embedded_project_round_trip() {
             .iter()
             .any(|hit| hit.address == aes && hit.algorithm.contains("AES"))
     );
+    // Persist a second real function, independently of the displayed export.
+    let additional_address = info.entry;
+    assert_ne!(additional_address, address);
+    let Response::Graph {
+        view: additional_view,
+    } = request(
+        &mut worker,
+        Request::Graph {
+            address: additional_address,
+        },
+    )
+    else {
+        panic!("Windows worker did not return the additional function's CFG");
+    };
+    let Response::Decompiled {
+        address: additional_entry,
+        text: additional_text,
+        mappings: additional_mappings,
+        semantics: additional_semantics,
+    } = request(
+        &mut worker,
+        Request::Decompile {
+            address: additional_address,
+        },
+    )
+    else {
+        panic!("Windows worker did not decompile the additional function");
+    };
+    assert_eq!(additional_entry, additional_address);
+    assert!(!additional_text.is_empty());
+    let additional = SavedFunction {
+        view: additional_view,
+        decompiled: Some(additional_text.clone()),
+        mappings: additional_mappings.clone(),
+        semantics: additional_semantics,
+    };
     let mut discovery = Discovery::new(
         Some(info.entry),
         info.functions.iter().map(|function| function.address),
@@ -313,6 +349,7 @@ fn real_windows_worker_and_embedded_project_round_trip() {
         },
     );
     let mut project = ProjectData {
+        function_results: vec![additional],
         semantics,
         info,
         session,
@@ -346,7 +383,20 @@ fn real_windows_worker_and_embedded_project_round_trip() {
         .unwrap()
         .comment = "Updated Windows project 日本語".into();
     project.save(&project_path, &protection, true).unwrap();
-    let loaded = ProjectData::load(&project_path).expect("reload embedded SQLite project");
+    let mut loaded = ProjectData::load(&project_path).expect("reload embedded SQLite project");
+    assert_eq!(loaded.data.function_results.len(), 1);
+    let prepared = ghidra_rust::project::prepare_functions(&mut loaded.data);
+    assert_eq!(prepared.len(), 1);
+    assert_eq!(prepared[0].graph.address(), additional_address);
+    let additional_code = prepared[0]
+        .code
+        .as_ref()
+        .expect("restore additional pseudocode");
+    assert_eq!(additional_code.text(), additional_text);
+    assert_eq!(
+        serde_json::to_value(additional_code.mappings().as_ref()).unwrap(),
+        serde_json::to_value(&additional_mappings).unwrap()
+    );
     assert!(loaded.cache_compatible);
     assert!(loaded.data.info.source_identity.is_none());
     assert_eq!(loaded.source_hint, project.info.path);

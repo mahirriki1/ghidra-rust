@@ -23,8 +23,8 @@ internal p-code branches can conservatively leave successors unknown.
 
 Decompilation uses genuine engine address marks; optimized-away instructions can
 have no pseudocode counterpart. Verified local renaming uses the same
-storage-backed subset on each architecture. Projects are saved as version 4,
-including function signatures; versions 1–3 remain readable. See
+storage-backed subset on each architecture. Projects are saved as version 5,
+including signatures and bounded per-function results; versions 1–4 remain readable. See
 [project formats and saved analysis](analysis.md#project-formats-and-saved-analysis)
 for compatibility and provenance.
 

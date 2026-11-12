@@ -512,8 +512,8 @@ total process memory; preparation, uncached results, workers, and images add mor
 Saves track result revisions so older saves cannot mark newer results saved.
 
 Misses use the warm worker, whose shared type knowledge can change later Refresh
-output. There is no canonical fresh replay for each miss. Projects persist only
-the displayed function; saving all retained functions needs a format migration.
+output. There is no canonical fresh replay for each miss. Projects persist the displayed function and a bounded set of recent retained
+functions, with saved provenance on every restored component.
 
 ## Annotations and signatures
 
@@ -759,14 +759,19 @@ first page.
 
 A `.grproj` SQLite snapshot stores annotations, known functions, displayed-function
 listing/graph and pseudocode, string/crypto results, selection, and committed
-discovery. It does not serialize every visited function or the engine database.
+discovery. Additional function results are saved most-recent-first, up to 128
+retained functions and 16 MiB of serialized data. Evicted results and components
+that do not fit are recomputed on demand. Opening prepares additional results
+on the file thread within a 32 MiB presentation budget, then admits them into
+the shared 64 MiB session store. These limits can leave some saved components
+unavailable for immediate reuse. It does not serialize the engine database.
 Embedded binaries extract privately and remain owned through worker reaping;
 external binaries require explicit selection and SHA-256 verification. Source
 paths are display hints. The engine reopens the verified binary before adopting
 cached results. There is no autosave or Ghidra/IDA import.
 
-Current saves use project schema version 4, adding function signatures. Versions
-1–3 remain readable; older releases reject newer schemas. Version 2 introduced
+Current saves use project schema version 5, adding bounded per-function results.
+Version 4 added function signatures. Versions 1–4 remain readable; older releases reject newer schemas. Version 2 introduced
 saved discovery; version 3 added semantic tokens and local-name overrides.
 JSON v1/v2 remain readable: legacy local overrides use v2; signatures and local
 identities recovered under signature context use v3. Signature-context upgrades
@@ -863,6 +868,7 @@ for project parsing and residual filesystem limitations.
 | Program-text search | 32 MiB copied text and 32 MiB scanned text; 10,000 hits and 4 MiB results |
 | Bytes / decode | 64 KiB input and XOR keys / 256 KiB output; oversize is rejected |
 | Pseudocode | 2 MiB returned text |
+| Additional saved functions | 128 retained functions / 16 MiB serialized data; 32 MiB restored presentation |
 | Session result store | 64 MiB accounted allocations; see [eviction](#per-function-session-results) |
 | Worker request | 30-second wall-time deadline; progress does not extend it |
 

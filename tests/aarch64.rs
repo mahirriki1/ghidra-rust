@@ -77,6 +77,7 @@ fn legacy_macho_projects_migrate_exact_stub_additions_and_keep_annotations() {
     old.sections.retain(|section| section.name != "__stubs");
     assert_eq!(info.sections.len(), old.sections.len() + 1);
     let project = ProjectData {
+        function_results: Vec::new(),
         info: old,
         session,
         view: Some(graph(&mut worker, base + 48)),
@@ -248,6 +249,7 @@ fn macho_instruction_and_stub_sections_survive_worker_and_project_validation() {
             .bind_snapshot(&info)
             .unwrap();
         let project = ProjectData {
+            function_results: Vec::new(),
             session: Session::new(info.sha256.clone()),
             info,
             view: Some(view),
@@ -622,6 +624,7 @@ fn contained_aarch64_workers_analyze_elf_pe_macho_and_reopen_projects() {
             },
         );
         let project = ProjectData {
+            function_results: Vec::new(),
             semantics: Default::default(),
             info,
             session,

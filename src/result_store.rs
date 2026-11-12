@@ -384,6 +384,33 @@ impl<G: Retained, D: Retained> ResultStore<G, D> {
         hit
     }
 
+    /// Pins a bounded most-recent-first save snapshot without copying payloads.
+    /// Save jobs keep these allocations charged even if the store invalidates.
+    pub fn snapshot(&self, maximum: usize) -> Vec<(u64, Hit<G, D>, String)> {
+        let mut records: Vec<_> = self.records.iter().collect();
+        records.sort_by_key(|(_, record)| std::cmp::Reverse(record.used));
+        records
+            .into_iter()
+            .take(maximum)
+            .map(|(&address, record)| {
+                (
+                    address,
+                    Hit {
+                        graph: record.graph.as_ref().map(|v| (v.value.clone(), v.origin)),
+                        decompiled: record
+                            .decompiled
+                            .as_ref()
+                            .map(|(_, v)| (v.value.clone(), v.origin)),
+                    },
+                    record
+                        .decompiled
+                        .as_ref()
+                        .map_or_else(String::new, |(state, _)| state.clone()),
+                )
+            })
+            .collect()
+    }
+
     /// Stores a graph/listing result, replacing any graph for the address.
     pub fn admit_graph(
         &mut self,

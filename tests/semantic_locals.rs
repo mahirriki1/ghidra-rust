@@ -269,6 +269,7 @@ fn project_and_annotation_roundtrip_retain_verified_local_names() {
         panic!()
     };
     let project = ProjectData {
+        function_results: Vec::new(),
         info: program.info.clone(),
         session: restored,
         view: Some(view),
