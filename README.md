@@ -224,7 +224,7 @@ tab-separated text. Sort choices reset when a binary closes.
 Right-click acts on exactly the clicked row or pseudocode token and does not
 change the selection. Listing rows offer **Go to target**, **Show in Graph**,
 **Show in Hex**, **Rename…**, **Comment…**, xrefs and copying the address,
-bytes or instruction. Decompiler tokens can be copied, supported locals can
+file offset, bytes or instruction. Decompiler tokens can be copied, supported locals can
 be renamed, and calls can be followed or renamed. A call to code that is not a
 known function cannot be renamed,
 a local without verified storage cannot be renamed, and other pseudocode
@@ -234,17 +234,37 @@ annotations or table it came from changes.
 
 **G** and the toolbar address field share one Go resolver. A query is first
 tried whole as a hexadecimal address, then an exact label, function name, raw
-symbol and display name, so names such as `operator+` or `a-b` keep working.
-Only if that fails is the last `+` or `-` read as one hexadecimal offset
-(optional `0x`, up to 16 digits) from a base address or exact name, as in
-`main+0x20` or `0x401000-0x10`. Nested arithmetic and signed offsets are
-rejected. The result must lie in mapped memory and must not wrap. A known
+symbol and display name, so names such as `operator+`, `a-b` or `file(1)` keep
+working. Next, `file(offset)` goes to the address that byte of the input file
+is loaded at. As in Ghidra the offset is decimal unless it starts with `0x`:
+`file(4620)` and `file(0x120c)` are the same byte and `file(120c)` is
+rejected. The keyword ignores case and spaces may surround the offset.
+Otherwise the query is a base (a hexadecimal address or exact name) followed by
+1–16 `+`/`-` hexadecimal terms (optional `0x`, up to 16 digits each), as in
+`main+0x20`, `main+10-4` or `0x401000-0x10+8`. The fewest trailing terms
+whose remaining text is a base are used, so a label such as `next-1` stays
+one base, and the terms apply left to right with each step checked for
+overflow and underflow. A leading `+` is not a term: `+1040` stays the
+address `0x1040`. `*`, `/`, parentheses other than `file(…)`, offsets relative
+to the current location, and terms after `file(…)` are rejected. The result must lie in
+mapped memory. A known
 function entry, or an instruction the current graph, pseudocode or history
 saw, opens in that function; Graph stays Graph, other tabs switch to Listing.
 Any other mapped address opens in Hex, including executable bytes that are not
 a known entry; in the Listing's Program scope it lands on its row instead
-(see above). A rejected query changes nothing; the toolbar keeps the text
-and reports the reason in the status bar.
+(see above). A file offset goes wherever its address goes and is recorded
+in history as that address. A rejected query changes nothing; the toolbar
+keeps the text and reports the reason in the status bar.
+
+File offsets are mapped only through the loaded sections the worker
+published, so file headers, load commands, alignment padding, non-loaded
+sections and overlays have no address even where the operating system maps
+them, and Go rejects such an offset with the reason (before every loaded section, between
+sections, after every loaded section, or past the end of the file). An offset
+that two sections share is rejected with both addresses named, and
+zero-filled memory has no file offset. While the current location (the Hex
+selection on the Hex tab) has one, the status bar shows it as `file(0x…)`,
+which Go accepts unchanged.
 
 Visited functions reuse compatible session results. **Analysis → Refresh
 function** recomputes the selected function. This session cache does not mean
@@ -268,7 +288,7 @@ but a stalled filesystem still delays further listings until it returns.
 | --- | --- |
 | `F1` | Open Keyboard shortcuts |
 | `L` | Rename the selected function, address label, or supported local |
-| `G` | Go to a hexadecimal address or exact name, optionally with a `+`/`-` hex offset |
+| `G` | Go to a hexadecimal address or exact name, optionally with `+`/`-` hex offsets, or to `file(offset)` |
 | `;` | Edit the comment at the selected address |
 | `X` | Show references to the selection's exact target |
 | `S` | Search memory |
@@ -346,7 +366,8 @@ function, bytes inside a decoded instruction select that instruction, and
 Back returns to the same Hex span. Bytes of a section that has no Program
 rows (one overlapping an earlier section) change nothing; the status bar
 says so. Unmapped headers, overlays,
-and runtime process memory are outside this view.
+and runtime process memory are outside this view, so a `file(…)` offset there
+has no address.
 
 ### Search
 

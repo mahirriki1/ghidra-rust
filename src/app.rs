@@ -860,6 +860,9 @@ pub struct DesktopApp {
     decoder: DecoderPanel,
     hex: HexPanel,
     status: String,
+    /// The toolbar Go rejection the status bar shows, retired by the next
+    /// navigation unless something else has replaced it.
+    go_error: Option<String>,
     file_job: Option<Receiver<FileEvent>>,
     file_dialogs: FileDialogs,
     intent: Option<Intent>,
@@ -1017,6 +1020,7 @@ impl DesktopApp {
             decoder: DecoderPanel::default(),
             hex: HexPanel::default(),
             status: "Open a binary to begin".into(),
+            go_error: None,
             file_job: None,
             file_dialogs: FileDialogs::default(),
             intent: None,
@@ -5169,11 +5173,13 @@ impl DesktopApp {
     }
 
     /// Resolves a Go query to a mapped address. The whole query is looked up
-    /// first, so names containing `+` or `-` keep resolving. Only when that
-    /// fails is the last `+`/`-` taken as one hexadecimal offset from a base
-    /// address or name. Mapping is checked after the arithmetic.
+    /// first, so names containing `+`, `-` or parentheses keep resolving.
+    /// Then `file(offset)` maps a file offset through the section table.
+    /// Otherwise 1–16 trailing hexadecimal `+`/`-` terms are peeled off,
+    /// fewest first, until the rest is a strict hex address or exact name;
+    /// the terms apply left to right with checked arithmetic. Mapping is
+    /// checked after the arithmetic.
     fn resolve_location(&self, query: &str) -> Result<u64, String> {
-        const UNKNOWN: &str = "Enter a hex address or exact name, optionally +/- hex offset";
         let info = self.info.as_ref().ok_or("Open a binary first")?;
         let query = query.trim();
         let address = match parse_address(query)
@@ -5181,18 +5187,28 @@ impl DesktopApp {
             .or_else(|| self.named_location(info, query))
         {
             Some(address) => address,
-            None => {
-                let (base, negative, offset) = split_offset(query).ok_or(UNKNOWN)?;
-                let base = strict_hex(base)
-                    .or_else(|| self.named_location(info, base))
-                    .ok_or(UNKNOWN)?;
-                if negative {
-                    base.checked_sub(offset)
-                } else {
-                    base.checked_add(offset)
+            None => match file_query(query) {
+                Some(offset) => {
+                    use crate::file_offsets::FileAddress;
+                    match crate::file_offsets::address_at(&info.sections, info.file_len, offset?) {
+                        FileAddress::One(address) => address,
+                        FileAddress::Several {
+                            first,
+                            second,
+                            more: false,
+                        } => {
+                            return Err(format!("File offset maps to {first:x} and {second:x}"));
+                        }
+                        FileAddress::Several { first, second, .. } => {
+                            return Err(format!(
+                                "File offset maps to {first:x}, {second:x} and more"
+                            ));
+                        }
+                        FileAddress::Unmapped(reason) => return Err(reason.reason().into()),
+                    }
                 }
-                .ok_or("Offset leaves the address space")?
-            }
+                None => self.offset_terms(info, query)?,
+            },
         };
         if !info
             .sections
@@ -5202,6 +5218,39 @@ impl DesktopApp {
             return Err("Address is outside mapped program memory".into());
         }
         Ok(address)
+    }
+
+    /// `base ± term ± …`: the fewest trailing terms whose remaining text is a
+    /// strict hex address or exact name. At most one lookup per term, and
+    /// one more to name a query with too many terms.
+    fn offset_terms(&self, info: &BinaryInfo, query: &str) -> Result<u64, String> {
+        let mut terms = [(false, 0); MAX_OFFSET_TERMS + 1];
+        let mut rest = query;
+        for count in 1..=terms.len() {
+            let (base, negative, offset) = split_offset(rest).ok_or(GO_UNKNOWN)?;
+            terms[count - 1] = (negative, offset);
+            if let Some(base) = strict_hex(base).or_else(|| self.named_location(info, base)) {
+                if count > MAX_OFFSET_TERMS {
+                    return Err("Use at most 16 +/- offsets".into());
+                }
+                return terms[..count]
+                    .iter()
+                    .rev()
+                    .try_fold(base, |address, &(negative, offset)| {
+                        if negative {
+                            address.checked_sub(offset)
+                        } else {
+                            address.checked_add(offset)
+                        }
+                    })
+                    .ok_or_else(|| "Offset leaves the address space".into());
+            }
+            if file_query(base).is_some() {
+                return Err("Offsets apply to addresses, not file(…)".into());
+            }
+            rest = base;
+        }
+        Err(GO_UNKNOWN.into())
     }
 
     /// Go To from the dialog or toolbar. Code opens only at a known entry or
@@ -5225,7 +5274,20 @@ impl DesktopApp {
                 self.open_search_data(address, length, context);
             }
         }
+        self.retire_go_error();
         Ok(())
+    }
+
+    /// Clears a toolbar Go rejection that is still the status once the
+    /// user has navigated on; a message set since then stays.
+    fn retire_go_error(&mut self) {
+        if self
+            .go_error
+            .take()
+            .is_some_and(|error| error == self.status)
+        {
+            self.status = "Ready".into();
+        }
     }
 
     fn rename_at(
@@ -5297,6 +5359,7 @@ impl DesktopApp {
             return;
         };
         self.history_index = index;
+        self.retire_go_error();
         match place {
             crate::linkage_ui::Place::Code(address) => self.restore_code_place(address, context),
             crate::linkage_ui::Place::Data { address, length } => {
@@ -5452,6 +5515,13 @@ impl DesktopApp {
         self.selected
     }
 
+    /// The file offset of the current location (the Hex selection while
+    /// Hex is shown), when file bytes back it.
+    fn location_file_offset(&self) -> Option<u64> {
+        let sections = &self.info.as_ref()?.sections;
+        crate::file_offsets::offset_of(sections, self.function_step_origin()?)
+    }
+
     /// The nearest adopted function entry strictly before or after the
     /// current location, in the address-ordered inventory. Never wraps.
     fn adjacent_function(&self, forward: bool) -> Option<u64> {
@@ -5561,7 +5631,7 @@ impl DesktopApp {
                 .show(ui);
             if matches!(dialog.kind, BrowserDialogKind::GoTo) {
                 egui::Response::clone(&output.response).on_hover_text(
-                    "Hex address or exact function/label name, optionally +/- hex offset.",
+                    "Hex address or exact function/label name, optionally +/- hex offsets, or file(offset).",
                 );
             }
             if dialog.focus {
@@ -5890,7 +5960,8 @@ impl DesktopApp {
                 // The typed query stays in place when it is rejected.
                 let query = self.address.clone();
                 if let Err(error) = self.go_to(&query, &context) {
-                    self.status = error;
+                    self.status = error.clone();
+                    self.go_error = Some(error);
                 }
             }
             ui.separator();
@@ -9188,11 +9259,13 @@ impl DesktopApp {
                 let identity = self.info.as_ref().map(|info| format!(
                     "{} · {} · {} bytes", info.format, info.architecture, info.file_len,
                 ));
-                if ui.available_width() >= 600.0
-                    && let Some(identity) = &identity
-                {
+                let wide = ui.available_width() >= 600.0;
+                if wide && let Some(identity) = &identity {
                     ui.add(egui::Label::new(RichText::new(identity).weak()).truncate())
                         .on_hover_text(identity);
+                }
+                if wide && let Some(offset) = self.location_file_offset() {
+                    theme::status_token(ui, &format!("file({offset:#x})"));
                 }
                 ui.allocate_ui_with_layout(
                     egui::vec2(ui.available_width().max(0.0), row.height()),
@@ -10296,6 +10369,46 @@ fn strict_hex(text: &str) -> Option<u64> {
         && digits.bytes().all(|byte| byte.is_ascii_hexdigit()))
     .then(|| u64::from_str_radix(digits, 16).ok())
     .flatten()
+}
+
+/// Trailing `+`/`-` terms after one Go base.
+const MAX_OFFSET_TERMS: usize = 16;
+
+const GO_UNKNOWN: &str =
+    "Enter a hex address or exact name, optionally +/- hex offsets, or file(offset)";
+
+/// Decimal digits of a `file(…)` offset: a full 64-bit value.
+const MAX_DECIMAL_DIGITS: usize = 20;
+
+/// `file(<offset>)`, keyword in any ASCII case, spaces around the operand
+/// and before `(`. As in Ghidra the offset is decimal unless it starts with
+/// `0x`/`0X`. `None` when the text is not of this form; an error when it is
+/// but the operand is not a number.
+fn file_query(text: &str) -> Option<Result<u64, &'static str>> {
+    let text = text.trim();
+    let keyword = text.get(..4)?;
+    let inner = text[4..]
+        .trim_start()
+        .strip_prefix('(')?
+        .strip_suffix(')')?;
+    if !keyword.eq_ignore_ascii_case("file") || inner.contains(['(', ')']) {
+        return None;
+    }
+    let operand = inner.trim();
+    const BASE: &str = "File offsets are decimal unless prefixed with 0x";
+    Some(if operand.starts_with("0x") || operand.starts_with("0X") {
+        strict_hex(operand).ok_or(BASE)
+    } else if !operand.is_empty()
+        && operand.len() <= MAX_DECIMAL_DIGITS
+        && operand.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        // Only a value beyond u64 fails here; no file is that long.
+        operand
+            .parse()
+            .map_err(|_| crate::file_offsets::Unmapped::PastEnd.reason())
+    } else {
+        Err(BASE)
+    })
 }
 
 /// Splits `query` at its last `+` or `-` into a trimmed, non-empty base and
@@ -12258,10 +12371,12 @@ mod tests {
     }
 
     #[test]
-    fn go_queries_try_whole_names_first_then_one_checked_hex_offset() {
+    fn go_queries_try_whole_names_first_then_checked_hex_offsets() {
         let app = go_app();
-        let unknown =
-            Err("Enter a hex address or exact name, optionally +/- hex offset".to_string());
+        let unknown = Err(
+            "Enter a hex address or exact name, optionally +/- hex offsets, or file(offset)"
+                .to_string(),
+        );
         let outside = Err("Address is outside mapped program memory".to_string());
         let overflow = Err("Offset leaves the address space".to_string());
         for (query, expected) in [
@@ -12294,7 +12409,23 @@ mod tests {
             ("next+0xc0", outside.clone()),
             ("ffffffffffffffff+1", overflow.clone()),
             ("0-1", overflow.clone()),
-            ("next-0x1041", overflow),
+            ("next-0x1041", overflow.clone()),
+            // Chained terms: the fewest trailing terms whose rest is a base,
+            // applied left to right, each step checked.
+            ("next+0x10+0x10", Ok(0x1060)),
+            ("next+10-4", Ok(0x104c)),
+            ("1000+20+8", Ok(0x1028)),
+            (" 0x1000 + 20 - 0x8 + 1 ", Ok(0x1019)),
+            ("operator+++4+4", Ok(0x10b8)),
+            // `a-b` is a name, so its `-b` is never read as a term from `a`.
+            ("a-b-a0+10", Ok(0x1010)),
+            ("next-2-1", Ok(0x103d)),
+            // The label `next-1` is the longer base, so this is 0x9000 - 1.
+            ("next-1-1", outside.clone()),
+            ("0x2000-0x1000-0xfc0+0x1000", Ok(0x1040)),
+            ("0-1+2", overflow.clone()),
+            ("ffffffffffffffff+1-2", overflow.clone()),
+            ("next+0x10-0x1051", overflow),
             ("", unknown.clone()),
             ("next+", unknown.clone()),
             ("next+0x", unknown.clone()),
@@ -12305,8 +12436,15 @@ mod tests {
             ("+0x10", unknown.clone()),
             ("+1040+0x10", unknown.clone()),
             ("0x+1040+0", unknown.clone()),
-            ("next+0x10+0x10", unknown.clone()),
+            ("next+0x10+zz", unknown.clone()),
+            ("next+0x10+", unknown.clone()),
+            ("next++0x10+1", unknown.clone()),
             ("next*2", unknown.clone()),
+            ("next*2+1", unknown.clone()),
+            ("next/2+1", unknown.clone()),
+            ("(next)+1", unknown.clone()),
+            ("(next+1)+1", unknown.clone()),
+            ("missing+10+10", unknown.clone()),
             ("next+0x00000000000000001", unknown.clone()),
             ("missing+10", unknown.clone()),
         ] {
@@ -12314,6 +12452,15 @@ mod tests {
         }
         // A hex-like label never shadows the address it spells.
         assert_eq!(app.resolve_location("1040+0x10"), Ok(0x1050));
+        assert_eq!(app.resolve_location("1040+0x10-0x10"), Ok(0x1040));
+        // Up to 16 terms; a 17th is named rather than misread.
+        let terms = |count| format!("1000{}", "+1".repeat(count));
+        assert_eq!(app.resolve_location(&terms(16)), Ok(0x1010));
+        assert_eq!(
+            app.resolve_location(&terms(17)),
+            Err("Use at most 16 +/- offsets".into())
+        );
+        assert_eq!(app.resolve_location(&terms(40)), unknown);
 
         // Raw symbols and display names are bases too.
         let context = egui::Context::default();
@@ -12436,6 +12583,257 @@ mod tests {
         assert_eq!(app.selected, Some(0));
         app.history_step(true, &context);
         assert_eq!((app.selected, app.data_location), (Some(0x1000), None));
+    }
+
+    /// `hex_app` with headers before `.text` (file 0x400, 0xc00 below its
+    /// address), a gap before `.data` (file 0x2700, 32 bytes, then
+    /// zero-fill), a zero-filled `.bss` and trailing bytes to 0x2800.
+    fn file_app() -> DesktopApp {
+        let mut app = hex_app();
+        let info = app.info.as_mut().unwrap();
+        info.sections[0].file_offset = 0x400;
+        info.sections[1].file_offset = 0x2700;
+        info.sections.push(SectionInfo {
+            name: ".bss".into(),
+            address: 0x9000,
+            size: 0x100,
+            file_offset: 0,
+            file_size: 0,
+            executable: false,
+        });
+        info.file_len = 0x2800;
+        app
+    }
+
+    #[test]
+    fn file_queries_are_decimal_unless_0x_and_name_why_an_offset_has_no_address() {
+        let mut app = file_app();
+        let annotations = &mut app.session.as_mut().unwrap().annotations;
+        for (address, label) in [(0x10e0, "file(100)"), (0x10f0, "file(1)")] {
+            annotations.insert(
+                address,
+                Annotation {
+                    label: label.into(),
+                    ..Default::default()
+                },
+            );
+        }
+        let err = |text: &str| Err(text.to_string());
+        let base = err("File offsets are decimal unless prefixed with 0x");
+        let terms = err("Offsets apply to addresses, not file(…)");
+        let unknown =
+            err("Enter a hex address or exact name, optionally +/- hex offsets, or file(offset)");
+        let header = err("File offset is before every loaded section and has no address");
+        let gap = err("File offset is between sections and has no address");
+        let trailing = err("File offset is after every loaded section");
+        let past = err("File offset is past the end of the file");
+        for (query, expected) in [
+            ("file(0x400)", Ok(0x1000)),
+            ("file(1024)", Ok(0x1000)),
+            ("FILE( 0X400 )", Ok(0x1000)),
+            ("File (1028)", Ok(0x1004)),
+            ("  file(\t0x404\t)  ", Ok(0x1004)),
+            ("file(0x0000000000000400)", Ok(0x1000)),
+            ("file(00001024)", Ok(0x1000)),
+            // Decimal, not hex: 1100 is 0x44c, not 0x1100.
+            ("file(1100)", Ok(0x104c)),
+            ("file(0x25ff)", Ok(0x31ff)),
+            ("file(0x2704)", Ok(0x8004)),
+            ("file(9988)", Ok(0x8004)),
+            ("file(0x271f)", Ok(0x801f)),
+            // An exact name wins, also as the base of offsets.
+            ("file(100)", Ok(0x10e0)),
+            ("file(1)+4", Ok(0x10f4)),
+            ("file(120c)", base.clone()),
+            ("file(0x400h)", base.clone()),
+            ("file()", base.clone()),
+            ("file( )", base.clone()),
+            ("file(1 2)", base.clone()),
+            ("file(-1)", base.clone()),
+            ("file(+1)", base.clone()),
+            ("file(main)", base.clone()),
+            ("file(entry)", base.clone()),
+            ("file(0x)", base.clone()),
+            ("file(0x00000000000000400)", base.clone()),
+            ("file(000000000000000001024)", base.clone()),
+            ("file(1.5)", base.clone()),
+            ("file(1e3)", base.clone()),
+            ("file(0x400+4)", base),
+            ("file(0x400)+4", terms.clone()),
+            ("file(1024) - 0x4", terms.clone()),
+            ("file(0x400)+4+4", terms),
+            ("file 1024", unknown.clone()),
+            ("file(1024", unknown.clone()),
+            ("file1024)", unknown.clone()),
+            ("file((1024))", unknown.clone()),
+            ("files(1024)", unknown.clone()),
+            ("4+file(0x400)", unknown.clone()),
+            ("fi(1024)", unknown),
+            ("file(0)", header.clone()),
+            ("file(0x3ff)", header),
+            ("file(0x2600)", gap.clone()),
+            ("file(9983)", gap),
+            ("file(0x2720)", trailing.clone()),
+            ("file(10239)", trailing),
+            ("file(0x2800)", past.clone()),
+            ("file(10240)", past.clone()),
+            ("file(0xffffffffffffffff)", past.clone()),
+            ("file(18446744073709551615)", past.clone()),
+            ("file(99999999999999999999)", past),
+        ] {
+            assert_eq!(app.resolve_location(query), expected, "{query:?}");
+        }
+        // Bytes two sections share name both addresses; never a guess.
+        let info = app.info.as_mut().unwrap();
+        let mut alias = info.sections[1].clone();
+        alias.address = 0xa000;
+        info.sections.push(alias.clone());
+        assert_eq!(
+            app.resolve_location("file(0x2704)"),
+            err("File offset maps to 8004 and a004")
+        );
+        alias.address = 0xb000;
+        app.info.as_mut().unwrap().sections.push(alias);
+        assert_eq!(
+            app.resolve_location("file(0x2704)"),
+            err("File offset maps to 8004, a004 and more")
+        );
+    }
+
+    #[test]
+    fn file_offsets_go_exactly_where_their_addresses_go() {
+        let context = egui::Context::default();
+        let state = |app: &DesktopApp| {
+            (
+                app.tab,
+                app.selected,
+                app.data_location,
+                app.history.clone(),
+                app.history_index,
+                app.address.clone(),
+                app.result_scope,
+                app.view().map(|view| view.address),
+            )
+        };
+        for (file, address, start, tab, selected, data) in [
+            // A known entry, an observed instruction (Graph stays Graph),
+            // unowned executable bytes and initialized data.
+            (
+                "file(1088)",
+                "1040",
+                Tab::Strings,
+                Tab::Listing,
+                0x1040,
+                None,
+            ),
+            (
+                "file(0x404)",
+                "1004",
+                Tab::Strings,
+                Tab::Listing,
+                0x1004,
+                None,
+            ),
+            ("file(1032)", "1008", Tab::Graph, Tab::Graph, 0x1008, None),
+            (
+                "file(0x411)",
+                "1011",
+                Tab::Listing,
+                Tab::Hex,
+                0x1011,
+                Some((0x1011, 1)),
+            ),
+            (
+                "file(9988)",
+                "8004",
+                Tab::Listing,
+                Tab::Hex,
+                0x8004,
+                Some((0x8004, 1)),
+            ),
+        ] {
+            let go = |query| {
+                let mut app = file_app();
+                app.history = vec![crate::linkage_ui::Place::Code(0x1000)];
+                app.tab = start;
+                app.go_to(query, &context).unwrap();
+                state(&app)
+            };
+            let by_offset = go(file);
+            assert_eq!(by_offset, go(address), "{file}");
+            assert_eq!(
+                (by_offset.0, by_offset.1, by_offset.2),
+                (tab, Some(selected), data),
+                "{file}"
+            );
+            assert_eq!(by_offset.3.len(), 2, "history records the address");
+            assert_eq!(by_offset.5, address, "the field shows the address");
+        }
+    }
+
+    #[test]
+    fn rejected_file_and_chained_queries_change_nothing() {
+        let context = egui::Context::default();
+        let mut app = file_app();
+        app.history = vec![crate::linkage_ui::Place::Code(0x1000)];
+        app.tab = Tab::Strings;
+        let state = |app: &DesktopApp| {
+            (
+                app.selected,
+                app.history.clone(),
+                app.history_index,
+                app.tab,
+                app.data_location,
+                app.address.clone(),
+                app.view().map(|view| view.address),
+            )
+        };
+        let before = state(&app);
+        for query in [
+            "file(0)",
+            "file(120c)",
+            "file(0x2600)",
+            "file(0x2720)",
+            "file(0x2800)",
+            "file(0x400)+4",
+            "file()",
+            "file(99999999999999999999)",
+            "entry+4+zz",
+            "entry+0x10000-0x10",
+            "0-1+0x1004",
+            &format!("1000{}", "+1".repeat(17)),
+        ] {
+            assert!(app.go_to(query, &context).is_err(), "{query}");
+            assert_eq!(state(&app), before, "{query}");
+        }
+        // Chained terms land like the address they spell.
+        app.go_to("entry+10-8", &context).unwrap();
+        assert_eq!((app.tab, app.selected), (Tab::Listing, Some(0x1008)));
+    }
+
+    #[test]
+    fn a_toolbar_go_rejection_is_retired_by_the_next_navigation_only() {
+        let context = egui::Context::default();
+        let mut app = file_app();
+        let reject = |app: &mut DesktopApp, query: &str| {
+            // What the toolbar does with a rejected query.
+            let error = app.go_to(query, &context).unwrap_err();
+            app.status = error.clone();
+            app.go_error = Some(error);
+        };
+        reject(&mut app, "file(0)");
+        app.go_to("entry", &context).unwrap();
+        assert_eq!(app.status, "Ready");
+        // A message set after the rejection is not the rejection's to clear.
+        reject(&mut app, "file(120c)");
+        app.status = "Project saved".into();
+        app.go_to("entry+8", &context).unwrap();
+        assert_eq!(app.status, "Project saved");
+        // Back and Forward retire it too.
+        reject(&mut app, "file(0)");
+        app.history_step(false, &context);
+        assert_eq!(app.status, "Ready");
+        assert_eq!(app.go_error, None);
     }
 
     #[test]
@@ -12985,6 +13383,15 @@ mod tests {
         assert!(dialog.error.is_some());
         assert_eq!((app.selected, app.history.clone(), app.tab), before);
 
+        // File offset errors stay inline too.
+        app.browser_dialog.as_mut().unwrap().text = "file(120c)".into();
+        keyboard_frame(&context, &mut app, enter());
+        assert_eq!(
+            app.browser_dialog.as_ref().unwrap().error.as_deref(),
+            Some("File offsets are decimal unless prefixed with 0x")
+        );
+        assert_eq!((app.selected, app.history.clone(), app.tab), before);
+
         app.browser_dialog.as_mut().unwrap().text = "operator++0x10".into();
         keyboard_frame(&context, &mut app, enter());
         assert!(app.browser_dialog.is_none());
@@ -13082,6 +13489,25 @@ mod tests {
             app.history.last(),
             Some(&crate::linkage_ui::Place::Code(0x10a0))
         );
+
+        // File offsets and chained terms use the same field.
+        let history = app.history.clone();
+        focus(&mut app, "file(64)+4");
+        frame(&mut app, vec![]);
+        frame(&mut app, enter());
+        assert_eq!(app.address, "file(64)+4");
+        assert_eq!(app.status, "Offsets apply to addresses, not file(…)");
+        assert_eq!((app.selected, &app.history), (Some(0x10a0), &history));
+        focus(&mut app, "file(64)");
+        frame(&mut app, vec![]);
+        frame(&mut app, enter());
+        assert_eq!((app.tab, app.selected), (Tab::Listing, Some(0x1040)));
+        assert_eq!(app.address, "1040");
+        focus(&mut app, "next+8-4+0x10");
+        frame(&mut app, vec![]);
+        frame(&mut app, enter());
+        assert_eq!((app.tab, app.data_location), (Tab::Hex, Some((0x1054, 1))));
+        assert_eq!(app.address, "1054");
     }
 
     #[test]
@@ -16034,6 +16460,53 @@ mod tests {
             // Saved partial coverage continues to show an indicator after reopen.
             app.discovery_saved = app.discovery.take().map(|state| Arc::new(state.save()));
             assert_eq!(app.status_notes().count(), 1);
+        }
+    }
+
+    #[test]
+    fn status_bar_prints_the_location_file_offset_as_a_go_query() {
+        for scale in [1.0, 1.25] {
+            let context = egui::Context::default();
+            theme::install(&context);
+            context.set_pixels_per_point(scale);
+            let now = Instant::now();
+            let mut app = file_app();
+            let token = |app: &DesktopApp, width| {
+                let (output, rect) = status_frame(&context, app, now, width, vec![]);
+                assert!(rect.height() <= theme::ROW_HEIGHT + 8.0, "{rect:?}");
+                for shape in &output.shapes {
+                    if let egui::epaint::Shape::Text(text) = &shape.shape {
+                        assert_eq!(text.galley.rows.len(), 1, "{:?}", text.galley.text());
+                    }
+                }
+                let tokens: Vec<_> = rendered_text(&output)
+                    .into_iter()
+                    .filter(|text| text.starts_with("file("))
+                    .collect();
+                assert!(tokens.len() <= 1, "{tokens:?}");
+                tokens.into_iter().next()
+            };
+            app.tab = Tab::Listing;
+            app.selected = Some(0x1004);
+            assert_eq!(token(&app, 1100.0).as_deref(), Some("file(0x404)"));
+            // Hidden with the identity on narrow bars.
+            assert_eq!(token(&app, 520.0), None);
+            // The Hex selection, not the code selection, while Hex is shown.
+            app.go_to("8004", &context).unwrap();
+            app.selected = Some(0x1004);
+            assert_eq!(app.tab, Tab::Hex);
+            assert_eq!(token(&app, 1100.0).as_deref(), Some("file(0x2704)"));
+            app.tab = Tab::Listing;
+            assert_eq!(token(&app, 1100.0).as_deref(), Some("file(0x404)"));
+            // Zero-fill, unmapped and empty selections have no offset.
+            for selected in [Some(0x8020), Some(0x9000), Some(0x7000), None] {
+                app.selected = selected;
+                assert_eq!(token(&app, 1100.0), None, "{selected:?}");
+            }
+            // The token is what Go accepts.
+            app.selected = Some(0x31ff);
+            let query = token(&app, 1100.0).unwrap();
+            assert_eq!(app.resolve_location(&query), Ok(0x31ff));
         }
     }
 

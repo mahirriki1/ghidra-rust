@@ -626,6 +626,38 @@ mod tests {
     }
 
     #[test]
+    fn a_data_file_offset_lands_on_its_program_row_like_its_address() {
+        // `.data` starts at file 0x100, so file 33056 (0x8120) is 0x18020.
+        let land = |query| {
+            let mut h = Harness::new(dest_app());
+            h.go_to(query);
+            (
+                h.cursor(),
+                h.app.selected,
+                h.app.tab,
+                h.app.history.clone(),
+                h.app.program.expanded.covering(0x18020),
+                h.app.address.clone(),
+            )
+        };
+        let by_offset = land("file(33056)");
+        assert_eq!(by_offset, land("18020"));
+        assert_eq!(by_offset.0, Some(Row::Byte { address: 0x18020 }));
+        assert_eq!(
+            by_offset.3,
+            [Place::Code(0x1000), listing(0x18020, Rank::Body)]
+        );
+        // The string row itself, then Back to the departure.
+        let mut h = Harness::new(dest_app());
+        h.go_to("file(0x8100)");
+        assert!(matches!(h.cursor(), Some(Row::Data { start: 0x18000, .. })));
+        assert_eq!(h.app.history.last(), Some(&listing(0x18000, Rank::Body)));
+        h.step(false);
+        assert_eq!((h.app.selected, h.app.tab), (Some(0x1000), Tab::Listing));
+        assert_eq!(h.app.history_index, 0);
+    }
+
+    #[test]
     fn a_search_hit_expands_every_page_its_span_touches_and_function_scope_keeps_hex() {
         for program in [true, false] {
             let mut h = Harness::new(dest_app());

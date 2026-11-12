@@ -25,7 +25,8 @@ addresses and the inventory's effective names, exactly as before. Demangling
 writes no annotation, creates no undo history and never marks a project dirty.
 
 **Go to** accepts a hexadecimal address, an exact label or inventory name, an
-exact raw symbol, or an exact display name. The Functions filter matches both
+exact raw symbol, or an exact display name, each optionally followed by
+`+`/`-` hexadecimal offsets, or a `file(offset)` file offset. The Functions filter matches both
 the shown name and the raw symbol. When several functions share a name, the
 first address wins; use the address to choose another.
 

@@ -64,6 +64,7 @@ pub(super) enum MenuCommand {
     Comment,
     Xrefs(XrefTarget),
     CopyAddress,
+    CopyFileOffset,
     CopyBytes,
     CopyInstruction,
     CopyToken,
@@ -191,6 +192,15 @@ fn xref_items(items: &mut Vec<MenuItem>, targets: &TargetSet, function: Option<u
             "Xrefs to this function",
         ));
     }
+}
+
+/// **Copy file offset** for a row starting at `address`; disabled where no
+/// file byte backs it.
+fn file_offset_item(info: &BinaryInfo, address: u64) -> MenuItem {
+    MenuItem::new(MenuCommand::CopyFileOffset, "Copy file offset").enabled(
+        crate::file_offsets::offset_of(&info.sections, address).is_some(),
+        "No file offset",
+    )
 }
 
 /// Bytes a string row selects: the scanned length when known, else the
@@ -420,6 +430,7 @@ impl DesktopApp {
         }
         match command {
             MenuCommand::CopyAddress
+            | MenuCommand::CopyFileOffset
             | MenuCommand::CopyBytes
             | MenuCommand::CopyInstruction
             | MenuCommand::CopyToken
@@ -678,6 +689,7 @@ impl DesktopApp {
                 xref_items(edit, &targets, Some(entry));
                 let bytes = !instruction.bytes.is_empty();
                 copy.push(MenuItem::new(MenuCommand::CopyAddress, "Copy address"));
+                copy.push(file_offset_item(info, pc));
                 copy.push(
                     MenuItem::new(MenuCommand::CopyBytes, "Copy bytes").enabled(bytes, "No bytes"),
                 );
@@ -811,6 +823,7 @@ impl DesktopApp {
                 });
                 xref_items(edit, &targets, None);
                 copy.push(MenuItem::new(MenuCommand::CopyAddress, "Copy address"));
+                copy.push(file_offset_item(info, address));
                 if self.span_bytes(source).is_some() {
                     copy.push(MenuItem::new(MenuCommand::CopyBytes, "Copy bytes"));
                 }
@@ -833,6 +846,13 @@ impl DesktopApp {
         let info = self.info.as_ref()?;
         Some(match (source, command) {
             (MenuSource::Instruction { pc, .. }, MenuCommand::CopyAddress) => format!("{pc:#x}"),
+            (
+                MenuSource::Instruction { pc: address, .. } | MenuSource::Span { address, .. },
+                MenuCommand::CopyFileOffset,
+            ) => format!(
+                "{:#x}",
+                crate::file_offsets::offset_of(&info.sections, address)?
+            ),
             (MenuSource::Instruction { entry, pc }, MenuCommand::CopyBytes) => {
                 hex(&self.menu_instruction(entry, pc)?.bytes)
             }
@@ -1155,6 +1175,7 @@ mod tests {
             "Xrefs to call target 1040",
             "Xrefs to this function",
             "Copy address",
+            "Copy file offset",
             "Copy bytes",
             "Copy instruction",
             "Decode bytes",
@@ -1163,6 +1184,7 @@ mod tests {
         }
         for (item, expected) in [
             ("Copy address", "0x1001"),
+            ("Copy file offset", "0x1"),
             ("Copy bytes", "e8 3a 00 00 00"),
             ("Copy instruction", "call 0x1040"),
         ] {
@@ -1235,7 +1257,10 @@ mod tests {
                     MenuCommand::ShowHex,
                 ][..],
             ),
-            (0x1007, &[MenuCommand::ShowHex][..]),
+            (
+                0x1007,
+                &[MenuCommand::ShowHex, MenuCommand::CopyFileOffset][..],
+            ),
         ] {
             let source = MenuSource::Instruction {
                 entry: 0x1000,
@@ -1639,7 +1664,8 @@ mod tests {
     fn menus_fit_narrow_fractional_screens_and_keep_fixed_rows() {
         let mut desk = Desk::new(menu_app());
         desk.context.set_pixels_per_point(1.25);
-        desk.size = egui::vec2(360.0, 220.0);
+        // Short enough that the 11-item row menu needs nearly all of it.
+        desk.size = egui::vec2(360.0, 260.0);
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, desk.size);
         let rows = |output: &egui::FullOutput| {
             ["00001000", "00001001", "00001006", "00001007"]
@@ -1652,6 +1678,7 @@ mod tests {
         for item in [
             "Comment…",
             "Copy address",
+            "Copy file offset",
             "Copy instruction",
             "Decode bytes",
         ] {
@@ -1715,6 +1742,49 @@ mod tests {
         app.tab = Tab::Listing;
         app.set_listing_scope(super::super::program_listing::ListingScope::Program);
         app
+    }
+
+    #[test]
+    fn copy_file_offset_copies_the_clicked_row_in_both_scopes_and_not_zero_fill() {
+        for program in [false, true] {
+            let mut app = if program { span_app() } else { menu_app() };
+            let info = app.info.as_mut().unwrap();
+            info.sections[0].file_offset = 0x400;
+            info.file_len = 0x500;
+            let mut desk = Desk::new(app);
+            desk.app.select_instruction(0x1000);
+            let before = position(&desk.app);
+            let menu = desk.open(Pane::Listing, "00001007", 3);
+            let output = desk.choose(Pane::Listing, &menu, "Copy file offset");
+            assert_eq!(copies(&output), ["0x407"], "program {program}");
+            assert_eq!(position(&desk.app), before, "copies never navigate");
+        }
+        let mut desk = Desk::new(span_app());
+        // The `??` row at 0x2000 (its length column; the section header
+        // also prints 00002000).
+        let menu = desk.open(Pane::Listing, "20h", 0);
+        let output = desk.choose(Pane::Listing, &menu, "Copy file offset");
+        assert_eq!(copies(&output), ["0x100"]);
+        // Zero-filled rows show the item disabled.
+        let menu = desk.open(Pane::Listing, "00002020", 1);
+        assert!(shows(&menu, "Copy file offset"));
+        let output = desk.choose(Pane::Listing, &menu, "Copy file offset");
+        assert!(copies(&output).is_empty());
+        let span = MenuSource::Span {
+            address: 0x2020,
+            length: 0x20,
+        };
+        assert!(
+            desk.app
+                .menu_items(span)
+                .iter()
+                .flatten()
+                .any(|item| item.command == MenuCommand::CopyFileOffset && !item.enabled)
+        );
+        assert_eq!(
+            desk.app.menu_copy_text(span, MenuCommand::CopyFileOffset),
+            None
+        );
     }
 
     #[test]
@@ -1796,6 +1866,7 @@ mod tests {
             "Expand",
             "Xrefs to address 1008",
             "Copy address",
+            "Copy file offset",
         ] {
             assert!(shows(&menu, item), "{item}");
         }

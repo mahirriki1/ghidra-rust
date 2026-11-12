@@ -161,6 +161,13 @@ pub fn status_frame(style: &egui::Style) -> Frame {
     Frame::side_top_panel(style).inner_margin(Margin::symmetric(8, 3))
 }
 
+/// A muted monospace status-bar value, such as a location's `file(0x…)`.
+pub fn status_token(ui: &mut Ui, text: &str) -> egui::Response {
+    ui.add(egui::Label::new(
+        RichText::new(text).monospace().color(MUTED),
+    ))
+}
+
 /// A ratio of admitted function attempts, or activity when the work is unknown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BarProgress {
