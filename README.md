@@ -88,8 +88,9 @@ cursor keys, pseudocode selection and navigation to an instruction reveal its
 exact graph row, clear of that overview.
 **Legend** and graph warnings are in the graph toolbar.
 
-The Listing shows one function by default. Choose **Program** in its title
-row to list the whole program in address order instead: each section, each
+The Listing lists the whole program by default (**Program** in its title
+row); choose **Function** there to show only the displayed function. The
+Program scope lists the program in address order: each section, each
 known function's name, the instructions of loaded functions, and one `??`
 row with its byte count for each run of bytes no loaded function decoded.
 Zero-filled section tails get their own dimmer row, and a function whose
@@ -171,8 +172,10 @@ load until you scroll; discovery, renames and signature edits keep both the view
 and the selected instruction. Listing keys move through the whole program (see
 [Keyboard shortcuts](#keyboard-shortcuts)). The
 scope, position, expanded runs and loaded bodies and bytes last for the
-session only; loaded bodies and bytes are released when you switch back to
-**Function**, and projects do not store any of them.
+session only: a scope you choose is kept while you open other binaries and
+projects, and each launch starts in **Program**. Loaded bodies and bytes are
+released when you switch to **Function**, and projects do not store any of
+them.
 
 Narrow dock headers keep the active tab visible and put additional tabs in **»**.
 Decompiler controls that do not fit move into **⋯**. The Listing keeps code
@@ -397,6 +400,16 @@ Imports and exports are not saved; reopening rebuilds them from the verified bin
 **File → Include binary in project** is enabled initially. Embedded projects
 include the analyzed binary. Without it, reopening asks you to select the
 binary and verifies its SHA-256; saved source paths are display hints only.
+
+Projects store the exact selected Listing address. Reopening opens a
+function only where the address is proven code: a known function entry, or
+an instruction of the saved function. Any other saved address, such as a
+`??` byte inside a code section or a data row, lands on its Program row over
+the saved function; without that saved function's results it lands over the
+function that was displayed, while that is still a known function, else over
+the opening location. In the **Function** scope the same function opens
+without moving to that row. Older releases may still open such a saved
+executable address as a function of its own.
 
 Reopened results are labeled **Saved analysis** until recomputed.
 Use **Analysis → Refresh function** for listing/graph and pseudocode, and

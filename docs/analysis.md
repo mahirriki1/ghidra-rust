@@ -268,10 +268,13 @@ in Hex at exactly that address, selecting the pointer-width slot clipped to
 file-backed bytes. Further verified stubs and slots appear as child rows and in
 the row's context menu. Code and IFUNC-resolver exports open as code. Data
 exports open in Hex, including mapped zero-fill, and never become functions.
-Saving while viewing a slot or data export retains the previous code location
-(or the opening location) for reopening; Hex spans remain session-only. Reopening
-also accepts earlier projects saved at a data address and quietly falls back to
-the saved function or the opening location. A binary opens at `main`, else its
+Saving while viewing a slot or data export in Hex retains the previous Listing
+location (or the opening location) for reopening; Hex spans remain session-only.
+Reopening also accepts earlier projects saved at a data address: the Program
+scope lands on that address's row, and the Function scope falls back to the
+saved function or the opening location (see
+[Project formats and saved analysis](#project-formats-and-saved-analysis)).
+A binary opens at `main`, else its
 entry point, else its lowest known function, each only when it is file-backed
 executable code; a shared library with no entry point opens at a known function
 instead of address zero.
@@ -764,6 +767,28 @@ saved discovery; version 3 added semantic tokens and local-name overrides.
 JSON v1/v2 remain readable: legacy local overrides use v2; signatures and local
 identities recovered under signature context use v3. Signature-context upgrades
 refresh older analysis caches while retaining annotations.
+
+The saved selection is the exact selected Listing address while it is
+file-backed (while Hex is shown, the Listing selection it departed from);
+otherwise the displayed function's entry or the opening location. Reopening
+resolves it with the same resolver as Go To and history, never guessing a
+function:
+
+| Saved state | Program scope | Function scope |
+| --- | --- | --- |
+| The saved view holds the address (its entry, an instruction or a decompiler mapping) | Saved view, address selected | Same |
+| Saved view present, address not in it | Saved view, then the cursor lands on the address's row | Saved view, its entry selected |
+| No usable view, address is a known function entry | That function | Same |
+| No usable view, any other address | The saved view's entry if it is still in the inventory, else the opening location; then the cursor lands on the row | The same function, its entry selected |
+
+There is no usable view when none was saved or the cache is incompatible; an
+incompatible body still records the view's entry, which is read without a
+schema change. Landing follows
+[Program-listing destinations](#program-listing-destinations), so a byte inside
+a body that has not loaded lands once the body arrives. Older releases still
+open an executable address that is not a function entry as a function of its
+own; this was already possible with projects saved by releases that list
+`??` byte rows inside code sections.
 
 Saved inventory and results retain **Saved analysis** provenance until recomputed.
 Refresh replaces function results; Discover discards saved discovery and starts

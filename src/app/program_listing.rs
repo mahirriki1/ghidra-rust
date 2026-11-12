@@ -56,8 +56,8 @@ struct Turn {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum ListingScope {
-    #[default]
     Function,
+    #[default]
     Program,
 }
 
@@ -2271,6 +2271,38 @@ mod tests {
                 .any(|request| matches!(request, Request::Graph { address: 0x1040 }))
         );
         assert_eq!(app.program.reveal, Some(Reveal::Entry(0x1040)));
+    }
+
+    #[test]
+    fn program_is_the_default_scope_and_a_choice_lasts_the_session() {
+        assert!(DesktopApp::empty(None).program_scope());
+        let mut app = program_app();
+        // Function scope stays selectable; a new binary keeps the choice.
+        app.set_listing_scope(ListingScope::Function);
+        app.clear_binary();
+        assert_eq!(app.program.scope, ListingScope::Function);
+        app.set_listing_scope(ListingScope::Program);
+        app.clear_binary();
+        assert!(app.program_scope());
+    }
+
+    #[test]
+    fn function_header_rows_offer_xrefs_to_their_function() {
+        let mut h = Harness::new(program_app());
+        let output = h.frame(vec![]);
+        let point = fixture::text_position(&output, "next", 1);
+        h.frame(fixture::secondary_events(point));
+        let output = h.frame(vec![]);
+        let point = fixture::text_position(&output, "Xrefs to this function", 1);
+        h.frame(fixture::pointer_events(point));
+        assert_eq!(
+            h.app.xref_target,
+            Some(crate::xrefs::XrefTarget {
+                address: 0x1040,
+                kind: crate::xrefs::TargetKind::Function,
+            })
+        );
+        assert_eq!(h.app.tab, Tab::References);
     }
 
     #[test]

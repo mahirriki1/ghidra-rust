@@ -92,6 +92,10 @@ pub struct LoadedProject {
     /// Display-only. An external input must be explicitly selected by the user.
     pub source_hint: String,
     pub cache_compatible: bool,
+    /// The entry of the saved function view, kept even when the view itself
+    /// is discarded as an incompatible cache. Unvalidated: a restore uses it
+    /// only while it is still an inventory entry.
+    pub displayed_entry: Option<u64>,
 }
 
 impl LoadedProject {
@@ -367,6 +371,7 @@ impl ProjectData {
             .transpose()
             .map_err(|_| "Project decompilation is not UTF-8")?;
         let source_hint = body.info.path.clone();
+        let displayed_entry = body.view.as_ref().map(|view| view.address);
         let local_context = if session.signatures.is_empty() {
             String::new()
         } else {
@@ -472,6 +477,7 @@ impl ProjectData {
             binary,
             source_hint,
             cache_compatible: compatible,
+            displayed_entry,
         })
     }
 

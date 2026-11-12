@@ -58,6 +58,8 @@ pub(super) struct SavedRestore {
     pub selection: u64,
     pub binding: Option<ResultBinding>,
     pub selected: Option<u64>,
+    /// A saved Program row the view does not hold, landed on once shown.
+    pub listing: Option<u64>,
     pub decompiled: Option<String>,
     pub mappings: Vec<CodeMapping>,
     pub semantics: SemanticInfo,
@@ -439,6 +441,7 @@ mod tests {
 
     fn project(app: &DesktopApp, view: FunctionView) -> ProjectOpen {
         let source = "int entry() { return 7; }";
+        let displayed_entry = Some(view.address);
         let data = ProjectData {
             info: app.info.clone().unwrap(),
             session: app.session.clone().unwrap(),
@@ -463,6 +466,7 @@ mod tests {
                 binary: None,
                 source_hint: "fixture".into(),
                 cache_compatible: true,
+                displayed_entry,
             },
             project_path: "analysis.grproj".into(),
             binary_path: "fixture".into(),
@@ -649,7 +653,7 @@ mod tests {
             app.graph_preparation.pause(false, &context);
             app.settle_graph();
             assert!(app.view().is_none(), "never admit old graph: {change}");
-            app.poll_graph_preparation();
+            app.poll_graph_preparation(&egui::Context::default());
             assert_eq!(
                 app.queue
                     .iter()

@@ -58,6 +58,7 @@ mod listing_cursor;
 mod listing_destinations;
 mod program_cursor;
 mod program_listing;
+mod project_restore;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Tab {
@@ -200,6 +201,13 @@ fn start_address(info: &BinaryInfo) -> Option<u64> {
                 .filter(code)
                 .min()
         })
+}
+
+/// Whether a section stores the byte at `address` in the file.
+fn file_backed(info: &BinaryInfo, address: u64) -> bool {
+    info.sections
+        .iter()
+        .any(|section| section.backs(address, 1))
 }
 
 /// The greatest entry strictly below `address`, or the smallest strictly
@@ -3764,13 +3772,15 @@ impl DesktopApp {
             .map(std::path::Path::to_path_buf)
     }
 
-    /// The existing project field describes a code selection, never a Hex span.
+    /// The exact selected listing address, never a Hex span: while Hex is
+    /// shown, the selection it departed from. Only a file-backed address is
+    /// kept; a reopen proves whether it is code before opening anything.
     fn project_selection(&self) -> Option<u64> {
         let info = self.info.as_ref()?;
         self.selected
             .filter(|_| self.data_location.is_none())
             .or(self.code_selection)
-            .filter(|&address| crate::call_analysis::code_address(info, address))
+            .filter(|&address| file_backed(info, address))
             .or_else(|| self.view().map(|view| view.address))
             .or_else(|| start_address(info))
     }
@@ -3851,7 +3861,7 @@ impl DesktopApp {
     }
 
     /// Adopts finished presentation work still bound to the current state.
-    fn poll_graph_preparation(&mut self) {
+    fn poll_graph_preparation(&mut self, context: &egui::Context) {
         use graph_preparation::{Continuation, Output};
         let Some((continuation, output, charge)) = self.graph_preparation.poll() else {
             return;
@@ -3933,7 +3943,7 @@ impl DesktopApp {
             }
             (Continuation::Saved(restore), Output::Base(graph)) => {
                 drop(charge);
-                self.finish_restore(graph, *restore);
+                self.finish_restore(graph, *restore, context);
             }
             (Continuation::Annotation(key), Output::Annotated(geometry)) => {
                 let Some(charge) = charge else {
@@ -3972,7 +3982,12 @@ impl DesktopApp {
     }
 
     /// The saved graph, selection and decompilation of a restored project.
-    fn finish_restore(&mut self, graph: PreparedGraph, restore: graph_preparation::SavedRestore) {
+    fn finish_restore(
+        &mut self,
+        graph: PreparedGraph,
+        restore: graph_preparation::SavedRestore,
+        context: &egui::Context,
+    ) {
         let address = graph.address();
         // Saved results enter the store with their provenance, so the
         // marker stays visible on revisits until each is recomputed.
@@ -4024,13 +4039,19 @@ impl DesktopApp {
         }
         self.saved_result_revision = self.result_revision;
         self.status = "Project opened · saved analysis".into();
+        // The saved row supersedes the entry's own listing scroll.
+        if let Some(address) = restore.listing
+            && self.land_in_listing(address, 1, None, false, context)
+        {
+            self.pending_listing_scroll = None;
+        }
     }
 
     /// Waits for presentation work and adopts it, as a later frame would.
     #[cfg(test)]
     fn settle_graph(&mut self) {
         self.graph_preparation.settle();
-        self.poll_graph_preparation();
+        self.poll_graph_preparation(&egui::Context::default());
     }
 
     /// The displayed graph and the revisions its comment rows depend on.
@@ -4135,9 +4156,10 @@ impl DesktopApp {
             data,
             binary,
             cache_compatible,
+            displayed_entry,
             ..
         } = project;
-        // Projects persist a code location, so reveal it even if the previous
+        // Projects persist a Listing location, so reveal it even if the previous
         // binary was closed while Hex or another analysis tab was active.
         self.tab = Tab::Listing;
         self.embed_binary = binary.is_some();
@@ -4170,60 +4192,18 @@ impl DesktopApp {
             self.saved_references = true;
             self.discovery_saved = Some(saved);
         }
-        let selected = data
-            .selected_address
-            .filter(|&address| {
-                self.info
-                    .as_ref()
-                    .is_some_and(|info| crate::call_analysis::code_address(info, address))
-            })
-            .or_else(|| data.view.as_ref().map(|v| v.address))
-            .or_else(|| self.info.as_ref().and_then(start_address));
-        if let Some(view) = data.view.filter(|view| {
-            selected.is_some_and(|address| {
-                address == view.address
-                    || data
-                        .mappings
-                        .iter()
-                        .any(|mapping| mapping.addresses.contains(&address))
-                    || view
-                        .blocks
-                        .iter()
-                        .any(|b| b.instructions.iter().any(|i| i.address == address))
-            })
-        }) {
-            let address = view.address;
-            let binding = self
-                .results
-                .binding(address, self.local_override_state(address));
-            // The graph-dependent remainder runs once its geometry is ready,
-            // never paired with another graph.
-            let restore = graph_preparation::SavedRestore {
-                generation: self.generation,
-                selection: self.selection_generation,
-                binding,
-                selected,
+        self.restore_place(
+            data.selected_address,
+            displayed_entry,
+            project_restore::SavedResults {
+                view: data.view,
                 decompiled: data.decompiled,
                 mappings: data.mappings,
                 semantics: data.semantics,
-            };
-            let held = restore.retained_bytes();
-            self.saved_result_revision = self.result_revision;
-            self.prepare_graph(
-                view,
-                graph_preparation::Continuation::Saved(Box::new(restore)),
-                held,
-                context,
-            );
-        } else if let Some(address) = selected {
-            self.navigate(address, true, context);
-            self.status = if cache_compatible {
-                "Project opened; loading function"
-            } else {
-                "Project opened; engine version changed, regenerating analysis"
-            }
-            .into();
-        }
+            },
+            cache_compatible,
+            context,
+        );
     }
 
     fn open_project(&mut self, project_path: PathBuf, context: &egui::Context) {
@@ -9257,7 +9237,7 @@ impl DesktopApp {
         }
         self.poll_files(&context);
         if !self.updater.installing() {
-            self.poll_graph_preparation();
+            self.poll_graph_preparation(&context);
             self.poll_worker(&context);
         }
         self.pump_text_search(&context);
@@ -11063,8 +11043,11 @@ mod tests {
         assert!(app.filtered_functions.contains(&(0x1fff - 0x1000)));
     }
 
+    /// Function scope: the suites built on this fixture exercise the
+    /// per-function listing; Program-scope helpers switch scope themselves.
     pub(super) fn keyboard_app() -> DesktopApp {
         let mut app = DesktopApp::empty(None);
+        app.program.scope = program_listing::ListingScope::Function;
         app.info = Some(BinaryInfo {
             path: "fixture".into(),
             architecture: "x86-64".into(),
@@ -15114,6 +15097,7 @@ mod tests {
                     binary: None,
                     source_hint: "fixture".into(),
                     cache_compatible: true,
+                    displayed_entry: None,
                 },
                 project_path: "analysis.grproj".into(),
                 binary_path: "fixture".into(),
@@ -17700,8 +17684,10 @@ mod tests {
         assert_eq!(app.revision, app.saved_revision);
     }
 
+    /// Function scope: linkage data opens Hex there.
     fn linkage_app(sha256: &str) -> (DesktopApp, crate::linkage::LinkageTable) {
         let mut app = DesktopApp::empty(None);
+        app.program.scope = program_listing::ListingScope::Function;
         app.info = Some(crate::linkage_ui::fixture::info(sha256));
         app.session = Some(Session::new(sha256.into()));
         app.selected = Some(0x1000);
@@ -18699,7 +18685,7 @@ mod tests {
                 || app.results.preparing()
                 || app.graph_preparation.awaits(|_| true)
             {
-                app.poll_graph_preparation();
+                app.poll_graph_preparation(&context);
                 app.poll_worker(&context);
                 assert!(Instant::now() < deadline, "{}", app.status);
                 assert!(app.client.is_some(), "{}", app.status);
@@ -18843,6 +18829,9 @@ mod tests {
         );
         let context = egui::Context::default();
         let mut app = DesktopApp::empty(None);
+        // Function scope first: linkage data opens Hex, and reopening keeps
+        // the saved code selection.
+        app.program.scope = program_listing::ListingScope::Function;
         // Use the application's executable rather than Cargo's test harness.
         let start = |app: &mut DesktopApp, path: PathBuf| {
             let mut client =
@@ -18868,7 +18857,7 @@ mod tests {
         let settle = |app: &mut DesktopApp| {
             let deadline = Instant::now() + Duration::from_secs(30);
             loop {
-                app.poll_graph_preparation();
+                app.poll_graph_preparation(&context);
                 app.poll_worker(&context);
                 if app.linkage.status() == Status::Ready
                     && app.pending.is_none()
@@ -18951,11 +18940,7 @@ mod tests {
             .unwrap();
         // Without a saved view, reopening lands where a fresh open would.
         let opening_pc = start_address(app.info.as_ref().unwrap()).unwrap();
-        for (path, expected_pc) in [
-            (project_path, code_pc),
-            (legacy_path, code_pc),
-            (entry_path, opening_pc),
-        ] {
+        let reopen = |app: &mut DesktopApp, path: PathBuf| {
             app.clear_binary();
             app.open_project(path, &context);
             while app.file_job.is_some() {
@@ -18970,14 +18955,40 @@ mod tests {
                 .clone();
             // Replace only Cargo's harness process; keep the real file-load,
             // Opened verification, deferred restore and page-adoption paths.
-            start(&mut app, opening);
-            settle(&mut app);
+            start(app, opening);
+            settle(app);
+        };
+        let code_entry = app.view().unwrap().address;
+        let paths = [project_path, legacy_path, entry_path];
+        for (path, expected_pc) in paths.iter().cloned().zip([code_pc, code_pc, opening_pc]) {
+            reopen(&mut app, path);
             assert_eq!(app.selected, Some(expected_pc));
             assert_eq!(app.tab, Tab::Listing);
             assert!(app.view().is_some());
             assert!(!app.status.contains("outside file-backed"));
             assert_eq!(app.linkage.status(), Status::Ready);
             assert!(!app.linkage.prepared().unwrap().linkage().imports.is_empty());
+        }
+        // Program scope lands on the exact saved data row instead: over the
+        // saved view, and over the opening function without one. Neither
+        // opens a function at the data address.
+        app.set_listing_scope(program_listing::ListingScope::Program);
+        for (path, selected, entry) in [
+            (&paths[0], code_pc, code_entry),
+            (&paths[1], data_address, code_entry),
+            (&paths[2], data_address, opening_pc),
+        ] {
+            reopen(&mut app, path.clone());
+            assert_eq!(app.selected, Some(selected));
+            assert_eq!(app.tab, Tab::Listing);
+            assert!(app.data_location.is_none());
+            assert_eq!(app.view().map(|view| view.address), Some(entry));
+            assert_eq!(app.result_scope, Some(entry));
+            assert_eq!(
+                app.program.cursor.is_some() || app.program.landing.is_some(),
+                selected == data_address,
+                "only the saved data row holds the Program cursor"
+            );
         }
         app.clear_binary();
     }
@@ -19029,7 +19040,7 @@ mod tests {
             || !app.queue.is_empty()
             || app.graph_preparation.awaits(|_| true)
         {
-            app.poll_graph_preparation();
+            app.poll_graph_preparation(&context);
             app.poll_worker(&context);
             assert!(
                 Instant::now() < deadline,
