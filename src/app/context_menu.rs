@@ -457,11 +457,13 @@ impl DesktopApp {
                 MenuSource::Instruction { entry, pc } => {
                     if let Some(instruction) = self.menu_instruction(entry, pc) {
                         let length = instruction.bytes.len() as u64;
+                        self.select_menu_row(source, context);
                         self.navigate_data(pc, length, context);
                     }
                 }
                 MenuSource::TreeSection(index) => self.open_hex_section(index, context),
                 MenuSource::Span { address, length } => {
+                    self.select_menu_row(source, context);
                     self.navigate_data(address, length, context);
                 }
                 _ => {}
@@ -511,11 +513,43 @@ impl DesktopApp {
             MenuSource::StringRow { .. } | MenuSource::TreeString { .. } => {
                 if let Some(string) = self.menu_string(source) {
                     let (address, span) = (string.address, string_span(string) as u64);
-                    self.navigate_data(address, span, context);
+                    // Program scope lands on the string's row.
+                    if !self.land_destination(address, span, true, context) {
+                        self.navigate_data(address, span, context);
+                    }
                 }
             }
             MenuSource::TreeLabel(address) => self.navigate_annotation(address, true, context),
             MenuSource::TreeSection(_) | MenuSource::Span { .. } => {}
+        }
+    }
+
+    /// Selects the Listing row a menu was opened on, as a click would but
+    /// without opening another function, so Back from where the command
+    /// goes returns to that row.
+    fn select_menu_row(&mut self, source: MenuSource, context: &egui::Context) {
+        use crate::program_listing::{Position, Rank, Row};
+        match source {
+            MenuSource::Instruction { entry, pc } => {
+                let row = self
+                    .program_scope()
+                    .then(|| self.program_layout()?.exact(Position::new(pc, Rank::Body)))
+                    .flatten()
+                    .filter(|row| matches!(row, Row::Instruction { owner, .. } if *owner == entry));
+                if let Some(row) = row {
+                    self.move_program_cursor(row, context);
+                    self.program.follow = None;
+                } else if self.view().is_some_and(|view| view.address == entry) {
+                    self.select_instruction(pc);
+                }
+            }
+            MenuSource::Span { .. } => {
+                if let Some(row) = self.span_row(source) {
+                    self.move_program_cursor(row, context);
+                    self.program.follow = None;
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1684,6 +1718,65 @@ mod tests {
     }
 
     #[test]
+    fn show_in_hex_selects_its_row_first_so_back_returns_there() {
+        use crate::program_listing::{Rank, Row};
+        let mut desk = Desk::new(span_app());
+        assert_eq!(desk.app.selected, Some(0x1000));
+        // A `??` row the cursor is not on: right-click alone selects nothing.
+        let menu = desk.open(Pane::Listing, "00001008", 1);
+        assert_eq!(desk.app.selected, Some(0x1000));
+        desk.choose(Pane::Listing, &menu, "Show in Hex");
+        assert_eq!(desk.app.tab, Tab::Hex);
+        assert_eq!(
+            desk.app.history,
+            [
+                Place::Listing {
+                    address: 0x1008,
+                    rank: Rank::Body
+                },
+                Place::Data {
+                    address: 0x1008,
+                    length: 0x38
+                }
+            ]
+        );
+        // An instruction row of the displayed function records itself.
+        desk.app.tab = Tab::Listing;
+        let menu = desk.open(Pane::Listing, "00001001", 3);
+        desk.choose(Pane::Listing, &menu, "Show in Hex");
+        assert_eq!(
+            desk.app.history[1..],
+            [
+                Place::Code(0x1001),
+                Place::Data {
+                    address: 0x1001,
+                    length: 5
+                }
+            ]
+        );
+        assert!(desk.app.program.follow.is_none());
+        let back = egui::Event::Key {
+            key: egui::Key::ArrowLeft,
+            physical_key: Some(egui::Key::ArrowLeft),
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers::ALT,
+        };
+        desk.frame(
+            Pane::Listing,
+            vec![
+                fixture::key_event(egui::Key::ArrowLeft, egui::Modifiers::ALT),
+                back,
+            ],
+        );
+        let layout = desk.app.program_layout().unwrap();
+        assert!(matches!(
+            desk.app.program_cursor(&layout),
+            Some(Row::Instruction { start: 0x1001, .. })
+        ));
+    }
+
+    #[test]
     fn span_menus_show_hex_expand_and_copy_from_byte_rows() {
         let mut desk = Desk::new(span_app());
         // Zero-filled bytes have nothing to show in Hex or expand.
@@ -1714,7 +1807,10 @@ mod tests {
         assert_eq!(
             desk.app.history,
             [
-                Place::Code(0x1008),
+                Place::Listing {
+                    address: 0x1008,
+                    rank: crate::program_listing::Rank::Body
+                },
                 Place::Data {
                     address: 0x1008,
                     length: 0x38

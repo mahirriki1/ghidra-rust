@@ -260,7 +260,9 @@ are session-only.
 
 Click selects a row; double-click opens it, and Back/Forward record the visit.
 Back/Forward restores slot and data destinations in Hex with the original span;
-code destinations retain their instruction navigation.
+code destinations retain their instruction navigation. In the Listing's Program
+scope, slot and data-export destinations instead land on their exact Program row
+(see [Program-listing destinations](#program-listing-destinations)).
 An import opens its verified stub through code navigation, or otherwise its slot
 in Hex at exactly that address, selecting the pointer-width slot clipped to
 file-backed bytes. Further verified stubs and slots appear as child rows and in
@@ -516,8 +518,12 @@ Comments appear beside Listing instructions and on Graph rows. The Decompiler
 shows each once above a genuinely mapped statement, with entry comments at top;
 unmapped ones remain under **Comments without visible code**. Double-click a
 comment, use its context menu, or press **;** for full text. **View → Annotations**
-opens a filterable address/label/comment browser. Address navigation preserves
-observed function context and history; data addresses open Decode.
+opens a filterable address/label/comment browser. Jumps from it and from the
+Labels tree's **Go to** open code only at a known function entry or an
+instruction a graph, decompiler mapping, loaded Program-listing body or recorded
+history observed; they never treat any other address as a function. Otherwise
+the Program scope lands on the address's row; without one (and in Function
+scope) non-code addresses open Decode and executable ones open Hex.
 
 Local renaming requires a verified symbol with one whole stack/register storage
 mapping, including recovered parameters. Declarations and uses change together.
@@ -620,6 +626,44 @@ Row queries are logarithmic lookups and never scan bytes. Witnesses are not
 saved in projects: after a reopen they appear again only once discovery
 runs.
 
+### Program-listing destinations
+
+In the Program scope, a destination that the shared resolver does not prove
+to be code (a known entry, or an instruction a displayed graph, decompiler
+mapping, loaded Program-listing body or recorded history observed) lands on a
+Program row instead of opening Hex. This applies to Go, memory and
+program-text search results, linkage slots and data exports, **Go to** on
+Strings and Symbol Tree rows, label and comment jumps, Back/Forward and Hex's
+**Show in Listing**. Landing moves only the Program cursor: it never
+navigates, opens a function, changes the selection generation or sends a
+worker request, and it arms no follow of the cursor's function.
+
+- A row starting exactly at the address is used as it is.
+- Inside a collapsed `??` row, the 4 KiB pages (section-relative, clipped to
+  the section's file-backed end) holding `[address, address + length)` are
+  expanded, clipped to that row and capped at 64 KiB, and the cursor lands
+  on the byte row. The expansion is an ordinary session interval: the 64
+  interval cap applies, and the new interval and the departure's are never
+  the ones evicted.
+- Inside an evidence item, the item's bytes are expanded (capped at 64 KiB
+  from the address's page) and the cursor lands on the byte row.
+- Inside a zero-filled tail, one session-only anchor splits the tail at the
+  address; no bytes are read. A later zero-fill destination moves the anchor.
+- Inside a body that has not loaded, the address is selected and revealed,
+  and the landing is re-evaluated whenever the derived rows change, as long
+  as the selection stays there. It never switches tabs, records history or
+  opens a function.
+- Inside a decoded instruction there is no exact row: callers open Hex, as
+  in Function scope. Only **Show in Listing** lands on the covering
+  instruction instead.
+
+History records a Program row without a function owner as a session-only
+Listing place with its rank, so Back tells a section header from the first
+byte row at the same address. Restoring one lands on it again, expanding the
+page once more if its run was collapsed; in Function scope it opens the byte
+in Hex. **Show in Listing** records the Hex span it left, so Back restores
+it. Expansions, the anchor and Listing places are not saved in projects.
+
 ## Search
 
 Search results, dialogs and bindings are transient. Projects store none of
@@ -696,7 +740,9 @@ labels and comments open as code only at an exact known function entry or at
 an exact instruction observed in the current graph, a genuine decompiler
 mapping or recorded history; otherwise they open in Hex at the exact address
 (memory matches select their length), never at a nearest function. String hits
-open in Hex at the preview start. Imports and exports use the existing
+open in Hex at the preview start. In the Listing's Program scope these
+non-code destinations land on their Program row instead (a string hit on its
+string row; see [Program-listing destinations](#program-listing-destinations)). Imports and exports use the existing
 stub/slot/target destinations while the same table is loaded; forwarded and
 unresolved entries have none. A file-backed Hex span of at most 4 KiB that
 crosses a page keeps its full selection; **Prev** can return to the section's

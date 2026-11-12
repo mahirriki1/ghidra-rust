@@ -491,6 +491,7 @@ pub(crate) fn show_results(
                             let label = match place {
                                 Place::Code(address) => format!("Go to {address:x}"),
                                 Place::Data { address, .. } => format!("Go to slot {address:x}"),
+                                Place::Listing { address, .. } => format!("Go to {address:x}"),
                             };
                             if ui.button(label).clicked() {
                                 action = Some(ResultAction::OpenPlace(index, item, place));

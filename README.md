@@ -144,11 +144,23 @@ with Back/Forward history; on an import slot or string they do nothing.
 Evidence rows never expand. Pointer entries are not saved in projects: after a
 reopen they return only once discovery runs again. **Show in Hex** on a `??`,
 byte, evidence or zero-fill row selects exactly its file-backed bytes in Hex
-(zero-filled bytes have none).
-Back/Forward to an address that is neither a known function entry nor an
-instruction a loaded function decoded (such as a `??` or byte row the
-cursor left) returns the Program cursor to the row starting there, without
-opening a function; without such a row it opens Hex, as Go does. Scroll with the wheel or drag the
+(zero-filled bytes have none) and first puts the cursor on that row, so
+Back returns to it.
+In the Program scope, non-code destinations land on their exact row instead
+of Hex: Go, memory and program-text search results (a string result on its
+string row), import slots and data exports from the Symbol Tree and
+Imports/Exports, **Go to** on Strings and Symbol Tree rows, label and
+comment jumps, and Back/Forward. Where no row starts at the destination, a
+`??` row expands the 4 KiB page or pages holding the destination's bytes
+(up to 64 KiB), an evidence row entered past its start expands its bytes,
+and a zero-filled tail gets a row starting there without reading anything.
+Landing keeps the row where it is on screen, never opens a function and
+sends nothing. Inside a function whose body is still loading, the cursor
+waits at that address and lands once the body arrives, without switching
+tabs or adding history. A destination inside a decoded instruction has no
+row of its own and still opens in Hex. Back/Forward returns to the exact row
+left, telling a section header from the first byte below it, and expands a
+byte row again if its run was collapsed since. Scroll with the wheel or drag the
 address bar at the right edge, which spans all sections. Clicking an
 instruction opens its function in the Graph and Decompiler, and right-click
 menus work on the instructions of any loaded function. Highlights linked to
@@ -156,8 +168,7 @@ the pseudocode still come only from the displayed function. Function, Go,
 history and pseudocode navigation scroll the Program listing to the
 destination once, and it keeps its place on screen while bodies above it
 load until you scroll; discovery, renames and signature edits keep both the view
-and the selected instruction. Non-code destinations
-still open in Hex. Listing keys move through the whole program (see
+and the selected instruction. Listing keys move through the whole program (see
 [Keyboard shortcuts](#keyboard-shortcuts)). The
 scope, position, expanded runs and loaded bodies and bytes last for the
 session only; loaded bodies and bytes are released when you switch back to
@@ -188,7 +199,8 @@ The Symbol Tree lists **Imports**, grouped by declaring library (or **Unknown
 library**), and **Exports**. The function filter applies to them too. Click a
 row to select it; double-click to open it. An import opens its verified stub as
 code, or else its slot in Hex at that exact address. Code exports open as code
-and data exports open in Hex; neither creates a function. Forwarded and
+and data exports open in Hex; neither creates a function. In the Listing's
+Program scope, slots and data exports land on their row instead. Forwarded and
 unresolved exports have no destination. Right-click for every known location.
 Names prefer your label at the row's address, then the demangled name; hover
 shows the raw name, library, ordinal and other declared facts.
@@ -227,7 +239,8 @@ rejected. The result must lie in mapped memory and must not wrap. A known
 function entry, or an instruction the current graph, pseudocode or history
 saw, opens in that function; Graph stays Graph, other tabs switch to Listing.
 Any other mapped address opens in Hex, including executable bytes that are not
-a known entry. A rejected query changes nothing; the toolbar keeps the text
+a known entry; in the Listing's Program scope it lands on its row instead
+(see above). A rejected query changes nothing; the toolbar keeps the text
 and reports the reason in the status bar.
 
 Visited functions reuse compatible session results. **Analysis → Refresh
@@ -323,7 +336,13 @@ an empty result does not prove that no references exist.
 it does not provide complete Unicode or Rust string-slice recovery.
 
 **Hex / Memory Map** browses mapped sections of the analyzed snapshot.
-Select bytes and choose **Decode selection**. Unmapped headers, overlays,
+Select bytes and choose **Decode selection**. **Show in Listing** switches the
+Listing to the Program scope and puts the cursor on the selected bytes' row
+(or the page's first byte without a selection): known code opens in its
+function, bytes inside a decoded instruction select that instruction, and
+Back returns to the same Hex span. Bytes of a section that has no Program
+rows (one overlapping an earlier section) change nothing; the status bar
+says so. Unmapped headers, overlays,
 and runtime process memory are outside this view.
 
 ### Search
@@ -340,7 +359,9 @@ Enter, or **Open** in its menu goes there. A match opens as code only at a known
 function entry or at an instruction already observed in a recovered graph or
 decompiler mapping. Otherwise it opens in Hex at its exact bytes, even inside
 code. Strings open in Hex; imports and exports open like their Functions-dock
-rows. Back / Forward records each destination.
+rows. In the Listing's Program scope, results that are not code land on their
+row instead, expanding the pages a match spans. Back / Forward records each
+destination.
 
 Search state is transient: it is not saved in projects and is cleared when the
 binary or project changes. Program-text results become **Stale** when the

@@ -45,7 +45,8 @@ impl DesktopApp {
         let rows = self.program.current_rows(self.generation)?;
         Some(
             rows.layout(&self.info.as_ref()?.functions, &self.program.expanded)
-                .with_evidence(&self.program.evidence.index),
+                .with_evidence(&self.program.evidence.index)
+                .with_anchor(self.program.anchor),
         )
     }
 
@@ -1198,17 +1199,31 @@ mod tests {
         );
         h.tap(egui::Key::ArrowDown, egui::Modifiers::CTRL);
         assert_eq!(h.app.result_scope, Some(0x1040));
+        assert_eq!(h.app.program.cursor, None, "the row kind is forgotten");
+        assert!(matches!(
+            h.cursor(),
+            Some(Row::Instruction { start: 0x1040, .. })
+        ));
+        // History recorded the header it left, and Back lands exactly there
+        // without reopening its address's function.
+        assert_eq!(
+            h.app.history[0],
+            crate::linkage_ui::Place::Listing {
+                address: 0x1000,
+                rank: Rank::Section
+            }
+        );
         h.tap(egui::Key::ArrowLeft, egui::Modifiers::ALT);
         assert_eq!(h.app.selected, Some(0x1000));
         assert_eq!(
             h.cursor(),
-            Some(Row::Instruction {
-                owner: 0x1000,
-                start: 0x1000,
-                end: 0x1004
-            }),
-            "back at the instruction, not the section header"
+            Some(Row::Section {
+                section: 0,
+                start: 0x1000
+            })
         );
+        assert_eq!(h.app.result_scope, Some(0x1040));
+        assert_eq!(h.graph_requests(), 0);
     }
 
     #[test]

@@ -60,12 +60,20 @@ pub(crate) enum Place {
     /// A slot or data object: opened in Hex, selecting at most `length`
     /// file-backed bytes. Never becomes a function.
     Data { address: u64, length: u64 },
+    /// A Program-listing row without a function owner, told apart from
+    /// rows sharing its address by `rank`. Session-only history.
+    Listing {
+        address: u64,
+        rank: crate::program_listing::Rank,
+    },
 }
 
 impl Place {
     pub(crate) fn address(self) -> u64 {
         match self {
-            Self::Code(address) | Self::Data { address, .. } => address,
+            Self::Code(address) | Self::Data { address, .. } | Self::Listing { address, .. } => {
+                address
+            }
         }
     }
 }
@@ -850,7 +858,9 @@ fn place_label(place: Place, stub: bool) -> String {
         Place::Code(address) if stub => format!("Go to stub {address:x}"),
         Place::Code(address) => format!("Go to {address:x}"),
         Place::Data { address, length } if length > 1 => format!("Go to slot {address:x}"),
-        Place::Data { address, .. } => format!("Go to {address:x}"),
+        Place::Data { address, .. } | Place::Listing { address, .. } => {
+            format!("Go to {address:x}")
+        }
     }
 }
 

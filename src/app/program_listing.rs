@@ -100,6 +100,7 @@ struct WindowKey {
     inventory: (u64, usize, usize, u64, u64),
     expansions: u64,
     evidence: u64,
+    anchor: Option<u64>,
     after: usize,
 }
 
@@ -149,7 +150,7 @@ pub(super) struct ProgramPane {
     /// Context the displayed graph was computed under, when known.
     pub(super) graph_context: Option<Arc<ProgramContext>>,
     rows: Option<(RowsKey, ProgramRows, AddressScale)>,
-    rows_serial: u64,
+    pub(super) rows_serial: u64,
     window: Option<Window>,
     pub(super) top: Option<Position>,
     offset: f32,
@@ -204,6 +205,11 @@ pub(super) struct ProgramPane {
     byte_visible: Vec<u64>,
     /// Data rows and split marks; session-only, cleared with the binary.
     pub(super) evidence: Evidence,
+    /// The one session-only split mark a destination inside a zero-filled
+    /// tail placed; it gives that address a row without reading bytes.
+    pub(super) anchor: Option<u64>,
+    /// A destination inside a pending body, landed once rows change.
+    pub(super) landing: Option<super::listing_destinations::Landing>,
     /// Tests without a worker process let follows send as if one ran.
     #[cfg(test)]
     pub(super) assume_worker: bool,
@@ -264,6 +270,7 @@ impl DesktopApp {
         self.program.quiet_scroll = None;
         self.program.follow = None;
         self.program.cursor = None;
+        self.program.landing = None;
         if scope == ListingScope::Function {
             // Function scope never reads the cache; release its charge, and
             // drop any reply in flight.
@@ -362,7 +369,7 @@ impl DesktopApp {
     }
 
     /// Rebuilds the derived rows when the cache or displayed graph changed.
-    fn program_rows_sync(&mut self) {
+    pub(super) fn program_rows_sync(&mut self) {
         let key = RowsKey {
             generation: self.generation,
             cache: self.program.cache.epoch(),
@@ -678,6 +685,7 @@ impl DesktopApp {
     pub(super) fn program_listing_pane(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
         self.program_rows_sync();
         self.program_evidence_sync();
+        self.resume_landing(context);
         // Until this frame reaches its rows, nothing is in view.
         self.program.drawn_empty = true;
         self.program.wanted.clear();
@@ -719,7 +727,8 @@ impl DesktopApp {
         }
         let layout = rows
             .layout(&info.functions, &self.program.expanded)
-            .with_evidence(&self.program.evidence.index);
+            .with_evidence(&self.program.evidence.index)
+            .with_anchor(self.program.anchor);
         // One-shot reveal: center only a row that is not fully shown, then
         // pin it where it is on screen.
         if let Some(reveal) = self.program.reveal.take() {
@@ -796,6 +805,7 @@ impl DesktopApp {
             ),
             expansions: self.program.expanded.epoch(),
             evidence: self.program.evidence.epoch,
+            anchor: self.program.anchor,
             after: (page + WINDOW_BEFORE).min(WINDOW_ROWS - WINDOW_BEFORE - 1),
         };
         let reused = self.program.window.as_mut().is_some_and(|window| {

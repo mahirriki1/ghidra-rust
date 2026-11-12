@@ -55,6 +55,7 @@ mod context_menu;
 #[path = "app/graph_preparation.rs"]
 mod graph_preparation;
 mod listing_cursor;
+mod listing_destinations;
 mod program_cursor;
 mod program_listing;
 
@@ -1767,6 +1768,9 @@ impl DesktopApp {
                 self.request_bytes(address, length, ByteDestination::HexPage { token }, context);
             }
             HexAction::Decode { address, bytes } => self.decode_loaded_bytes(address, bytes),
+            HexAction::ShowListing { address, length } => {
+                self.show_in_listing(address, length, context);
+            }
         }
     }
 
@@ -4843,7 +4847,11 @@ impl DesktopApp {
         self.clear_decompilation();
         self.pending_listing_scroll = None;
         self.comment_rows = CommentRows::default();
-        self.comment_owners.clear();
+        // Explicitly opened functions (also call targets outside the
+        // inventory) stay code for the history that still lists them.
+        let history = &self.history;
+        self.comment_owners
+            .retain(|pc, owner| pc == owner && history.iter().any(|place| place.address() == *pc));
         self.cached_graph = false;
         self.saved_analysis = false;
         self.discovery_activity = None;
@@ -5314,13 +5322,15 @@ impl DesktopApp {
             crate::linkage_ui::Place::Data { address, length } => {
                 self.open_data(address, length, context)
             }
+            crate::linkage_ui::Place::Listing { address, rank } => {
+                self.restore_listing_place(address, rank, context);
+            }
         }
     }
 
     /// Revisits a recorded code location only where Go To would open code:
-    /// a known entry or an exactly observed instruction. Any other address,
-    /// such as a `??` or byte row the Program cursor left, puts the cursor
-    /// back on the Program row starting there, else opens Hex; no function
+    /// a known entry or an exactly observed instruction. Any other address
+    /// lands on its Program row as Go To would, else opens Hex; no function
     /// is guessed and nothing is requested for it.
     fn restore_code_place(&mut self, address: u64, context: &egui::Context) {
         let Some(info) = self.info.as_ref() else {
@@ -5333,15 +5343,7 @@ impl DesktopApp {
             self.navigate_location(address, Some(owner), false, context);
             return;
         }
-        let row = self
-            .program_scope()
-            .then(|| self.program_layout()?.cursor(address, None))
-            .flatten();
-        if let Some(row) = row {
-            self.data_location = None;
-            self.tab = Tab::Listing;
-            self.move_program_cursor(row, context);
-        } else if destination.is_some() {
+        if destination.is_some() && !self.land_in_listing(address, 1, None, false, context) {
             self.open_data(address, 1, context);
         }
     }
@@ -5363,6 +5365,9 @@ impl DesktopApp {
                 crate::linkage_ui::Place::Code(address) => (0u8, address, 0).hash(&mut hasher),
                 crate::linkage_ui::Place::Data { address, length } => {
                     (1u8, address, length).hash(&mut hasher)
+                }
+                crate::linkage_ui::Place::Listing { address, rank } => {
+                    (2u8, address, rank as u64).hash(&mut hasher)
                 }
             }
         }
@@ -6482,10 +6487,6 @@ impl DesktopApp {
         self.comment_rows_key = Some(key);
     }
 
-    fn navigate_annotation(&mut self, address: u64, record: bool, context: &egui::Context) {
-        self.navigate_location(address, None, record, context);
-    }
-
     /// Opens `address`, inside `owner` when that is known from evidence.
     /// Recorded history keeps the exact departure and destination
     /// instructions and their observed owners for Back/Forward.
@@ -6497,8 +6498,6 @@ impl DesktopApp {
         context: &egui::Context,
     ) {
         self.update_comment_rows();
-        // Explicit: a Program row click sets its row kind afterwards.
-        self.program.cursor = None;
         let explicit = owner.is_some();
         let current_owner = self
             .view()
@@ -6517,8 +6516,11 @@ impl DesktopApp {
             .or_else(|| self.comment_owners.get(&address).copied())
             .unwrap_or(address);
         if record {
+            // The departure keeps the Program row it leaves.
             self.record_location(address, owner);
         }
+        // Explicit: a Program row click sets its row kind afterwards.
+        self.program.cursor = None;
         if self
             .info
             .as_ref()
@@ -6600,12 +6602,10 @@ impl DesktopApp {
                 self.comment_owners.insert(selected, view.address);
             }
             if departure.is_none()
+                && let Some(place) = self.current_place()
                 && let Some(previous) = self.history.get_mut(self.history_index)
             {
-                *previous = self.data_location.map_or(
-                    crate::linkage_ui::Place::Code(selected),
-                    |(address, length)| crate::linkage_ui::Place::Data { address, length },
-                );
+                *previous = place;
             }
         }
         self.history.truncate(self.history_index + 1);
@@ -7534,7 +7534,15 @@ impl DesktopApp {
                 self.navigate_location(address, None, true, context);
             }
             crate::linkage_ui::Place::Data { address, length } => {
-                self.navigate_data(address, length, context);
+                // A slot or data export lands on its Program row.
+                if address == 0 || !self.land_destination(address, length, true, context) {
+                    self.navigate_data(address, length, context);
+                }
+            }
+            crate::linkage_ui::Place::Listing { address, .. } => {
+                if address == 0 || !self.land_destination(address, 1, true, context) {
+                    self.navigate_data(address, 1, context);
+                }
             }
         }
         // X now follows the destination's selection.
@@ -7597,6 +7605,10 @@ impl DesktopApp {
                     crate::linkage_ui::Place::Data { address, .. } => XrefTarget {
                         address,
                         kind: TargetKind::DataAccess,
+                    },
+                    crate::linkage_ui::Place::Listing { address, .. } => XrefTarget {
+                        address,
+                        kind: TargetKind::Address,
                     },
                 }),
         )
@@ -10106,11 +10118,15 @@ impl DesktopApp {
         }
     }
 
-    /// Exact bytes in Hex, recorded for Back/Forward. Unlike linkage places,
-    /// a validated mapping at address zero is a real destination here.
+    /// Exact bytes recorded for Back/Forward: their Program row in Program
+    /// scope, else (or without an exact row) Hex. Unlike linkage places, a
+    /// validated mapping at address zero is a real destination here.
     fn open_search_data(&mut self, address: u64, length: u64, context: &egui::Context) {
         self.string_focus = None;
         self.linkage_focus = false;
+        if self.land_destination(address, length, true, context) {
+            return;
+        }
         self.record_destination(crate::linkage_ui::Place::Data { address, length }, address);
         self.open_data(address, length, context);
     }
@@ -13682,10 +13698,23 @@ mod tests {
         assert_eq!(app.pending_listing_scroll, Some(2));
         app.update_comment_rows();
         assert!(app.comment_rows.rows.contains(&CodeRow::Comment(0x1008)));
-        // An address numerically between symbols has no known owner.
+        // An address numerically between symbols has no known owner: it
+        // opens in Hex, never as a guessed function.
+        let selection = app.selection_generation;
         app.navigate_annotation(0x1020, true, &context);
-        assert_eq!(app.reference_focus, Some((0x1020, 0x1020)));
+        assert_eq!(app.reference_focus, None);
         assert_eq!(app.selected, Some(0x1020));
+        assert_eq!(app.tab, Tab::Hex);
+        assert_eq!(app.data_location, Some((0x1020, 1)));
+        assert_eq!(app.view().unwrap().address, 0x1000);
+        assert_eq!(app.result_scope, Some(0x1000));
+        assert!(!app.queue.iter().any(|r| matches!(r, Request::Graph { .. })));
+        assert!(
+            app.pending
+                .as_ref()
+                .is_none_or(|p| !matches!(p.request, Request::Graph { .. }))
+        );
+        assert_ne!(app.selection_generation, selection);
     }
 
     pub(super) fn text_position(
