@@ -637,6 +637,7 @@ mod tests {
             },
         );
         let strings = vec![StringEntry {
+            length: None,
             address: 0x30,
             text: "hello".into(),
             encoding: "ascii".into(),

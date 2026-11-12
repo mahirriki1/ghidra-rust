@@ -10,18 +10,25 @@
 //! collapsed `??` rows around them are clipped to the intervals. Decoded
 //! instructions, pending bodies and zero-filled tails ignore expansions.
 //!
-//! Body rows are derived in two steps. `Layout::unexpanded` finds the row
+//! Body rows are derived in three steps. `Layout::unexpanded` finds the row
 //! covering an address from decoded runs, entries and section bounds; an
 //! undefined zone it returns is then split by `Layout::undefined` into byte
-//! rows and the collapsed parts between intervals. Further evidence (data
-//! rows, split marks) belongs in the first step, clipping the undefined zone
-//! as entries do; because expanded intervals override data rows, a data row
-//! overlapping an interval falls back to its undefined zone there.
+//! rows and the collapsed parts between intervals; `Layout::collapsed` then
+//! divides a collapsed part by evidence. Because expanded intervals override
+//! data rows, an item overlapping an interval is no row and its bytes fall
+//! back to the zone there.
+//!
+//! The evidence is the session's [`ListingEvidence`]: inside one collapsed
+//! part, an item whose whole span lies in that part is one [`Row::Data`];
+//! others are omitted whole and their bytes stay `??`. Split marks clip the
+//! collapsed parts and zero-filled tails outside admitted items, without
+//! reading any bytes. Every query is a logarithmic lookup in the index.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::function_presentation::{Listing, ListingIndex};
+use crate::listing_evidence::{EvidenceKind, ListingEvidence};
 use crate::model::{FunctionInfo, FunctionView, MAX_BYTE_READ, SectionInfo, function_at};
 use crate::result_store::{Bytes, ProgramContext, RESULT_STORE_BUDGET};
 
@@ -82,6 +89,14 @@ pub enum Row {
     Byte {
         address: u64,
     },
+    /// Undefined file-backed bytes an evidence item spans: an import slot,
+    /// an absolute pointer-table witness or a scanned string candidate.
+    /// Nothing is defined there; the bytes stay `??`.
+    Data {
+        start: u64,
+        end: u64,
+        kind: EvidenceKind,
+    },
 }
 
 impl Row {
@@ -93,6 +108,7 @@ impl Row {
             | Self::Undefined { start, .. }
             | Self::ZeroFill { start, .. }
             | Self::Pending { start, .. }
+            | Self::Data { start, .. }
             | Self::Byte { address: start } => Position::new(start, Rank::Body),
         }
     }
@@ -104,7 +120,8 @@ impl Row {
             Self::Instruction { start, end, .. }
             | Self::Undefined { start, end }
             | Self::ZeroFill { start, end }
-            | Self::Pending { start, end, .. } => Some((start, end)),
+            | Self::Pending { start, end, .. }
+            | Self::Data { start, end, .. } => Some((start, end)),
             Self::Byte { address } => Some((address, address + 1)),
         }
     }
@@ -216,7 +233,8 @@ impl ProgramRows {
     }
 
     /// Navigation over these rows, the current inventory, which must be
-    /// ordered by address, and the expanded byte intervals.
+    /// ordered by address, and the expanded byte intervals; evidence is
+    /// added by [`Layout::with_evidence`].
     pub fn layout<'a>(
         &'a self,
         functions: &'a [FunctionInfo],
@@ -226,6 +244,7 @@ impl ProgramRows {
             rows: self,
             functions,
             expansions,
+            evidence: None,
         }
     }
 
@@ -262,6 +281,17 @@ pub struct Layout<'a> {
     rows: &'a ProgramRows,
     functions: &'a [FunctionInfo],
     expansions: &'a Expansions,
+    evidence: Option<&'a ListingEvidence>,
+}
+
+impl<'a> Layout<'a> {
+    /// This layout with the data rows and split marks of `evidence`.
+    pub fn with_evidence(self, evidence: &'a ListingEvidence) -> Self {
+        Self {
+            evidence: Some(evidence),
+            ..self
+        }
+    }
 }
 
 impl Layout<'_> {
@@ -287,13 +317,17 @@ impl Layout<'_> {
     fn body(&self, span: &Span, address: u64) -> Row {
         match self.unexpanded(span, address) {
             Row::Undefined { start, end } => self.undefined(address, start, end),
+            Row::ZeroFill { start, end } => {
+                let (start, end) = self.split(address, start, end);
+                Row::ZeroFill { start, end }
+            }
             row => row,
         }
     }
 
     /// An undefined zone `[start, end)` holding `address`, under the
     /// expansions: a byte row inside an interval, else the collapsed part
-    /// between the neighbouring intervals.
+    /// between the neighbouring intervals, which evidence may divide.
     fn undefined(&self, address: u64, start: u64, end: u64) -> Row {
         let expansions = &self.expansions.ranges;
         let before = expansions.range(..=address).next_back();
@@ -305,7 +339,58 @@ impl Layout<'_> {
             .range(address + 1..)
             .next()
             .map_or(end, |(&interval_start, _)| end.min(interval_start));
+        self.collapsed(address, start, end)
+    }
+
+    /// The collapsed undefined part `[start, end)` holding `address`, under
+    /// the evidence: the data row of an item lying wholly inside the part,
+    /// else the bytes between the neighbouring admitted items and split
+    /// marks. Marks inside admitted items divide nothing. An item starting
+    /// at a function entry (one whose view failed, so its part begins there)
+    /// is never admitted: an entry's bytes are not data evidence.
+    fn collapsed(&self, address: u64, start: u64, end: u64) -> Row {
+        let Some(evidence) = self.evidence else {
+            return Row::Undefined { start, end };
+        };
+        let admitted = |item: &crate::listing_evidence::Evidence| {
+            start <= item.start && item.end <= end && !(item.start == start && self.is_entry(start))
+        };
+        if let Some(item) = evidence.covering(address)
+            && admitted(item)
+        {
+            return Row::Data {
+                start: item.start,
+                end: item.end,
+                kind: item.kind,
+            };
+        }
+        // Items are disjoint and ordered, so only the nearest one on each
+        // side can be admitted: any farther one lies beyond its neighbour,
+        // which already crosses the part's bound or starts at its entry.
+        let mut low = start;
+        if let Some(item_end) = evidence.prev_end_before(address.saturating_add(1))
+            && item_end > low
+            && evidence.covering(item_end - 1).is_some_and(admitted)
+        {
+            low = item_end;
+        }
+        let mut high = end;
+        if let Some(item_start) = evidence.next_start_after(address)
+            && item_start < high
+            && evidence.covering(item_start).is_some_and(admitted)
+        {
+            high = item_start;
+        }
+        let (start, end) = marks_around(evidence, address, low, high);
         Row::Undefined { start, end }
+    }
+
+    /// `[start, end)` holding `address`, clipped to the nearest split marks.
+    fn split(&self, address: u64, start: u64, end: u64) -> (u64, u64) {
+        match self.evidence {
+            Some(evidence) => marks_around(evidence, address, start, end),
+            None => (start, end),
+        }
     }
 
     /// The body row covering `address` without expansions.
@@ -516,6 +601,20 @@ impl Layout<'_> {
         }
         self.resolve(Position::new(address, Rank::Body))
     }
+}
+
+/// `[start, end)` holding `address`, clipped to the split marks nearest it:
+/// the last at or before `address` and the first after it.
+fn marks_around(evidence: &ListingEvidence, address: u64, start: u64, end: u64) -> (u64, u64) {
+    let start = evidence
+        .prev_split_before(address.saturating_add(1))
+        .filter(|&mark| mark > start)
+        .unwrap_or(start);
+    let end = evidence
+        .next_split_after(address)
+        .filter(|&mark| mark < end)
+        .unwrap_or(end);
+    (start, end)
 }
 
 /// Bytes one expand action shows as byte rows; the rest of the gap stays one
@@ -1658,5 +1757,469 @@ mod tests {
             cache.fail(0x10000 + start * 0x1000);
         }
         assert_eq!(cache.next(&[page(0x700)], &[]), None);
+    }
+}
+
+#[cfg(test)]
+mod evidence_tests {
+    use super::*;
+    use crate::call_analysis::CallIndex;
+    use crate::listing_evidence::EvidenceKind;
+    use crate::model::{BasicBlock, BinaryInfo, Instruction, StringEntry};
+    use crate::session::{Annotation, Session};
+
+    static NONE: Expansions = Expansions {
+        ranges: BTreeMap::new(),
+        epoch: 0,
+    };
+
+    fn section(address: u64, size: u64, file_size: u64) -> SectionInfo {
+        SectionInfo {
+            name: format!("s{address:x}"),
+            address,
+            size,
+            file_offset: 0,
+            file_size,
+            executable: false,
+        }
+    }
+
+    fn info(sections: &[SectionInfo]) -> BinaryInfo {
+        let mut info: BinaryInfo = serde_json::from_value(serde_json::json!({
+            "path": "", "format": "ELF", "architecture": "x86-64", "entry": 0,
+            "sha256": "", "file_len": 0, "sections": [], "functions": [],
+            "functions_truncated": false, "warnings": []
+        }))
+        .unwrap();
+        info.sections = sections.to_vec();
+        info
+    }
+
+    fn string(address: u64, length: u32) -> StringEntry {
+        StringEntry {
+            address,
+            length: Some(length),
+            text: "s".repeat(length as usize),
+            encoding: "ASCII".into(),
+        }
+    }
+
+    fn labelled(addresses: &[u64]) -> Session {
+        let mut session = Session::new(String::new());
+        for &address in addresses {
+            session.annotations.insert(
+                address,
+                Annotation {
+                    label: format!("g_{address:x}"),
+                    ..Default::default()
+                },
+            );
+        }
+        session
+    }
+
+    fn slot_linkage(slot: u64) -> crate::linkage::Linkage {
+        crate::linkage::Linkage {
+            digest: String::new(),
+            libraries: Box::new([]),
+            exports: Box::new([]),
+            gaps: Box::new([]),
+            locations: Box::new([]),
+            imports: vec![crate::linkage::Import {
+                id: 0,
+                raw: Some("printf".into()),
+                display: None,
+                ordinal: None,
+                library: None,
+                scope: None,
+                version: None,
+                kind: crate::linkage::ImportKind::Normal,
+                weak: false,
+                slot: Some(slot),
+                stub: None,
+            }]
+            .into_boxed_slice(),
+        }
+    }
+
+    fn view(entry: u64, instructions: &[(u64, usize)]) -> FunctionView {
+        FunctionView {
+            address: entry,
+            blocks: vec![BasicBlock {
+                address: entry,
+                instructions: instructions
+                    .iter()
+                    .map(|&(address, length)| Instruction {
+                        address,
+                        bytes: vec![0x90; length],
+                        mnemonic: "nop".into(),
+                        operands: String::new(),
+                    })
+                    .collect(),
+            }],
+            edges: vec![],
+            calls: vec![],
+            warnings: vec![],
+        }
+    }
+
+    fn rows(sections: &[SectionInfo], views: &[FunctionView]) -> ProgramRows {
+        failed_rows(sections, views, &[])
+    }
+
+    fn failed_rows(
+        sections: &[SectionInfo],
+        views: &[FunctionView],
+        failed: &[u64],
+    ) -> ProgramRows {
+        let indexes: Vec<_> = views.iter().map(ListingIndex::new).collect();
+        ProgramRows::new(
+            sections,
+            views.iter().zip(&indexes).map(|(view, index)| BodySource {
+                owner: view.address,
+                listing: index.listing(view),
+            }),
+            failed.iter().copied(),
+        )
+    }
+
+    fn functions(entries: &[u64]) -> Vec<FunctionInfo> {
+        entries
+            .iter()
+            .map(|&address| FunctionInfo {
+                address,
+                name: format!("f{address:x}"),
+            })
+            .collect()
+    }
+
+    /// Every row forward, checked to be the exact reverse of walking back
+    /// and to partition the mapped bytes once, in increasing positions.
+    fn walk(layout: &Layout<'_>, sections: &[SectionInfo]) -> Vec<Row> {
+        let mut all = Vec::new();
+        let mut row = layout.first();
+        while let Some(current) = row {
+            assert!(all.len() < 20_000, "forward iteration terminates");
+            all.push(current);
+            row = layout.next(&current);
+        }
+        let mut back = Vec::new();
+        let mut row = layout.last();
+        while let Some(current) = row {
+            assert!(back.len() < 20_000, "backward iteration terminates");
+            back.push(current);
+            row = layout.previous(&current);
+        }
+        back.reverse();
+        assert_eq!(back, all, "backward = reverse of forward");
+        for pair in all.windows(2) {
+            assert!(pair[0].position() < pair[1].position(), "{pair:?}");
+        }
+        let mut covered: Vec<(u64, u64)> = Vec::new();
+        for (start, end) in all.iter().filter_map(Row::span) {
+            match covered.last_mut() {
+                Some(last) if last.1 == start => last.1 = end,
+                _ => covered.push((start, end)),
+            }
+        }
+        let mut expected: Vec<(u64, u64)> = Vec::new();
+        for s in sections.iter().filter(|s| s.size > 0) {
+            match expected.last_mut() {
+                Some(last) if last.1 == s.address => last.1 = s.address + s.size,
+                _ => expected.push((s.address, s.address + s.size)),
+            }
+        }
+        assert_eq!(covered, expected, "mapped bytes are covered exactly once");
+        for (index, row) in all.iter().enumerate() {
+            assert_eq!(layout.resolve(row.position()), Some(*row));
+            if index > 0 {
+                assert_eq!(layout.previous(row), Some(all[index - 1]));
+            }
+        }
+        all
+    }
+
+    fn data(start: u64, end: u64, kind: EvidenceKind) -> Row {
+        Row::Data { start, end, kind }
+    }
+
+    #[test]
+    fn strings_over_decoded_code_or_an_entry_are_no_rows() {
+        let sections = [section(0x1000, 0x100, 0x100)];
+        let strings = [string(0x1006, 4), string(0x1010, 8), string(0x1040, 0x10)];
+        let evidence = ListingEvidence::build(&info(&sections), None, [], &strings, None, None)
+            .expect("valid sections");
+        let program = rows(&sections, &[view(0x1000, &[(0x1000, 4), (0x1004, 4)])]);
+        // 0x1048 is an entry whose body has not loaded.
+        let inventory = functions(&[0x1000, 0x1048]);
+        let layout = program.layout(&inventory, &NONE).with_evidence(&evidence);
+        let all = walk(&layout, &sections);
+        assert!(all.contains(&data(0x1010, 0x1018, EvidenceKind::String(1))));
+        let data_rows: Vec<_> = all
+            .iter()
+            .filter(|row| matches!(row, Row::Data { .. }))
+            .collect();
+        assert_eq!(data_rows.len(), 1, "{data_rows:?}");
+        // The bytes the string shares with code stay undefined around it.
+        assert!(all.contains(&Row::Undefined {
+            start: 0x1008,
+            end: 0x1010
+        }));
+        assert!(all.contains(&Row::Undefined {
+            start: 0x1018,
+            end: 0x1048
+        }));
+        assert!(all.contains(&Row::Pending {
+            entry: 0x1048,
+            start: 0x1048,
+            end: 0x1100
+        }));
+    }
+
+    #[test]
+    fn no_evidence_row_starts_at_a_function_entry_whose_view_failed() {
+        let sections = [section(0x1000, 0x100, 0x100)];
+        // A prologue such as `41 57 41 56 …` reads as "AWAVAUATUS".
+        let strings = [string(0x1040, 10), string(0x1060, 8)];
+        let evidence =
+            ListingEvidence::build(&info(&sections), None, [], &strings, None, None).unwrap();
+        let program = failed_rows(&sections, &[], &[0x1040]);
+        let inventory = functions(&[0x1040]);
+        let layout = program.layout(&inventory, &NONE).with_evidence(&evidence);
+        let all = walk(&layout, &sections);
+        let header = all
+            .iter()
+            .position(|row| *row == Row::Function { entry: 0x1040 })
+            .unwrap();
+        assert_eq!(
+            all[header + 1..],
+            [
+                Row::Undefined {
+                    start: 0x1040,
+                    end: 0x1060
+                },
+                data(0x1060, 0x1068, EvidenceKind::String(1)),
+                Row::Undefined {
+                    start: 0x1068,
+                    end: 0x1100
+                },
+            ]
+        );
+        assert_eq!(layout.cursor(0x104a, None), None, "the string ends nowhere");
+    }
+
+    #[test]
+    fn a_slot_beats_an_overlapping_string_and_interior_marks_keep_one_row() {
+        let sections = [section(0x2000, 0x100, 0x100)];
+        let strings = [string(0x200c, 8), string(0x2040, 0x10)];
+        let mut calls = CallIndex::new(Default::default());
+        calls.data_incoming.insert(0x2048, vec![0]);
+        let session = labelled(&[0x2044, 0x2060]);
+        let linkage = slot_linkage(0x2010);
+        let evidence = ListingEvidence::build(
+            &info(&sections),
+            Some(&linkage),
+            [],
+            &strings,
+            Some(&calls),
+            Some(&session),
+        )
+        .unwrap();
+        let program = rows(&sections, &[]);
+        let layout = program.layout(&[], &NONE).with_evidence(&evidence);
+        let all = walk(&layout, &sections);
+        assert!(all.contains(&data(0x2010, 0x2018, EvidenceKind::ImportSlot(0))));
+        assert!(all.contains(&Row::Undefined {
+            start: 0x2000,
+            end: 0x2010
+        }));
+        // Marks inside the string neither split nor suppress it; they are
+        // its hover data.
+        let string_row = data(0x2040, 0x2050, EvidenceKind::String(1));
+        assert!(all.contains(&string_row));
+        let item = *evidence.covering(0x2048).unwrap();
+        assert_eq!(
+            evidence.marks_within(&item).collect::<Vec<_>>(),
+            [0x2044, 0x2048]
+        );
+        // A mark outside any item splits the gap and starts a row.
+        assert!(all.contains(&Row::Undefined {
+            start: 0x2050,
+            end: 0x2060
+        }));
+        assert!(all.contains(&Row::Undefined {
+            start: 0x2060,
+            end: 0x2100
+        }));
+        assert_eq!(
+            layout.cursor(0x2060, None),
+            Some(Row::Undefined {
+                start: 0x2060,
+                end: 0x2100
+            })
+        );
+        assert_eq!(layout.cursor(0x2044, None), None, "inside an item");
+    }
+
+    #[test]
+    fn split_marks_make_zero_fill_addressable_without_byte_pages() {
+        let sections = [section(0x3000, 0x1000, 0x10)];
+        let session = labelled(&[0x3008, 0x3100, 0x3800]);
+        let evidence =
+            ListingEvidence::build(&info(&sections), None, [], &[], None, Some(&session)).unwrap();
+        let program = rows(&sections, &[]);
+        let layout = program.layout(&[], &NONE).with_evidence(&evidence);
+        let all = walk(&layout, &sections);
+        let body: Vec<Row> = all.into_iter().skip(1).collect();
+        assert_eq!(
+            body,
+            [
+                Row::Undefined {
+                    start: 0x3000,
+                    end: 0x3008
+                },
+                Row::Undefined {
+                    start: 0x3008,
+                    end: 0x3010
+                },
+                Row::ZeroFill {
+                    start: 0x3010,
+                    end: 0x3100
+                },
+                Row::ZeroFill {
+                    start: 0x3100,
+                    end: 0x3800
+                },
+                Row::ZeroFill {
+                    start: 0x3800,
+                    end: 0x4000
+                },
+            ]
+        );
+        for address in [0x3100, 0x3800] {
+            assert!(matches!(
+                layout.cursor(address, None),
+                Some(Row::ZeroFill { start, .. }) if start == address
+            ));
+            assert_eq!(layout.byte_page(address), None, "zero-fill is never read");
+        }
+        // Without evidence the tail stays one row.
+        let plain = program.layout(&[], &NONE);
+        assert_eq!(
+            plain.cursor(0x3010, None),
+            Some(Row::ZeroFill {
+                start: 0x3010,
+                end: 0x4000
+            })
+        );
+    }
+
+    #[test]
+    fn expanded_intervals_override_data_rows_inside_them() {
+        let sections = [section(0x1000, 0x40, 0x40)];
+        let strings = [string(0x1010, 8), string(0x1020, 8)];
+        let evidence =
+            ListingEvidence::build(&info(&sections), None, [], &strings, None, None).unwrap();
+        let program = rows(&sections, &[]);
+        let mut expansions = Expansions::default();
+        expansions.expand(0x100c, 0x1014, None);
+        let layout = program.layout(&[], &expansions).with_evidence(&evidence);
+        let all = walk(&layout, &sections);
+        assert!(
+            !all.iter()
+                .any(|row| matches!(row, Row::Data { start: 0x1010, .. }))
+        );
+        assert!(all.contains(&Row::Byte { address: 0x1010 }));
+        // The rest of the overridden string stays a collapsed `??` part,
+        // and the next string still is a row.
+        assert!(all.contains(&Row::Undefined {
+            start: 0x1014,
+            end: 0x1020
+        }));
+        assert!(all.contains(&data(0x1020, 0x1028, EvidenceKind::String(1))));
+        // A data row never expands.
+        assert_eq!(
+            expand_interval(&data(0x1020, 0x1028, EvidenceKind::String(1))),
+            None
+        );
+    }
+
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn below(&mut self, bound: u64) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 33) % bound.max(1)
+        }
+    }
+
+    #[test]
+    fn random_evidence_partitions_bytes_once_and_reverses_exactly() {
+        let mut random = Lcg(11);
+        let sections = [
+            section(0x1000, 0x200, 0x180),
+            section(0x1200, 0x80, 0x80),
+            section(0x2000, 0x100, 0x20),
+        ];
+        let views = [
+            view(0x1000, &[(0x1000, 4), (0x1004, 3)]),
+            view(0x1100, &[(0x1100, 2), (0x1130, 5)]),
+        ];
+        // 0x1180's view failed: its zone starts at its entry.
+        let program = failed_rows(&sections, &views, &[0x1180]);
+        let inventory = functions(&[0x1000, 0x1100, 0x1180, 0x1240]);
+        let mut shown = 0;
+        for _ in 0..40 {
+            let strings: Vec<StringEntry> = (0..random.below(24))
+                .map(|_| {
+                    let s = &sections[random.below(3) as usize];
+                    string(
+                        s.address + random.below(s.size),
+                        random.below(0x30) as u32 + 1,
+                    )
+                })
+                .collect();
+            let marks: Vec<u64> = (0..random.below(16))
+                .map(|_| {
+                    let s = &sections[random.below(3) as usize];
+                    s.address + random.below(s.size)
+                })
+                .collect();
+            let session = labelled(&marks);
+            let evidence =
+                ListingEvidence::build(&info(&sections), None, [], &strings, None, Some(&session))
+                    .unwrap();
+            let mut expansions = Expansions::default();
+            for _ in 0..random.below(3) {
+                let start = 0x1000 + random.below(0x200);
+                expansions.expand(start, start + random.below(0x40) + 1, None);
+            }
+            let layout = program
+                .layout(&inventory, &expansions)
+                .with_evidence(&evidence);
+            for row in walk(&layout, &sections) {
+                match row {
+                    Row::Data { start, end, kind } => {
+                        shown += 1;
+                        assert!(!inventory.iter().any(|f| f.address == start));
+                        let item = evidence.covering(start).unwrap();
+                        assert_eq!((item.start, item.end, item.kind), (start, end, kind));
+                        assert!((start..end).all(|a| expansions.covering(a).is_none()));
+                    }
+                    Row::Undefined { start, end } | Row::ZeroFill { start, end } => {
+                        assert_eq!(
+                            evidence.split_marks(start + 1, end).count(),
+                            0,
+                            "{row:?} holds a mark"
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(shown > 20, "{shown} data rows");
     }
 }

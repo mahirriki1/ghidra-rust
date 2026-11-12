@@ -84,6 +84,7 @@ fn legacy_macho_projects_migrate_exact_stub_additions_and_keep_annotations() {
         decompiled: None,
         mappings: vec![],
         strings: vec![ghidra_rust::model::StringEntry {
+            length: None,
             address: base,
             text: "cached".into(),
             encoding: "ASCII".into(),

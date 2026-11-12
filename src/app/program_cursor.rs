@@ -4,9 +4,12 @@
 //! PageUp/PageDown cross functions and gaps; Home/End stay within the
 //! cursor's function, expanded byte run or (on a header or gap without
 //! one) section; Ctrl+Home/End reach the program's first and last rows.
-//! Enter follows an instruction's target, or expands a `??` row and
-//! collapses a byte row's run. `DesktopApp.selected` stays the cursor's
-//! address; the row's rank only tells rows sharing that address apart.
+//! Enter follows an instruction's target, expands a `??` row, collapses a
+//! byte row's run, or opens the function a pointer-table witness row points
+//! at; on import slot and string rows it does nothing. Data rows are stops
+//! without an owner: they never follow, and Home/End reach their section's
+//! bounds. `DesktopApp.selected` stays the cursor's address; the row's rank
+//! only tells rows sharing that address apart.
 //!
 //! Once the cursor rests in a function other than the displayed one, the
 //! Decompiler and Function Graph follow it: [`FOLLOW_REST`] after the last
@@ -40,7 +43,10 @@ pub(super) struct Follow {
 impl DesktopApp {
     pub(super) fn program_layout(&self) -> Option<Layout<'_>> {
         let rows = self.program.current_rows(self.generation)?;
-        Some(rows.layout(&self.info.as_ref()?.functions, &self.program.expanded))
+        Some(
+            rows.layout(&self.info.as_ref()?.functions, &self.program.expanded)
+                .with_evidence(&self.program.evidence.index),
+        )
     }
 
     /// The row the cursor stands on: exactly a row starting at `selected`,
@@ -69,6 +75,7 @@ impl DesktopApp {
         let mut moved = false;
         let mut follow = None;
         let mut toggle = None;
+        let mut witness = None;
         let held = context.input_mut(|input| {
             filter_keys(&mut input.events, held, command, true, |action| {
                 let Some(layout) = layout else {
@@ -84,9 +91,13 @@ impl DesktopApp {
                         Some(row @ (Row::Undefined { .. } | Row::Byte { .. })) => {
                             toggle = Some(row);
                         }
+                        Some(Row::Data {
+                            kind: crate::listing_evidence::EvidenceKind::Pointer { entry, .. },
+                            ..
+                        }) => witness = Some(entry),
                         _ => {}
                     }
-                    return follow.is_some() || toggle.is_some();
+                    return follow.is_some() || toggle.is_some() || witness.is_some();
                 }
                 if let Some(next) = self.program_step(&layout, row, action, page) {
                     row = Some(next);
@@ -106,6 +117,11 @@ impl DesktopApp {
         if let Some((owner, target)) = follow {
             self.program.follow = None;
             self.follow_row_target(owner, target, context);
+            context.request_repaint();
+            return 0;
+        }
+        if let Some(entry) = witness {
+            self.follow_witness(entry, context);
             context.request_repaint();
             return 0;
         }
@@ -164,7 +180,7 @@ impl DesktopApp {
     /// The rows Home and End reach from `row`: its function's first and
     /// last decoded instructions; an expanded run's first and last bytes
     /// from a byte row; a section's first and last rows from a section
-    /// header, gap or zero-filled tail.
+    /// header, gap, data row or zero-filled tail.
     fn row_extent(&self, layout: &Layout<'_>, row: Row) -> Option<(Row, Row)> {
         match row {
             Row::Byte { address } => {
@@ -176,6 +192,7 @@ impl DesktopApp {
             | Row::Instruction { owner: entry, .. } => self.function_extent(layout, entry),
             Row::Section { start, .. }
             | Row::Undefined { start, .. }
+            | Row::Data { start, .. }
             | Row::ZeroFill { start, .. } => layout.section_bounds(start),
         }
     }
@@ -1357,5 +1374,462 @@ mod tests {
         h.app.select_instruction(0x1010);
         h.tap(egui::Key::Enter, none);
         assert!(h.app.program.expanded.is_empty(), "not clicked");
+    }
+
+    fn string(address: u64, length: u32) -> crate::model::StringEntry {
+        crate::model::StringEntry {
+            address,
+            length: Some(length),
+            text: "s".repeat(length as usize),
+            encoding: "ASCII".into(),
+        }
+    }
+
+    fn witness(source: u64, entry: u64) -> crate::model::FunctionAdmission {
+        crate::model::FunctionAdmission {
+            source,
+            entry,
+            reason: crate::model::AdmissionReason::PointerTable,
+            encoding: crate::model::PointerEncoding::Absolute,
+            owner: None,
+            boundary: crate::model::BoundaryEvidence::Fde,
+            table: None,
+        }
+    }
+
+    /// [`program_app`] plus evidence: a string over `entry`'s code (no
+    /// row), a string in the first `.text` gap, an import slot, a pointer
+    /// witness to `next` and a string in `.data`, and a labelled global and
+    /// an exported one in a new zero-filled `.bss`.
+    fn evidence_app() -> DesktopApp {
+        let context = egui::Context::default();
+        let mut app = program_app();
+        app.info.as_mut().unwrap().sections.push(SectionInfo {
+            name: ".bss".into(),
+            address: 0x3000,
+            size: 0x1000,
+            file_offset: 0x140,
+            file_size: 0,
+            executable: false,
+        });
+        app.strings = vec![string(0x100a, 4), string(0x1018, 8), string(0x2018, 8)];
+        app.source_epochs.bump_strings();
+        app.linkage.build(
+            crate::linkage::Linkage {
+                digest: String::new(),
+                libraries: Box::new([]),
+                exports: vec![crate::linkage::Export {
+                    id: 0,
+                    raw: Some("g_export".into()),
+                    display: None,
+                    ordinal: None,
+                    version: None,
+                    target: crate::linkage::ExportTarget::Data { address: 0x3800 },
+                }]
+                .into_boxed_slice(),
+                gaps: Box::new([]),
+                locations: Box::new([]),
+                imports: vec![crate::linkage::Import {
+                    id: 0,
+                    raw: Some("printf".into()),
+                    display: None,
+                    ordinal: None,
+                    library: None,
+                    scope: None,
+                    version: None,
+                    kind: crate::linkage::ImportKind::Normal,
+                    weak: false,
+                    slot: Some(0x2000),
+                    stub: None,
+                }]
+                .into_boxed_slice(),
+            },
+            &context,
+        );
+        for _ in 0..5000 {
+            app.poll_linkage();
+            if app.linkage.prepared().is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(app.linkage.prepared().is_some());
+        let mut state = crate::discovery::Discovery::new(None, [0x1000], false);
+        state
+            .pointer_recovery
+            .admissions
+            .insert(0x1040, witness(0x2010, 0x1040));
+        app.discovery = Some(state);
+        app.session.as_mut().unwrap().annotations.insert(
+            0x3100,
+            crate::session::Annotation {
+                label: "g_counter".into(),
+                ..Default::default()
+            },
+        );
+        app.revision += 1;
+        app
+    }
+
+    fn data(start: u64, end: u64, kind: crate::listing_evidence::EvidenceKind) -> Row {
+        Row::Data { start, end, kind }
+    }
+
+    fn undefined(start: u64, end: u64) -> Row {
+        Row::Undefined { start, end }
+    }
+
+    fn at(h: &Harness, address: u64) -> Option<Row> {
+        h.app.program_layout()?.cursor(address, None)
+    }
+
+    #[test]
+    fn data_rows_are_owner_less_stops_and_up_down_stay_exact() {
+        use crate::listing_evidence::EvidenceKind::{ImportSlot, Pointer, String};
+        let mut h = Harness::new(evidence_app());
+        h.click(0x1000);
+        h.tap(egui::Key::ArrowUp, egui::Modifiers::NONE);
+        let down = walk(&mut h);
+        let tail: Vec<Row> = down
+            .iter()
+            .copied()
+            .skip_while(|row| {
+                *row != Row::Section {
+                    section: 1,
+                    start: 0x2000,
+                }
+            })
+            .collect();
+        assert_eq!(
+            tail,
+            [
+                Row::Section {
+                    section: 1,
+                    start: 0x2000
+                },
+                data(0x2000, 0x2008, ImportSlot(0)),
+                undefined(0x2008, 0x2010),
+                data(
+                    0x2010,
+                    0x2018,
+                    Pointer {
+                        source: 0x2010,
+                        entry: 0x1040
+                    }
+                ),
+                data(0x2018, 0x2020, String(2)),
+                undefined(0x2020, 0x2040),
+                Row::Section {
+                    section: 2,
+                    start: 0x3000
+                },
+                Row::ZeroFill {
+                    start: 0x3000,
+                    end: 0x3100
+                },
+                Row::ZeroFill {
+                    start: 0x3100,
+                    end: 0x3800
+                },
+                Row::ZeroFill {
+                    start: 0x3800,
+                    end: 0x4000
+                },
+            ]
+        );
+        // The string in the `.text` gap is a row; the one over code is not.
+        assert!(down.contains(&data(0x1018, 0x1020, String(1))));
+        assert!(down.contains(&undefined(0x1010, 0x1018)));
+        assert!(
+            !down
+                .iter()
+                .any(|row| matches!(row, Row::Data { start: 0x100a, .. }))
+        );
+        // Walking back up visits exactly the same rows.
+        let mut up = Vec::new();
+        for _ in 0..down.len() {
+            up.push(h.cursor().unwrap());
+            assert_eq!(h.app.selected, Some(up.last().unwrap().position().address));
+            h.tap(egui::Key::ArrowUp, egui::Modifiers::NONE);
+        }
+        up.reverse();
+        assert_eq!(up, down);
+        // Data rows have no owner: resting on one never follows, and the
+        // graph shows nothing related.
+        h.click(0x2018);
+        assert_eq!(h.cursor(), Some(data(0x2018, 0x2020, String(2))));
+        assert!(h.app.program.follow.is_none());
+        assert!(h.app.semantic.addresses.is_empty());
+        for _ in 0..3 {
+            h.frame(vec![]);
+        }
+        assert_eq!(h.graph_requests(), 0);
+        // Home and End reach the section's bounds.
+        h.tap(egui::Key::Home, egui::Modifiers::NONE);
+        assert_eq!(
+            h.cursor(),
+            Some(Row::Section {
+                section: 1,
+                start: 0x2000
+            })
+        );
+        h.tap(egui::Key::End, egui::Modifiers::NONE);
+        assert_eq!(h.cursor(), Some(undefined(0x2020, 0x2040)));
+    }
+
+    #[test]
+    fn enter_opens_a_witness_target_with_history_but_not_slots_or_strings() {
+        let mut h = Harness::new(evidence_app());
+        for address in [0x2000, 0x2018] {
+            h.click(address);
+            let (history, scope) = (h.app.history.clone(), h.app.result_scope);
+            h.tap(egui::Key::Enter, egui::Modifiers::NONE);
+            assert_eq!(h.app.selected, Some(address));
+            assert_eq!(h.app.history, history);
+            assert_eq!(h.app.result_scope, scope);
+            assert_eq!(h.graph_requests(), 0);
+            assert!(h.app.program.expanded.is_empty(), "data rows never expand");
+        }
+        h.click(0x2010);
+        let before = h.app.history.len();
+        h.tap(egui::Key::Enter, egui::Modifiers::NONE);
+        assert_eq!(h.app.result_scope, Some(0x1040));
+        assert_eq!(h.app.selected, Some(0x1040));
+        assert!(h.app.history.len() > before, "recorded in history");
+        // Double-clicking the witness row does the same.
+        h.app.navigate(0x1000, true, &h.context.clone());
+        let point = h.point(0x2010);
+        h.double_click(point);
+        assert_eq!(h.app.result_scope, Some(0x1040));
+    }
+
+    #[test]
+    fn zero_fill_marks_are_addressable_without_reading_bytes() {
+        let mut h = Harness::new(evidence_app());
+        h.click(0x3100);
+        assert_eq!(
+            h.cursor(),
+            Some(Row::ZeroFill {
+                start: 0x3100,
+                end: 0x3800
+            })
+        );
+        h.frame(vec![]);
+        assert!(h.app.program.bytes.is_empty());
+        assert!(
+            h.app
+                .pending
+                .iter()
+                .map(|p| &p.request)
+                .chain(&h.app.queue)
+                .all(|r| !matches!(r, Request::Bytes { .. }))
+        );
+    }
+
+    #[test]
+    fn committed_witnesses_and_references_apply_without_a_rebuild() {
+        use crate::listing_evidence::EvidenceKind::Pointer;
+        let context = egui::Context::default();
+        let mut h = Harness::new(evidence_app());
+        let builds = h.app.program.evidence.builds;
+        assert!(builds > 0);
+        // One committed batch with a new witness into the `.data` gap.
+        let mut state = h.app.discovery.take().unwrap();
+        let added = witness(0x2028, 0x1080);
+        state.pointer_recovery.admissions.insert(0x1080, added);
+        h.app.deferred_discovery = Some(super::super::DiscoveryUpdate {
+            budget_exhausted: false,
+            partial_index: None,
+            generation: h.app.generation,
+            saved: std::sync::Arc::new(state.save()),
+            state,
+            publication: Ok(None),
+        });
+        h.app.poll_discovery(&context);
+        h.frame(vec![]);
+        let row = data(
+            0x2028,
+            0x2030,
+            Pointer {
+                source: 0x2028,
+                entry: 0x1080,
+            },
+        );
+        assert_eq!(at(&h, 0x2028), Some(row));
+        assert_eq!(h.app.program.evidence.builds, builds, "no rebuild");
+        // A later commit extends the run's references; the earlier witness
+        // stays and the new data target splits the gap after it.
+        let state = h.app.discovery.take().unwrap();
+        let mut calls = crate::call_analysis::CallIndex::new(Default::default());
+        calls.data_incoming.insert(0x2038, vec![0]);
+        h.app.deferred_discovery = Some(super::super::DiscoveryUpdate {
+            budget_exhausted: true,
+            partial_index: Some(std::sync::Arc::new(calls)),
+            generation: h.app.generation,
+            saved: std::sync::Arc::new(state.save()),
+            state,
+            publication: Ok(None),
+        });
+        h.app.poll_discovery(&context);
+        assert!(h.app.deferred_discovery.is_none());
+        h.frame(vec![]);
+        assert_eq!(h.app.program.evidence.builds, builds, "no rebuild");
+        assert_eq!(at(&h, 0x2028), Some(row));
+        assert_eq!(at(&h, 0x2038), Some(undefined(0x2038, 0x2040)));
+        assert_eq!(at(&h, 0x2030), Some(undefined(0x2030, 0x2038)));
+        // Another run's report replaces it: a rebuild, keeping the
+        // committed witnesses.
+        h.app.set_call_index(None);
+        h.frame(vec![]);
+        assert_eq!(h.app.program.evidence.builds, builds + 1);
+        assert_eq!(at(&h, 0x2028), Some(row));
+        assert_eq!(at(&h, 0x2030), Some(undefined(0x2030, 0x2040)));
+    }
+
+    #[test]
+    fn a_rebuild_while_a_commit_is_in_flight_keeps_every_committed_witness() {
+        use crate::listing_evidence::EvidenceKind::Pointer;
+        let context = egui::Context::default();
+        let mut h = Harness::new(evidence_app());
+        let earlier = data(
+            0x2010,
+            0x2018,
+            Pointer {
+                source: 0x2010,
+                entry: 0x1040,
+            },
+        );
+        assert_eq!(at(&h, 0x2010), Some(earlier));
+        // The state is away in its background commit, as `receive` takes
+        // it, when a strings adoption forces a rebuild.
+        let mut state = h.app.discovery.take().unwrap();
+        h.app.source_epochs.bump_strings();
+        h.frame(vec![]);
+        assert!(h.app.program_evidence_current());
+        assert_ne!(at(&h, 0x2010), Some(earlier), "no witnesses while away");
+        let added = witness(0x2028, 0x1080);
+        state.pointer_recovery.admissions.insert(0x1080, added);
+        h.app.deferred_discovery = Some(super::super::DiscoveryUpdate {
+            budget_exhausted: false,
+            partial_index: None,
+            generation: h.app.generation,
+            saved: std::sync::Arc::new(state.save()),
+            state,
+            publication: Ok(None),
+        });
+        let builds = h.app.program.evidence.builds;
+        h.app.poll_discovery(&context);
+        h.frame(vec![]);
+        assert_eq!(h.app.program.evidence.builds, builds, "in place");
+        assert_eq!(at(&h, 0x2010), Some(earlier));
+        assert!(matches!(
+            at(&h, 0x2028),
+            Some(Row::Data {
+                kind: Pointer { entry: 0x1080, .. },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn signature_and_local_edits_do_not_rebuild_but_a_session_load_does() {
+        let mut h = Harness::new(evidence_app());
+        let builds = h.app.program.evidence.builds;
+        // Revisions that touch no annotation keep the index.
+        h.app.revision += 7;
+        h.frame(vec![]);
+        assert_eq!(h.app.program.evidence.builds, builds);
+        h.app.program.evidence.replace_annotations();
+        h.frame(vec![]);
+        assert_eq!(h.app.program.evidence.builds, builds + 1);
+    }
+
+    #[test]
+    fn label_and_comment_edits_and_undo_update_marks_in_place() {
+        let context = egui::Context::default();
+        let mut h = Harness::new(evidence_app());
+        let builds = h.app.program.evidence.builds;
+        assert_eq!(at(&h, 0x2030), None, "inside the gap");
+        h.app.edit_annotation(
+            0x2030,
+            crate::session::Annotation {
+                label: "g_table".into(),
+                ..Default::default()
+            },
+        );
+        h.frame(vec![]);
+        assert_eq!(at(&h, 0x2030), Some(undefined(0x2030, 0x2040)));
+        h.app.edit_annotation(
+            0x2030,
+            crate::session::Annotation {
+                comment: "kept".into(),
+                ..Default::default()
+            },
+        );
+        h.frame(vec![]);
+        assert_eq!(at(&h, 0x2030), Some(undefined(0x2030, 0x2040)));
+        h.app
+            .edit_annotation(0x2030, crate::session::Annotation::default());
+        h.frame(vec![]);
+        assert_eq!(at(&h, 0x2030), None, "both empty: unmarked");
+        h.app.undo(&context);
+        h.frame(vec![]);
+        assert_eq!(at(&h, 0x2030), Some(undefined(0x2030, 0x2040)));
+        h.app.undo(&context);
+        h.app.undo(&context);
+        h.frame(vec![]);
+        assert_eq!(at(&h, 0x2030), None);
+        assert_eq!(h.app.program.evidence.builds, builds, "no rebuild");
+        // Clearing a zero-filled global's label joins its tail again.
+        h.app
+            .edit_annotation(0x3100, crate::session::Annotation::default());
+        h.frame(vec![]);
+        assert_eq!(at(&h, 0x3100), None);
+        assert_eq!(
+            at(&h, 0x3000),
+            Some(Row::ZeroFill {
+                start: 0x3000,
+                end: 0x3800
+            })
+        );
+    }
+
+    #[test]
+    fn a_binary_change_clears_the_evidence() {
+        let mut h = Harness::new(evidence_app());
+        assert!(h.app.program.evidence.index.covering(0x2000).is_some());
+        h.app.generation += 1;
+        assert!(!h.app.program_evidence_current());
+        h.app.clear_views();
+        assert!(h.app.program.evidence.index.covering(0x2000).is_none());
+        assert!(!h.app.program_evidence_current());
+        // Function scope releases it too.
+        let mut h = Harness::new(evidence_app());
+        h.app.set_listing_scope(ListingScope::Function);
+        assert!(h.app.program.evidence.index.covering(0x2000).is_none());
+    }
+
+    #[test]
+    fn data_rows_keep_the_mnemonic_unknown_and_show_their_evidence() {
+        let mut h = Harness::new(evidence_app());
+        let mut calls = crate::call_analysis::CallIndex::new(Default::default());
+        calls.data_incoming.insert(0x2020, vec![0, 1]);
+        h.app.set_call_index(Some(std::sync::Arc::new(calls)));
+        h.frame(vec![]);
+        let text = fixture::rendered_text(&h.frame(vec![]));
+        for wanted in [
+            "printf",
+            "00001040  next",
+            "\"ssssssss\"",
+            "20h  XREF[2]",
+            "700h  g_counter",
+            "800h  g_export",
+        ] {
+            assert!(text.iter().any(|t| t == wanted), "{wanted}: {text:?}");
+        }
+        // Every data row keeps `??` as its mnemonic: three in `.data`, one
+        // in `.text`, beside the collapsed and zero-filled rows.
+        let unknown = text.iter().filter(|t| *t == "??").count();
+        assert!(unknown >= 4 + 6, "{unknown}");
     }
 }

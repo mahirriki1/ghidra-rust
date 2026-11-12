@@ -899,9 +899,45 @@ pub fn validate_listing_entries(entries: &[u64]) -> Result<(), String> {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StringEntry {
+    /// Byte length of the scanned run; no terminator is required or counted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub length: Option<u32>,
     pub address: u64,
     pub text: String,
     pub encoding: String,
+}
+
+impl StringEntry {
+    /// Validate known lengths against the preview, or infer legacy ASCII only.
+    /// A trailing ellipsis is scanner metadata, not part of the scanned bytes.
+    pub(crate) fn evidence_length(&self) -> Result<Option<u64>, &'static str> {
+        let Some(length) = self.length else {
+            return Ok(
+                (self.encoding == "ASCII" && self.text.is_ascii() && !self.text.is_empty())
+                    .then_some(self.text.len() as u64),
+            );
+        };
+        let truncated = self.text.ends_with('…');
+        let preview = self.text.strip_suffix('…').unwrap_or(&self.text);
+        let (bytes, unit) = match self.encoding.as_str() {
+            "ASCII" if preview.is_ascii() => (preview.len() as u64, 1),
+            "UTF-16LE" => (preview.chars().count() as u64 * 2, 2),
+            _ => return Err("String length has an unsupported preview encoding"),
+        };
+        let length = u64::from(length);
+        if bytes == 0
+            || length == 0
+            || length % unit != 0
+            || if truncated {
+                length <= bytes
+            } else {
+                length != bytes
+            }
+        {
+            return Err("String length is inconsistent with its preview");
+        }
+        Ok(Some(length))
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

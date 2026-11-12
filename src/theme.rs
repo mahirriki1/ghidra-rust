@@ -41,6 +41,8 @@ const ADDRESS: Color32 = MUTED;
 const BYTES: Color32 = Color32::from_rgb(92, 99, 112);
 /// A byte whose page could not be read: a muted error tone.
 pub const BYTES_FAILED: Color32 = Color32::from_rgb(150, 86, 92);
+/// The target name of a pointer-table witness row.
+pub const DATA_POINTER: Color32 = Color32::from_rgb(86, 182, 194);
 const MNEMONIC: Color32 = SYNTAX_KEYWORD;
 const HOVER: Color32 = Color32::from_rgb(44, 46, 51);
 const INPUT: Color32 = Color32::from_rgb(18, 19, 21);
@@ -1342,6 +1344,26 @@ pub fn listing_cells(
     elided
 }
 
+/// What an undefined data row's evidence shows in its operands column.
+#[derive(Clone, Copy, Debug)]
+pub enum DataEvidence<'a> {
+    /// An import slot: the import's name.
+    Slot { name: &'a str },
+    /// An absolute pointer-table witness: its target and the target's name.
+    Pointer { target: u64, name: Option<&'a str> },
+    /// A string candidate: its preview, quoted and muted.
+    String { preview: &'a str },
+}
+
+/// What a split mark at a row's start adds after its operands: the
+/// analyst's label, the reference count and the analyst's comment.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ListingNote<'a> {
+    pub label: Option<&'a str>,
+    pub xrefs: usize,
+    pub comment: Option<&'a str>,
+}
+
 /// A Program-listing row that is not a decoded instruction.
 #[derive(Clone, Copy, Debug)]
 pub enum ListingMark<'a> {
@@ -1350,9 +1372,14 @@ pub enum ListingMark<'a> {
     /// A function entry: its name; `partial` marks an incomplete view.
     Function { name: &'a str, partial: bool },
     /// Undefined file-backed bytes collapsed to one row.
-    Undefined { length: u64 },
+    Undefined { length: u64, note: ListingNote<'a> },
     /// Zero-filled bytes beyond a section's file-backed part.
-    ZeroFill { length: u64 },
+    ZeroFill { length: u64, note: ListingNote<'a> },
+    /// Undefined bytes some evidence spans; the mnemonic stays `??`.
+    Data {
+        evidence: DataEvidence<'a>,
+        note: ListingNote<'a>,
+    },
     /// A function body that has not loaded yet.
     Pending,
     /// One undefined byte of an expanded gap; `None` until its page loads,
@@ -1407,7 +1434,7 @@ pub fn listing_mark(
             let color = if partial { WARNING } else { SYNTAX_FUNCTION };
             heading(name, color, format!("  {address:0digits$x}"))
         }
-        ListingMark::Undefined { length } | ListingMark::ZeroFill { length } => {
+        ListingMark::Undefined { length, note } | ListingMark::ZeroFill { length, note } => {
             let color = if matches!(mark, ListingMark::ZeroFill { .. }) {
                 BYTES
             } else {
@@ -1417,12 +1444,50 @@ pub fn listing_mark(
             let mut elided =
                 shortened | paint_listing_cell(ui, rect, columns.address, mono(text, ADDRESS));
             elided |= paint_listing_cell(ui, rect, columns.mnemonic, mono("??".into(), color));
-            elided |= paint_listing_cell(
-                ui,
-                rect,
-                columns.operands,
-                mono(format!("{length:x}h"), color),
-            );
+            let mut operands = mono(format!("{length:x}h"), color);
+            append_note(&mut operands, &note);
+            elided |= paint_listing_cell(ui, rect, columns.operands, operands);
+            elided
+        }
+        ListingMark::Data { evidence, note } => {
+            let (text, shortened) = listing_address(ui, columns, address, digits);
+            let mut elided =
+                shortened | paint_listing_cell(ui, rect, columns.address, mono(text, ADDRESS));
+            elided |= paint_listing_cell(ui, rect, columns.mnemonic, mono("??".into(), MUTED));
+            let proportional = |color| egui::TextFormat {
+                font_id: FontId::proportional(13.0),
+                color,
+                valign: egui::Align::Center,
+                ..Default::default()
+            };
+            let mut operands = egui::text::LayoutJob::default();
+            match evidence {
+                DataEvidence::Slot { name } => {
+                    operands.append(name, 0.0, proportional(SYNTAX_FUNCTION));
+                }
+                DataEvidence::Pointer { target, name } => {
+                    operands.append(
+                        &format!("{target:0digits$x}"),
+                        0.0,
+                        mono_format(SYNTAX_CONSTANT),
+                    );
+                    if let Some(name) = name {
+                        operands.append(&format!("  {name}"), 0.0, proportional(DATA_POINTER));
+                    }
+                }
+                DataEvidence::String { preview } => {
+                    operands.append(
+                        &format!("\"{preview}\""),
+                        0.0,
+                        egui::TextFormat {
+                            italics: true,
+                            ..mono_format(MUTED)
+                        },
+                    );
+                }
+            }
+            append_note(&mut operands, &note);
+            elided |= paint_listing_cell(ui, rect, columns.operands, operands);
             elided
         }
         ListingMark::Pending => {
@@ -1458,6 +1523,28 @@ pub fn listing_mark(
             }
             elided
         }
+    }
+}
+
+/// Appends a split mark's label, reference count and comment to `job`.
+fn append_note(job: &mut egui::text::LayoutJob, note: &ListingNote<'_>) {
+    if let Some(label) = note.label {
+        job.append(
+            &format!("  {label}"),
+            0.0,
+            egui::TextFormat {
+                font_id: FontId::proportional(13.0),
+                color: TEXT,
+                valign: egui::Align::Center,
+                ..Default::default()
+            },
+        );
+    }
+    if note.xrefs > 0 {
+        job.append(&format!("  XREF[{}]", note.xrefs), 0.0, mono_format(MUTED));
+    }
+    if let Some(comment) = note.comment {
+        job.append(&format!("  ; {comment}"), 0.0, mono_format(SYNTAX_COMMENT));
     }
 }
 

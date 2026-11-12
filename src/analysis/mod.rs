@@ -3581,6 +3581,7 @@ pub(crate) mod tests {
             assert_eq!(strings.len(), 1);
             assert_eq!(strings[0].address, 0x1000 + start as u64);
             assert_eq!(strings[0].text, "boundary string");
+            assert_eq!(strings[0].length, Some(15 * if wide { 2 } else { 1 }));
             assert_eq!(strings[0].encoding, if wide { "UTF-16LE" } else { "ASCII" });
         }
     }

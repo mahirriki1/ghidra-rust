@@ -125,8 +125,26 @@ page loads. Zero-filled tails never expand. Expanding or collapsing keeps
 the row where it is on screen and adds no Back/Forward history; collapsing
 moves a cursor inside the run to its first byte. Up to 64 expanded runs are
 kept for the session; beyond that the one farthest away collapses (never
-the one holding the cursor). **Show in Hex** on a `??`, byte or zero-fill row
-selects exactly its file-backed bytes in Hex (zero-filled bytes have none).
+the one holding the cursor). Inside `??` gaps the Program listing also shows
+evidence as rows whose mnemonic stays `??`, because nothing is defined there:
+an import slot shows the import's name, an absolute pointer-table entry that
+discovery committed shows its target address and function name, and a scanned
+or saved string shows its muted, italic quoted preview. Each appears only when
+its whole span lies in one undefined gap, so decoded code, function entries
+and expanded byte runs always win; an import slot wins over a pointer entry,
+which wins over a string. Data and address reference targets, data exports,
+labels and comments start a row of their own in `??` gaps and zero-filled
+tails (so `.bss` globals become rows, without reading bytes), showing the
+label (or the export's name), a reference count and the comment; inside an
+evidence row they are
+listed in its hover. Hover a row for its provenance (library and kind, the
+discovery evidence, or encoding, length and whether the string was scanned or
+saved). Enter or a double-click on a pointer entry opens its target function
+with Back/Forward history; on an import slot or string they do nothing.
+Evidence rows never expand. Pointer entries are not saved in projects: after a
+reopen they return only once discovery runs again. **Show in Hex** on a `??`,
+byte, evidence or zero-fill row selects exactly its file-backed bytes in Hex
+(zero-filled bytes have none).
 Back/Forward to an address that is neither a known function entry nor an
 instruction a loaded function decoded (such as a `??` or byte row the
 cursor left) returns the Program cursor to the row starting there, without
@@ -246,9 +264,9 @@ but a stalled filesystem still delays further listings until it returns.
 | `Ctrl+Z` | Undo an annotation outside text editors |
 | `Up` / `Down` | Listing: previous / next row |
 | `PageUp` / `PageDown` | Listing: previous / next page |
-| `Home` / `End` | Listing: first / last instruction of the function (in the Program scope, first / last byte of the run from a byte row, and of the section from a section, `??` or zero-fill row) |
+| `Home` / `End` | Listing: first / last instruction of the function (in the Program scope, first / last byte of the run from a byte row, and of the section from a section, `??`, evidence or zero-fill row) |
 | `Ctrl+Home` / `Ctrl+End` | Program listing: first / last row of the program |
-| `Enter` | Listing: follow the selected call or branch target (in the Program scope, also expand a `??` row or collapse a byte row's run) |
+| `Enter` | Listing: follow the selected call or branch target (in the Program scope, also expand a `??` row, collapse a byte row's run or open a pointer entry's target) |
 
 On macOS, Save, Undo and program-text search use Command. Shortcuts pause while
 typing, in dialogs, and during file operations.
@@ -256,9 +274,9 @@ typing, in dialogs, and during file operations.
 Listing keys apply after clicking the Listing; clicking elsewhere, focusing a
 text field or switching tabs releases them. In the **Function** scope they stay
 within the displayed function. In the **Program** scope every row is a cursor
-stop: section and function headers, instructions, `??`, byte and zero-fill
-rows and pending `…` rows, and clicking a `??`, byte or zero-fill row puts the
-cursor there. Up/Down and PageUp/PageDown cross functions and gaps, and the
+stop: section and function headers, instructions, `??`, byte, evidence and
+zero-fill rows and pending `…` rows, and clicking a `??`, byte, evidence or
+zero-fill row puts the cursor there. Up/Down and PageUp/PageDown cross functions and gaps, and the
 selection becomes the row's address (a header's entry or section start, a
 gap's first byte, a byte row's byte). When the cursor rests (about 200 ms, no key held) on a row
 of a function other than the displayed one, the Graph and Decompiler switch to
@@ -267,7 +285,7 @@ loads only the last one. The switch waits while a dialog, text field or menu
 is open and while any non-background request (a graph, pseudocode, string or
 FindCrypt scan, byte read or rename) is running, and never restarts or
 preempts the analysis worker (after a cancel or failure, resting switches
-nothing). Section headers, `??`, byte and zero-fill rows
+nothing). Section headers, `??`, byte, evidence and zero-fill rows
 belong to no function, so nothing follows there. Cursor travel adds no
 Back/Forward history. From the Listing, `Space` starts a waiting switch at
 once when the worker is free and then shows the Graph, which may still be

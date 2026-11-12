@@ -791,7 +791,13 @@ pub(crate) fn validate_strings(
     for string in strings {
         bounded(string.text.len(), 4096, "String text")?;
         bounded(string.encoding.len(), 64, "String encoding")?;
+        string.evidence_length().map_err(str::to_owned)?;
         mapped(ranges, string.address)?;
+        if let Some(length) = string.length
+            && !ranges.backs_span(string.address, u64::from(length))
+        {
+            return Err("String length is outside mapped file-backed bytes".into());
+        }
     }
     Ok(())
 }
@@ -1449,6 +1455,137 @@ mod tests {
                 .unwrap_err()
                 .contains("executable file-backed")
         );
+    }
+
+    #[test]
+    fn known_string_lengths_validate_preview_and_file_backing() {
+        let section = |address, size, file_size| SectionInfo {
+            name: String::new(),
+            address,
+            size,
+            file_size,
+            file_offset: 0,
+            executable: false,
+        };
+        let ranges = MappedRanges::new(&[section(0, 8, 8), section(8, 8, 4)]).unwrap();
+        let check = |address, text: &str, encoding: &str, length| {
+            validate_strings(
+                &[StringEntry {
+                    address,
+                    text: text.into(),
+                    encoding: encoding.into(),
+                    length: Some(length),
+                }],
+                MAX_PROJECT_STRINGS,
+                &ranges,
+            )
+        };
+        assert!(check(0, "hi", "ASCII", 2).is_ok());
+        assert!(check(6, "hi", "ASCII", 2).is_ok()); // first section end
+        assert!(check(6, "hello", "ASCII", 5).is_ok()); // adjacent backed sections
+        assert!(check(10, "hi", "ASCII", 2).is_ok()); // backed end
+        assert!(check(11, "hi", "ASCII", 2).is_err()); // zero-fill tail
+        assert!(check(0, "Hello", "UTF-16LE", 10).is_ok());
+        assert!(check(0, "hi…", "ASCII", 3).is_ok());
+        assert!(check(0, "hi…", "UTF-16LE", 6).is_ok());
+        for (text, encoding, length) in [
+            ("hi", "ASCII", 1_000_000),
+            ("hi", "ASCII", 1),
+            ("hi", "UTF-16LE", 2),
+            ("hi…", "ASCII", 2),
+            ("hi…", "UTF-16LE", 4),
+            ("hi…", "UTF-16LE", 5),
+        ] {
+            assert!(check(0, text, encoding, length).is_err());
+        }
+        let gap = MappedRanges::new(&[section(0, 8, 8), section(9, 8, 8)]).unwrap();
+        assert!(
+            validate_strings(
+                &[StringEntry {
+                    address: 6,
+                    text: "hello".into(),
+                    encoding: "ASCII".into(),
+                    length: Some(5)
+                }],
+                MAX_PROJECT_STRINGS,
+                &gap
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn version_4_strings_without_length_round_trip_and_bad_lengths_fail() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut data, protection) = sample(directory.path());
+        data.strings = vec![
+            serde_json::from_value(serde_json::json!({
+                "address": 4096, "text": "example", "encoding": "ASCII"
+            }))
+            .unwrap(),
+        ];
+        assert!(
+            serde_json::to_value(&data.strings[0])
+                .unwrap()
+                .get("length")
+                .is_none()
+        );
+        let path = directory.path().join("strings.grproj");
+        data.save(&path, &protection, true).unwrap();
+        let loaded = ProjectData::load(&path).unwrap();
+        assert_eq!(loaded.data.strings[0].length, None);
+        // Rebind the loaded records to the original opened-file identity;
+        // extracted images deliberately do not carry that identity on load.
+        data.strings = loaded.data.strings;
+        data.save(&path, &protection, true).unwrap();
+        assert_eq!(
+            ProjectData::load(&path).unwrap().data.strings[0].text,
+            "example"
+        );
+        let db = Connection::open(&path).unwrap();
+        let version: i64 = db
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            version, 4,
+            "optional string lengths must not change the v4 project format"
+        );
+        for length in [0, 15, u32::MAX] {
+            data.strings[0].length = Some(length);
+            assert!(data.validate().unwrap_err().contains("String length"));
+        }
+        data.info.sections[0].file_size = 4;
+        data.strings[0].length = Some(5);
+        assert!(data.validate().unwrap_err().contains("String length"));
+    }
+
+    #[test]
+    fn string_records_accept_unknown_fields_for_older_reader_compatibility() {
+        // Exercise the actual production type, not just a surrogate old reader.
+        let current: StringEntry = serde_json::from_value(serde_json::json!({
+            "address": 4096, "text": "hello", "encoding": "ASCII",
+            "length": 5, "future_optional_field": {"value": 1}
+        }))
+        .unwrap();
+        assert_eq!(current.length, Some(5));
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct OldStringEntry {
+            address: u64,
+            text: String,
+            encoding: String,
+        }
+        let entry = StringEntry {
+            address: 0x1000,
+            text: "hello".into(),
+            encoding: "ASCII".into(),
+            length: Some(5),
+        };
+        let old: OldStringEntry =
+            serde_json::from_value(serde_json::to_value(entry).unwrap()).unwrap();
+        let reread: StringEntry =
+            serde_json::from_value(serde_json::to_value(old).unwrap()).unwrap();
+        assert_eq!(reread.length, None);
+        assert_eq!(reread.text, "hello");
     }
 
     #[test]

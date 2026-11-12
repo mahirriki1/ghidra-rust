@@ -2349,6 +2349,8 @@ impl DesktopApp {
             }
         }
         crate::performance::event("result_store_discovery_preparation_bytes", 0);
+        // Whether the listing evidence may take this commit in place.
+        let evidence_current = self.program_evidence_current();
         self.discovery = Some(update.state);
         self.discovery_saved = Some(update.saved);
         if let Some(index) = update.partial_index {
@@ -2385,6 +2387,7 @@ impl DesktopApp {
                     self.rebuild_filter();
                 }
                 self.status = "Discovery batch committed".into();
+                self.program_evidence_commit(evidence_current);
                 self.grant_listing_turn();
             }
             Ok(None) if update.budget_exhausted => {
@@ -2392,10 +2395,15 @@ impl DesktopApp {
                 self.worker_inventory = None;
                 self.status =
                     "Function-start pattern work budget exhausted; discovery is partial".into();
+                self.program_evidence_commit(evidence_current);
                 self.grant_listing_turn();
             }
-            Ok(None) => self.grant_listing_turn(),
+            Ok(None) => {
+                self.program_evidence_commit(evidence_current);
+                self.grant_listing_turn();
+            }
             Err(error) => {
+                self.program_evidence_commit(evidence_current);
                 self.stop_worker();
                 self.status = format!("Invalid discovery batch: {error}");
             }
@@ -2896,6 +2904,7 @@ impl DesktopApp {
                 };
                 if let Some(project) = &project {
                     self.session = Some(project.project.data.session.clone());
+                    self.program.evidence.replace_annotations();
                     if project.project.cache_compatible {
                         info.functions = project.project.data.info.functions.clone();
                         info.functions_truncated = project.project.data.info.functions_truncated;
@@ -3670,6 +3679,7 @@ impl DesktopApp {
             self.undo.pop_front();
         }
         self.revision = self.revision.wrapping_add(1);
+        self.program_evidence_annotation(address);
     }
 
     fn undo(&mut self, context: &egui::Context) {
@@ -3737,6 +3747,7 @@ impl DesktopApp {
                     context,
                 );
             }
+            self.program_evidence_annotation(edit.address);
         }
     }
 
@@ -4501,6 +4512,7 @@ impl DesktopApp {
                             .as_ref()
                             .is_none_or(|old| old.local_renames != session.local_renames);
                         self.session = Some(session);
+                        self.program.evidence.replace_annotations();
                         self.session_path = Some(path);
                         self.undo.clear();
                         self.revision = self.revision.wrapping_add(1);
@@ -10632,6 +10644,7 @@ mod tests {
         let mut app = semantic_app();
         app.strings_scanned = true;
         app.strings.push(StringEntry {
+            length: None,
             address: 0x1010,
             text: "bytes".into(),
             encoding: "ASCII".into(),
@@ -11610,6 +11623,7 @@ mod tests {
         app.strings_scanned = true;
         app.strings = (0..512)
             .map(|index| StringEntry {
+                length: None,
                 address: 0x9000 + index * 256,
                 text: format!("resize_string_{index:04}_{}", "long_text_".repeat(15)),
                 encoding: "ASCII".into(),
@@ -14904,6 +14918,7 @@ mod tests {
             }],
             semantics: Default::default(),
             strings: vec![StringEntry {
+                length: None,
                 address: 0x1040,
                 text: "saved string".into(),
                 encoding: "ASCII".into(),
@@ -19590,6 +19605,7 @@ mod tests {
             },
         );
         app.strings = vec![StringEntry {
+            length: None,
             address: 0x1080,
             text: "a srch string".into(),
             encoding: "ascii".into(),

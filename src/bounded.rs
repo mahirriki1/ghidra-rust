@@ -175,7 +175,7 @@ fn reply_nodes(kind: &str) -> Option<usize> {
         "signatures_synced" => 5 * crate::signatures::MAX_SIGNATURES,
         "memory_search" => 7 * MAX_SEARCH_PAGE_RESULTS + 96,
         "bytes" => MAX_BYTE_READ,
-        "strings" => 7 * MAX_STRING_RESULTS,
+        "strings" => 9 * MAX_STRING_RESULTS,
         "crypto" => 9 * MAX_CRYPTO_MATCHES,
         "symbol_names" => 7 * MAX_SYMBOL_NAME_PAGE_RECORDS + 10,
         // The widest record: a tag, eleven scalar fields and nothing nested.
@@ -318,6 +318,27 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(error.contains("2-element limit"), "{error}");
+    }
+
+    #[test]
+    fn full_string_reply_with_lengths_fits_preflight_and_frame() {
+        let reply = WorkerResponse {
+            id: 1,
+            response: Response::Strings {
+                strings: (0..MAX_STRING_RESULTS)
+                    .map(|address| StringEntry {
+                        address: address as u64,
+                        length: Some(u32::MAX),
+                        text: "x".repeat(512),
+                        encoding: "UTF-16LE".into(),
+                    })
+                    .collect(),
+                truncated: false,
+            },
+        };
+        let encoded = serde_json::to_vec(&reply).unwrap();
+        assert!(encoded.len() < MAX_REPLY_BYTES);
+        assert_eq!(check_reply(&encoded).unwrap().kind, "strings");
     }
 
     #[test]
