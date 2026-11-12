@@ -245,7 +245,13 @@ impl ProgramRows {
             functions,
             expansions,
             evidence: None,
+            anchor: None,
         }
+    }
+
+    /// Whether a section span holds `address`: whether any row can cover it.
+    pub fn contains(&self, address: u64) -> bool {
+        self.span_at(address).is_some()
     }
 
     /// The byte page holding file-backed `address`: aligned to
@@ -282,6 +288,9 @@ pub struct Layout<'a> {
     functions: &'a [FunctionInfo],
     expansions: &'a Expansions,
     evidence: Option<&'a ListingEvidence>,
+    /// A session-only split mark that only divides zero-filled tails, so a
+    /// destination there has a row of its own without any byte read.
+    anchor: Option<u64>,
 }
 
 impl<'a> Layout<'a> {
@@ -291,6 +300,11 @@ impl<'a> Layout<'a> {
             evidence: Some(evidence),
             ..self
         }
+    }
+
+    /// This layout with a zero-fill split mark at `anchor`.
+    pub fn with_anchor(self, anchor: Option<u64>) -> Self {
+        Self { anchor, ..self }
     }
 }
 
@@ -385,12 +399,21 @@ impl Layout<'_> {
         Row::Undefined { start, end }
     }
 
-    /// `[start, end)` holding `address`, clipped to the nearest split marks.
+    /// The zero-filled `[start, end)` holding `address`, clipped to the
+    /// nearest split marks and the anchor.
     fn split(&self, address: u64, start: u64, end: u64) -> (u64, u64) {
-        match self.evidence {
+        let (mut start, mut end) = match self.evidence {
             Some(evidence) => marks_around(evidence, address, start, end),
             None => (start, end),
+        };
+        if let Some(anchor) = self.anchor {
+            if start < anchor && anchor <= address {
+                start = anchor;
+            } else if address < anchor && anchor < end {
+                end = anchor;
+            }
         }
+        (start, end)
     }
 
     /// The body row covering `address` without expansions.
@@ -581,6 +604,11 @@ impl Layout<'_> {
         self.rows.byte_page(address)
     }
 
+    /// See [`ProgramRows::contains`].
+    pub fn contains(&self, address: u64) -> bool {
+        self.rows.contains(address)
+    }
+
     /// The expanded run holding the byte row at `address`: its undefined
     /// zone intersected with the covering interval.
     pub fn byte_run(&self, address: u64) -> Option<(u64, u64)> {
@@ -590,6 +618,37 @@ impl Layout<'_> {
         };
         let (interval_start, interval_end) = self.expansions.covering(address)?;
         Some((start.max(interval_start), end.min(interval_end)))
+    }
+
+    /// The interval a landing on `address` auto-expands inside `row`, the
+    /// body row covering it: for a collapsed `??` row, the byte pages
+    /// holding `[address, address + length)` clipped to the row; for a data
+    /// row entered past its start, the item. Either is capped at
+    /// [`EXPAND_STEP`] bytes and always holds `address`. Other rows, and a
+    /// data row entered at its start, expand nothing.
+    pub fn landing_interval(&self, row: &Row, address: u64, length: u64) -> Option<(u64, u64)> {
+        let (start, end) = match *row {
+            Row::Undefined { start, end } => {
+                let last = address
+                    .saturating_add(length.max(1) - 1)
+                    .min(end.checked_sub(1)?);
+                let (first, _) = self.byte_page(address)?;
+                let (page, size) = self.byte_page(last)?;
+                (start.max(first), end.min(page + size as u64))
+            }
+            Row::Data { start, end, .. } if start < address => (start, end),
+            _ => return None,
+        };
+        if !(start <= address && address < end) {
+            return None;
+        }
+        if end - start <= EXPAND_STEP {
+            return Some((start, end));
+        }
+        // Too long for one step: start at the page holding the address.
+        let (page, _) = self.byte_page(address)?;
+        let start = start.max(page);
+        Some((start, end.min(start + EXPAND_STEP)))
     }
 
     /// Where a reveal of `address` lands: an entry's header, else the body
@@ -2221,5 +2280,126 @@ mod evidence_tests {
             }
         }
         assert!(shown > 20, "{shown} data rows");
+    }
+
+    #[test]
+    fn landing_intervals_clip_to_the_row_and_cap_at_one_step() {
+        let sections = [section(0x10000, 0x40000, 0x30000)];
+        let strings = [string(0x18000, 0x10)];
+        let evidence =
+            ListingEvidence::build(&info(&sections), None, [], &strings, None, None).unwrap();
+        let program = rows(&sections, &[]);
+        let layout = program.layout(&[], &NONE).with_evidence(&evidence);
+        let gap = Row::Undefined {
+            start: 0x18010,
+            end: 0x40000,
+        };
+        assert_eq!(
+            layout.resolve(Position::new(0x18020, Rank::Body)),
+            Some(gap)
+        );
+        // The page holding the address, clipped to the row's start.
+        assert_eq!(
+            layout.landing_interval(&gap, 0x18020, 1),
+            Some((0x18010, 0x19000))
+        );
+        // A span crossing a page boundary takes both pages.
+        assert_eq!(
+            layout.landing_interval(&gap, 0x38ffe, 4),
+            Some((0x38000, 0x3a000))
+        );
+        // A long span stops one step after its first page.
+        let (start, end) = layout.landing_interval(&gap, 0x20010, 0x20000).unwrap();
+        assert_eq!((start, end), (0x20000, 0x20000 + EXPAND_STEP));
+        // The last page ends at the row.
+        assert_eq!(
+            layout.landing_interval(&gap, 0x3fffc, 0x100),
+            Some((0x3f000, 0x40000))
+        );
+        // A data row entered past its start expands its item; at its start
+        // and on other rows nothing expands.
+        let item = data(0x18000, 0x18010, EvidenceKind::String(0));
+        assert_eq!(
+            layout.landing_interval(&item, 0x18004, 1),
+            Some((0x18000, 0x18010))
+        );
+        assert_eq!(layout.landing_interval(&item, 0x18000, 1), None);
+        let zero = Row::ZeroFill {
+            start: 0x40000,
+            end: 0x50000,
+        };
+        assert_eq!(layout.landing_interval(&zero, 0x40010, 1), None);
+        assert_eq!(layout.landing_interval(&gap, 0x10000, 1), None, "outside");
+    }
+
+    #[test]
+    fn random_landings_with_an_anchor_partition_bytes_once_and_reverse_exactly() {
+        let mut random = Lcg(23);
+        let sections = [
+            section(0x1000, 0x2400, 0x1180),
+            section(0x4000, 0x80, 0x80),
+            section(0x5000, 0x1100, 0x20),
+        ];
+        let views = [
+            view(0x1000, &[(0x1000, 4), (0x1004, 3)]),
+            view(0x1100, &[(0x1100, 2), (0x1130, 5)]),
+        ];
+        let program = failed_rows(&sections, &views, &[]);
+        let inventory = functions(&[0x1000, 0x1100, 0x1180]);
+        let mut landed = 0;
+        for _ in 0..24 {
+            let strings: Vec<StringEntry> = (0..random.below(16))
+                .map(|_| {
+                    let s = &sections[random.below(3) as usize];
+                    string(
+                        s.address + random.below(s.size),
+                        random.below(0x30) as u32 + 1,
+                    )
+                })
+                .collect();
+            let evidence =
+                ListingEvidence::build(&info(&sections), None, [], &strings, None, None).unwrap();
+            let mut expansions = Expansions::default();
+            let mut anchor = None;
+            for _ in 0..8 {
+                let s = &sections[random.below(3) as usize];
+                let address = s.address + random.below(s.size);
+                let length = random.below(0x2000) + 1;
+                let layout = program
+                    .layout(&inventory, &expansions)
+                    .with_evidence(&evidence)
+                    .with_anchor(anchor);
+                let row = layout
+                    .resolve(Position::new(address, Rank::Body))
+                    .expect("a covering row");
+                let (start, end) = row.span().unwrap();
+                assert!(start <= address && address < end, "{row:?} {address:#x}");
+                if start == address {
+                    continue;
+                }
+                match row {
+                    Row::Undefined { .. } | Row::Data { .. } => {
+                        let (low, high) = layout.landing_interval(&row, address, length).unwrap();
+                        assert!(start <= low && low <= address && address < high && high <= end);
+                        assert!(high - low <= EXPAND_STEP);
+                        expansions.expand(low, high, None);
+                    }
+                    Row::ZeroFill { .. } => anchor = Some(address),
+                    _ => continue,
+                }
+                let layout = program
+                    .layout(&inventory, &expansions)
+                    .with_evidence(&evidence)
+                    .with_anchor(anchor);
+                let exact = layout.exact(Position::new(address, Rank::Body));
+                assert!(
+                    matches!(exact, Some(Row::Byte { .. } | Row::ZeroFill { .. })),
+                    "{exact:?} at {address:#x}"
+                );
+                landed += 1;
+                walk(&layout, &sections);
+            }
+        }
+        assert!(landed > 40, "{landed} landings");
     }
 }

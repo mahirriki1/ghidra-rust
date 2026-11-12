@@ -30,6 +30,11 @@ pub(crate) enum HexAction {
         address: u64,
         bytes: Vec<u8>,
     },
+    /// The shown span, to be revealed in the Program listing.
+    ShowListing {
+        address: u64,
+        length: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -140,6 +145,17 @@ impl HexPanel {
                 && let Some((address, bytes)) = self.selected_bytes()
             {
                 action = Some(HexAction::Decode { address, bytes });
+            }
+            let location = self.location();
+            if ui
+                .add_enabled(
+                    action.is_none() && location.is_some(),
+                    egui::Button::new("Show in Listing"),
+                )
+                .clicked()
+                && let Some((address, length)) = location
+            {
+                action = Some(HexAction::ShowListing { address, length });
             }
         });
         if let Some(message) = &self.navigation_error {
@@ -975,7 +991,7 @@ mod tests {
                 address,
                 length,
             } => (token, address, length),
-            HexAction::Decode { .. } => panic!("unexpected decode action"),
+            other => panic!("unexpected action {other:?}"),
         }
     }
 
