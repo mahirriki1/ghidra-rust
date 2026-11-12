@@ -426,6 +426,55 @@ fn decompile(
     (text, mappings)
 }
 
+/// File offsets through `info`'s sections. The oracles: the raw position
+/// of the fixture's instruction bytes (loaded at `base`), and the bytes the
+/// worker reads at each section's first and last backed byte.
+fn assert_file_offsets(worker: &mut WorkerClient, info: &BinaryInfo, raw: &[u8], base: u64) {
+    use ghidra_rust::file_offsets::{FileAddress, Unmapped, address_at, offset_of};
+    let code = common::code();
+    let mut positions = raw.windows(code.len()).enumerate();
+    let (position, _) = positions.find(|(_, w)| *w == code).unwrap();
+    assert!(positions.all(|(_, w)| w != code), "unique fixture code");
+    let last = (position + code.len() - 1) as u64;
+    for (offset, address) in [
+        (position as u64, base),
+        (last, base + code.len() as u64 - 1),
+    ] {
+        assert_eq!(
+            address_at(&info.sections, info.file_len, offset),
+            FileAddress::One(address),
+            "{}",
+            info.format
+        );
+        assert_eq!(offset_of(&info.sections, address), Some(offset));
+    }
+    for section in info.sections.iter().filter(|s| s.file_size > 0) {
+        for address in [section.address, section.address + section.file_size - 1] {
+            let offset = offset_of(&info.sections, address).unwrap();
+            assert_eq!(
+                address_at(&info.sections, info.file_len, offset),
+                FileAddress::One(address)
+            );
+            let Response::Bytes { bytes, .. } =
+                request(worker, Request::Bytes { address, length: 1 })
+            else {
+                panic!("{}: cannot read {address:#x}", info.format)
+            };
+            assert_eq!(bytes, [raw[offset as usize]], "{}", section.name);
+        }
+    }
+    assert_eq!(
+        address_at(&info.sections, info.file_len, 0),
+        FileAddress::Unmapped(Unmapped::BeforeSections),
+        "{}",
+        info.format
+    );
+    assert_eq!(
+        address_at(&info.sections, info.file_len, raw.len() as u64),
+        FileAddress::Unmapped(Unmapped::PastEnd)
+    );
+}
+
 #[test]
 fn contained_aarch64_workers_analyze_elf_pe_macho_and_reopen_projects() {
     for (format, (bytes, base)) in [
@@ -453,6 +502,7 @@ fn contained_aarch64_workers_analyze_elf_pe_macho_and_reopen_projects() {
             panic!("Open {format}: {response:?}");
         };
         let declarations = linkage::read(|query| request(&mut worker, query), &info);
+        assert_file_offsets(&mut worker, &info, &bytes, base);
         assert_eq!(info.architecture, "AArch64");
         assert_eq!(info.format, format);
         assert_eq!(info.entry, base);
@@ -617,6 +667,8 @@ fn contained_aarch64_workers_analyze_elf_pe_macho_and_reopen_projects() {
             linkage::read(|query| request(&mut reopened, query), &fresh).digest
         );
         loaded.data.validate_against(&fresh).unwrap();
+        assert_file_offsets(&mut reopened, &fresh, &bytes, base);
+        assert_file_offsets(&mut reopened, &loaded.data.info, &bytes, base);
         drop(loaded);
         assert!(extracted.is_file());
         let reopened_sum = graph(&mut reopened, base + 48);

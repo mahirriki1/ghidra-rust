@@ -910,17 +910,7 @@ fn byte_location(
     if relative >= section.size {
         return Err("Byte exceeds section".into());
     }
-    let file_offset = if relative < section.file_size.min(section.size) {
-        Some(
-            section
-                .file_offset
-                .checked_add(relative)
-                .ok_or("Byte file offset overflow")?,
-        )
-    } else {
-        None
-    };
-    Ok((address, file_offset))
+    Ok((address, section.file_offset_at(address)))
 }
 
 #[derive(Debug, PartialEq, Eq)]

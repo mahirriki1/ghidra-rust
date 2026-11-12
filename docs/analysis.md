@@ -581,7 +581,11 @@ selects, use that length when it is known and the preview's size otherwise
 and their exclusive virtual/file ranges. Browse section-relative 4 KiB pages
 using **Prev/Next** or **VA (hex)**. Invalid jumps preserve the page. File bytes
 show offsets on hover; zero-filled bytes have none. Unmapped headers, overlays,
-and runtime process memory are outside this immutable snapshot view.
+and runtime process memory are outside this immutable snapshot view. The same
+section table maps Go's `file(offset)` queries, the status bar's `file(0x…)`
+readout and the Listing's **Copy file offset**; no file bytes are read for
+them, and an offset outside every section's file bytes, or inside two
+sections' bytes, has no address.
 
 Click/Shift-click hex or ASCII bytes, then **Decode selection** for the exact
 slice and address. Page changes clear selection. Browsing preserves navigation

@@ -19,6 +19,7 @@ mod elf_function_metadata;
 mod elf_startup;
 mod engine_cleanup;
 pub mod file_dialog;
+pub mod file_offsets;
 pub mod function_patterns;
 pub mod function_presentation;
 pub mod function_results;

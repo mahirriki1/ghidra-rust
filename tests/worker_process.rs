@@ -213,6 +213,141 @@ fn real_worker_reads_section_pages_and_clipped_zero_filled_tails() {
     assert_eq!(std::fs::read(&binary).unwrap(), original);
 }
 
+/// File offsets come from the published sections; the oracles here do not:
+/// the ELF program headers, and the raw positions of unique fixture bytes.
+#[test]
+fn real_worker_sections_map_file_offsets_like_the_program_headers() {
+    use ghidra_rust::file_offsets::{FileAddress, Unmapped, address_at, offset_of};
+    use object::read::elf::{ElfFile64, FileHeader, ProgramHeader, SectionHeader};
+    let directory = tempfile::tempdir().unwrap();
+    let binary = directory.path().join("fixture");
+    let result = Command::new("gcc")
+        .args(["-g", "-O0", "-fno-pie", "-no-pie", "-fno-inline"])
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/sample.c"
+        ))
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .expect("Linux integration tests require GCC");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let raw = std::fs::read(&binary).unwrap();
+    let elf = ElfFile64::<object::Endianness>::parse(raw.as_slice()).unwrap();
+    let endian = elf.endian();
+    let symbol = |name: &str| {
+        elf.symbols()
+            .find(|s| s.name().ok() == Some(name))
+            .unwrap()
+            .address()
+    };
+    // `p_offset + (address - p_vaddr)` within a PT_LOAD's file bytes.
+    let loads: Vec<_> = elf
+        .elf_header()
+        .program_headers(endian, raw.as_slice())
+        .unwrap()
+        .iter()
+        .filter(|header| header.p_type(endian) == object::elf::PT_LOAD)
+        .map(|header| {
+            (
+                header.p_vaddr(endian),
+                header.p_filesz(endian),
+                header.p_offset(endian),
+            )
+        })
+        .collect();
+    let segment_offset = |address: u64| {
+        let mut hits = loads.iter().filter_map(|&(vaddr, filesz, offset)| {
+            let relative = address.checked_sub(vaddr)?;
+            (relative < filesz).then_some(offset + relative)
+        });
+        let hit = hits.next();
+        assert!(hits.next().is_none(), "{address:#x} in two segments");
+        hit
+    };
+    let mut worker = Process::start();
+    let Response::Opened { info, .. } = worker.request(Request::Open {
+        path: binary.to_string_lossy().into_owned(),
+    }) else {
+        panic!("cannot open fixture")
+    };
+    assert_eq!(info.file_len, raw.len() as u64);
+    let read = |worker: &mut Process, address, length| {
+        let Response::Bytes { bytes, .. } = worker.request(Request::Bytes { address, length })
+        else {
+            panic!("cannot read {address:#x}")
+        };
+        bytes
+    };
+
+    // Raw positions of unique bytes map to the address the worker reads
+    // them back from.
+    let marker = [0xd3, 0x71, 0x53, 0x72, 0x63, 0x48, 0x34, 0x41];
+    for needle in [&b"aGVsbG8gcmV2ZXJzZXI="[..], &marker[..]] {
+        let mut positions = raw.windows(needle.len()).enumerate();
+        let (position, _) = positions.find(|(_, w)| *w == needle).unwrap();
+        assert!(positions.all(|(_, w)| w != needle), "unique fixture bytes");
+        let FileAddress::One(address) = address_at(&info.sections, info.file_len, position as u64)
+        else {
+            panic!("{position:#x} has no address")
+        };
+        assert_eq!(read(&mut worker, address, needle.len()), needle);
+        assert_eq!(segment_offset(address), Some(position as u64));
+    }
+    assert_eq!(
+        address_at(
+            &info.sections,
+            info.file_len,
+            offset_of(&info.sections, symbol("base64_message")).unwrap()
+        ),
+        FileAddress::One(symbol("base64_message"))
+    );
+
+    // Code: `main` and `branch_loop` entries agree with the program headers,
+    // and their raw bytes are what the worker reads.
+    for name in ["main", "branch_loop"] {
+        let address = symbol(name);
+        let offset = offset_of(&info.sections, address).unwrap();
+        assert_eq!(Some(offset), segment_offset(address), "{name}");
+        let at = offset as usize;
+        assert_eq!(read(&mut worker, address, 4), raw[at..at + 4], "{name}");
+    }
+    // Every published section's first and last backed byte agrees too.
+    for section in info.sections.iter().filter(|s| s.file_size > 0) {
+        for address in [section.address, section.address + section.file_size - 1] {
+            let offset = offset_of(&info.sections, address).unwrap();
+            assert_eq!(Some(offset), segment_offset(address), "{}", section.name);
+            assert_eq!(
+                address_at(&info.sections, info.file_len, offset),
+                FileAddress::One(address)
+            );
+        }
+    }
+
+    // Zero-fill has no offset, and no offset reaches `.bss`; headers and the
+    // end of the file have no address.
+    let bss = elf.section_by_name(".bss").unwrap();
+    let bss_offset = bss.elf_section_header().sh_offset(endian);
+    assert_eq!(offset_of(&info.sections, symbol("fixture_sink")), None);
+    assert!(matches!(
+        address_at(&info.sections, info.file_len, bss_offset),
+        FileAddress::Unmapped(_)
+    ));
+    assert_eq!(
+        address_at(&info.sections, info.file_len, 0),
+        FileAddress::Unmapped(Unmapped::BeforeSections)
+    );
+    assert_eq!(
+        address_at(&info.sections, info.file_len, info.file_len),
+        FileAddress::Unmapped(Unmapped::PastEnd)
+    );
+    assert_eq!(std::fs::read(&binary).unwrap(), raw);
+}
+
 #[test]
 fn real_worker_browses_decompiles_decodes_scans_and_recovers_from_bad_open() {
     let directory = std::env::temp_dir().join(format!("grust-process-test-{}", std::process::id()));

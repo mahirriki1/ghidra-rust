@@ -520,6 +520,62 @@ fn open_names(
     (worker, info, pages.finish().unwrap())
 }
 
+/// File offsets come from the published sections; the oracles here are the
+/// export table and raw positions of fixture bytes.
+#[test]
+fn pe_file_offsets_map_raw_bytes_to_export_addresses() {
+    use ghidra_rust::file_offsets::{FileAddress, Unmapped, address_at, offset_of};
+    let Some((_directory, binary, _executable)) = fixture() else {
+        return;
+    };
+    let raw = std::fs::read(&binary).unwrap();
+    let export = |name: &str| {
+        exports(&binary)
+            .into_iter()
+            .find(|(export, _)| export == name)
+            .unwrap()
+            .1
+    };
+    let (mut worker, info, _names) = open_names(&binary);
+    assert_eq!(info.file_len, raw.len() as u64);
+    // The raw base64 text is loaded at the `base64_message` export.
+    let text = b"aGVsbG8gcmV2ZXJzZXI=";
+    let mut positions = raw.windows(text.len()).enumerate();
+    let (position, _) = positions.find(|(_, w)| *w == text).unwrap();
+    assert!(positions.all(|(_, w)| w != text), "unique fixture text");
+    assert_eq!(
+        address_at(&info.sections, info.file_len, position as u64),
+        FileAddress::One(export("base64_message"))
+    );
+    // Code at an export address maps to raw bytes the worker reads there.
+    let branch = export("branch_loop");
+    let offset = offset_of(&info.sections, branch).unwrap() as usize;
+    let Response::Bytes { bytes, .. } = request(
+        &mut worker,
+        Request::Bytes {
+            address: branch,
+            length: 16,
+        },
+    ) else {
+        panic!("cannot read branch_loop")
+    };
+    assert_eq!(bytes, raw[offset..offset + 16]);
+    assert_eq!(
+        address_at(&info.sections, info.file_len, offset as u64),
+        FileAddress::One(branch)
+    );
+    // The DOS header and the end of the file have no address.
+    assert_eq!(&raw[..2], b"MZ");
+    assert_eq!(
+        address_at(&info.sections, info.file_len, 0),
+        FileAddress::Unmapped(Unmapped::BeforeSections)
+    );
+    assert_eq!(
+        address_at(&info.sections, info.file_len, info.file_len),
+        FileAddress::Unmapped(Unmapped::PastEnd)
+    );
+}
+
 fn exports(binary: &Path) -> Vec<(String, u64)> {
     let bytes = std::fs::read(binary).unwrap();
     let image = object::File::parse(bytes.as_slice()).unwrap();

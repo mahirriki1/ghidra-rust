@@ -6,7 +6,7 @@ use eframe::egui::{self, RichText};
 pub(crate) const SHORTCUTS: &[(&str, &str)] = &[
     ("F1", "Keyboard shortcuts"),
     ("L", "Rename function / label / local"),
-    ("G", "Go to address or name"),
+    ("G", "Go to address, name or file(offset)"),
     (";", "Edit comment"),
     ("X", "Xrefs to selection"),
     ("S", "Search memory"),
