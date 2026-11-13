@@ -145,7 +145,7 @@ def assert_executable(path):
         raise ValueError(f"Release binary is not executable: {path}")
 
 
-def build_info(binary, compiler):
+def build_info(binary, compiler, headless=False):
     versions = sorted(set(re.findall(r"\bGLIBC_([0-9]+(?:\.[0-9]+)+)\b", run("readelf", "--version-info", str(binary)))),
                       key=lambda v: tuple(map(int, v.split("."))))
     libraries = re.findall(r"\(NEEDED\).*\[([^\]]+)\]", run("readelf", "--dynamic", str(binary)))
@@ -158,7 +158,7 @@ def build_info(binary, compiler):
         "needed_shared_libraries": libraries,
         "runtime_requirements": [
             "Conventional glibc-based GNU/Linux x64; this is not a universal static binary or AppImage.",
-            "Compatible system shared libraries and an OpenGL-capable X11 or Wayland desktop.",
+            ("Compatible system shared libraries; no display or OpenGL context is initialized." if headless else "Compatible system shared libraries and an OpenGL-capable X11 or Wayland desktop."),
             "bubblewrap (bwrap), working unprivileged user namespaces, and a conventional /usr-based filesystem for analysis workers.",
             "The measured GLIBC symbol requirement is a minimum; it does not certify compatibility with every distribution.",
             "No Rust or Python runtime is required by the shipped application.",
@@ -208,7 +208,15 @@ def main():
         run("strip", "--strip-unneeded", str(bundled_binary))
         bundled_binary.chmod(0o755)
         assert_executable(bundled_binary)
-        for relative in ("README.md", "LICENSE", "NOTICE", "docs/releases.md", "docs/crypto-signatures.md", "docs/architectures.md"):
+        headless = package_file(executable.parent, "ghidra-rust-headless")
+        assert_executable(headless)
+        bundled_headless = bundle / "ghidra-rust-headless"
+        copy_file(headless, bundled_headless)
+        run("strip", "--strip-unneeded", str(bundled_headless))
+        bundled_headless.chmod(0o755)
+        assert_executable(bundled_headless)
+        write_json(bundle / "HEADLESS-BUILD-INFO.json", build_info(bundled_headless, compiler, headless=True))
+        for relative in ("README.md", "LICENSE", "NOTICE", "docs/releases.md", "docs/crypto-signatures.md", "docs/architectures.md", "docs/headless.md"):
             copy_file(package_file(ROOT, relative), bundle / relative)
         for relative in ("docs/linux.md", "docs/windows.md"):
             if (ROOT / relative).exists():

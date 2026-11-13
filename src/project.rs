@@ -702,26 +702,29 @@ impl ProjectData {
     /// Compare persisted mapping metadata with a fresh parse of the chosen input.
     pub fn validate_against(&self, actual: &BinaryInfo) -> Result<(), String> {
         self.validate()?;
-        let a = &self.info;
-        if a.sha256 != actual.sha256
-            || a.file_len != actual.file_len
-            || a.architecture != actual.architecture
-            || a.format != actual.format
-            || a.entry != actual.entry
-            || a.sections.len() != actual.sections.len()
-            || !a.sections.iter().zip(&actual.sections).all(|(a, b)| {
-                a.name == b.name
-                    && a.address == b.address
-                    && a.size == b.size
-                    && a.file_offset == b.file_offset
-                    && a.file_size == b.file_size
-                    && a.executable == b.executable
-            })
-        {
+        if !same_image(&self.info, actual) {
             return Err("Project metadata does not match the freshly analyzed binary".into());
         }
         Ok(())
     }
+}
+
+/// Whether two parses describe the same image hash, format and address mapping.
+pub fn same_image(a: &BinaryInfo, b: &BinaryInfo) -> bool {
+    a.sha256 == b.sha256
+        && a.file_len == b.file_len
+        && a.architecture == b.architecture
+        && a.format == b.format
+        && a.entry == b.entry
+        && a.sections.len() == b.sections.len()
+        && a.sections.iter().zip(&b.sections).all(|(a, b)| {
+            a.name == b.name
+                && a.address == b.address
+                && a.size == b.size
+                && a.file_offset == b.file_offset
+                && a.file_size == b.file_size
+                && a.executable == b.executable
+        })
 }
 
 fn validate_function(

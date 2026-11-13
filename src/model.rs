@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+/// Parent-enforced deadline for one contained worker request. Progress does not extend it.
+pub const WORKER_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Enforced by both the worker and the desktop before syntax-cache construction.
 pub const MAX_DECOMPILED_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_CODE_MAPPINGS: usize = 32_768;
@@ -68,6 +71,9 @@ pub const MAX_STRING_MINIMUM: usize = 64;
 pub const MAX_ANALYSIS_FUNCTIONS: usize = 128;
 /// Interrupted batches retry each affected seed individually at most once.
 pub const MAX_DISCOVERY_INTERRUPTION_ATTEMPTS: usize = 2;
+/// Automatic worker restarts during one logical discovery run, shared by the
+/// desktop and headless controllers. Successful resumed batches do not refund it.
+pub const MAX_DISCOVERY_RESUMES: u8 = 3;
 /// Entries in one function-name synchronization. Requests are also packed by
 /// encoded size with [`sync_chunks`] or [`sync_entry_bytes`].
 pub const MAX_DISCOVERY_SYNC_FUNCTIONS: usize = 1024;

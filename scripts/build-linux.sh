@@ -54,5 +54,6 @@ if ((run_tests)); then
     cargo test --release --locked --test worker_process
     cargo test --release --locked --test linux_worker
     cargo test --release --locked --test aarch64
+    cargo test --release --locked --test headless
 fi
 python3 scripts/package-linux.py

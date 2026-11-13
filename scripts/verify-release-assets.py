@@ -15,7 +15,7 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parent.parent
 REQUIRED = ("README.md", "LICENSE", "NOTICE", "THIRD-PARTY.json",
-            "docs/releases.md", "docs/linux.md", "docs/windows.md")
+            "docs/releases.md", "docs/linux.md", "docs/windows.md", "docs/headless.md")
 
 
 def require(condition, message):
@@ -71,6 +71,12 @@ def verify(directory, version):
         require(binary.mode & 0o111, "Bundled Linux application is not executable")
         with archive.extractfile(binary) as stream:
             require(digest(stream) == hashes[linux], "Linux archive executable differs from standalone")
+        headless = archive.getmember(f"{linux}/ghidra-rust-headless")
+        require(headless.mode & 0o111, "Bundled Linux headless application is not executable")
+        with archive.extractfile(headless) as stream:
+            header = stream.read(20)
+            require(header[:7] == b"\x7fELF\x02\x01\x01" and header[18:20] == b"\x3e\0",
+                    "Linux headless application must be little-endian x64 ELF")
         with archive.extractfile(f"{linux}/THIRD-PARTY.json") as stream:
             metadata(stream, version, "x86_64-unknown-linux-gnu")
         with archive.extractfile(f"{linux}/BUILD-INFO.json") as stream:
@@ -86,6 +92,17 @@ def verify(directory, version):
             archive.getinfo(f"{windows}/{name}")
         with archive.open(f"{windows}/ghidra-rust.exe") as stream:
             require(digest(stream) == hashes[windows + ".exe"], "Windows archive executable differs from standalone")
+        with archive.open(f"{windows}/ghidra-rust-headless.exe") as stream:
+            require(stream.read(2) == b"MZ", "Windows headless application must be PE")
+            stream.seek(0x3c)
+            offset = struct.unpack("<I", stream.read(4))[0]
+            require(offset <= 1024 * 1024, "Windows headless PE header is oversized")
+            stream.seek(offset)
+            require(stream.read(6) == b"PE\0\0\x64\x86", "Windows headless application must be x64 PE")
+            stream.seek(offset + 24)
+            require(stream.read(2) == b"\x0b\x02", "Windows headless application must be PE32+")
+            stream.seek(offset + 24 + 68)
+            require(stream.read(2) == b"\x03\0", "Windows headless application must use the console subsystem")
         with archive.open(f"{windows}/THIRD-PARTY.json") as stream:
             metadata(stream, version, "x86_64-pc-windows-msvc")
 

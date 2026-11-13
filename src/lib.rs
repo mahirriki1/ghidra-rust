@@ -24,6 +24,7 @@ pub mod function_patterns;
 pub mod function_presentation;
 pub mod function_results;
 pub mod graph;
+pub mod headless;
 mod help;
 mod hex_ui;
 pub mod highlight;
