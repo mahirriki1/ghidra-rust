@@ -267,8 +267,8 @@ selection on the Hex tab) has one, the status bar shows it as `file(0x…)`,
 which Go accepts unchanged.
 
 Visited functions reuse compatible session results. **Analysis → Refresh
-function** recomputes the selected function. This session cache does not mean
-every visited function is saved in a project.
+function** recomputes the selected function. Project saves also retain a bounded
+set of these function results for reuse after reopening.
 
 Opening and saving use an in-app file chooser rather than a desktop portal or
 native dialog. It has Back / Forward / Up, clickable breadcrumbs (**Ctrl+L**
@@ -415,7 +415,9 @@ completion percentage. Use **Analysis → Cancel analysis** to stop a run.
 **File → Save project** or **Ctrl+S** creates one SQLite `.grproj` file.
 It stores annotations, the known function list, the displayed function's
 listing/graph and pseudocode, scan results, and committed discovery results.
-It does not save every visited function or the engine's complete database.
+It also saves up to 128 recent retained functions within a 16 MiB result budget.
+Evicted or oversized results are recomputed when needed; the engine's complete
+database is not saved.
 Imports and exports are not saved; reopening rebuilds them from the verified binary.
 
 **File → Include binary in project** is enabled initially. Embedded projects

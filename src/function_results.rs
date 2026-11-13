@@ -358,6 +358,23 @@ impl FunctionResults {
         }
     }
 
+    /// Snapshot only results whose complete input projection is committed.
+    pub fn snapshot(&self) -> Vec<FunctionHit> {
+        if self.preparing() || self.input_failed {
+            return Vec::new();
+        }
+        self.store
+            .snapshot(crate::project::MAX_SAVED_FUNCTIONS)
+            .into_iter()
+            .map(|(address, hit, state)| FunctionHit {
+                graph: hit.graph,
+                decompiled: (state == self.local_state(address))
+                    .then_some(hit.decompiled)
+                    .flatten(),
+            })
+            .collect()
+    }
+
     /// Warm-worker miss policy: request each missing component from the
     /// existing worker, which already holds the replayed program context.
     pub fn miss_requests(hit: &FunctionHit, address: u64, decompile: bool) -> Vec<Request> {

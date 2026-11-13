@@ -347,6 +347,7 @@ fn sandboxed_linux_worker_and_embedded_project_round_trip() {
         },
     );
     let mut project = ProjectData {
+        function_results: Vec::new(),
         semantics: Default::default(),
         info,
         session,
@@ -1241,6 +1242,7 @@ fn demangled_cpp_names_keep_raw_identities_through_worker_and_project() {
         },
     );
     let project = ProjectData {
+        function_results: Vec::new(),
         semantics: Default::default(),
         info,
         session,
@@ -1394,6 +1396,7 @@ fn plt_stubs_link_to_their_imports_in_classic_and_ibt_layouts() {
             .bind_snapshot(&info)
             .unwrap();
         let project = ProjectData {
+            function_results: Vec::new(),
             session: Session::new(info.sha256.clone()),
             info,
             view: Some(view),

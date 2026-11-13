@@ -682,6 +682,7 @@ struct ProjectOpen {
     /// Prepared by the file job, so restoring a large reference index never
     /// sorts or allocates its lookup tables on the GUI thread.
     discovery_index: Option<Arc<crate::call_analysis::CallIndex>>,
+    function_results: Vec<crate::project::PreparedFunction>,
 }
 
 #[derive(Clone)]
@@ -3797,11 +3798,12 @@ impl DesktopApp {
         ) else {
             return;
         };
-        // Project format v4 stores the displayed function's results.
+        // The displayed function and a pinned snapshot share the save job lifetime.
+        let function_snapshot = self.results.snapshot();
         let view = self
             .view()
             .map(|view| crate::project::persistable_view(view, &info.sections));
-        let data = ProjectData {
+        let mut data = ProjectData {
             info,
             session,
             view,
@@ -3814,6 +3816,7 @@ impl DesktopApp {
             crypto_truncated: self.crypto_truncated,
             selected_address: self.project_selection(),
             discovery: self.discovery_saved.clone(),
+            function_results: Vec::new(),
         };
         let generation = self.generation;
         let revision = self.revision;
@@ -3823,6 +3826,11 @@ impl DesktopApp {
         let sender = self.file_dialogs.sender();
         let initial_dir = self.dialog_directory();
         self.file_task(context, move || {
+            data.function_results = crate::project::SavedFunction::capture(
+                function_snapshot,
+                data.view.as_ref().map(|view| view.address),
+                &data.info.sections,
+            );
             let path = previous
                 .or_else(|| request_file(&sender, FileDialogKind::SaveProject, initial_dir));
             let result = path
@@ -4154,6 +4162,7 @@ impl DesktopApp {
             project,
             project_path,
             discovery_index,
+            function_results,
             ..
         } = project;
         let LoadedProject {
@@ -4196,6 +4205,24 @@ impl DesktopApp {
             self.saved_references = true;
             self.discovery_saved = Some(saved);
         }
+        if cache_compatible {
+            for saved in function_results.into_iter().rev() {
+                let address = saved.graph.address();
+                let binding = self
+                    .results
+                    .binding(address, self.local_override_state(address));
+                self.results
+                    .admit_graph(binding.as_ref(), saved.graph, ResultOrigin::Saved, None);
+                if let Some(code) = saved.code {
+                    self.results.admit_decompilation(
+                        binding.as_ref(),
+                        code,
+                        ResultOrigin::Saved,
+                        None,
+                    );
+                }
+            }
+        }
         self.restore_place(
             data.selected_address,
             displayed_entry,
@@ -4219,7 +4246,7 @@ impl DesktopApp {
         let initial_dir = project_path.parent().map(std::path::Path::to_path_buf);
         self.file_task(context, move || {
             let result = (|| {
-                let project = ProjectData::load(&project_path)?;
+                let mut project = ProjectData::load(&project_path)?;
                 let binary_path = if let Some(binary) = &project.binary {
                     binary.path().to_owned()
                 } else {
@@ -4236,7 +4263,9 @@ impl DesktopApp {
                         saved.clone(),
                     ))
                 });
+                let function_results = crate::project::prepare_functions(&mut project.data);
                 Ok(Some(Box::new(ProjectOpen {
+                    function_results,
                     project,
                     project_path,
                     binary_path,
@@ -9512,6 +9541,13 @@ impl DesktopApp {
                     assert!(self.cached_graph && self.saved_analysis);
                     assert_eq!(self.view().unwrap().address, a);
                     assert_eq!(self.selected, Some(check.pc));
+                    assert!(!self.dirty());
+                    self.navigate(b, true, context);
+                    assert_eq!(self.view().unwrap().address, b);
+                    assert!(self.cached_graph && self.saved_analysis);
+                    assert!(self.pending.is_none() && self.queue.is_empty());
+                    self.navigate_location(check.pc, Some(a), true, context);
+                    assert_eq!(self.selected, Some(check.pc));
                 }
                 check.code = self.code.clone();
                 let path = self.binary_path.clone().unwrap();
@@ -9532,7 +9568,8 @@ impl DesktopApp {
                 ));
                 if check.project.is_some() {
                     assert!(self.saved_analysis && self.cached_graph && self.cached_functions);
-                    assert!(!self.dirty());
+                    // The B/A navigation changed the saved displayed scope.
+                    assert_eq!(self.revision, self.saved_revision);
                 }
                 check.code = None;
                 self.tab = Tab::Listing;
@@ -9576,6 +9613,7 @@ impl DesktopApp {
             || self.file_job.is_some()
             || self.analysis_plan.is_some()
             || self.discovery_running
+            || self.graph_preparation.awaits(|_| true)
             || self.results.preparing()
             || self.deferred_restore.is_some()
             || self.info.is_none();
@@ -15366,6 +15404,7 @@ mod tests {
             crypto_truncated: false,
             selected_address: Some(0x1000),
             discovery: None,
+            function_results: Vec::new(),
         };
         let project_path = directory.path().join("analysis.grproj");
         data.save(&project_path, &protection, true).unwrap();
@@ -15374,6 +15413,7 @@ mod tests {
         app.session = Some(project.data.session.clone());
         app.restore_project(
             ProjectOpen {
+                function_results: Vec::new(),
                 project,
                 project_path: project_path.clone(),
                 binary_path: extracted.clone(),
@@ -15512,9 +15552,11 @@ mod tests {
             crypto_truncated: false,
             selected_address: None,
             discovery: Some(saved.clone()),
+            function_results: Vec::new(),
         };
         app.restore_project(
             ProjectOpen {
+                function_results: Vec::new(),
                 discovery_index: Some(Arc::new(crate::call_analysis::CallIndex::from_snapshot(
                     saved.clone(),
                 ))),
@@ -17925,6 +17967,73 @@ mod tests {
     }
 
     #[test]
+    fn saved_additional_functions_restore_without_worker_requests_and_refresh_invalidates() {
+        let context = egui::Context::default();
+        let source = retained_app();
+        let info = source.info.clone().unwrap();
+        let functions = crate::project::SavedFunction::capture(
+            source.results.snapshot(),
+            Some(0x1000),
+            &info.sections,
+        );
+        assert_eq!(functions.len(), 1);
+        let mut data = ProjectData {
+            info: info.clone(),
+            session: source.session.clone().unwrap(),
+            view: Some(source.view().unwrap().clone()),
+            decompiled: Some(source.decompiled().into()),
+            mappings: source.semantic.mappings.to_vec(),
+            semantics: source.semantics().clone(),
+            strings: vec![],
+            strings_truncated: false,
+            crypto: vec![],
+            crypto_truncated: false,
+            selected_address: Some(0x1008),
+            discovery: None,
+            function_results: functions,
+        };
+        let prepared = crate::project::prepare_functions(&mut data);
+        let mut app = retained_app();
+        app.results.close();
+        app.results.open(&info.sha256, &[]);
+        app.results.update_inputs(info.functions.clone(), vec![]);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while app.results.preparing() {
+            assert!(Instant::now() < deadline);
+            app.results.poll_inputs();
+            std::thread::yield_now();
+        }
+        app.restore_project(
+            ProjectOpen {
+                project: LoadedProject {
+                    data,
+                    binary: None,
+                    source_hint: String::new(),
+                    cache_compatible: true,
+                    displayed_entry: Some(0x1000),
+                },
+                project_path: "functions.grproj".into(),
+                binary_path: "fixture".into(),
+                discovery_index: None,
+                function_results: prepared,
+            },
+            &context,
+        );
+        app.settle_graph();
+        assert_eq!(app.selected, Some(0x1008));
+        app.navigate(0x1040, true, &context);
+        assert_eq!(app.view().unwrap().address, 0x1040);
+        assert_eq!(app.decompiled(), "return;");
+        assert!(app.cached_graph && app.saved_analysis);
+        assert!(app.client.is_none() && app.pending.is_none() && app.queue.is_empty());
+        app.history_step(false, &context);
+        assert_eq!(app.selected, Some(0x1008));
+        app.results.refresh(0x1040);
+        assert!(app.results.lookup(0x1040, "").graph.is_none());
+        assert!(app.results.lookup(0x1000, "").graph.is_some());
+    }
+
+    #[test]
     fn full_hits_restore_exact_instruction_history_and_saved_provenance_synchronously() {
         let context = egui::Context::default();
         let mut app = retained_app();
@@ -19197,6 +19306,7 @@ mod tests {
             crypto_truncated: false,
             selected_address: Some(base),
             discovery: None,
+            function_results: Vec::new(),
         };
         for embedded in [true, false] {
             let path = directory.path().join("legacy.grproj");
@@ -19232,6 +19342,7 @@ mod tests {
                 .to_owned();
             let mut app = DesktopApp::empty(None);
             app.opening_project = Some(Box::new(ProjectOpen {
+                function_results: Vec::new(),
                 project: loaded,
                 project_path: path.clone(),
                 binary_path: selected.clone(),
@@ -19586,6 +19697,7 @@ mod tests {
             crypto_truncated: false,
             selected_address: app.selected,
             discovery: None,
+            function_results: Vec::new(),
         };
         let project_path = directory.path().join("linkage.grproj");
         data.save(&project_path, &protection, true).unwrap();
@@ -19608,6 +19720,7 @@ mod tests {
         app.session = Some(project.data.session.clone());
         app.restore_project(
             ProjectOpen {
+                function_results: Vec::new(),
                 project,
                 project_path,
                 binary_path: extracted,

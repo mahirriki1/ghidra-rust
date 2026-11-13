@@ -469,3 +469,46 @@ fn address_evidence_is_charged_once_per_publication_until_save_pins_drop() {
     drop(saved);
     assert_eq!(results.usage().charged, baseline + empty_charge);
 }
+
+#[test]
+fn save_snapshot_pins_results_and_rejects_pending_or_changed_contexts() {
+    let mut results = opened();
+    for address in [0x1000, 0x1040] {
+        let binding = results.binding(address, String::new()).unwrap();
+        results.admit_graph(Some(&binding), graph(address), ResultOrigin::Computed, None);
+        results.admit_decompilation(
+            Some(&binding),
+            code(address, "return;"),
+            ResultOrigin::Computed,
+            None,
+        );
+    }
+    let snapshot = results.snapshot();
+    assert_eq!(snapshot.len(), 2);
+    let charged = results.usage().charged;
+    assert!(charged > 0);
+    results.close();
+    assert!(results.snapshot().is_empty());
+    assert!(
+        results.usage().charged > 0,
+        "save pins survive invalidation"
+    );
+    drop(snapshot);
+    assert_eq!(results.usage().charged, 0);
+
+    let mut results = opened();
+    let binding = results.binding(0x1000, String::new()).unwrap();
+    results.admit_graph(Some(&binding), graph(0x1000), ResultOrigin::Computed, None);
+    let mut renamed = functions();
+    renamed[0].name = "new_name".into();
+    results.update_inputs(renamed, vec![]);
+    assert!(
+        results.snapshot().is_empty(),
+        "uncommitted input projections cannot be saved"
+    );
+    ready(&mut results);
+    assert!(
+        results.snapshot().is_empty(),
+        "old global context cannot be saved"
+    );
+}

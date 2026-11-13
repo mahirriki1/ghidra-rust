@@ -66,6 +66,12 @@ impl HighlightedCode {
             .total()
     }
 
+    /// Conservative span-allocation bound before tokenizing untrusted text.
+    pub fn estimated_bytes(text: &str) -> usize {
+        let spans = text.len().min(MAX_SYNTAX_SPANS).next_power_of_two().max(4);
+        size_of::<Self>().saturating_add(spans.saturating_mul(size_of::<Span>()))
+    }
+
     pub fn new(text: &str) -> Self {
         let mut code = Self {
             spans: Vec::new(),

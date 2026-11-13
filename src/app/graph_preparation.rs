@@ -443,6 +443,7 @@ mod tests {
         let source = "int entry() { return 7; }";
         let displayed_entry = Some(view.address);
         let data = ProjectData {
+            function_results: Vec::new(),
             info: app.info.clone().unwrap(),
             session: app.session.clone().unwrap(),
             view: Some(view),
@@ -461,6 +462,7 @@ mod tests {
             discovery: None,
         };
         ProjectOpen {
+            function_results: Vec::new(),
             project: LoadedProject {
                 data,
                 binary: None,

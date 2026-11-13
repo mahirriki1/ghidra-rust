@@ -479,6 +479,7 @@ fn real_worker_browses_decompiles_decodes_scans_and_recovers_from_bad_open() {
         },
     );
     let project = ghidra_rust::project::ProjectData {
+        function_results: Vec::new(),
         semantics: Default::default(),
         info,
         session,
