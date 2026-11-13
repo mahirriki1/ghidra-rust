@@ -79,6 +79,8 @@ try {
         if ($LASTEXITCODE -ne 0) { throw 'Windows release worker/project test failed.' }
         & cargo test --release --locked --target $target --test aarch64
         if ($LASTEXITCODE -ne 0) { throw 'AArch64 release worker/project test failed.' }
+        & cargo test --release --locked --target $target --test headless
+        if ($LASTEXITCODE -ne 0) { throw 'Release headless API tests failed.' }
     }
     & "$PSScriptRoot\package-windows.ps1"
 } finally {

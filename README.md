@@ -465,6 +465,14 @@ See [Linux requirements and isolation](docs/linux.md).
 **Windows worker limits control resources only; there is no filesystem or
 network sandbox. Use trusted inputs.** See the [Windows guide](docs/windows.md).
 
+## Headless analysis
+
+The native archives also include `ghidra-rust-headless`, a versioned JSON/console
+API and Rust controller for contained analysis and project checkpoints without a
+desktop window. See [the headless API guide](docs/headless.md) for commands,
+provenance, lifecycle, and limits. HTTP hosting and cloud synchronization are
+not included yet.
+
 ## Documentation
 
 | Topic | Guide |

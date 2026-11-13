@@ -367,17 +367,20 @@ class PackageVerificationTests(unittest.TestCase):
         pe[128:134] = b"PE\0\0\x64\x86"
         pe[152:154] = b"\x0b\x02"
         pe[220:222] = b"\x02\0"
+        self.console = bytearray(pe)
+        self.console[220:222] = b"\x03\0"
         (self.root / self.linux).write_bytes(elf)
         (self.root / (self.windows + ".exe")).write_bytes(pe)
         with tarfile.open(self.root / (self.linux + ".tar.gz"), "w:gz") as archive:
             files = self.bundle("x86_64-unknown-linux-gnu")
             files["ghidra-rust"] = bytes(elf)
+            files["ghidra-rust-headless"] = bytes(elf)
             files["BUILD-INFO.json"] = json.dumps({"application_version": self.version,
                 "target": "x86_64-unknown-linux-gnu", "maximum_required_glibc_symbol_version": "GLIBC_2.39"}).encode()
             for name, value in files.items():
                 member = tarfile.TarInfo(self.linux + "/" + name)
                 member.size = len(value)
-                member.mode = 0o755 if name == "ghidra-rust" else 0o644
+                member.mode = 0o755 if name in ("ghidra-rust", "ghidra-rust-headless") else 0o644
                 archive.addfile(member, io.BytesIO(value))
         self.write_windows(bytes(pe))
         self.checksums()
@@ -393,6 +396,7 @@ class PackageVerificationTests(unittest.TestCase):
             for name, value in self.bundle("x86_64-pc-windows-msvc").items():
                 archive.writestr(self.windows + "/" + name, value)
             archive.writestr(self.windows + "/ghidra-rust.exe", executable)
+            archive.writestr(self.windows + "/ghidra-rust-headless.exe", self.console)
 
     def checksums(self):
         for file in self.root.iterdir():
@@ -402,6 +406,22 @@ class PackageVerificationTests(unittest.TestCase):
 
     def test_complete_matching_native_packages_are_accepted(self):
         assets.verify(self.root, self.version)
+
+    def test_gui_subsystem_in_headless_archive_is_rejected(self):
+        path = self.root / (self.windows + ".zip")
+        with zipfile.ZipFile(path) as archive:
+            files = {name: archive.read(name) for name in archive.namelist()}
+        name = self.windows + "/ghidra-rust-headless.exe"
+        image = bytearray(files[name])
+        offset = struct.unpack_from("<I", image, 0x3c)[0]
+        image[offset + 24 + 68:offset + 24 + 70] = b"\x02\0"
+        files[name] = image
+        with zipfile.ZipFile(path, "w") as archive:
+            for name, value in files.items():
+                archive.writestr(name, value)
+        self.checksums()
+        with self.assertRaisesRegex(ValueError, "console subsystem"):
+            assets.verify(self.root, self.version)
 
     def test_missing_windows_download_is_rejected(self):
         (self.root / (self.windows + ".exe")).unlink()

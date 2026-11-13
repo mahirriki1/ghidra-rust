@@ -503,6 +503,19 @@ impl LinkageFetch {
         &self.summary
     }
 
+    /// Conservative allocation bound for a paged headless consumer. Escaped
+    /// text bounds decoded string capacity; sparse address-map nodes get slack.
+    pub(crate) fn estimated_bytes(&self) -> Option<usize> {
+        crate::result_store::Bytes::of::<Self>()
+            .slots::<LinkageRecord>(self.records.capacity())
+            .slots::<LinkageGap>(self.summary.gaps.capacity())
+            .plus(self.summary.image_sha256.capacity())
+            .plus(self.summary.digest.capacity())
+            .add_total(self.text.checked_mul(2))
+            .add_total(self.addresses.len().checked_mul(256))
+            .total()
+    }
+
     /// Next cursor to request, or `None` when every record arrived.
     pub fn cursor(&self) -> Option<usize> {
         (self.records.len() < self.summary.records()).then_some(self.records.len())

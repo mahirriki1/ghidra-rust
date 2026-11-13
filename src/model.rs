@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+/// Parent-enforced deadline for one contained worker request. Progress does not extend it.
+pub const WORKER_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Enforced by both the worker and the desktop before syntax-cache construction.
 pub const MAX_DECOMPILED_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_CODE_MAPPINGS: usize = 32_768;

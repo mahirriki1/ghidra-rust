@@ -117,7 +117,10 @@ try {
     $bundle = Join-Path $staging $bundleName
     [IO.Directory]::CreateDirectory($bundle) | Out-Null
     Copy-BundleFile $executable (Join-Path $bundle 'ghidra-rust.exe')
-    foreach ($relative in @('README.md', 'LICENSE', 'NOTICE', 'docs/releases.md', 'docs/windows.md', 'docs/linux.md', 'docs/crypto-signatures.md', 'docs/architectures.md')) {
+    $headless = Join-Path ([IO.Path]::GetDirectoryName($executable)) 'ghidra-rust-headless.exe'
+    Assert-X64Executable $headless
+    Copy-BundleFile $headless (Join-Path $bundle 'ghidra-rust-headless.exe')
+    foreach ($relative in @('README.md', 'LICENSE', 'NOTICE', 'docs/releases.md', 'docs/windows.md', 'docs/linux.md', 'docs/crypto-signatures.md', 'docs/architectures.md', 'docs/headless.md')) {
         Copy-BundleFile (Join-Path $repository $relative) (Join-Path $bundle $relative)
     }
     $images = Join-Path $repository 'docs/images'
