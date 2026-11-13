@@ -13,12 +13,14 @@ use crate::discovery::{Discovery, DiscoverySnapshot, WorkerInventory};
 use crate::function_presentation::{PreparedDecompilation, PreparedGraph};
 use crate::function_results::FunctionResults;
 use crate::model::*;
-use crate::project::{ProjectData, SavedFunction};
+use crate::project::{EmbeddedBinary, ProjectData, SavedFunction};
 use crate::result_store::{ResultOrigin, Shared};
 use crate::session::{BinaryProtection, Session};
 use serde::{Deserialize, Serialize};
 
 pub mod protocol;
+#[cfg(all(test, any(target_os = "linux", windows)))]
+mod tests;
 
 /// Version of the public console protocol, independent of worker/project formats.
 pub const API_VERSION: u16 = 1;
@@ -66,6 +68,7 @@ pub enum ErrorCode {
     InvalidRequest,
     UnsupportedVersion,
     InvalidAddress,
+    CommandFailed,
     WorkerFailed,
     Timeout,
     Cancelled,
@@ -197,25 +200,188 @@ pub enum Output {
 }
 
 /// A single verified binary, its annotations and bounded reusable results.
-/// Errors in the worker transport, cancellation, and timeouts close the worker;
-/// completed results remain owned until this controller is dropped.
+/// Worker transport failures, malformed replies, timeouts, cancellation and
+/// non-recoverable engine errors stop the worker. Completed results, scans,
+/// committed discovery and annotations stay owned by this controller, so
+/// `info`, `annotations` and `save_project` keep working without a worker.
+/// Only `discover` starts a replacement worker for the same verified image,
+/// at most [`MAX_DISCOVERY_RESUMES`] times per session.
 pub struct Analyzer {
-    worker: Option<WorkerClient>,
+    worker: Option<ReapingWorker>,
     data: ProjectData,
+    /// The protection bound when the session opened. Replacement workers must
+    /// verify the same source identity; checkpoints keep using this guard.
     protection: BinaryProtection,
+    /// The controller's own lease on an extracted project image, independent
+    /// of any worker, so a checkpoint can still embed it after a stop.
+    source: Option<EmbeddedBinary>,
+    /// Canonical input path the first worker verified; replacement workers
+    /// reopen exactly this path and are then checked against `protection`.
+    binary_path: PathBuf,
+    executable: PathBuf,
     options: Options,
     results: FunctionResults,
     graph: Option<Shared<PreparedGraph>>,
     code: Option<Shared<PreparedDecompilation>>,
     discovery: Option<Discovery>,
+    /// Inventory adopted from the current worker; reset with every worker.
     inventory: Option<WorkerInventory>,
+    /// Distinct per worker so discovery bindings never cross a restart.
+    worker_epoch: u64,
+    discovery_resumes: u8,
     unapplied_signatures: Vec<SignatureStatus>,
     linkage: Option<crate::linkage::LinkageFetch>,
+}
+
+/// Synchronously stops and reaps its worker on drop, releasing any retained
+/// extracted-image lease before the owner returns. The desktop's asynchronous
+/// [`WorkerClient`] drop could otherwise let a short-lived console exit first.
+struct ReapingWorker(Option<WorkerClient>);
+impl ReapingWorker {
+    fn start(path: &Path, executable: &Path) -> Result<Self, Error> {
+        WorkerClient::start_using_executable(eframe::egui::Context::default(), path, executable)
+            .map(|worker| Self(Some(worker)))
+            .map_err(|e| Error::new(ErrorCode::WorkerFailed, e))
+    }
+}
+impl std::ops::Deref for ReapingWorker {
+    type Target = WorkerClient;
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().expect("owned worker")
+    }
+}
+impl std::ops::DerefMut for ReapingWorker {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.as_mut().expect("owned worker")
+    }
+}
+impl Drop for ReapingWorker {
+    fn drop(&mut self) {
+        if let Some(worker) = self.0.take() {
+            // On a reaping failure the client falls back to its own
+            // asynchronous drop, which still keeps the lease until exit.
+            let _ = worker.stop_and_wait();
+        }
+    }
+}
+
+/// Startup and replay failures discard the worker, so an engine error there
+/// is never reported as a recoverable `CommandFailed`.
+fn fatal(mut error: Error) -> Error {
+    if error.code == ErrorCode::CommandFailed {
+        error.code = ErrorCode::WorkerFailed;
+    }
+    error
+}
+
+/// A verified worker `Open` reply and the protection bound to its snapshot.
+struct Opened {
+    info: BinaryInfo,
+    macho_legacy: Option<MachoLegacySections>,
+    protection: BinaryProtection,
+}
+
+fn open_worker(worker: &mut WorkerClient, options: &Options) -> Result<Opened, Error> {
+    let actual_path = worker
+        .protection()
+        .path()
+        .to_str()
+        .ok_or_else(|| Error::new(ErrorCode::InvalidRequest, "The binary path must be UTF-8"))?
+        .to_owned();
+    let Response::Opened {
+        info, macho_legacy, ..
+    } = exchange(worker, Request::Open { path: actual_path }, options).map_err(fatal)?
+    else {
+        return Err(Error::new(
+            ErrorCode::WorkerFailed,
+            "Unexpected worker open reply",
+        ));
+    };
+    crate::project::validate_info(&info, MAX_FUNCTION_NAME_BYTES, true)
+        .map_err(|e| Error::new(ErrorCode::WorkerFailed, e))?;
+    let protection = worker
+        .protection()
+        .bind_snapshot(&info)
+        .map_err(|e| Error::new(ErrorCode::WorkerFailed, e))?;
+    Ok(Opened {
+        info,
+        macho_legacy,
+        protection,
+    })
+}
+
+/// Replays complete effective names before prototypes, and both before any
+/// analysis. Returns the worker's unapplied saved signatures.
+fn replay(
+    worker: &mut WorkerClient,
+    data: &ProjectData,
+    options: &Options,
+) -> Result<Vec<SignatureStatus>, Error> {
+    let effective: Vec<_> = data
+        .info
+        .functions
+        .iter()
+        .map(|function| {
+            let mut end = function.name.len().min(MAX_FUNCTION_NAME_BYTES);
+            while !function.name.is_char_boundary(end) {
+                end -= 1;
+            }
+            FunctionInfo {
+                address: function.address,
+                name: function.name[..end].into(),
+            }
+        })
+        .collect();
+    for chunk in sync_chunks(&effective) {
+        if !matches!(
+            exchange(
+                worker,
+                Request::SyncFunctions {
+                    functions: chunk.to_vec()
+                },
+                options
+            )
+            .map_err(fatal)?,
+            Response::FunctionsSynced
+        ) {
+            return Err(Error::new(
+                ErrorCode::WorkerFailed,
+                "Unexpected function synchronization reply",
+            ));
+        }
+    }
+    if data.session.signatures.is_empty() {
+        return Ok(Vec::new());
+    }
+    let context = crate::signatures::state_digest(&data.session.signatures);
+    match exchange(
+        worker,
+        Request::SyncSignatures {
+            binary_sha256: data.info.sha256.clone(),
+            context: context.clone(),
+            signatures: data.session.signatures.clone(),
+        },
+        options,
+    )
+    .map_err(fatal)?
+    {
+        Response::SignaturesSynced {
+            binary_sha256,
+            context: actual,
+            unapplied,
+        } if binary_sha256 == data.info.sha256 && actual == context => Ok(unapplied),
+        _ => Err(Error::new(
+            ErrorCode::WorkerFailed,
+            "Unexpected signature synchronization reply",
+        )),
+    }
 }
 
 impl Analyzer {
     /// `executable` is selected by the host, supports `--analysis-worker`, and
     /// must be trusted. Project source hints are never opened automatically.
+    /// A startup error stops and reaps any worker before returning, so an
+    /// extracted project image never outlives this call.
     pub fn open(input: Input, executable: &Path, options: Options) -> Result<Self, Error> {
         if options.worker_timeout.is_zero() || options.worker_timeout > WORKER_REQUEST_TIMEOUT {
             return Err(Error::new(
@@ -253,39 +419,19 @@ impl Analyzer {
                 (Some(project), binary)
             }
         };
-        let mut worker = WorkerClient::start_using_executable(
-            eframe::egui::Context::default(),
-            &path,
-            executable,
-        )
-        .map_err(|e| Error::new(ErrorCode::WorkerFailed, e))?;
-        if let Some(binary) = project.as_ref().and_then(|p| p.binary.as_ref()) {
+        // Declared after `project` so every early return reaps the worker
+        // (dropping its lease) before the project's own image lease drops.
+        let source = project.as_ref().and_then(|p| p.binary.clone());
+        let mut worker = ReapingWorker::start(&path, executable)?;
+        if let Some(binary) = &source {
             worker.retain_source(Arc::new(binary.clone()));
         }
-        let actual_path = worker
-            .protection()
-            .path()
-            .to_str()
-            .ok_or_else(|| Error::new(ErrorCode::InvalidRequest, "The binary path must be UTF-8"))?
-            .to_owned();
-        let response = exchange(&mut worker, Request::Open { path: actual_path }, &options)?;
-        let Response::Opened {
+        let binary_path = worker.protection().path().to_owned();
+        let Opened {
             mut info,
             macho_legacy,
-            ..
-        } = response
-        else {
-            return Err(Error::new(
-                ErrorCode::WorkerFailed,
-                "Unexpected worker open reply",
-            ));
-        };
-        crate::project::validate_info(&info, MAX_FUNCTION_NAME_BYTES, true)
-            .map_err(|e| Error::new(ErrorCode::WorkerFailed, e))?;
-        let protection = worker
-            .protection()
-            .bind_snapshot(&info)
-            .map_err(|e| Error::new(ErrorCode::WorkerFailed, e))?;
+            protection,
+        } = open_worker(&mut worker, &options)?;
         let mut data = if let Some(mut project) = project {
             project
                 .accept_opened(&info, macho_legacy.as_ref())
@@ -319,7 +465,6 @@ impl Analyzer {
         data.session
             .validate_ranges(&data.info.sections, &data.info.architecture)
             .map_err(|e| Error::new(ErrorCode::Project, e))?;
-        // Replay complete effective names before prototypes, and prototypes before analysis.
         for function in &mut data.info.functions {
             if let Some(annotation) = data
                 .session
@@ -330,75 +475,22 @@ impl Analyzer {
                 function.name.clone_from(&annotation.label);
             }
         }
-        let effective: Vec<_> = data
-            .info
-            .functions
-            .iter()
-            .map(|function| {
-                let mut end = function.name.len().min(MAX_FUNCTION_NAME_BYTES);
-                while !function.name.is_char_boundary(end) {
-                    end -= 1;
-                }
-                FunctionInfo {
-                    address: function.address,
-                    name: function.name[..end].into(),
-                }
-            })
-            .collect();
-        for chunk in sync_chunks(&effective) {
-            if !matches!(
-                exchange(
-                    &mut worker,
-                    Request::SyncFunctions {
-                        functions: chunk.to_vec()
-                    },
-                    &options
-                )?,
-                Response::FunctionsSynced
-            ) {
-                return Err(Error::new(
-                    ErrorCode::WorkerFailed,
-                    "Unexpected function synchronization reply",
-                ));
-            }
-        }
-        let mut unapplied_signatures = Vec::new();
-        if !data.session.signatures.is_empty() {
-            let context = crate::signatures::state_digest(&data.session.signatures);
-            match exchange(
-                &mut worker,
-                Request::SyncSignatures {
-                    binary_sha256: data.info.sha256.clone(),
-                    context: context.clone(),
-                    signatures: data.session.signatures.clone(),
-                },
-                &options,
-            )? {
-                Response::SignaturesSynced {
-                    binary_sha256,
-                    context: actual,
-                    unapplied,
-                } if binary_sha256 == data.info.sha256 && actual == context => {
-                    unapplied_signatures = unapplied
-                }
-                _ => {
-                    return Err(Error::new(
-                        ErrorCode::WorkerFailed,
-                        "Unexpected signature synchronization reply",
-                    ));
-                }
-            }
-        }
+        let unapplied_signatures = replay(&mut worker, &data, &options)?;
         let mut analyzer = Self {
             worker: Some(worker),
             data,
             protection,
+            source,
+            binary_path,
+            executable: executable.to_owned(),
             options,
             results: FunctionResults::default(),
             graph: None,
             code: None,
             discovery: None,
             inventory: None,
+            worker_epoch: 1,
+            discovery_resumes: 0,
             unapplied_signatures,
             linkage: None,
         };
@@ -406,7 +498,8 @@ impl Analyzer {
             &analyzer.data.info.sha256,
             &analyzer.data.session.signatures,
         );
-        analyzer.update_context()?;
+        analyzer.update_context();
+        analyzer.wait_context()?;
         for saved in crate::project::prepare_functions(&mut analyzer.data)
             .into_iter()
             .rev()
@@ -474,41 +567,70 @@ impl Analyzer {
         if self.worker.is_none() {
             return Err(Error::new(
                 ErrorCode::SessionClosed,
-                "The worker stopped; open a new analysis session",
+                "The worker stopped; run discover to resume it or open a new analysis session",
             ));
         }
         Ok(())
     }
 
+    /// In-protocol byte and linkage errors leave the worker usable, as on the
+    /// desktop, and are reported as `CommandFailed`. Every other failure stops
+    /// the worker; an engine error is then reported as `WorkerFailed`.
     fn request(&mut self, request: Request) -> Result<Response, Error> {
         self.active()?;
+        let recoverable = matches!(request, Request::Bytes { .. } | Request::Linkage { .. });
         let response = exchange(
             self.worker.as_mut().expect("active worker"),
             request,
             &self.options,
         );
-        if response.is_err() {
-            self.stop();
+        match response {
+            Err(error) if recoverable && error.code == ErrorCode::CommandFailed => Err(error),
+            Err(error) => {
+                self.stop();
+                Err(fatal(error))
+            }
+            Ok(response) => Ok(response),
         }
-        response
     }
 
+    /// Stops and reaps the worker. Retained results, scans, annotations and
+    /// committed discovery survive; per-worker state does not.
     fn stop(&mut self) {
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.stop_and_wait();
+        drop(self.worker.take());
+        self.inventory = None;
+        self.reset_linkage();
+        if let Some(state) = &mut self.discovery {
+            state.interrupt();
         }
     }
 
-    fn update_context(&mut self) -> Result<(), Error> {
+    fn reset_linkage(&mut self) {
+        self.linkage = None;
+        self.results.set_linkage_bytes(0);
+    }
+
+    /// Starts preparing the function-result context for the current names.
+    fn update_context(&mut self) {
         self.results.update_inputs(
             self.data.info.functions.clone(),
             self.data.session.local_renames.clone(),
         );
+    }
+
+    /// Parent-side preparation shares the request deadline and, for analysis,
+    /// cancellation. Checkpoints still finish preparing after cancellation.
+    fn wait_context(&mut self) -> Result<(), Error> {
+        self.wait_context_for(true)
+    }
+
+    fn wait_context_for(&mut self, cancellable: bool) -> Result<(), Error> {
         let deadline = Instant::now() + self.options.worker_timeout;
         while self.results.preparing() {
-            self.active()?;
+            if cancellable && self.options.cancellation.is_cancelled() {
+                return Err(Error::new(ErrorCode::Cancelled, "Analysis cancelled"));
+            }
             if Instant::now() >= deadline {
-                self.stop();
                 return Err(Error::new(
                     ErrorCode::Timeout,
                     "Function context preparation timed out",
@@ -536,9 +658,18 @@ impl Analyzer {
     fn execute_inner(&mut self, command: Command) -> Result<Output, Error> {
         if self.options.cancellation.is_cancelled() {
             self.stop();
-            return Err(Error::new(ErrorCode::Cancelled, "Analysis cancelled"));
         }
-        self.active()?;
+        // Retained data stays readable and checkpointable without a worker,
+        // including after permanent cancellation. Discovery checks its own.
+        if !matches!(
+            command,
+            Command::Info {}
+                | Command::Annotations {}
+                | Command::SaveProject { .. }
+                | Command::Discover {}
+        ) {
+            self.active()?;
+        }
         match command {
             Command::Info {} => {
                 let mut info = self.data.info.clone();
@@ -616,12 +747,15 @@ impl Analyzer {
             }
             Command::Linkage { cursor, digest } => self.linkage(cursor, digest),
             Command::SaveProject { embed_binary } => {
-                let path = self.options.output_project.as_ref().ok_or_else(|| {
-                    Error::new(
+                if self.options.output_project.is_none() {
+                    return Err(Error::new(
                         ErrorCode::InvalidRequest,
                         "Configure --output-project before requesting a checkpoint",
-                    )
-                })?;
+                    ));
+                }
+                // Results are captured only under a committed context.
+                self.wait_context_for(false)?;
+                let path = self.options.output_project.as_ref().expect("checked");
                 let mut data = self.data.clone();
                 data.view = self
                     .graph
@@ -652,6 +786,8 @@ impl Analyzer {
                 "Function entry is not executable file-backed code",
             ));
         }
+        // A context left preparing by an earlier timeout is never bound against.
+        self.wait_context()?;
         if refresh {
             self.results.refresh(address);
         }
@@ -743,7 +879,15 @@ impl Analyzer {
         })
     }
 
+    /// One bounded discovery step. A failed step returns its error after
+    /// [`Discovery::interrupt`] has re-queued or failed the in-flight seeds,
+    /// keeping all committed evidence. With unfinished work and no worker, the
+    /// next call first starts a verified replacement under the shared cap.
     fn discover(&mut self) -> Result<Output, Error> {
+        if self.options.cancellation.is_cancelled() {
+            return Err(Error::new(ErrorCode::Cancelled, "Analysis cancelled"));
+        }
+        // Saved discovery is display data: a run always starts fresh.
         let mut state = self.discovery.take().unwrap_or_else(|| {
             let info = &self.data.info;
             let mut state = Discovery::new(
@@ -756,49 +900,106 @@ impl Analyzer {
             }
             state
         });
-        if let Some(mut request) = state.begin(1, 1, 0) {
-            let requested = self.inventory.as_ref().map(WorkerInventory::revision);
-            if let Request::DiscoverBatch { inventory_base, .. } = &mut request {
-                *inventory_base = requested;
-            }
-            let Response::DiscoveryBatch { mut batch } = self.request(request)? else {
-                return self.unexpected();
-            };
-            match state
-                .commit_reply(
-                    &self.data.info,
-                    self.inventory.as_ref(),
-                    requested,
-                    &mut batch,
-                )
-                .map_err(|e| Error::new(ErrorCode::WorkerFailed, e))?
-            {
-                crate::discovery::ReplyCommit::Adopted(inventory, changed) => {
-                    if changed {
-                        self.data.info.functions = inventory.functions().to_vec();
-                    }
-                    self.data.info.functions_truncated = batch.truncated;
-                    self.inventory = Some(inventory);
-                    if changed {
-                        self.graph = None;
-                        self.code = None;
-                        self.update_context()?;
-                    }
-                }
-                crate::discovery::ReplyCommit::PatternBudgetExhausted => {
-                    self.inventory = None;
-                    state.interrupt();
-                }
-            }
+        let unfinished = state.remaining() != 0 || state.scanning();
+        let result = if unfinished && self.worker.is_none() {
+            self.restart()
+        } else {
+            Ok(())
+        }
+        .and_then(|()| self.discovery_step(&mut state));
+        if result.is_err() {
+            state.interrupt();
         }
         let complete = state.remaining() == 0 && !state.scanning();
         let snapshot = state.save();
+        // Checkpoints keep committed evidence, including after a failed step.
         self.data.discovery = Some(Arc::new(snapshot.clone()));
         self.discovery = Some(state);
-        Ok(Output::Discovery {
+        result.map(|()| Output::Discovery {
             snapshot: Box::new(snapshot),
             complete,
         })
+    }
+
+    fn discovery_step(&mut self, state: &mut Discovery) -> Result<(), Error> {
+        let Some(mut request) = state.begin(1, self.worker_epoch, 0) else {
+            return Ok(());
+        };
+        let requested = self
+            .inventory
+            .as_ref()
+            .filter(|inventory| inventory.epoch() == self.worker_epoch)
+            .map(WorkerInventory::revision);
+        if let Request::DiscoverBatch { inventory_base, .. } = &mut request {
+            *inventory_base = requested;
+        }
+        let Response::DiscoveryBatch { mut batch } = self.request(request)? else {
+            return self.unexpected();
+        };
+        let commit = state.commit_reply(
+            &self.data.info,
+            self.inventory.as_ref(),
+            requested,
+            &mut batch,
+        );
+        match commit.map_err(|e| Error::new(ErrorCode::WorkerFailed, e))? {
+            crate::discovery::ReplyCommit::Adopted(inventory, changed) => {
+                if changed {
+                    self.data.info.functions = inventory.functions().to_vec();
+                }
+                self.data.info.functions_truncated = batch.truncated;
+                self.inventory = Some(inventory);
+                if changed {
+                    self.graph = None;
+                    self.code = None;
+                    self.update_context();
+                    self.wait_context()?;
+                }
+            }
+            crate::discovery::ReplyCommit::PatternBudgetExhausted => {
+                self.inventory = None;
+                state.interrupt();
+            }
+        }
+        Ok(())
+    }
+
+    /// Starts a replacement worker for the same verified image. Its identity,
+    /// hash and mapping must match the session; the controller's names and
+    /// signatures are replayed before any analysis. Each attempt, successful
+    /// or not, spends one of the session's [`MAX_DISCOVERY_RESUMES`].
+    fn restart(&mut self) -> Result<(), Error> {
+        if self.discovery_resumes >= MAX_DISCOVERY_RESUMES {
+            return Err(Error::new(
+                ErrorCode::SessionClosed,
+                "Discovery worker restarts are exhausted; open a new analysis session",
+            ));
+        }
+        self.discovery_resumes += 1;
+        self.worker_epoch = self.worker_epoch.wrapping_add(1);
+        let mut worker = ReapingWorker::start(&self.binary_path, &self.executable)?;
+        if !worker.protection().same_source(&self.protection) {
+            return Err(Error::new(
+                ErrorCode::WorkerFailed,
+                "Input binary identity changed; open a new analysis session",
+            ));
+        }
+        if let Some(binary) = &self.source {
+            worker.retain_source(Arc::new(binary.clone()));
+        }
+        let opened = open_worker(&mut worker, &self.options)?;
+        if !opened.protection.same_source(&self.protection)
+            || !crate::project::same_image(&self.data.info, &opened.info)
+        {
+            return Err(Error::new(
+                ErrorCode::WorkerFailed,
+                "Binary changed on disk; open a new analysis session",
+            ));
+        }
+        self.unapplied_signatures = replay(&mut worker, &self.data, &self.options)?;
+        self.inventory = None;
+        self.worker = Some(worker);
+        Ok(())
     }
 
     fn linkage(&mut self, cursor: usize, digest: Option<String>) -> Result<Output, Error> {
@@ -809,8 +1010,7 @@ impl Analyzer {
                     "Start linkage at cursor 0 without a digest",
                 ));
             }
-            self.linkage = None;
-            self.results.set_linkage_bytes(0);
+            self.reset_linkage();
         } else if self.linkage.as_ref().is_none_or(|fetch| {
             fetch.cursor() != Some(cursor)
                 || digest.as_deref() != Some(fetch.summary().digest.as_str())
@@ -820,8 +1020,9 @@ impl Analyzer {
                 "Continue linkage with its exact cursor and digest",
             ));
         }
-        let Response::Linkage { summary, page } =
-            self.request(Request::Linkage { cursor, digest })?
+        let response = self.request(Request::Linkage { cursor, digest });
+        // A failed page ends this fetch; restart it at cursor 0.
+        let Response::Linkage { summary, page } = response.inspect_err(|_| self.reset_linkage())?
         else {
             return self.unexpected();
         };
@@ -844,16 +1045,14 @@ impl Analyzer {
         }
         let bytes = fetch.estimated_bytes().unwrap_or(usize::MAX);
         if !self.results.set_linkage_bytes(bytes) {
-            self.linkage = None;
-            self.results.set_linkage_bytes(0);
+            self.reset_linkage();
             return Err(Error::new(
                 ErrorCode::ResponseTooLarge,
                 "Linkage accumulation exceeds the shared memory budget",
             ));
         }
         if page.next.is_none() {
-            self.linkage = None;
-            self.results.set_linkage_bytes(0);
+            self.reset_linkage();
         }
         Ok(Output::Linkage { summary, page })
     }
@@ -914,7 +1113,7 @@ fn exchange(
                 }
                 match reply.response {
                     Response::Error { message } => {
-                        return Err(Error::new(ErrorCode::WorkerFailed, message));
+                        return Err(Error::new(ErrorCode::CommandFailed, message));
                     }
                     Response::DiscoveryBatch { ref batch } => batch
                         .analysis

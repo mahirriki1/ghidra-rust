@@ -41,21 +41,23 @@ verified binary. Start a new process to change it.
 ## Framing and commands
 
 Each stdin line is one UTF-8 JSON request. IDs are nonzero unsigned 64-bit
-integers and must strictly increase for accepted requests. Addresses are JSON
-unsigned integers, in decimal. Clients must preserve 64-bit integers exactly;
-JavaScript clients need a lossless JSON decoder rather than rounding large
-addresses through `Number`. Version 1 produces exactly one terminal JSON
-reply per request, with the same ID:
+integers and must strictly increase. Addresses are JSON unsigned integers, in
+decimal. Clients must preserve 64-bit integers exactly; JavaScript clients need
+a lossless JSON decoder rather than rounding large addresses through `Number`.
+Version 1 produces exactly one terminal JSON reply per request line, carrying
+the request's ID:
 
 ```json
 {"api_version":1,"id":1,"command":{"kind":"info"}}
 ```
 
 Successful replies contain `result`; failed replies contain `error` with a
-snake-case `code` and a bounded `message`. Malformed requests use an available
-numeric ID when one can be safely recovered, otherwise `null`. Ordinary command
-errors are returned as data; a successful process exit does not mean every
-command succeeded. Startup and transport failures exit unsuccessfully. Help and
+snake-case `code` and a bounded `message`. A reply never repeats an ID. A
+rejected request whose numeric ID is greater than every earlier one still
+echoes that ID, and the ID is then used up: a later request reusing it is
+rejected. A zero, replayed, non-increasing, non-numeric or unreadable ID is
+answered with `"id": null`. Ordinary command errors are returned as data; a
+successful process exit does not mean every command succeeded. Startup and transport failures exit unsuccessfully. Help and
 version options produce conventional text instead of JSON.
 
 | Command | Fields | Result |
@@ -82,6 +84,19 @@ work; it does not prove exhaustive code coverage. Inspect the snapshot's
 `partial`, capped, failed and limited results. Saved discovery is display data;
 an explicit discovery run always begins fresh rather than trusting saved
 completion claims. Inventory changes invalidate incompatible function results.
+
+A failed discovery step returns its error and stops the worker, but committed
+batches are kept: they appear in later snapshots and checkpoints. Seeds from
+the failed batch are retried one at a time and are marked failed if they fail
+again; an interrupted scan step gets the same single retry. With work left and
+no running worker, the next `discover` call starts a replacement worker before
+its step. Each discover call still runs at most one bounded step. A
+replacement must report the same file identity, SHA-256 and section mapping;
+effective names and saved signatures are replayed to it before any analysis.
+A session can start at most three replacement workers, the same limit the
+desktop uses. Each attempt counts, whether it succeeds or fails, and
+successful steps do not earn attempts back. After that, `discover` returns
+`session_closed`. A completed run needs no worker.
 
 Function `graph_origin` and `decompiled_origin` are `computed` or `saved`.
 `cache_hit` reports whether both components were already available for this
@@ -122,9 +137,24 @@ opening and immediately saving a project preserves its exact prior selection.
   function-count and serialized-byte caps. Oversized/evicted results are
   recomputed on demand.
 - The Rust `CancellationToken` lets another thread stop in-flight analysis.
-  Cancellation, timeouts, malformed worker replies and worker errors close the
-  worker and require a new analysis session. Dropping the controller stops and
-  reaps its worker; extracted-image ownership survives through reaping.
+  Cancellation is permanent for the session. Cancellation, timeouts, malformed
+  or invalid worker replies, transport failures and engine errors stop the
+  worker. Engine errors from `function`, `strings`, `crypto` and `discover` are
+  reported as `worker_failed`. Engine errors from `bytes` and `linkage` are
+  reported as `command_failed`, and the worker keeps running. A failed linkage
+  page ends that fetch; start again at cursor 0.
+- Stopping the worker does not end the session. Completed function results,
+  scans, committed discovery and annotations stay in the controller, and
+  `info`, `annotations` and `save_project` keep working, even after
+  cancellation. `save_project` still uses the same protected atomic save guard
+  and keeps the saved-analysis origins. Other analysis commands return
+  `session_closed` until `discover` starts a replacement worker, as described
+  above. Embedded project images belong to the controller, not to any single
+  worker.
+- Dropping the controller, or a failed `Analyzer::open`, stops and reaps every
+  worker before it returns. An extracted project image is deleted only after
+  that reaping, so a console startup error does not leave the image in the
+  temporary directory.
 - EOF closes the console after the current command. Terminating the console
   closes its worker containment as well. A service wrapper can use the Rust
   cancellation token when a client disconnects.

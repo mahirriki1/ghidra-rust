@@ -29,8 +29,12 @@ enum Outcome {
 }
 
 /// One terminal response per frame. IDs must be nonzero and strictly increasing.
-/// A malformed bounded frame does not touch analysis. Oversized frames close
-/// the stream so their remainder can never be mistaken for a second command.
+/// A reply echoes a frame's ID only when it exceeds every ID echoed before,
+/// even if that frame is otherwise rejected; this consumes the ID, so no two
+/// replies share one. Zero, replayed, non-increasing or unreadable IDs reply
+/// with `null`. A malformed bounded frame does not touch analysis. Oversized
+/// frames close the stream so their remainder can never be mistaken for a
+/// second command.
 pub fn serve(
     mut input: impl BufRead,
     mut output: impl Write,
@@ -59,15 +63,12 @@ pub fn serve(
             write_reply(&mut output, None, Err(error))?;
             return Err(Error::new(ErrorCode::InvalidRequest, "Oversized API frame"));
         }
-        let id = available_id(&line);
+        let id = available_id(&line).filter(|&id| id > last_id);
         let parsed = parse(&line, last_id);
-        let response = match parsed {
-            Ok(request) => {
-                last_id = request.id;
-                analyzer.execute(request.command)
-            }
-            Err(error) => Err(error),
-        };
+        if let Some(id) = id {
+            last_id = id;
+        }
+        let response = parsed.and_then(|request| analyzer.execute(request.command));
         write_reply(&mut output, id, response)?;
     }
 }

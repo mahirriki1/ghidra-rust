@@ -42,8 +42,6 @@ use crate::xrefs::{
 use context_menu::MenuSource;
 
 const DEADLINE: Duration = crate::model::WORKER_REQUEST_TIMEOUT;
-/// Consecutive automatic discovery resumes after unrelated worker failures.
-const MAX_DISCOVERY_RESUMES: u8 = 3;
 /// Decompiler line pitch: denser than table rows, like a code editor.
 const CODE_ROW_HEIGHT: f32 = 18.0;
 const HISTORY_LIMIT: usize = 32;

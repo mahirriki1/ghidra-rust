@@ -367,6 +367,10 @@ fn console_recovers_from_bad_frames_and_never_accepts_path_commands() {
     assert_eq!(lines[1]["error"]["code"], "unsupported_version");
     assert_eq!(lines[2]["result"]["kind"], "info");
     assert_eq!(lines[3]["error"]["code"], "invalid_request");
+    assert_eq!(
+        lines.iter().map(|v| v["id"].as_u64()).collect::<Vec<_>>(),
+        [Some(1), Some(2), Some(3), None]
+    );
     let out = console(
         &f,
         &[],
@@ -629,4 +633,97 @@ fn headless_replays_saved_function_names_and_signatures_before_analysis() {
     let analysis = analyze(&mut api, f.a, false);
     assert!(analysis.text.contains("mobile_branch"));
     assert!(analysis.text.contains("mobile_count"));
+}
+
+#[test]
+fn console_reaps_its_worker_before_a_startup_error_exits() {
+    let Some(f) = fixture() else {
+        return;
+    };
+    let path = f._directory.path().join("mismatch.grproj");
+    let mut api = Analyzer::open(
+        Input::Binary(f.path.clone()),
+        executable(),
+        Options {
+            output_project: Some(path.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    analyze(&mut api, f.a, false);
+    api.execute(ApiCommand::SaveProject { embed_binary: true })
+        .unwrap();
+    drop(api);
+    // Valid bounded metadata which a fresh parse of the embedded image rejects.
+    let mut data = editable_project(&f, &path);
+    assert_ne!(data.info.entry, f.a);
+    data.info.entry = f.a;
+    write_project(&f, &path, &data);
+    let private = tempfile::tempdir().unwrap();
+    let out = Command::new(executable())
+        .arg("--project")
+        .arg(&path)
+        .env("TMPDIR", private.path())
+        .env("TEMP", private.path())
+        .env("TMP", private.path())
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let frames: Vec<serde_json::Value> = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(|s| serde_json::from_str(s).unwrap())
+        .collect();
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0]["error"]["code"], "project");
+    assert!(frames[0]["id"].is_null());
+    // The extracted image is removed only after its worker was reaped.
+    assert_eq!(std::fs::read_dir(private.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn console_never_echoes_an_id_twice() {
+    let Some(f) = fixture() else {
+        return;
+    };
+    let frames = [
+        r#"{"api_version":1,"id":1,"command":{"kind":"info"}}"#,
+        r#"{"api_version":1,"id":1,"command":{"kind":"info"}}"#,
+        r#"{"api_version":1,"id":0,"command":{"kind":"info"}}"#,
+        r#"{"api_version":2,"id":3,"command":{"kind":"info"}}"#,
+        r#"{"api_version":1,"id":2,"command":{"kind":"info"}}"#,
+        r#"{"api_version":1,"id":3,"command":{"kind":"info"}}"#,
+        r#"{"api_version":1,"id":"5","command":{"kind":"info"}}"#,
+        r#"{"api_version":1,"id":4,"command":{"kind":"info"}}"#,
+    ];
+    let out = console(&f, &[], (frames.join("\n") + "\n").as_bytes());
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let replies: Vec<serde_json::Value> = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(|s| serde_json::from_str(s).unwrap())
+        .collect();
+    assert_eq!(replies.len(), frames.len());
+    let ids: Vec<_> = replies.iter().map(|v| v["id"].as_u64()).collect();
+    assert_eq!(
+        ids,
+        [Some(1), None, None, Some(3), None, None, None, Some(4)]
+    );
+    for (reply, ok) in replies
+        .iter()
+        .zip([true, false, false, false, false, false, false, true])
+    {
+        assert_eq!(reply["result"]["kind"] == "info", ok, "{reply}");
+        assert_eq!(reply.get("error").is_some(), !ok, "{reply}");
+    }
+    assert_eq!(replies[3]["error"]["code"], "unsupported_version");
 }

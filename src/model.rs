@@ -71,6 +71,9 @@ pub const MAX_STRING_MINIMUM: usize = 64;
 pub const MAX_ANALYSIS_FUNCTIONS: usize = 128;
 /// Interrupted batches retry each affected seed individually at most once.
 pub const MAX_DISCOVERY_INTERRUPTION_ATTEMPTS: usize = 2;
+/// Automatic worker restarts during one logical discovery run, shared by the
+/// desktop and headless controllers. Successful resumed batches do not refund it.
+pub const MAX_DISCOVERY_RESUMES: u8 = 3;
 /// Entries in one function-name synchronization. Requests are also packed by
 /// encoded size with [`sync_chunks`] or [`sync_entry_bytes`].
 pub const MAX_DISCOVERY_SYNC_FUNCTIONS: usize = 1024;
