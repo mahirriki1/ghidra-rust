@@ -1,166 +1,104 @@
-# Native analysis fixture
+# Analysis fixtures
 
-`sample.c` is a small deterministic source fixture for manually checking the
-initial Linux x86-64 workflow. Build it locally; generated executables should not
-be committed. From the repository root, on an x86-64 Linux system with GCC:
+These original fixtures exercise the loader and worker. Build generated files
+under ignored `target/` or a temporary directory. Open them for analysis
+without running them.
+
+## Desktop smoke test
+
+On Linux x86-64, build the C fixture from the repository root.
 
 ```sh
 gcc -g -O0 -fno-inline -fno-pie -no-pie tests/fixtures/sample.c -o /tmp/ghidra-rust-sample
 ```
 
-Open `/tmp/ghidra-rust-sample` in the GUI and verify:
+On Windows, the native build script compiles the same source into
+`target\windows-fixture\sample.exe`. [Windows build steps](../../docs/windows.md#reproduce-the-windows-checks-and-portable-zip)
 
-- The function list includes `main`, `branch_loop`, and `decode_xor`.
-- `branch_loop` has conditional edges and a loop in the function graph.
-- Selecting functions updates disassembly and requests actual decompilation.
-- The strings view includes `aGVsbG8gcmV2ZXJzZXI=`. Base64 decoding yields
-  `hello reverser`.
-- Selecting the six bytes at `xor_message` and applying XOR with key `2a`
-  yields `secret`.
-- The crypto scan identifies the AES S-box prefix at `aes_sbox_prefix`.
-- After **Discover**, pressing **X** on the `address taken` string lists the
-  address-taking instruction in `remember_label`; on `aGVsbG8gcmV2ZXJzZXI=` it
-  lists `main`.
-- A function rename, comment, and saved decoded result survive a session
-  save/reopen, including a portable embedded `.grproj`. The executable's SHA-256
-  remains unchanged. Reopening a project displays its saved analysis provenance.
+Open the resulting file. Check these behaviors in the desktop.
 
-On native Windows, the [build script](../../docs/windows.md) compiles this PE
-fixture and tests both debug and release GUI-subsystem workers. To run just the
-worker integration check from an x64 Visual Studio developer command prompt:
+1. Find `main`, `branch_loop`, and `decode_xor` in Functions. Open
+   `branch_loop` and check its conditional edges and loop.
+2. Select mapped instructions and pseudocode in both directions. Follow a
+   resolved call and return with Back. Rename a function, add a comment,
+   and check Undo.
+3. Decode `aGVsbG8gcmV2ZXJzZXI=` as Base64 to get `hello reverser`. Select
+   six bytes at `xor_message` and decode with key `hex:2a` to get `secret`.
+   FindCrypt should report the AES S-box prefix at `aes_sbox_prefix`.
+4. After discovery, check that **X** on the `address taken` string lists
+   `remember_label`, and on the Base64 string lists `main`.
+5. Save and reopen an embedded project, then try an external-binary project.
+   Check annotations, selection, and **Saved analysis** provenance. Verify
+   the input's SHA-256 stays the same and the worker exits with the app.
 
-```bat
-mkdir target\windows-fixture
-cl /nologo /Od /Zi /Fo:target\windows-fixture\sample.obj /Fd:target\windows-fixture\compiler.pdb /Fe:target\windows-fixture\sample.exe tests\fixtures\sample.c /link /INCREMENTAL:NO /PDB:target\windows-fixture\sample.pdb /EXPORT:branch_loop /EXPORT:base64_message /EXPORT:aes_sbox_prefix
-set GHIDRA_RUST_TEST_PE=%CD%\target\windows-fixture\sample.exe
+## Worker integration
+
+The Linux build script exercises the direct protocol and the production
+bubblewrap client. It requires working unprivileged namespaces. The Linux
+integration compares direct-call addresses and targets with GNU objdump.
+
+The Windows build script sets `GHIDRA_RUST_TEST_PE` for the native PE worker
+test in debug and release. Run that integration separately by pointing the
+variable at the built fixture. Without it, the PE check skips.
+
+```powershell
+$env:GHIDRA_RUST_TEST_PE = (Resolve-Path target/windows-fixture/sample.exe).Path
 cargo test --locked --target x86_64-pc-windows-msvc --test windows_worker
 cargo test --release --locked --target x86_64-pc-windows-msvc --test windows_worker
 ```
 
-The Windows integration test uses the production suspended worker/job startup,
-opens the PE from Unicode paths, verifies handle identity and writer exclusion,
-requests real graph/decompiler/string results, and saves/replaces/reopens an
-embedded project. `scripts/build-windows.ps1` compiles the fixture and sets this
-variable when run locally without `-SkipTests`.
-It verifies exported names reach the decompiler and that a private copy with its
-export directory removed still recovers functions from x64 runtime metadata.
-Without the variable, this integration check skips locally; Windows unit tests
-still exercise file identity, replacement, path validation, and job lifetime.
+## Optional large PE
 
-On Linux, `scripts/build-linux.sh` runs both the direct worker protocol test and
-the production WorkerClient/bubblewrap test in debug and release. The latter
-requires working unprivileged namespaces and tests the host's loader layout,
-Unicode paths, analysis mappings, and embedded project replacement/reopening.
-It fails if sandbox startup fails; it does not substitute an unrestricted worker.
-On the original linked C fixture, the Linux integration also compares confirmed
-call instruction addresses and direct destinations with GNU objdump from binutils.
+Put a trusted PE under ignored `target/local-input`. Set
+`GHIDRA_RUST_TEST_LARGE_PE` to the copy and run:
 
-For an optional large-PE check, copy a trusted executable beneath ignored
-`target/local-input`, set `GHIDRA_RUST_TEST_LARGE_PE` to that copy, and run
-`cargo test --release --locked --test large_pe -- --ignored --nocapture`.
-On Windows also pass `--target x86_64-pc-windows-msvc`. Optional hexadecimal
-`GHIDRA_RUST_TEST_FUNCTION` selects a function; `GHIDRA_RUST_TEST_IMPORT` checks
-an expected imported name in its pseudocode. The check uses production worker
-containment and stores temporary projects beneath `target/large-pe-test`.
-It never executes the selected input. Do not commit third-party executables or
-their analysis projects.
+```sh
+cargo test --release --locked --test large_pe -- --ignored --nocapture
+```
 
-The crypto table contains standardized numeric constants from AES (FIPS 197),
-not a copied signature database. This fixture does not establish broad processor,
-compiler, binary-format, C++, or Rust compatibility. Compiler-generated startup
-code and addresses can vary with the compiler and system libraries.
+On Windows, add `--target x86_64-pc-windows-msvc` before `--`. Set
+`GHIDRA_RUST_TEST_FUNCTION` to a hexadecimal function entry or
+`GHIDRA_RUST_TEST_IMPORT` to an expected imported name when needed.
+Temporary projects stay under `target/large-pe-test`.
 
 ## Demangling backend
 
-`demangle.rs` and `demangle.cpp` are original name-handling fixtures compiled to
-temporary object files by `tests/demangle_backend.rs`, never executed. The Rust
-v0 case runs on native Linux and Windows with the pinned Rust toolchain and
-includes a Unicode identifier. The C++ overload/template case requires G++ on
-Linux. These test the non-UI [demangling backend](../../docs/demangling.md), not application
-loader support for relocatable objects. Legacy Rust uses literal regression
-cases; the stable pinned compiler requires unstable options to emit that format.
-
-`demangle_program.cpp` and `demangle_program.rs` are original linked fixtures
-for [display names](../../docs/demangling.md), analyzed and never executed.
-`tests/linux_worker.rs` links the C++ file with G++ and the `no_std` Rust file
-with the pinned rustc (v0 mangling, linking libc) into temporary executables.
-On Windows, `tests/windows_worker.rs` builds the Rust file as a dylib, and
-`scripts/build-windows.ps1` builds the C++ file as an MSVC DLL beneath ignored
-`target/windows-fixture` and sets `GHIDRA_RUST_TEST_PE_CPP`; without that
-variable the MSVC check skips locally.
+`demangle.rs`, `demangle.cpp`, and `demangle_msvc.cpp` test compiler-generated
+symbols, including Rust v0, C++ overloads and templates, and MSVC names.
+The backend tests inspect object symbols directly. Linked
+`demangle_program.cpp` and `demangle_program.rs` cover worker display names.
+Linux uses G++ and rustc. The Windows build script sets
+`GHIDRA_RUST_TEST_PE_CPP` for the MSVC DLL fixture.
+[Display-name behavior](../../docs/demangling.md)
 
 ## Differential corpus
 
-`differential/corpus.c` and `differential/many_functions.c` are original C for
-the opt-in [Ghidra differential benchmark](../../docs/analysis-performance.md#differential-comparison-with-ghidra).
-They cover dense and sparse switches, indirect and tail calls, standard and
-custom no-return calls, recursion, static helpers, globals, strings, and 300
-distinct functions reachable only through a pointer table. The benchmark builds
-them with GCC at `-O0`/`-O2`, PIE and non-PIE, plus stripped copies, beneath
-ignored `target/ghidra-differential/`. The binaries are analyzed, never executed.
-Optimization can remove or reshape constructs; the generated ground truth
-records which jump tables, indirect calls and tail jumps actually survived.
+`differential/corpus.c` and `differential/many_functions.c` cover switches,
+calls, no-return cases, globals, strings, and a 300-function pointer table.
+The benchmark builds GCC `-O0` and `-O2`, PIE and non-PIE, with stripped
+copies. It records which constructs survived compilation.
+[Differential benchmark](../../docs/analysis-performance.md#differential-comparison-with-ghidra)
 
-`switch.c` is an original fixture for [switch tables](../../docs/analysis.md#switch-tables).
-At `-O2`, GCC emits its dense switch as a jump table; `case_only` is called only
-from one case, and `computed` tail-jumps through an unknown function pointer.
-`tests/linux_worker.rs` builds PIE and non-PIE copies, checks the recovered `S`
-edges, the case's call reference and decompilation, the unresolved computed jump,
-and discovery of `case_only` in a stripped copy.
+Other focused x86-64 fixtures include:
 
-`callbacks.c` is an original fixture for
-[function-start patterns](../../docs/analysis.md#function-start-patterns): four
-callbacks reached only through a table of function pointers, and a helper called
-only from them. `tests/linux_worker.rs` builds stripped `-O0`/`-O2`, PIE and
-non-PIE copies and checks that every pattern-derived function exists in the
-unstripped twin, and that `-O0` recovers all five.
-
-`noreturn.c` is an original fixture for [no-return calls](../../docs/analysis.md#no-return-calls).
-The Linux worker test compiles `-O0`/`-O2`, PIE and non-PIE, with stack protection,
-and checks that `exit`, `abort`, and stack-failure calls end their blocks without
-claiming neighbouring instructions. Stripped copies exercise discovery and
-separate recovery of a callback after a no-return call. The binaries are never
-executed. Synthetic x86/x64 IAT calls and ARM64 import veneers have separate
-engine/worker regression coverage.
+| Source | Coverage |
+| --- | --- |
+| `switch.c` | A recoverable jump table and an unresolved computed jump |
+| `callbacks.c` | Function-start pattern recovery in stripped builds |
+| `noreturn.c` | Terminating calls and adjacent code |
+| `pointer-tables.S` | Valid and rejected pointer-table candidates and batch boundaries |
+| `linkage.c` | ELF imports, exports, and immutable snapshot handling |
 
 ## AArch64
 
-`aarch64.S` is original assembly with explicit little-endian instruction words.
-`tests/common/mod.rs` generates minimal linked ELF64, Windows ARM64 PE32+, and
-baseline arm64 Mach-O containers from it in temporary paths. The instructions
-are analyzed, never executed. No cross compiler or emulator is required.
-`cargo test --locked --test aarch64` exercises contained native workers, genuine
-semantic mappings, and protected embedded projects for all three containers;
-it also checks stripped ELF discovery and invalid instruction boundaries.
-The release build scripts run this test against the optimized worker too.
-See [architecture coverage](../../docs/architectures.md) for unsupported modes
-and platform validation limits.
+`aarch64.S` supplies instruction words for minimal ELF, ARM64 PE32+, and
+baseline arm64 Mach-O files. `arm64-pe.S` adds PE runtime records and an
+import veneer. No cross compiler or emulator is required. The unknown jump
+in `fixture_indirect` is expected to remain unresolved.
 
-`fixture_indirect` deliberately jumps through unknown register `x2`. The engine's
-"Could not recover jumptable" warning is expected there; this fixture contains
-no actual jump table. Its call-like pseudocode fallback does not establish a call
-target. The instruction graph retains an unresolved jump instead.
+```sh
+cargo test --locked --test aarch64
+```
 
-`arm64-pe.S` adds original metadata-only functions, a fragment, a caller, and a
-conventional import veneer. `common::arm64_pe_metadata` embeds these in a stripped
-PE with original synthetic packed/full runtime records and a named IAT slot.
-The contained worker regression verifies isolated function recovery, excludes
-the fragment as independent function evidence, names the confirmed import call,
-retains an unresolved register branch, and checks unchanged input bytes/hash.
-
-`pointer-tables.S` is original x86-64 ELF source for stripped PIE/non-PIE
-worker regressions: two callable targets, duplicate-only/singleton runs,
-instruction offcuts, internal labels, mixed data, init/fini single callbacks,
-and source/validation batch boundaries. Builds with `NO_UNWIND` check precision
-without requiring equal recall. `pointer_recovery.rs` also uses the original
-300-function differential corpus; unstripped symbols score the stripped worker
-results and never seed discovery.
-
-`linkage.c` is an original declaration-only ELF fixture, built with
-`gcc -O0 -fPIC -shared` into a temporary shared library. It declares a versioned
-libc import, an unversioned weak import, a decorated C++ export, and a data
-export. The real-worker test replaces its private on-disk copy after opening to
-check that metadata comes from the retained immutable snapshot. It never runs
-the shared library. PE normal/delay/ordinal imports, aliases and forwarded/data
-exports, and Mach-O library ordinals and indirect locations use original
-synthetic format bytes in module tests.
+See the input ABI limits before interpreting results.
+[Architecture coverage](../../docs/architectures.md)
