@@ -1,505 +1,94 @@
 # <img src="docs/images/ghidra-rust-logo.svg" width="40" height="40" alt="Ghidra Rust logo"> Ghidra Rust
 
-An early-alpha native Rust reverse-engineering desktop with Ghidra-derived
-decompilation and function-graph navigation. Its long-term goal is a faster,
-more modern replacement for Ghidra's everyday analysis workflow.
-
-Today it is an experimental subset, not a complete Ghidra or IDA replacement.
-The desktop runs without Java or Python. [Measured comparisons and their scope](docs/analysis-performance.md)
-are recorded separately; no general speed advantage over Ghidra is claimed yet.
+Ghidra Rust is an early-alpha desktop for static binary analysis. Open a
+program to browse its disassembly, control-flow graphs, and C-like pseudocode
+side by side. The native app uses a Ghidra-derived decompiler and runs without
+Java or Python.
 
 ![Function graph with linked instruction and pseudocode selection](docs/images/desktop-selection-sync.png)
 
-## Highlights
-
-- Familiar layout: symbols and functions on the left, Listing / Function Graph
-  in the middle, and a full-height Decompiler on the right.
-- C-like decompilation with linked instruction selection, call navigation,
-  and Back / Forward history.
-- Function discovery, confirmed call, data-access and address-taking
-  references, and bounded recovery from supported metadata, pointer tables,
-  and function-start patterns.
-- Strings, Hex / Memory Map, byte decoding, and FindCrypt-style constant scans.
-- Memory search for hex, ASCII or UTF-16LE patterns, and text search over
-  loaded names, imports, exports, labels, comments and string previews.
-- Declared imports grouped by library and exports in the Symbol Tree, plus
-  flat, filterable Imports and Exports tabs in the Functions dock, with exact
-  navigation and references.
-- Compact C++, Rust and MSVC display names with the raw symbol on hover.
-  See [demangling](docs/demangling.md).
-- Function labels, comments, supported local renames, and limited function
-  signature editing.
-- Portable `.grproj` snapshots with optional embedded binaries.
-
 ## Quick start
 
-Download a Linux x64 or Windows x64 package from
-[GitHub Releases](https://github.com/mahirriki1/ghidra-rust/releases).
-See the [Linux guide](docs/linux.md) or [Windows guide](docs/windows.md)
-for installation, runtime requirements, and troubleshooting.
+Download the Linux x64 tarball or Windows x64 ZIP and run the desktop executable.
+The archives also include a headless console tool. [GitHub Releases](https://github.com/mahirriki1/ghidra-rust/releases)
 
-To run from source, use Rust 1.98.1, a native C/C++ toolchain, and an
-OpenGL-capable desktop:
+- **Linux x64** requires OpenGL, bubblewrap, and working unprivileged user
+  namespaces. [Linux setup](docs/linux.md)
+- **Windows x64** requires an OpenGL driver and local drives. The analysis
+  worker has resource limits but can access the filesystem and network. Use
+  trusted binaries. [Windows setup](docs/windows.md)
+
+Choose **Open binary** or drop a file into the window. In **Analyze binary?**,
+choose function discovery, strings, and optionally FindCrypt. You can keep
+browsing while analysis runs or start it again from **Analysis → Auto analyze…**.
+
+Open a function from the Functions list. Click an instruction or mapped
+pseudocode to highlight its counterpart. Double-click a resolved call to
+follow it, and use Back to return.
+
+## What you can open
+
+Linked executables and shared libraries need file-backed executable sections.
+Analysis runs on the file without executing it.
+
+| Input | Supported architectures |
+| --- | --- |
+| ELF | x86, x86-64, little-endian AArch64 with a 64-bit ABI |
+| PE | x86, x86-64, Windows ARM64 PE32+ |
+| Mach-O | Thin x86, x86-64, and baseline Apple Silicon arm64 |
+
+See the architecture guide for exclusions and platform validation.
+[Architecture coverage](docs/architectures.md)
+
+## Keyboard shortcuts
+
+| Key | Action |
+| --- | --- |
+| `F1` | Show all shortcuts |
+| `Space` | Switch between Listing and Function Graph |
+| `G` | Go to an address, exact name, or file offset |
+| `X` | Show references to the selected target |
+| `S` / `Ctrl+F` | Search memory / loaded program text |
+| `L` / `;` | Rename / edit a comment |
+| `Alt+Left` / `Alt+Right` | Go back / forward |
+| `Ctrl+S` | Save a project |
+
+The Listing starts in **Program** scope. Choose **Function** in its title row
+to focus on one function. See the analysis guide for navigation, search, byte
+inspection, and editing. [Desktop workflows](docs/analysis.md#desktop-workflows)
+
+## Projects
+
+A `.grproj` project stores annotations and selected analysis results. It
+includes the binary by default. For an external-binary project, select the
+matching binary when you reopen it. Reopened results show **Saved analysis**
+until recomputed. Open projects only from trusted sources because SQLite
+parses them in the desktop process. [Projects](docs/analysis.md#project-formats-and-saved-analysis)
+
+## Guides
+
+Browse the full guide set online if you are reading from a portable archive.
+[Project documentation](https://github.com/mahirriki1/ghidra-rust/tree/main/docs)
+
+| If you want to… | Read |
+| --- | --- |
+| Analyze without a desktop window | [Headless API](docs/headless.md) |
+| Understand what discovery can recover | [Analysis coverage](docs/analysis.md) |
+| Interpret C++, Rust, or MSVC names | [Demangled display names](docs/demangling.md) |
+| Decode bytes or identify crypto constants | [Decode and FindCrypt](docs/crypto-signatures.md) |
+| Check performance or compare results with Ghidra | [Analysis measurements](docs/analysis-performance.md) |
+| Build, package, or update the app | [Release workflow](docs/releases.md) |
+
+## Build from source
+
+Use Rust 1.98.1, a native C/C++ toolchain, and an OpenGL-capable desktop.
+Platform setup and local checks are in the [Linux guide](docs/linux.md) and the
+[Windows guide](docs/windows.md).
 
 ```sh
 cargo run --release --locked
 ```
 
-The first engine build can take minutes; use release builds to evaluate performance.
+See the repository guidance before contributing. [AGENTS.md](AGENTS.md)
 
-Choose **Open binary**, **Open project**, or drop a file into the window.
-The executable also accepts a file path when launched.
-
-Opening a binary offers **Analyze binary?**. Choose discovery, strings, and
-optional FindCrypt scanning; continue browsing while analysis runs.
-Use **Analysis → Auto analyze…** to reopen these choices.
-
-Linux analysis requires **bubblewrap** and working unprivileged user namespaces.
-Windows source builds require native MSVC tools. macOS remains unvalidated.
-
-## Supported formats and architectures
-
-Inputs must be linked executables or shared libraries with file-backed
-executable sections.
-
-| Format | x86 / x86-64 | AArch64 |
-| --- | --- | --- |
-| ELF | Supported | Little-endian, 64-bit AAPCS |
-| PE | Supported | Windows ARM64 PE32+ |
-| Mach-O | Thin images | Thin baseline Apple Silicon arm64 |
-
-Unsupported inputs include ARM32/Thumb, big-endian images, AArch64 ILP32,
-arm64e, ARM64EC/hybrid images, other processors, raw images, archives,
-relocatable objects, universal/fat Mach-O, and sectionless images.
-
-Analyzing ARM64 on x64 does not establish native ARM64 desktop support.
-See [architecture coverage](docs/architectures.md).
-
-## Using the desktop
-
-Browse or filter Functions, then select a function to inspect its listing,
-graph, and pseudocode. Graph blocks show every instruction and comment row the
-bounded analysis returned; zoomed out, rows become compact marks. Pan and zoom
-the graph; **Fit** shows an overview and **Entry** returns to readable entry
-code. The graph's lower-right corner shows every block and the visible area;
-click there to center that part of the graph at the current zoom without
-changing the selection. It is hidden when the graph pane is small. Listing
-cursor keys, pseudocode selection and navigation to an instruction reveal its
-exact graph row, clear of that overview.
-**Legend** and graph warnings are in the graph toolbar.
-
-The Listing lists the whole program by default (**Program** in its title
-row); choose **Function** there to show only the displayed function. The
-Program scope lists the program in address order: each section, each
-known function's name, the instructions of loaded functions, and one `??`
-row with its byte count for each run of bytes no loaded function decoded.
-Zero-filled section tails get their own dimmer row, and a function whose
-body has not loaded yet shows a muted `…` row. Bodies of the functions in
-view (and a few beyond, in the scroll direction) load in small batches from
-the same analysis as the Function Graph, so nothing is disassembled linearly
-or guessed. Batches have the lowest priority: they wait for the selected
-function's graph and pseudocode, searches, symbol and import table pages and
-automatic analysis. While discovery runs, each committed discovery batch is
-followed by at most one batch for the bodies in view (nothing beyond them);
-discovery waits for it at most a few seconds, and not at all when nothing in
-view needs a body. A batch starts no new function after about 250 ms and no
-further switch-table recovery once those recoveries have taken 250 ms, so a
-click waits at most that long plus one function's analysis. A function that
-failed to load is requested again only after discovery, a rename, a
-signature change or a switch to **Function** and back; opening it shows its
-full body. If a batch stops or times out the analysis worker, its
-functions are retried one per request, and only one whose own request fails
-is skipped for that binary; after eight such failures the binary's Program
-listing loads no more bodies. These failures never use up discovery's worker
-restarts, and outside discovery they never reopen the worker. Instructions decoded only from a function whose entry
-lies elsewhere stay `??` until that function loads, an instruction that
-overlaps another function's instruction with different bounds appears only
-in its own function, and a function with an incomplete graph shows its name
-in the warning color (hover for details). Expand a `??` row with Enter, a
-double-click, its triangle or **Expand** in its right-click menu to show up
-to 64 KiB of it as one row per byte (`??`, the byte's value in hex and, when
-printable, its character); the rest of the run stays one `??` row, and
-Enter, a double-click, the triangle or **Collapse** on any byte row collapses
-its run. Bytes are read in 4 KiB pages at the Program listing's lowest
-priority (at most four pages are kept); a byte shows `??` alone until its
-page loads. Zero-filled tails never expand. Expanding or collapsing keeps
-the row where it is on screen and adds no Back/Forward history; collapsing
-moves a cursor inside the run to its first byte. Up to 64 expanded runs are
-kept for the session; beyond that the one farthest away collapses (never
-the one holding the cursor). Inside `??` gaps the Program listing also shows
-evidence as rows whose mnemonic stays `??`, because nothing is defined there:
-an import slot shows the import's name, an absolute pointer-table entry that
-discovery committed shows its target address and function name, and a scanned
-or saved string shows its muted, italic quoted preview. Each appears only when
-its whole span lies in one undefined gap, so decoded code, function entries
-and expanded byte runs always win; an import slot wins over a pointer entry,
-which wins over a string. Data and address reference targets, data exports,
-labels and comments start a row of their own in `??` gaps and zero-filled
-tails (so `.bss` globals become rows, without reading bytes), showing the
-label (or the export's name), a reference count and the comment; inside an
-evidence row they are
-listed in its hover. Hover a row for its provenance (library and kind, the
-discovery evidence, or encoding, length and whether the string was scanned or
-saved). Enter or a double-click on a pointer entry opens its target function
-with Back/Forward history; on an import slot or string they do nothing.
-Evidence rows never expand. Pointer entries are not saved in projects: after a
-reopen they return only once discovery runs again. **Show in Hex** on a `??`,
-byte, evidence or zero-fill row selects exactly its file-backed bytes in Hex
-(zero-filled bytes have none) and first puts the cursor on that row, so
-Back returns to it.
-In the Program scope, non-code destinations land on their exact row instead
-of Hex: Go, memory and program-text search results (a string result on its
-string row), import slots and data exports from the Symbol Tree and
-Imports/Exports, **Go to** on Strings and Symbol Tree rows, label and
-comment jumps, and Back/Forward. Where no row starts at the destination, a
-`??` row expands the 4 KiB page or pages holding the destination's bytes
-(up to 64 KiB), an evidence row entered past its start expands its bytes,
-and a zero-filled tail gets a row starting there without reading anything.
-Landing keeps the row where it is on screen, never opens a function and
-sends nothing. Inside a function whose body is still loading, the cursor
-waits at that address and lands once the body arrives, without switching
-tabs or adding history. A destination inside a decoded instruction has no
-row of its own and still opens in Hex. Back/Forward returns to the exact row
-left, telling a section header from the first byte below it, and expands a
-byte row again if its run was collapsed since. Scroll with the wheel or drag the
-address bar at the right edge, which spans all sections. Clicking an
-instruction opens its function in the Graph and Decompiler, and right-click
-menus work on the instructions of any loaded function. Highlights linked to
-the pseudocode still come only from the displayed function. Function, Go,
-history and pseudocode navigation scroll the Program listing to the
-destination once, and it keeps its place on screen while bodies above it
-load until you scroll; discovery, renames and signature edits keep both the view
-and the selected instruction. Listing keys move through the whole program (see
-[Keyboard shortcuts](#keyboard-shortcuts)). The
-scope, position, expanded runs and loaded bodies and bytes last for the
-session only: a scope you choose is kept while you open other binaries and
-projects, and each launch starts in **Program**. Loaded bodies and bytes are
-released when you switch to **Function**, and projects do not store any of
-them.
-
-Narrow dock headers keep the active tab visible and put additional tabs in **»**.
-Decompiler controls that do not fit move into **⋯**. The Listing keeps code
-columns in view by reducing the bytes column first; hover shortened fields to
-inspect the full instruction.
-
-Double-click a resolved call instruction or decompiler call-name token to
-open its target. Back / Forward returns to previous instruction selections.
-The small arrows beside Back and Forward list those destinations, nearest
-first; choosing one jumps straight to it without changing the list.
-**Navigation → Previous function** / **Next function** (`Ctrl+Up` /
-`Ctrl+Down`) open the nearest known function entry before or after the
-current location: the selected Hex bytes while Hex is shown, otherwise the
-selected address. Previous from inside a function opens its entry first.
-They follow address order, not the Functions table's sort or filter, stop at
-the first and last known entries, and keep the Function Graph tab open.
-
-Selecting an instruction highlights its mapped pseudocode; selecting mapped
-pseudocode selects the corresponding instructions. Links use genuine engine
-addresses. Several instructions can share an expression, and optimized-away
-instructions may have no visible counterpart.
-
-The Symbol Tree lists **Imports**, grouped by declaring library (or **Unknown
-library**), and **Exports**. The function filter applies to them too. Click a
-row to select it; double-click to open it. An import opens its verified stub as
-code, or else its slot in Hex at that exact address. Code exports open as code
-and data exports open in Hex; neither creates a function. In the Listing's
-Program scope, slots and data exports land on their row instead. Forwarded and
-unresolved exports have no destination. Right-click for every known location.
-Names prefer your label at the row's address, then the demangled name; hover
-shows the raw name, library, ordinal and other declared facts.
-
-The Functions dock below has **Functions**, **Imports** and **Exports** tabs.
-The Imports and Exports tabs list every entry by name, with its address and
-library (or export ordinal), and each has its own filter. They share the Symbol
-Tree's selection, opening behaviour and context menu.
-
-Click a column heading in the Functions, Imports, Exports, Strings and
-References tables to sort ascending, again for descending, and a third time to
-restore the original order. Text sorts ignore case; unknown or empty values
-stay last. Sorting keeps the filter and the selection, which scrolls into view
-once. A narrow Imports or Exports list sorts its hidden column from **⋯**.
-Right-click a row and choose **Copy row** to copy its visible columns as
-tab-separated text. Sort choices reset when a binary closes.
-
-Right-click acts on exactly the clicked row or pseudocode token and does not
-change the selection. Listing rows offer **Go to target**, **Show in Graph**,
-**Show in Hex**, **Rename…**, **Comment…**, xrefs and copying the address,
-file offset, bytes or instruction. Decompiler tokens can be copied, supported locals can
-be renamed, and calls can be followed or renamed. A call to code that is not a
-known function cannot be renamed,
-a local without verified storage cannot be renamed, and other pseudocode
-offers **Copy line**. Functions, Strings and Symbol Tree rows add **Go to** and
-**Copy row**. An open menu closes when the binary, function, pseudocode, graph,
-annotations or table it came from changes.
-
-**G** and the toolbar address field share one Go resolver. A query is first
-tried whole as a hexadecimal address, then an exact label, function name, raw
-symbol and display name, so names such as `operator+`, `a-b` or `file(1)` keep
-working. Next, `file(offset)` goes to the address that byte of the input file
-is loaded at. As in Ghidra the offset is decimal unless it starts with `0x`:
-`file(4620)` and `file(0x120c)` are the same byte and `file(120c)` is
-rejected. The keyword ignores case and spaces may surround the offset.
-Otherwise the query is a base (a hexadecimal address or exact name) followed by
-1–16 `+`/`-` hexadecimal terms (optional `0x`, up to 16 digits each), as in
-`main+0x20`, `main+10-4` or `0x401000-0x10+8`. The fewest trailing terms
-whose remaining text is a base are used, so a label such as `next-1` stays
-one base, and the terms apply left to right with each step checked for
-overflow and underflow. A leading `+` is not a term: `+1040` stays the
-address `0x1040`. `*`, `/`, parentheses other than `file(…)`, offsets relative
-to the current location, and terms after `file(…)` are rejected. The result must lie in
-mapped memory. A known
-function entry, or an instruction the current graph, pseudocode or history
-saw, opens in that function; Graph stays Graph, other tabs switch to Listing.
-Any other mapped address opens in Hex, including executable bytes that are not
-a known entry; in the Listing's Program scope it lands on its row instead
-(see above). A file offset goes wherever its address goes and is recorded
-in history as that address. A rejected query changes nothing; the toolbar
-keeps the text and reports the reason in the status bar.
-
-File offsets are mapped only through the loaded sections the worker
-published, so file headers, load commands, alignment padding, non-loaded
-sections and overlays have no address even where the operating system maps
-them, and Go rejects such an offset with the reason (before every loaded section, between
-sections, after every loaded section, or past the end of the file). An offset
-that two sections share is rejected with both addresses named, and
-zero-filled memory has no file offset. While the current location (the Hex
-selection on the Hex tab) has one, the status bar shows it as `file(0x…)`,
-which Go accepts unchanged.
-
-Visited functions reuse compatible session results. **Analysis → Refresh
-function** recomputes the selected function. Project saves also retain a bounded
-set of these function results for reuse after reopening.
-
-Opening and saving use an in-app file chooser rather than a desktop portal or
-native dialog. It has Back / Forward / Up, clickable breadcrumbs (**Ctrl+L**
-edits the path), Places, recent folders from the current session, a name
-filter, file-type filters and a table sortable by name, size or age. Arrow keys,
-Home/End and Page Up/Down move the selection, Enter opens it, and Backspace
-goes up. Listings stop at 4,096 entries and are marked **Partial**; type a path
-to reach anything else. Saving over an existing file asks first. Recent folders
-reset when the app exits. On Windows, Places shows existing `USERPROFILE`
-folders and local drives, so redirected known folders need a typed path;
-network (UNC) paths are not supported. Directory reads run off the UI thread,
-but a stalled filesystem still delays further listings until it returns.
-
-### Keyboard shortcuts
-
-| Shortcut | Action |
-| --- | --- |
-| `F1` | Open Keyboard shortcuts |
-| `L` | Rename the selected function, address label, or supported local |
-| `G` | Go to a hexadecimal address or exact name, optionally with `+`/`-` hex offsets, or to `file(offset)` |
-| `;` | Edit the comment at the selected address |
-| `X` | Show references to the selection's exact target |
-| `S` | Search memory |
-| `Ctrl+F` | Search program text |
-| `Space` | Switch Listing / Function Graph |
-| `Alt+Left` / `Alt+Right` | Back / Forward |
-| `Ctrl+Up` / `Ctrl+Down` | Previous / next function entry |
-| `Ctrl+S` | Save project |
-| `Ctrl+Z` | Undo an annotation outside text editors |
-| `Up` / `Down` | Listing: previous / next row |
-| `PageUp` / `PageDown` | Listing: previous / next page |
-| `Home` / `End` | Listing: first / last instruction of the function (in the Program scope, first / last byte of the run from a byte row, and of the section from a section, `??`, evidence or zero-fill row) |
-| `Ctrl+Home` / `Ctrl+End` | Program listing: first / last row of the program |
-| `Enter` | Listing: follow the selected call or branch target (in the Program scope, also expand a `??` row, collapse a byte row's run or open a pointer entry's target) |
-
-On macOS, Save, Undo and program-text search use Command. Shortcuts pause while
-typing, in dialogs, and during file operations.
-
-Listing keys apply after clicking the Listing; clicking elsewhere, focusing a
-text field or switching tabs releases them. In the **Function** scope they stay
-within the displayed function. In the **Program** scope every row is a cursor
-stop: section and function headers, instructions, `??`, byte, evidence and
-zero-fill rows and pending `…` rows, and clicking a `??`, byte, evidence or
-zero-fill row puts the cursor there. Up/Down and PageUp/PageDown cross functions and gaps, and the
-selection becomes the row's address (a header's entry or section start, a
-gap's first byte, a byte row's byte). When the cursor rests (about 200 ms, no key held) on a row
-of a function other than the displayed one, the Graph and Decompiler switch to
-that function without moving the listing; holding a key across many functions
-loads only the last one. The switch waits while a dialog, text field or menu
-is open and while any non-background request (a graph, pseudocode, string or
-FindCrypt scan, byte read or rename) is running, and never restarts or
-preempts the analysis worker (after a cancel or failure, resting switches
-nothing). Section headers, `??`, byte, evidence and zero-fill rows
-belong to no function, so nothing follows there. Cursor travel adds no
-Back/Forward history. From the Listing, `Space` starts a waiting switch at
-once when the worker is free and then shows the Graph, which may still be
-loading that function.
-Enter and Listing double-click follow a resolved call or a single taken
-branch target from the row's own function; ambiguous, unresolved or
-switch-table destinations, and a jump to the next instruction, are not
-followed.
-
-**Help → Keyboard shortcuts** opens the same reference as F1.
-**Help → About Ghidra Rust** shows the version and license/notice links.
-
-**Help → Check for updates…** checks GitHub on request, including newer alpha
-releases while running a `0.x` version. Download a verified update, then choose
-**Install and restart**. Unsaved work uses the normal save/discard/cancel prompt;
-a saved project reopens after restart. Linux x64 and Windows x64 portable builds
-require a writable installation folder. Review and accept the license and dependency
-notices before installation. Updates replace the executable at its existing path;
-notices remain available in **Help → About Ghidra Rust**. Older or unsigned releases cannot
-be installed through the updater. See [update setup and recovery](docs/releases.md#in-app-updates).
-
-### References and inspection
-
-Use **X** or **Xrefs to…** to inspect confirmed call/data targets. Multiple
-targets require an explicit choice. On a **Strings** row, **X** lists the code
-that reads, writes or takes the address of that string's first byte. On an
-**Imports** or **Exports** row, **X** uses its exact address, or offers its stub
-and slot locations as choices.
-**References → Data references** filters by **All / Read / Write / Address**.
-Address-taking (x86 LEA/immediates, AArch64 ADR/ADRP+ADD) is concrete address
-formation, not proof of pointer use. References cover examined functions;
-an empty result does not prove that no references exist.
-
-**Strings** (**View → Defined Strings**) scans ASCII and printable-ASCII UTF-16LE;
-it does not provide complete Unicode or Rust string-slice recovery.
-
-**Hex / Memory Map** browses mapped sections of the analyzed snapshot.
-Select bytes and choose **Decode selection**. **Show in Listing** switches the
-Listing to the Program scope and puts the cursor on the selected bytes' row
-(or the page's first byte without a selection): known code opens in its
-function, bytes inside a decoded instruction select that instruction, and
-Back returns to the same Hex span. Bytes of a section that has no Program
-rows (one overlapping an earlier section) change nothing; the status bar
-says so. Unmapped headers, overlays,
-and runtime process memory are outside this view, so a `file(…)` offset there
-has no address.
-
-### Search
-
-**Search → Memory…** (`S`) finds hex bytes (`??` matches any one byte), ASCII
-or UTF-16LE text in the mapped, file-backed bytes of the analyzed snapshot.
-**Search → Program text…** (`Ctrl+F`) finds a literal in the names, imports,
-exports, labels, comments and string previews already loaded in the desktop. It
-does not fetch more metadata, demangle, or search listing or pseudocode text.
-
-Results appear in a **Search** tab with a state and count: Searching, Complete,
-Partial, Canceled, Stale or Unavailable. Click selects a row; double-click,
-Enter, or **Open** in its menu goes there. A match opens as code only at a known
-function entry or at an instruction already observed in a recovered graph or
-decompiler mapping. Otherwise it opens in Hex at its exact bytes, even inside
-code. Strings open in Hex; imports and exports open like their Functions-dock
-rows. In the Listing's Program scope, results that are not code land on their
-row instead, expanding the pages a match spans. Back / Forward records each
-destination.
-
-Search state is transient: it is not saved in projects and is cleared when the
-binary or project changes. Program-text results become **Stale** when the
-searched names, annotations, tables or strings change; search again to refresh.
-See [search scope and limits](docs/analysis.md#search).
-
-**Decode** supports UTF-8, UTF-16LE/BE, hex, Base64, and supplied-key XOR.
-**FindCrypt** finds a small set of standardized constants; matches are
-candidates, not proof of encryption or recovered keys.
-See [coverage and provenance](docs/crypto-signatures.md).
-
-### Annotations and signatures
-
-Use **L** and **;** to edit names and comments, or open **View → Annotations**
-to browse them. Local renaming requires a verified recovered symbol.
-
-Use **Signature…** above the Decompiler to edit supported integer/void/pointer
-prototypes under the binary's ABI. This is not general type or variable-storage
-editing. See [editing limits](docs/analysis.md#annotations-and-signatures).
-
-The status-bar warning indicator opens loading and coverage notes.
-Discovery can be partial; its activity indicator is not a whole-program
-completion percentage. Use **Analysis → Cancel analysis** to stop a run.
-
-## Projects
-
-**File → Save project** or **Ctrl+S** creates one SQLite `.grproj` file.
-It stores annotations, the known function list, the displayed function's
-listing/graph and pseudocode, scan results, and committed discovery results.
-It also saves up to 128 recent retained functions within a 16 MiB result budget.
-Evicted or oversized results are recomputed when needed; the engine's complete
-database is not saved.
-Imports and exports are not saved; reopening rebuilds them from the verified binary.
-
-**File → Include binary in project** is enabled initially. Embedded projects
-include the analyzed binary. Without it, reopening asks you to select the
-binary and verifies its SHA-256; saved source paths are display hints only.
-
-Projects store the exact selected Listing address. Reopening opens a
-function only where the address is proven code: a known function entry, or
-an instruction of the saved function. Any other saved address, such as a
-`??` byte inside a code section or a data row, lands on its Program row over
-the saved function; without that saved function's results it lands over the
-function that was displayed, while that is still a known function, else over
-the opening location. In the **Function** scope the same function opens
-without moving to that row. Older releases may still open such a saved
-executable address as a function of its own.
-
-Reopened results are labeled **Saved analysis** until recomputed.
-Use **Analysis → Refresh function** for listing/graph and pseudocode, and
-**Analysis → Discover functions** for fresh references. A matching binary hash
-does not authenticate cached analysis. Function, view, block and instruction
-starts must be ABI-aligned executable file-backed code; complete instruction
-spans must stay in executable file-backed bytes. Invalid function inventories
-reject loading regardless of cache compatibility; incompatible result caches
-are discarded. Older Mach-O section lists migrate only on an exact match to
-the worker-reported previous loader rules, retaining annotations and refreshing
-analysis. Migration compares bounded metadata in `Opened`; binary parsing stays
-in the worker.
-
-**Export annotations (JSON)…** and **Open annotations…** preserve JSON sidecars.
-Export independently hashes the retained binary off the GUI thread and refuses
-to save if it differs from the analyzed snapshot.
-There is no autosave or Ghidra/IDA project import. The app does not patch inputs.
-
-**Open projects only from trusted sources:** SQLite parses `.grproj` files
-inside the desktop process, outside the contained analysis worker.
-
-## Security and isolation
-
-Analysis runs in a disposable worker with cancellation and a 30-second
-per-request wall-time limit. A stopped worker can be reopened for later work.
-
-Linux workers use bubblewrap containment and resource limits.
-See [Linux requirements and isolation](docs/linux.md).
-
-**Windows worker limits control resources only; there is no filesystem or
-network sandbox. Use trusted inputs.** See the [Windows guide](docs/windows.md).
-
-## Headless analysis
-
-The native archives also include `ghidra-rust-headless`, a versioned JSON/console
-API and Rust controller for contained analysis and project checkpoints without a
-desktop window. See [the headless API guide](docs/headless.md) for commands,
-provenance, lifecycle, and limits. HTTP hosting and cloud synchronization are
-not included yet.
-
-## Documentation
-
-| Topic | Guide |
-| --- | --- |
-| Linux installation and troubleshooting | [Linux](docs/linux.md) |
-| Windows installation, building, and troubleshooting | [Windows](docs/windows.md) |
-| Formats, instruction sets, and ABI exclusions | [Architecture coverage](docs/architectures.md) |
-| Discovery, editing, project formats, and limits | [Analysis coverage](docs/analysis.md) |
-| C++, Rust and MSVC display names | [Demangling](docs/demangling.md) |
-| Constant signatures and decoding | [Coverage and provenance](docs/crypto-signatures.md) |
-| Measurement methods and recorded results | [Analysis measurements](docs/analysis-performance.md) |
-| Packaging and publishing releases | [Release workflow](docs/releases.md) |
-| Contributor rules | [AGENTS.md](AGENTS.md) |
-
-## Building and contributing
-
-Follow [AGENTS.md](AGENTS.md) and the platform guides. For Rust changes:
-
-```sh
-cargo fmt --all --check
-cargo test --locked
-cargo clippy --all-targets --locked -- -D warnings
-cargo build --release --locked
-```
-
-Tests run locally; GitHub Actions builds, lints, and packages without running
-them. Report which platforms you actually validated. Documentation-only changes
-need factual and link checks, not an application rebuild.
-
-See [NOTICE](NOTICE) for the pinned engine and attribution; licensed under [Apache 2.0](LICENSE).
+Licensed under [Apache 2.0](LICENSE). See [NOTICE](NOTICE) for attribution.
