@@ -11,6 +11,8 @@ pub mod client;
 mod code_pointers;
 pub mod crypto;
 pub mod data_analysis;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub mod debugger;
 pub mod decode;
 pub mod decoder_ui;
 pub mod decompile;
