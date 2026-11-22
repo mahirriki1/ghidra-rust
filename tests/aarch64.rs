@@ -56,6 +56,7 @@ fn legacy_macho_projects_migrate_exact_stub_additions_and_keep_annotations() {
     let Response::Opened { info, .. } = request(
         &mut worker,
         Request::Open {
+            debug: Default::default(),
             path: binary.to_string_lossy().into_owned(),
         },
     ) else {
@@ -77,6 +78,10 @@ fn legacy_macho_projects_migrate_exact_stub_additions_and_keep_annotations() {
     old.sections.retain(|section| section.name != "__stubs");
     assert_eq!(info.sections.len(), old.sections.len() + 1);
     let project = ProjectData {
+        debug_source: None,
+        debug_state: String::new(),
+        use_debug_info: true,
+        debug_skip: Vec::new(),
         function_results: Vec::new(),
         info: old,
         session,
@@ -145,6 +150,7 @@ fn legacy_macho_projects_migrate_exact_stub_additions_and_keep_annotations() {
         } = request(
             &mut reopened_worker,
             Request::Open {
+                debug: Default::default(),
                 path: selected.to_string_lossy().into_owned(),
             },
         )
@@ -198,6 +204,7 @@ fn macho_instruction_attributes_cannot_override_non_executable_segment() {
     let response = request(
         &mut worker,
         Request::Open {
+            debug: Default::default(),
             path: binary.to_string_lossy().into_owned(),
         },
     );
@@ -233,6 +240,7 @@ fn macho_instruction_and_stub_sections_survive_worker_and_project_validation() {
         let Response::Opened { info, .. } = request(
             &mut worker,
             Request::Open {
+                debug: Default::default(),
                 path: binary.to_string_lossy().into_owned(),
             },
         ) else {
@@ -249,6 +257,10 @@ fn macho_instruction_and_stub_sections_survive_worker_and_project_validation() {
             .bind_snapshot(&info)
             .unwrap();
         let project = ProjectData {
+            debug_source: None,
+            debug_state: String::new(),
+            use_debug_info: true,
+            debug_skip: Vec::new(),
             function_results: Vec::new(),
             session: Session::new(info.sha256.clone()),
             info,
@@ -309,6 +321,7 @@ fn contained_data_accesses_use_literal_reads_and_block_local_propagation() {
         let Response::Opened { info, .. } = request(
             &mut worker,
             Request::Open {
+                debug: Default::default(),
                 path: binary.to_string_lossy().into_owned(),
             },
         ) else {
@@ -497,6 +510,7 @@ fn contained_aarch64_workers_analyze_elf_pe_macho_and_reopen_projects() {
         let response = request(
             &mut worker,
             Request::Open {
+                debug: Default::default(),
                 path: binary.to_string_lossy().into_owned(),
             },
         );
@@ -624,6 +638,10 @@ fn contained_aarch64_workers_analyze_elf_pe_macho_and_reopen_projects() {
             },
         );
         let project = ProjectData {
+            debug_source: None,
+            debug_state: String::new(),
+            use_debug_info: true,
+            debug_skip: Vec::new(),
             function_results: Vec::new(),
             semantics: Default::default(),
             info,
@@ -660,6 +678,7 @@ fn contained_aarch64_workers_analyze_elf_pe_macho_and_reopen_projects() {
         let Response::Opened { info: fresh, .. } = request(
             &mut reopened,
             Request::Open {
+                debug: Default::default(),
                 path: extracted.to_string_lossy().into_owned(),
             },
         ) else {
@@ -708,6 +727,7 @@ fn stripped_aarch64_discovery_follows_real_calls_in_all_containers() {
         let response = request(
             &mut worker,
             Request::Open {
+                debug: Default::default(),
                 path: binary.to_string_lossy().into_owned(),
             },
         );
@@ -763,6 +783,7 @@ fn aarch64_rejects_unaligned_entries_and_truncated_instructions() {
     let response = request(
         &mut worker,
         Request::Open {
+            debug: Default::default(),
             path: binary.to_string_lossy().into_owned(),
         },
     );
@@ -819,6 +840,7 @@ fn arm64_pe_named_noreturn_veneer_ends_its_callers_block() {
     let Response::Opened { info, .. } = request(
         &mut worker,
         Request::Open {
+            debug: Default::default(),
             path: binary.to_string_lossy().into_owned(),
         },
     ) else {
@@ -867,6 +889,7 @@ fn stripped_arm64_pe_recovers_unwind_entries_and_names_confirmed_import_veneers(
     let Response::Opened { info, .. } = request(
         &mut worker,
         Request::Open {
+            debug: Default::default(),
             path: binary.to_string_lossy().into_owned(),
         },
     ) else {
@@ -971,6 +994,7 @@ fn memory_search_is_architecture_and_container_neutral() {
         let Response::Opened { info, .. } = request(
             &mut worker,
             Request::Open {
+                debug: Default::default(),
                 path: binary.to_string_lossy().into_owned(),
             },
         ) else {

@@ -555,7 +555,7 @@ pub struct RecoveryAccounting {
 }
 
 /// UTF-8 byte span in rendered C and its originating machine instructions.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CodeMapping {
     pub start: usize,
     pub end: usize,
@@ -567,6 +567,15 @@ pub struct CodeMapping {
 pub struct FunctionInfo {
     pub address: u64,
     pub name: String,
+}
+
+/// The bounded inventory spelling of an engine-side function name.
+pub(crate) fn inventory_spelling(name: &str) -> &str {
+    let mut end = name.len().min(MAX_FUNCTION_NAME_BYTES);
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    &name[..end]
 }
 
 /// Bytes `serde_json` emits for `text` inside a string literal, excluding quotes.
@@ -958,6 +967,8 @@ pub struct CryptoMatch {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
     Open {
+        #[serde(default)]
+        debug: crate::debug_info::DebugOptions,
         path: String,
     },
     Graph {
@@ -972,6 +983,42 @@ pub enum Request {
             deserialize_with = "crate::bounded::vec::<_, _, { crate::semantic::MAX_FUNCTION_RENAMES }>"
         )]
         renames: Vec<crate::semantic::LocalRename>,
+    },
+    /// [`Request::DecompileWithLocals`] that never reuses a cached render.
+    RefreshDecompile {
+        address: u64,
+        #[serde(
+            deserialize_with = "crate::bounded::vec::<_, _, { crate::semantic::MAX_FUNCTION_RENAMES }>"
+        )]
+        renames: Vec<crate::semantic::LocalRename>,
+    },
+    /// Managed first phase (private to the host/worker pair): the ordinary
+    /// render as a baseline, plus an offer for one optional debug render.
+    #[doc(hidden)]
+    PrepareDecompile {
+        logical_id: u64,
+        address: u64,
+        #[serde(
+            deserialize_with = "crate::bounded::vec::<_, _, { crate::semantic::MAX_FUNCTION_RENAMES }>"
+        )]
+        renames: Vec<crate::semantic::LocalRename>,
+        /// Never reuse a cached final render.
+        refresh: bool,
+        /// A one-shot recovery after the first attempt stopped before its
+        /// baseline: only the ordinary render, with no evidence capture,
+        /// offer or optional job, answered by a final `Decompiled`.
+        #[serde(default)]
+        inference_only: bool,
+    },
+    /// Managed second phase in a disposable fork of this worker.
+    #[doc(hidden)]
+    TryPreparedDebug {
+        job: crate::analysis::managed::PeerJob,
+    },
+    /// A debug peer's one optional render, after its verified replay.
+    #[doc(hidden)]
+    RenderDebugOnce {
+        job: crate::analysis::managed::PeerJob,
     },
     Discover,
     DiscoverBatch {
@@ -1040,6 +1087,20 @@ pub enum Request {
     },
 }
 
+impl Request {
+    pub(crate) fn changes_managed_program(&self) -> bool {
+        matches!(
+            self,
+            Self::Open { .. }
+                | Self::Discover
+                | Self::DiscoverBatch { .. }
+                | Self::SyncFunctions { .. }
+                | Self::SyncSignatures { .. }
+                | Self::Rename { .. }
+        )
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SignatureStatus {
@@ -1051,6 +1112,8 @@ pub struct SignatureStatus {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Response {
     Opened {
+        #[serde(default)]
+        debug: Option<crate::debug_info::DebugSummary>,
         info: BinaryInfo,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         macho_legacy: Option<MachoLegacySections>,
@@ -1078,6 +1141,38 @@ pub enum Response {
     },
     DiscoveryBatch {
         batch: DiscoveryBatch,
+    },
+    /// A managed request's baseline and its optional-render offer.
+    #[doc(hidden)]
+    PreparedDecompile {
+        address: u64,
+        text: String,
+        #[serde(default)]
+        #[serde(deserialize_with = "crate::bounded::vec::<_, _, { MAX_CODE_MAPPINGS }>")]
+        mappings: Vec<CodeMapping>,
+        #[serde(default)]
+        semantics: crate::semantic::SemanticInfo,
+        offer: crate::analysis::managed::DebugOffer,
+    },
+    /// No optional render result for this exchange; the baseline stands.
+    #[doc(hidden)]
+    DebugUnavailable {
+        ticket: crate::analysis::managed::Ticket,
+        #[serde(deserialize_with = "crate::bounded::string::<_, 32>")]
+        reason: String,
+    },
+    /// A single non-terminal notice that isolated debug work started.
+    #[doc(hidden)]
+    DebugStarted {
+        ticket: crate::analysis::managed::Ticket,
+        direct: bool,
+    },
+    /// An executor's measured digests and its uncommitted outcome.
+    #[doc(hidden)]
+    DebugFinished {
+        ticket: crate::analysis::managed::Ticket,
+        measured: crate::analysis::managed::Binding,
+        outcome: crate::analysis::managed::PeerOutcome,
     },
     FunctionsSynced,
     SignaturesSynced {

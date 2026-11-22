@@ -47,6 +47,9 @@ pub(super) enum Continuation {
         revision: u64,
         result: Option<ResultBinding>,
         address: u64,
+        /// Whether the Graph was requested by a Refresh, whose Decompile
+        /// then bypasses reused renders.
+        refresh: bool,
     },
     /// The graph-dependent remainder of a project restore.
     Saved(Box<SavedRestore>),
@@ -443,6 +446,10 @@ mod tests {
         let source = "int entry() { return 7; }";
         let displayed_entry = Some(view.address);
         let data = ProjectData {
+            debug_source: None,
+            debug_state: String::new(),
+            use_debug_info: true,
+            debug_skip: Vec::new(),
             function_results: Vec::new(),
             info: app.info.clone().unwrap(),
             session: app.session.clone().unwrap(),
@@ -659,14 +666,14 @@ mod tests {
             assert_eq!(
                 app.queue
                     .iter()
-                    .filter(|request| matches!(request, Request::Graph { address: 0x1000 }))
+                    .filter(|request| matches!(request.request, Request::Graph { address: 0x1000 }))
                     .count(),
                 1
             );
             settle_inputs(&mut app);
             // Model the dispatcher's fresh binding and worker response, with
             // no additional navigation or selection change by the user.
-            let request = app.queue.pop_front().unwrap();
+            let request = app.queue.pop_front().unwrap().request;
             assert!(matches!(request, Request::Graph { address: 0x1000 }));
             let mut fresh = pending(&app);
             fresh.request = request;
@@ -891,7 +898,7 @@ mod tests {
         assert!(
             app.queue
                 .iter()
-                .any(|request| matches!(request, Request::Decompile { address: 0x1000 }))
+                .any(|request| matches!(request.request, Request::Decompile { address: 0x1000 }))
         );
     }
 
@@ -916,6 +923,7 @@ mod tests {
             revision: app.revision,
             result: None,
             address: 0x1000,
+            refresh: false,
         };
         app.graph_preparation
             .submit(Work::Panic, continuation, None, &context)

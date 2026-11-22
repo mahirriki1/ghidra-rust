@@ -1540,6 +1540,7 @@ mod tests {
     #[test]
     fn cache_needs_track_context_failures_and_budget_eviction() {
         let context = Arc::new(ProgramContext {
+            debug_state: String::new(),
             binary_sha256: "a".into(),
             engine_fingerprint: "e",
             signature_fingerprint: "s",
@@ -1548,6 +1549,7 @@ mod tests {
             function_name_state: String::new(),
         });
         let newer = Arc::new(ProgramContext {
+            debug_state: String::new(),
             inventory_state: "2".into(),
             ..(*context).clone()
         });

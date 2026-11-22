@@ -4,6 +4,9 @@
 //! normal Program::decompile path still performs string enrichment, analysis,
 //! pretty printing, and cleanup. Neither cached source nor the engine is patched.
 
+#[cfg(target_os = "linux")]
+mod probe_process;
+
 use crate::model::{
     CodeMapping, MAX_CODE_ADDRESS_REFS, MAX_CODE_MAPPINGS, MAX_DECOMPILED_BYTES,
     MAX_MAPPING_ADDRESSES, SectionInfo,
@@ -27,7 +30,7 @@ use std::sync::{Arc, Mutex};
 pub const TRUNCATION_TRAILER: &str =
     "\n/* Decompiler output truncated at the 2 MiB prototype limit. */\n";
 
-const MAX_CAPTURED_OPS: usize = 131_072;
+pub(crate) const MAX_CAPTURED_OPS: usize = 131_072;
 const MAX_STATEMENT_DEPTH: usize = 256;
 const TEXT_BUDGET: usize = MAX_DECOMPILED_BYTES - 100;
 
@@ -37,10 +40,19 @@ struct Capture {
     spans: Vec<CodeMapping>,
     truncated: bool,
     calls: BTreeMap<OpId, u64>,
+    call_walk_complete: bool,
     locals: crate::local_symbols::Locals,
     tokens: Vec<SemanticToken>,
     prototype: Option<crate::signatures::InferredSignature>,
+    abi_evidence: crate::debug_info::abi::Evidence,
+    caller: Option<crate::debug_info::caller::Facts>,
+    probe_complete: bool,
 }
+
+/// The engine's parameter-identification action group: prototype recovery
+/// without structuring, merging, casts or printing.
+const PROBE_ACTION: &str = "paramid";
+const PROBE_DONE: &str = "ABI probe complete";
 
 #[cfg(test)]
 std::thread_local! {
@@ -59,6 +71,8 @@ struct CaptureAction {
     signature_context: String,
     signature_owned: bool,
     abi: String,
+    probe: bool,
+    caller: bool,
 }
 
 impl CaptureAction {
@@ -105,6 +119,20 @@ impl Action for CaptureAction {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         capture.operations.clear();
+        capture.abi_evidence = crate::debug_info::abi::capture(data);
+        if self.probe {
+            // Evidence is complete; stop before the printer runs.
+            capture.probe_complete = true;
+            return Err(Error::Lowlevel(PROBE_DONE.into()));
+        }
+        if self.caller {
+            let _evidence = crate::performance::span("caller_evidence_capture");
+            capture.caller = Some(crate::debug_info::caller::capture(
+                data,
+                architecture,
+                &self.executable,
+            ));
+        }
         capture.prototype = Some(crate::signatures::capture(data, architecture, &self.abi));
         capture.locals = crate::local_symbols::capture(
             data,
@@ -161,6 +189,7 @@ impl Action for CaptureAction {
             }
             current = data.obank.next_in_list(id, PcodeOp::INSERT_LIST);
         }
+        capture.call_walk_complete = current.is_none();
         Ok(result)
     }
 }
@@ -215,6 +244,256 @@ pub fn render_named(
     signature_owned: bool,
     names: Option<Arc<SymbolTable>>,
 ) -> Result<(String, Vec<CodeMapping>, SemanticInfo)> {
+    render_named_with_calls(
+        program,
+        address,
+        sections,
+        renames,
+        signature_context,
+        signature_owned,
+        names,
+    )
+    .map(|(text, mappings, semantics, _)| (text, mappings, semantics))
+}
+
+pub(crate) fn render_named_with_calls(
+    program: &mut Program,
+    address: u64,
+    sections: &[SectionInfo],
+    renames: &[LocalRename],
+    signature_context: &str,
+    signature_owned: bool,
+    names: Option<Arc<SymbolTable>>,
+) -> Result<(String, Vec<CodeMapping>, SemanticInfo, Vec<u64>)> {
+    render_full(
+        program,
+        address,
+        sections,
+        renames,
+        signature_context,
+        signature_owned,
+        names,
+        false,
+    )
+    .map(|render| (render.text, render.mappings, render.semantics, render.calls))
+}
+
+/// A complete render and the evidence captured while its analysis was live.
+/// The public render helpers are projections of this.
+pub(crate) struct Render {
+    pub text: String,
+    pub mappings: Vec<CodeMapping>,
+    pub semantics: SemanticInfo,
+    /// Verified direct call targets, sorted and bounded.
+    pub calls: Vec<u64>,
+    pub calls_complete: bool,
+    /// Register inputs the analysis read, for verifying an installed
+    /// prototype of the rendered function.
+    pub evidence: crate::debug_info::abi::Evidence,
+    /// Formal uses and call operands, when requested.
+    pub caller: Option<crate::debug_info::caller::Facts>,
+}
+
+/// [`render_named_with_calls`] that also returns the analysis evidence, and
+/// with `caller`, the caller facts that compare a render with callee debug
+/// prototypes installed against one without.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_full(
+    program: &mut Program,
+    address: u64,
+    sections: &[SectionInfo],
+    renames: &[LocalRename],
+    signature_context: &str,
+    signature_owned: bool,
+    names: Option<Arc<SymbolTable>>,
+    caller: bool,
+) -> Result<Render> {
+    render_impl(
+        program,
+        address,
+        sections,
+        renames,
+        signature_context,
+        signature_owned,
+        names,
+        Mode::Render { caller },
+    )
+}
+
+/// Register inputs of `address` under inference, from the engine's
+/// parameter-identification pass only. Nothing is printed.
+pub(crate) fn probe_abi(
+    program: &mut Program,
+    address: u64,
+    sections: &[SectionInfo],
+) -> Result<crate::debug_info::abi::Evidence> {
+    let actions = &mut program.architecture().allacts;
+    let previous = actions.get_current_name().to_owned();
+    actions.set_current(PROBE_ACTION)?;
+    let result = render_impl(
+        program,
+        address,
+        sections,
+        &[],
+        "",
+        false,
+        None,
+        Mode::Probe,
+    );
+    program.architecture().allacts.set_current(&previous)?;
+    result.map(|render| render.evidence)
+}
+
+/// A disposable copy of the worker computing one optional result while the
+/// worker waits; see [`isolate`]. Dropping it stops and reaps the copy. It
+/// has no value on platforms without a fork-based executor.
+pub(crate) enum Isolated {
+    #[cfg(target_os = "linux")]
+    Child(probe_process::Isolated),
+}
+
+/// Runs `work` in a disposable child of this single-threaded worker, limited
+/// to `cpu` of CPU time (whole seconds, at least one). The child inherits
+/// this process's scheduling policy and priority. The worker's own state is
+/// unchanged by `work`. `None` when isolation is unavailable
+/// ([`callee_probes_available`]) or the child cannot start; `work` then never
+/// runs.
+pub(crate) fn isolate<T: serde::Serialize>(
+    cpu: std::time::Duration,
+    work: impl FnOnce() -> Option<T>,
+) -> Option<Isolated> {
+    #[cfg(target_os = "linux")]
+    {
+        let seconds = (cpu.as_secs() + u64::from(cpu.subsec_nanos() > 0)).max(1);
+        probe_process::spawn_isolated(seconds as libc::rlim_t, crate::model::MAX_REPLY_BYTES, work)
+            .map(Isolated::Child)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (cpu, work);
+        None
+    }
+}
+
+/// Why an isolated child produced no reply.
+#[cfg(target_os = "linux")]
+pub(crate) use probe_process::Stop as Ended;
+/// Why an isolated child produced no reply (never, without isolation).
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
+pub(crate) enum Ended {
+    Expired,
+    Invalid,
+    Preempted,
+}
+
+impl Isolated {
+    /// The child's result if it arrives by `deadline`, unless `preempt`
+    /// asks to abandon it first. The child is stopped and reaped either way.
+    pub(crate) fn reply<T: serde::de::DeserializeOwned>(
+        self,
+        _deadline: std::time::Instant,
+        _preempt: &mut dyn FnMut() -> bool,
+    ) -> std::result::Result<T, Ended> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Isolated::Child(child) => child.reply_checked(_deadline, _preempt, |frame| {
+                crate::bounded::check_debug_frame(frame).is_ok()
+            }),
+        }
+    }
+}
+
+static ISOLATION_DISABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Makes this worker behave as one without process isolation (as on
+/// Windows or in a threaded worker): no fork for optional or callee work.
+pub fn disable_isolation() {
+    ISOLATION_DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn callee_probes_available() -> bool {
+    if ISOLATION_DISABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        probe_process::single_threaded()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+pub(crate) fn probe_callees(
+    program: &mut Program,
+    addresses: &[u64],
+    sections: &[SectionInfo],
+    deadline: std::time::Instant,
+) -> Vec<Option<crate::debug_info::abi::Evidence>> {
+    #[cfg(target_os = "linux")]
+    {
+        let Some(space) = program.architecture().manager.get_space_by_name("register") else {
+            return Vec::new();
+        };
+        let replies = probe_process::run(addresses.len(), deadline, |index| {
+            let evidence = probe_abi(program, addresses[index], sections).ok()?;
+            evidence.complete.then(|| {
+                evidence
+                    .inputs
+                    .into_iter()
+                    .map(|(address, size)| (address.get_offset(), size))
+                    .collect::<Vec<_>>()
+            })
+        });
+        replies
+            .into_iter()
+            .map(|reply| {
+                reply.map(|inputs| crate::debug_info::abi::Evidence {
+                    complete: true,
+                    inputs: inputs
+                        .into_iter()
+                        .map(|(offset, size)| {
+                            (
+                                ghidra_decompiler::address::Address::new(space.clone(), offset),
+                                size,
+                            )
+                        })
+                        .collect(),
+                })
+            })
+            .collect()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (program, addresses, sections, deadline);
+        Vec::new()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Parameter identification only.
+    Probe,
+    Render {
+        caller: bool,
+    },
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_impl(
+    program: &mut Program,
+    address: u64,
+    sections: &[SectionInfo],
+    renames: &[LocalRename],
+    signature_context: &str,
+    signature_owned: bool,
+    names: Option<Arc<SymbolTable>>,
+    mode: Mode,
+) -> Result<Render> {
+    let probe = mode == Mode::Probe;
     crate::semantic::validate_renames(renames, Some(address)).map_err(Error::Lowlevel)?;
     if signature_context.len() > 96 || (signature_owned && signature_context.is_empty()) {
         return Err(Error::Lowlevel(
@@ -261,6 +540,8 @@ pub fn render_named(
             signature_context: signature_context.into(),
             signature_owned,
             abi,
+            probe,
+            caller: mode == Mode::Render { caller: true },
         }),
     );
     let engine = crate::performance::span("engine_decompile_inclusive");
@@ -304,8 +585,24 @@ pub fn render_named(
             })?;
         }
     }
-    let mut text = result.unwrap_or_else(|payload| std::panic::resume_unwind(payload))?;
+    let result = result.unwrap_or_else(|payload| std::panic::resume_unwind(payload));
     let mut capture = capture.lock().unwrap_or_else(|error| error.into_inner());
+    if probe {
+        if !capture.probe_complete {
+            result?;
+            return Err(Error::Lowlevel("ABI probe did not complete".into()));
+        }
+        return Ok(Render {
+            text: String::new(),
+            mappings: Vec::new(),
+            semantics: SemanticInfo::default(),
+            calls: Vec::new(),
+            calls_complete: true,
+            evidence: std::mem::take(&mut capture.abi_evidence),
+            caller: None,
+        });
+    }
+    let mut text = result?;
     let flattening = crate::performance::span("mapping_flatten");
     let mappings = flatten(std::mem::take(&mut capture.spans), &text);
     flattening.finish(mappings.len() as u64);
@@ -313,6 +610,7 @@ pub fn render_named(
         text.push_str(TRUNCATION_TRAILER);
     }
     let semantics = SemanticInfo {
+        prototype_source: Default::default(),
         prototype: capture.prototype.take(),
         tokens: std::mem::take(&mut capture.tokens),
         locals: std::mem::take(&mut capture.locals.variables),
@@ -322,7 +620,26 @@ pub fn render_named(
     semantics
         .validate(&text, address, sections)
         .map_err(Error::Lowlevel)?;
-    Ok((text, mappings, semantics))
+    let calls = capture
+        .calls
+        .values()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .take(crate::model::MAX_GRAPH_CALLS + 1)
+        .collect::<Vec<_>>();
+    let calls_complete = capture.call_walk_complete && calls.len() <= crate::model::MAX_GRAPH_CALLS;
+    let mut calls = calls;
+    calls.truncate(crate::model::MAX_GRAPH_CALLS);
+    Ok(Render {
+        text,
+        mappings,
+        semantics,
+        calls,
+        calls_complete,
+        evidence: std::mem::take(&mut capture.abi_evidence),
+        caller: capture.caller.take(),
+    })
 }
 
 struct Statement {

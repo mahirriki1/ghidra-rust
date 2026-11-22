@@ -142,6 +142,7 @@ pub type Shared<T> = Arc<Stored<T>>;
 /// field makes all stored function results unreachable.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProgramContext {
+    pub debug_state: String,
     pub binary_sha256: String,
     pub engine_fingerprint: &'static str,
     pub signature_fingerprint: &'static str,
@@ -832,6 +833,7 @@ mod tests {
 
     fn context(signature_state: &str) -> Arc<ProgramContext> {
         Arc::new(ProgramContext {
+            debug_state: String::new(),
             binary_sha256: "a".repeat(64),
             engine_fingerprint: "engine",
             signature_fingerprint: "signatures",
@@ -1124,5 +1126,23 @@ mod tests {
         drop((old, index));
         assert!(store.retain_publication(&new, &new_index, &[]));
         assert_eq!(store.usage().charged, store.usage().budget);
+    }
+    #[test]
+    fn a_debug_context_change_makes_prior_pseudocode_unreachable() {
+        let mut store = Store::new(unit() * 4);
+        let original = context("");
+        store.set_context(original.clone());
+        store.admit_decompilation(
+            &code_key(&original, 0x10, ""),
+            Blob(UNIT),
+            ResultOrigin::Saved,
+            None,
+        );
+        assert!(store.lookup(&key(&original, 0x10), "").decompiled.is_some());
+        let mut changed = (*original).clone();
+        changed.debug_state = "debug-v2".into();
+        let changed = Arc::new(changed);
+        store.set_context(changed.clone());
+        assert!(store.lookup(&key(&changed, 0x10), "").decompiled.is_none());
     }
 }

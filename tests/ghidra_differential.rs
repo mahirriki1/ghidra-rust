@@ -184,6 +184,7 @@ fn rust_arm(request_doc: &RunRequest) -> RustRun {
     let info = match request(
         &mut worker,
         Request::Open {
+            debug: Default::default(),
             path: request_doc.input_path.to_string_lossy().into_owned(),
         },
     ) {

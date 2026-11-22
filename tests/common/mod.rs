@@ -290,3 +290,149 @@ pub fn macho_with_stubs() -> (Vec<u8>, u64) {
     bytes[0x1180..0x1184].copy_from_slice(&0xd65f03c0_u32.to_le_bytes());
     (bytes, base)
 }
+
+/// Minimal original DWARF v4 prototype, independent of any cross linker.
+#[allow(dead_code)]
+pub fn dwarf_prototype(macho_format: bool, register: u8) -> (Vec<u8>, u64) {
+    let (mut image, base) = if macho_format { macho() } else { elf(true) };
+    let abbrev = vec![
+        1, 0x11, 1, 0, 0, 2, 0x2e, 1, 0x11, 1, 0x03, 8, 0x49, 0x13, 0, 0, 3, 5, 0, 3, 8, 0x49,
+        0x13, 2, 0x18, 0, 0, 4, 0x24, 0, 0x0b, 0x0b, 0x3e, 0x0b, 0, 0, 0,
+    ];
+    let mut info = vec![0; 11];
+    info[4..6].copy_from_slice(&4u16.to_le_bytes());
+    info[10] = 8;
+    info.extend_from_slice(&[1, 2]);
+    info.extend_from_slice(&base.to_le_bytes());
+    info.extend_from_slice(b"fixture_entry\0");
+    let output = info.len();
+    info.extend_from_slice(&[0; 4]);
+    info.extend_from_slice(b"\x03count\0");
+    let input = info.len();
+    info.extend_from_slice(&[0; 4]);
+    info.extend_from_slice(&[1, 0x50 + register, 0]);
+    let ty = info.len() as u32;
+    info.extend_from_slice(&[4, 4, 5, 0]);
+    info[output..output + 4].copy_from_slice(&ty.to_le_bytes());
+    info[input..input + 4].copy_from_slice(&ty.to_le_bytes());
+    let size = (info.len() - 4) as u32;
+    info[..4].copy_from_slice(&size.to_le_bytes());
+    if macho_format {
+        let old = u32::from_le_bytes(image[20..24].try_into().unwrap());
+        let at = 32 + old as usize;
+        p32(&mut image, 16, 4);
+        p32(&mut image, 20, old + 232);
+        p32(&mut image, at, 0x19);
+        p32(&mut image, at + 4, 232);
+        name(&mut image, at + 8, "__DWARF");
+        p32(&mut image, at + 64, 2);
+        for (i, (n, data)) in [("__debug_info", &info), ("__debug_abbrev", &abbrev)]
+            .into_iter()
+            .enumerate()
+        {
+            let offset = image.len();
+            image.extend_from_slice(data);
+            let section = at + 72 + i * 80;
+            name(&mut image, section, n);
+            name(&mut image, section + 16, "__DWARF");
+            p64(&mut image, section + 40, data.len() as u64);
+            p32(&mut image, section + 48, offset as u32);
+        }
+    } else {
+        let names = b"\0.text\0.symtab\0.strtab\0.shstrtab\0.debug_info\0.debug_abbrev\0";
+        image[0x380..0x380 + names.len()].copy_from_slice(names);
+        p64(&mut image, 0x400 + 4 * 64 + 32, names.len() as u64);
+        p16(&mut image, 60, 7);
+        image.resize(0x400 + 7 * 64, 0);
+        for (i, data) in [&info, &abbrev].into_iter().enumerate() {
+            // Name offsets derive from the literal above, independent of parser output.
+            let n = if i == 0 {
+                names
+                    .windows(12)
+                    .position(|s| s == b".debug_info\0")
+                    .unwrap()
+            } else {
+                names
+                    .windows(14)
+                    .position(|s| s == b".debug_abbrev\0")
+                    .unwrap()
+            };
+            let offset = image.len();
+            image.extend_from_slice(data);
+            let at = 0x400 + (5 + i) * 64;
+            p32(&mut image, at, n as u32);
+            p32(&mut image, at + 4, 1);
+            p64(&mut image, at + 24, offset as u64);
+            p64(&mut image, at + 32, data.len() as u64);
+            p64(&mut image, at + 48, 1);
+        }
+    }
+    (image, base)
+}
+
+#[allow(dead_code)]
+pub fn replace_elf_dwarf(mut image: Vec<u8>, info: &[u8], abbrev: &[u8]) -> Vec<u8> {
+    for (i, bytes) in [info, abbrev].into_iter().enumerate() {
+        let at = 0x400 + (5 + i) * 64;
+        let offset = image.len();
+        image.extend_from_slice(bytes);
+        p64(&mut image, at + 24, offset as u64);
+        p64(&mut image, at + 32, bytes.len() as u64);
+    }
+    image
+}
+
+#[allow(dead_code)]
+pub fn with_macho_uuid(mut image: Vec<u8>, value: u8) -> Vec<u8> {
+    let count = u32::from_le_bytes(image[16..20].try_into().unwrap());
+    let size = u32::from_le_bytes(image[20..24].try_into().unwrap());
+    let at = 32 + size as usize;
+    p32(&mut image, at, 0x1b);
+    p32(&mut image, at + 4, 24);
+    image[at + 8..at + 24].fill(value);
+    p32(&mut image, 16, count + 1);
+    p32(&mut image, 20, size + 24);
+    image
+}
+
+/// Append an unallocated section and relocate the ELF section table. Existing
+/// linked code and symbol addresses remain unchanged.
+#[allow(dead_code)]
+pub fn elf_debug_section(mut image: Vec<u8>, section_name: &str, data: &[u8]) -> Vec<u8> {
+    let shoff = u64::from_le_bytes(image[40..48].try_into().unwrap()) as usize;
+    let count = u16::from_le_bytes(image[60..62].try_into().unwrap()) as usize;
+    let strings = u16::from_le_bytes(image[62..64].try_into().unwrap()) as usize;
+    let mut headers = image[shoff..shoff + count * 64].to_vec();
+    let old_names = u64::from_le_bytes(
+        headers[strings * 64 + 24..strings * 64 + 32]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let old_size = u64::from_le_bytes(
+        headers[strings * 64 + 32..strings * 64 + 40]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let mut names = image[old_names..old_names + old_size].to_vec();
+    let name = names.len();
+    names.extend_from_slice(section_name.as_bytes());
+    names.push(0);
+    let names_offset = image.len();
+    image.extend_from_slice(&names);
+    p64(&mut headers, strings * 64 + 24, names_offset as u64);
+    p64(&mut headers, strings * 64 + 32, names.len() as u64);
+    let data_offset = image.len();
+    image.extend_from_slice(data);
+    let new_shoff = image.len();
+    image.extend_from_slice(&headers);
+    image.resize(image.len() + 64, 0);
+    let at = new_shoff + count * 64;
+    p32(&mut image, at, name as u32);
+    p32(&mut image, at + 4, 1);
+    p64(&mut image, at + 24, data_offset as u64);
+    p64(&mut image, at + 32, data.len() as u64);
+    p64(&mut image, at + 48, 1);
+    p64(&mut image, 40, new_shoff as u64);
+    p16(&mut image, 60, (count + 1) as u16);
+    image
+}

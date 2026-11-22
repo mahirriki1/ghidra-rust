@@ -37,6 +37,21 @@ fn fixture() -> (tempfile::TempDir, String, u64, u64) {
         address("main"),
     )
 }
+/// These tests concern local identities under inference. A test harness is
+/// multithreaded, so an in-process program can never run the isolated debug
+/// render; the fixture's DWARF is therefore disabled rather than reported as
+/// unavailable on every render.
+fn open(path: &str) -> LoadedProgram {
+    LoadedProgram::open_debug(
+        path,
+        &ghidra_rust::debug_info::DebugOptions {
+            enabled: false,
+            ..Default::default()
+        },
+    )
+    .unwrap()
+}
+
 fn decompile(
     program: &mut LoadedProgram,
     address: u64,
@@ -63,7 +78,7 @@ fn decompile(
 #[test]
 fn local_storage_identity_renames_all_and_only_its_tokens_across_reanalysis() {
     let (_directory, path, branch, main) = fixture();
-    let mut program = LoadedProgram::open(&path).unwrap();
+    let mut program = open(&path);
     let (original, first) = decompile(&mut program, branch, vec![]);
     assert!(
         !first.locals.is_empty(),
@@ -107,7 +122,7 @@ fn local_storage_identity_renames_all_and_only_its_tokens_across_reanalysis() {
     );
     // Rebuild every arena, not just the selected function.
     drop(program);
-    let mut program = LoadedProgram::open(&path).unwrap();
+    let mut program = open(&path);
     assert_eq!(
         decompile(&mut program, branch, vec![rename.clone()]).0,
         renamed
@@ -164,7 +179,7 @@ fn local_storage_identity_renames_all_and_only_its_tokens_across_reanalysis() {
 #[test]
 fn actual_call_tokens_keep_targets_after_callee_rename_and_name_collision() {
     let (_directory, path, branch, main) = fixture();
-    let mut program = LoadedProgram::open(&path).unwrap();
+    let mut program = open(&path);
     let (_, before) = decompile(&mut program, main, vec![]);
     assert!(
         before
@@ -233,7 +248,7 @@ fn project_and_annotation_roundtrip_retain_verified_local_names() {
         session::{BinaryProtection, Session},
     };
     let (directory, path, branch, _) = fixture();
-    let mut program = LoadedProgram::open(&path).unwrap();
+    let mut program = open(&path);
     let (_, first) = decompile(&mut program, branch, vec![]);
     let rename = LocalRename {
         identity: first.locals.first().unwrap().identity.clone(),
@@ -269,6 +284,10 @@ fn project_and_annotation_roundtrip_retain_verified_local_names() {
         panic!()
     };
     let project = ProjectData {
+        debug_source: None,
+        debug_state: String::new(),
+        use_debug_info: true,
+        debug_skip: Vec::new(),
         function_results: Vec::new(),
         info: program.info.clone(),
         session: restored,

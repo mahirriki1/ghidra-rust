@@ -46,6 +46,7 @@ fn large_pe_metadata_analysis_and_project_round_trip() {
     let Response::Opened { info, .. } = request(
         &mut worker,
         Request::Open {
+            debug: Default::default(),
             path: binary.to_string_lossy().into_owned(),
         },
     ) else {
@@ -99,6 +100,10 @@ fn large_pe_metadata_analysis_and_project_round_trip() {
     eprintln!("Strings: {}, partial={truncated}", strings.len());
     let protection = worker.protection().bind_snapshot(&info).unwrap();
     let project = ProjectData {
+        debug_source: None,
+        debug_state: String::new(),
+        use_debug_info: true,
+        debug_skip: Vec::new(),
         function_results: Vec::new(),
         semantics: Default::default(),
         session: Session::new(hash.clone()),

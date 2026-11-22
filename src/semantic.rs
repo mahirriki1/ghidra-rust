@@ -159,7 +159,7 @@ pub fn validate_renames(renames: &[LocalRename], function: Option<u64>) -> Resul
     Ok(())
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LocalVariable {
     pub identity: LocalIdentity,
     pub name: String,
@@ -167,7 +167,7 @@ pub struct LocalVariable {
     #[serde(default)]
     pub signature_parameter: Option<usize>,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TokenKind {
     Call {
@@ -178,15 +178,24 @@ pub enum TokenKind {
         local: Option<usize>,
     },
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SemanticToken {
     pub start: usize,
     pub end: usize,
     #[serde(flatten)]
     pub kind: TokenKind,
 }
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrototypeSource {
+    #[default]
+    Inferred,
+    DebugInfo,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SemanticInfo {
+    #[serde(default)]
+    pub prototype_source: PrototypeSource,
     #[serde(default)]
     pub prototype: Option<crate::signatures::InferredSignature>,
     #[serde(
@@ -302,6 +311,7 @@ mod tests {
             executable: true,
         }];
         let mut info = SemanticInfo {
+            prototype_source: Default::default(),
             tokens: vec![SemanticToken {
                 start: 0,
                 end: 2,

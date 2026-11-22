@@ -26,6 +26,11 @@ Open a function from the Functions list. Click an instruction or mapped
 pseudocode to highlight its counterpart. Double-click a resolved call to
 follow it, and use Back to return.
 
+If the binary has supported DWARF debug info, the Decompiler shows inferred
+code first and then updates it in place with the source prototype once it
+is checked. Turn this off with **Analysis → Use debug info**.
+[Debug information](docs/analysis.md#debug-information)
+
 ## What you can open
 
 Linked executables and shared libraries need file-backed executable sections.
@@ -89,6 +94,8 @@ Platform setup and local checks are in the [Linux guide](docs/linux.md) and the
 cargo run --release --locked
 ```
 
+Run tests with `cargo test --locked --features test-hooks`. The test-only
+feature adds worker fault hooks, and packaging refuses builds that include it.
 See the repository guidance before contributing. [AGENTS.md](AGENTS.md)
 
 Licensed under [Apache 2.0](LICENSE). See [NOTICE](NOTICE) for attribution.

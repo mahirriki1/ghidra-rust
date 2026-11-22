@@ -48,16 +48,37 @@ pub enum Input {
 pub struct Options {
     /// A host-selected destination. API commands carry no filesystem paths.
     pub output_project: Option<PathBuf>,
+    pub use_debug_info: Option<bool>,
+    pub debug_info: Option<PathBuf>,
     /// May shorten, but never extend, the production worker deadline.
     pub worker_timeout: Duration,
     pub cancellation: CancellationToken,
+    /// Host-test-only internal worker arguments (see
+    /// [`crate::worker::NO_FORK_ARGUMENT`]); empty in production.
+    #[doc(hidden)]
+    pub worker_arguments: Vec<std::ffi::OsString>,
+    /// Host-test-only least optional window after a baseline: it replaces
+    /// the production three-second render minimum and raises a sibling's
+    /// setup minimum. Both still end by the request deadline less the
+    /// settlement reserve. `None` in production.
+    #[doc(hidden)]
+    pub optional_floor: Option<Duration>,
+    /// Host-test-only exact sibling setup allowance in place of the
+    /// adaptive one, for forcing a setup cutoff. `None` in production.
+    #[doc(hidden)]
+    pub optional_setup: Option<Duration>,
 }
 impl Default for Options {
     fn default() -> Self {
         Self {
             output_project: None,
+            use_debug_info: None,
+            debug_info: None,
             worker_timeout: WORKER_REQUEST_TIMEOUT,
             cancellation: CancellationToken::default(),
+            worker_arguments: Vec::new(),
+            optional_floor: None,
+            optional_setup: None,
         }
     }
 }
@@ -166,6 +187,11 @@ pub struct FunctionAnalysis {
 pub enum Output {
     Info {
         info: Box<BinaryInfo>,
+        use_debug_info: bool,
+        debug_status: crate::debug_info::DebugUseStatus,
+        /// Functions rendered without debug prototypes after a worker failure
+        /// (saved by earlier versions; a worker stop no longer adds one).
+        debug_skipped_functions: Vec<u64>,
         unapplied_signatures: Vec<SignatureStatus>,
     },
     Annotations {
@@ -204,8 +230,11 @@ pub enum Output {
 /// non-recoverable engine errors stop the worker. Completed results, scans,
 /// committed discovery and annotations stay owned by this controller, so
 /// `info`, `annotations` and `save_project` keep working without a worker.
-/// Only `discover` starts a replacement worker for the same verified image,
-/// at most [`MAX_DISCOVERY_RESUMES`] times per session.
+/// `discover` starts a replacement worker for the same verified image, at most
+/// [`MAX_DISCOVERY_RESUMES`] times per session. A debug-enabled Open failure
+/// retries once with debug info disabled and retains that setting; a worker
+/// stop before a debug-enabled function's baseline retries that function once
+/// with ordinary inference only and records no skip.
 pub struct Analyzer {
     worker: Option<ReapingWorker>,
     data: ProjectData,
@@ -230,6 +259,9 @@ pub struct Analyzer {
     worker_epoch: u64,
     discovery_resumes: u8,
     unapplied_signatures: Vec<SignatureStatus>,
+    peer_context: Option<Arc<crate::client::managed_decompile::PeerContext>>,
+    decision_book: crate::client::managed_decompile::DecisionBook,
+    recover_optional_primary: bool,
     linkage: Option<crate::linkage::LinkageFetch>,
 }
 
@@ -238,10 +270,23 @@ pub struct Analyzer {
 /// [`WorkerClient`] drop could otherwise let a short-lived console exit first.
 struct ReapingWorker(Option<WorkerClient>);
 impl ReapingWorker {
-    fn start(path: &Path, executable: &Path) -> Result<Self, Error> {
-        WorkerClient::start_using_executable(eframe::egui::Context::default(), path, executable)
-            .map(|worker| Self(Some(worker)))
-            .map_err(|e| Error::new(ErrorCode::WorkerFailed, e))
+    fn start(
+        path: &Path,
+        executable: &Path,
+        debug_path: Option<&Path>,
+        enabled: bool,
+        arguments: &[std::ffi::OsString],
+    ) -> Result<Self, Error> {
+        WorkerClient::start_with_worker_arguments(
+            eframe::egui::Context::default(),
+            path,
+            executable,
+            debug_path,
+            enabled,
+            arguments.to_vec(),
+        )
+        .map(|worker| Self(Some(worker)))
+        .map_err(|e| Error::new(ErrorCode::WorkerFailed, e))
     }
 }
 impl std::ops::Deref for ReapingWorker {
@@ -274,14 +319,27 @@ fn fatal(mut error: Error) -> Error {
     error
 }
 
+/// A failed managed preparation: `Stopped` before any reply, or `Failed`.
+enum Prepared {
+    Stopped(Error),
+    Failed(Error),
+}
+
 /// A verified worker `Open` reply and the protection bound to its snapshot.
 struct Opened {
     info: BinaryInfo,
     macho_legacy: Option<MachoLegacySections>,
     protection: BinaryProtection,
+    debug_state: String,
+    debug_source: Option<crate::debug_info::companion::DebugSource>,
 }
 
-fn open_worker(worker: &mut WorkerClient, options: &Options) -> Result<Opened, Error> {
+fn open_worker(
+    worker: &mut WorkerClient,
+    options: &Options,
+    use_debug_info: bool,
+    skip: &[u64],
+) -> Result<Opened, Error> {
     let actual_path = worker
         .protection()
         .path()
@@ -289,8 +347,23 @@ fn open_worker(worker: &mut WorkerClient, options: &Options) -> Result<Opened, E
         .ok_or_else(|| Error::new(ErrorCode::InvalidRequest, "The binary path must be UTF-8"))?
         .to_owned();
     let Response::Opened {
-        info, macho_legacy, ..
-    } = exchange(worker, Request::Open { path: actual_path }, options).map_err(fatal)?
+        info,
+        macho_legacy,
+        debug,
+        ..
+    } = exchange(
+        worker,
+        Request::Open {
+            debug: crate::debug_info::DebugOptions {
+                companion_path: None,
+                enabled: use_debug_info,
+                skip: skip.to_vec(),
+            },
+            path: actual_path,
+        },
+        options,
+    )
+    .map_err(fatal)?
     else {
         return Err(Error::new(
             ErrorCode::WorkerFailed,
@@ -304,34 +377,70 @@ fn open_worker(worker: &mut WorkerClient, options: &Options) -> Result<Opened, E
         .bind_snapshot(&info)
         .map_err(|e| Error::new(ErrorCode::WorkerFailed, e))?;
     Ok(Opened {
+        debug_source: debug.as_ref().and_then(|d| d.source.clone()),
+        debug_state: debug.map_or_else(String::new, |d| d.state),
         info,
         macho_legacy,
         protection,
     })
 }
 
+/// One fallback for a worker that dies or times out while reading debug info.
+fn start_open_worker(
+    path: &Path,
+    executable: &Path,
+    source: Option<&crate::project::EmbeddedBinary>,
+    options: &Options,
+    enabled: bool,
+    skip: &[u64],
+) -> Result<(ReapingWorker, Opened, bool), Error> {
+    let mut worker = ReapingWorker::start(
+        path,
+        executable,
+        options.debug_info.as_deref(),
+        enabled,
+        &options.worker_arguments,
+    )?;
+    if let Some(source) = source {
+        worker.retain_source(Arc::new(source.clone()));
+    }
+    match open_worker(&mut worker, options, enabled, skip) {
+        Ok(opened) => Ok((worker, opened, enabled)),
+        Err(error)
+            if enabled && matches!(error.code, ErrorCode::WorkerFailed | ErrorCode::Timeout) =>
+        {
+            drop(worker);
+            // A failed retry returns its error; the caller's setting and
+            // warnings are unchanged.
+            let (worker, mut opened, enabled) =
+                start_open_worker(path, executable, source, options, false, skip)?;
+            crate::debug_info::record_open_fallback(&mut opened.info);
+            Ok((worker, opened, enabled))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Replays complete effective names before prototypes, and both before any
 /// analysis. Returns the worker's unapplied saved signatures.
+/// The engine spelling of every controller function name, as replayed.
+fn effective_functions(data: &ProjectData) -> Vec<FunctionInfo> {
+    data.info
+        .functions
+        .iter()
+        .map(|function| FunctionInfo {
+            address: function.address,
+            name: crate::model::inventory_spelling(&function.name).to_owned(),
+        })
+        .collect()
+}
+
 fn replay(
     worker: &mut WorkerClient,
     data: &ProjectData,
     options: &Options,
 ) -> Result<Vec<SignatureStatus>, Error> {
-    let effective: Vec<_> = data
-        .info
-        .functions
-        .iter()
-        .map(|function| {
-            let mut end = function.name.len().min(MAX_FUNCTION_NAME_BYTES);
-            while !function.name.is_char_boundary(end) {
-                end -= 1;
-            }
-            FunctionInfo {
-                address: function.address,
-                name: function.name[..end].into(),
-            }
-        })
-        .collect();
+    let effective = effective_functions(data);
     for chunk in sync_chunks(&effective) {
         if !matches!(
             exchange(
@@ -422,17 +531,34 @@ impl Analyzer {
         // Declared after `project` so every early return reaps the worker
         // (dropping its lease) before the project's own image lease drops.
         let source = project.as_ref().and_then(|p| p.binary.clone());
-        let mut worker = ReapingWorker::start(&path, executable)?;
-        if let Some(binary) = &source {
-            worker.retain_source(Arc::new(binary.clone()));
-        }
+        let enabled = options
+            .use_debug_info
+            .unwrap_or_else(|| project.as_ref().is_none_or(|p| p.data.use_debug_info));
+        // Explicitly enabling debug info also clears per-function skips.
+        let skip = match &project {
+            Some(project) if options.use_debug_info != Some(true) => {
+                project.data.debug_skip.clone()
+            }
+            _ => Vec::new(),
+        };
+        let (mut worker, opened, enabled) =
+            start_open_worker(&path, executable, source.as_ref(), &options, enabled, &skip)?;
         let binary_path = worker.protection().path().to_owned();
         let Opened {
             mut info,
             macho_legacy,
             protection,
-        } = open_worker(&mut worker, &options)?;
+            debug_state,
+            debug_source,
+        } = opened;
+        if !enabled && let Some(project) = &project {
+            crate::debug_info::inherit_fallback(&mut info, &project.data.info);
+        }
         let mut data = if let Some(mut project) = project {
+            project.data.use_debug_info = enabled;
+            project.data.debug_skip = skip;
+            project.accept_debug(&debug_state);
+            project.data.debug_source = debug_source;
             project
                 .accept_opened(&info, macho_legacy.as_ref())
                 .map_err(|e| Error::new(ErrorCode::Project, e))?;
@@ -447,6 +573,10 @@ impl Analyzer {
             data
         } else {
             ProjectData {
+                debug_source,
+                debug_state,
+                use_debug_info: enabled,
+                debug_skip: Vec::new(),
                 session: Session::new(info.sha256.clone()),
                 info,
                 view: None,
@@ -489,6 +619,9 @@ impl Analyzer {
             code: None,
             discovery: None,
             inventory: None,
+            peer_context: None,
+            decision_book: Default::default(),
+            recover_optional_primary: false,
             worker_epoch: 1,
             discovery_resumes: 0,
             unapplied_signatures,
@@ -498,6 +631,7 @@ impl Analyzer {
             &analyzer.data.info.sha256,
             &analyzer.data.session.signatures,
         );
+        analyzer.results.set_debug_state(&analyzer.data.debug_state);
         analyzer.update_context();
         analyzer.wait_context()?;
         for saved in crate::project::prepare_functions(&mut analyzer.data)
@@ -594,10 +728,40 @@ impl Analyzer {
         }
     }
 
+    /// [`Self::request`] for a managed preparation, telling a stop before
+    /// any reply (process exit or wall deadline) from every other failure:
+    /// rejected or mismatched replies, engine errors and cancellation.
+    fn prepare(&mut self, request: Request) -> Result<Response, Prepared> {
+        self.active().map_err(Prepared::Failed)?;
+        let worker = self.worker.as_mut().expect("active worker");
+        let response = exchange(worker, request, &self.options);
+        let error = match response {
+            Ok(response) => return Ok(response),
+            Err(error) => error,
+        };
+        let stopped = match error.code {
+            ErrorCode::Timeout => true,
+            ErrorCode::WorkerFailed => self
+                .worker
+                .as_ref()
+                .and_then(|w| w.failure())
+                .is_some_and(|kind| kind != crate::client::FailureKind::Rejected),
+            _ => false,
+        };
+        self.stop();
+        let error = fatal(error);
+        Err(if stopped {
+            Prepared::Stopped(error)
+        } else {
+            Prepared::Failed(error)
+        })
+    }
+
     /// Stops and reaps the worker. Retained results, scans, annotations and
     /// committed discovery survive; per-worker state does not.
     fn stop(&mut self) {
         drop(self.worker.take());
+        self.peer_context = None;
         self.inventory = None;
         self.reset_linkage();
         if let Some(state) = &mut self.discovery {
@@ -612,6 +776,7 @@ impl Analyzer {
 
     /// Starts preparing the function-result context for the current names.
     fn update_context(&mut self) {
+        self.peer_context = None;
         self.results.update_inputs(
             self.data.info.functions.clone(),
             self.data.session.local_renames.clone(),
@@ -642,6 +807,14 @@ impl Analyzer {
         Ok(())
     }
 
+    /// Host-test-only: replaces [`Options::optional_floor`] and
+    /// [`Options::optional_setup`] for later commands of this session.
+    #[doc(hidden)]
+    pub fn set_optional_windows(&mut self, floor: Option<Duration>, setup: Option<Duration>) {
+        self.options.optional_floor = floor;
+        self.options.optional_setup = setup;
+    }
+
     pub fn execute(&mut self, command: Command) -> Result<Output, Error> {
         let result = self.execute_inner(command);
         if result.as_ref().is_err_and(|e| {
@@ -668,6 +841,12 @@ impl Analyzer {
                 | Command::SaveProject { .. }
                 | Command::Discover {}
         ) {
+            if self.worker.is_none()
+                && !self.options.cancellation.is_cancelled()
+                && std::mem::take(&mut self.recover_optional_primary)
+            {
+                self.restart_worker(false)?;
+            }
             self.active()?;
         }
         match command {
@@ -680,6 +859,12 @@ impl Analyzer {
                     .to_string_lossy()
                     .into_owned();
                 Ok(Output::Info {
+                    debug_status: crate::debug_info::DebugUseStatus::of(
+                        self.data.use_debug_info,
+                        &info,
+                    ),
+                    use_debug_info: self.data.use_debug_info,
+                    debug_skipped_functions: self.data.debug_skip.clone(),
                     info: Box::new(info),
                     unapplied_signatures: self.unapplied_signatures.clone(),
                 })
@@ -826,15 +1011,62 @@ impl Analyzer {
                 .iter()
                 .filter(|r| r.identity.function == address)
                 .cloned()
-                .collect();
-            let Response::Decompiled {
-                address: actual,
-                text,
-                mappings,
-                semantics,
-            } = self.request(Request::DecompileWithLocals { address, renames })?
-            else {
-                return self.unexpected();
+                .collect::<Vec<_>>();
+            let cached = self.decision_book.cached(
+                self.worker
+                    .as_ref()
+                    .and_then(|worker| worker.managed_program.as_deref()),
+                address,
+                &renames,
+                refresh,
+            );
+            let request = |inference_only| {
+                crate::client::managed_decompile::prepare_request(
+                    address,
+                    renames.clone(),
+                    refresh,
+                    inference_only,
+                )
+                .map_err(|e| Error::new(ErrorCode::CommandFailed, e))
+            };
+            let mut dispatched = Instant::now();
+            let first = match cached {
+                Some(reply) => Ok(reply),
+                None => self.prepare(request(false)?),
+            };
+            let (reply, recovered) = match first {
+                Ok(reply) => (reply, false),
+                Err(Prepared::Stopped(_))
+                    if self.data.use_debug_info && !self.data.debug_state.is_empty() =>
+                {
+                    // The worker stopped before any baseline (an exit, such
+                    // as the CPU limit, or the wall deadline). That says
+                    // nothing about debug work, so no skip is recorded: one
+                    // fresh worker renders only ordinary inference. A
+                    // second failure is the command's error. A
+                    // cancellation never launches the replacement.
+                    if self.options.cancellation.is_cancelled() {
+                        return Err(Error::new(ErrorCode::Cancelled, "Analysis cancelled"));
+                    }
+                    self.restart_worker(false)?;
+                    dispatched = Instant::now();
+                    (self.request(request(true)?)?, true)
+                }
+                Err(Prepared::Stopped(error) | Prepared::Failed(error)) => return Err(error),
+            };
+            let (actual, text, mappings, semantics) = match reply {
+                Response::Decompiled {
+                    address,
+                    text,
+                    mappings,
+                    semantics,
+                } => (address, text, mappings, semantics),
+                prepared @ Response::PreparedDecompile { .. } if !recovered => {
+                    let (text, mappings, semantics) =
+                        self.settle_prepared(address, renames, prepared, dispatched)?;
+                    (address, text, mappings, semantics)
+                }
+                _ => return self.unexpected(),
             };
             if actual != address {
                 return self.unexpected();
@@ -852,6 +1084,12 @@ impl Analyzer {
                     format!("Invalid pseudocode: {e:?}"),
                 )
             })?;
+            // A cancellation that arrived while the recovery's reply was
+            // read or validated ends the command instead of adopting it.
+            if recovered && self.options.cancellation.is_cancelled() {
+                self.stop();
+                return Err(Error::new(ErrorCode::Cancelled, "Analysis cancelled"));
+            }
             (
                 self.results.admit_decompilation(
                     binding.as_ref(),
@@ -877,6 +1115,296 @@ impl Analyzer {
         Ok(Output::Function {
             analysis: Box::new(analysis),
         })
+    }
+
+    /// Settles a managed baseline for `address` with at most one optional
+    /// debug render, and returns the one final render. After a validated
+    /// baseline, an optional failure or timeout is not a command failure:
+    /// the baseline stands (a stopped primary is replaced by the next
+    /// command), and no per-function skip is recorded.
+    fn settle_prepared(
+        &mut self,
+        address: u64,
+        renames: Vec<crate::semantic::LocalRename>,
+        reply: Response,
+        dispatched: Instant,
+    ) -> Result<
+        (
+            String,
+            Vec<crate::model::CodeMapping>,
+            crate::semantic::SemanticInfo,
+        ),
+        Error,
+    > {
+        use crate::client::managed_decompile as managed;
+        let context = self.signature_context();
+        let prepared = match managed::admit_prepared(address, reply, &self.data.info, &context) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.stop();
+                return Err(Error::new(ErrorCode::WorkerFailed, error));
+            }
+        };
+        // The validated baseline is published here; a sibling's setup
+        // allowance (including any wait for an earlier peer) starts now.
+        let published = Instant::now();
+        let Some(offer) = prepared.offer.as_ref() else {
+            return Ok(managed::Staged::unverified().result.render(&prepared));
+        };
+        let hard = managed::hard_cap(dispatched, self.options.worker_timeout);
+        let cutoff = match offer.executor {
+            crate::analysis::managed::Executor::ForkHere => managed::cutoff(
+                dispatched,
+                self.options.worker_timeout,
+                offer,
+                self.options.optional_floor,
+            ),
+            // A sibling's phases are bounded separately within this cap.
+            crate::analysis::managed::Executor::Sibling => hard,
+        };
+        let Some(transaction) = self.decision_book.begin(&prepared, renames, cutoff) else {
+            return Ok(managed::Staged::unverified().result.render(&prepared));
+        };
+        if let Some(worker) = self.worker.as_mut() {
+            worker.managed_program = Some(transaction.job.binding.program.clone());
+        }
+        let mut primary_failed = false;
+        let mut acceptance = transaction.cutoff();
+        let mut staged = if !transaction.has_work() {
+            transaction.stage_no_work(&prepared)
+        } else if managed::remaining_ms(cutoff) == 0 {
+            managed::Staged::unverified()
+        } else {
+            match offer.executor {
+                crate::analysis::managed::Executor::ForkHere => {
+                    let mut direct = false;
+                    let mut job = transaction.job.clone();
+                    job.remaining_ms = managed::remaining_ms(cutoff);
+                    let reply = self.worker.as_mut().map(|worker| {
+                        exchange_observing(
+                            worker,
+                            managed::optional_request(job, offer.executor),
+                            dispatched + self.options.worker_timeout,
+                            &self.options,
+                            |launched| direct = launched,
+                        )
+                    });
+                    match reply {
+                        Some(Ok(response)) => transaction.stage_reply(
+                            &prepared,
+                            response,
+                            direct,
+                            &self.data.info,
+                            &context,
+                        ),
+                        Some(Err(error)) if error.code == ErrorCode::Cancelled => {
+                            self.decision_book.cancel(&transaction);
+                            self.stop();
+                            return Err(error);
+                        }
+                        Some(Err(error)) => {
+                            primary_failed = error.code != ErrorCode::CommandFailed
+                                && error.message != "Request is too large";
+                            let expired = error.code == ErrorCode::Timeout
+                                || error.message.starts_with("Analysis worker exited:");
+                            transaction.stage_fallback(direct && expired, false)
+                        }
+                        None => managed::Staged::unverified(),
+                    }
+                }
+                crate::analysis::managed::Executor::Sibling => {
+                    let _trace = crate::performance::context(transaction.job.ticket.logical_id);
+                    match self.run_peer(transaction.job.clone(), offer, hard, published) {
+                        Ok(Some((end, timing))) => {
+                            acceptance = timing.acceptance();
+                            let settled = Instant::now();
+                            let code = end.code();
+                            let staged = match end {
+                                managed::PeerEnd::Finished(outcome) => transaction.stage_outcome(
+                                    &prepared,
+                                    *outcome,
+                                    &self.data.info,
+                                    &context,
+                                ),
+                                // Only an acknowledged direct attempt
+                                // defers the target.
+                                managed::PeerEnd::Expired => {
+                                    transaction.stage_fallback(true, false)
+                                }
+                                managed::PeerEnd::NotLaunched(_)
+                                | managed::PeerEnd::RenderCutoff => {
+                                    transaction.stage_fallback(false, false)
+                                }
+                                managed::PeerEnd::SetupCutoff(_) => {
+                                    transaction.stage_setup_cutoff()
+                                }
+                                managed::PeerEnd::Invalid | managed::PeerEnd::Cancelled => {
+                                    managed::Staged::unverified()
+                                }
+                            };
+                            crate::performance::interval(
+                                "sibling_settlement",
+                                settled,
+                                Instant::now(),
+                                code,
+                            );
+                            staged
+                        }
+                        Ok(None) => managed::Staged::unverified(),
+                        Err(error) => {
+                            self.decision_book.cancel(&transaction);
+                            return Err(error);
+                        }
+                    }
+                }
+            }
+        };
+        if self.options.cancellation.is_cancelled() {
+            self.decision_book.cancel(&transaction);
+            self.stop();
+            return Err(Error::new(ErrorCode::Cancelled, "Analysis cancelled"));
+        }
+        if !self
+            .decision_book
+            .accept_until(&transaction, &mut staged, acceptance)
+        {
+            staged = managed::Staged::unverified();
+        }
+        if primary_failed {
+            self.stop();
+            self.recover_optional_primary = true;
+        }
+        Ok(staged.result.render(&prepared))
+    }
+
+    /// The committed signature context the worker renders under.
+    fn signature_context(&self) -> String {
+        if self.data.session.signatures.is_empty() {
+            String::new()
+        } else {
+            crate::signatures::state_digest(&self.data.session.signatures)
+        }
+    }
+
+    /// Runs one sibling attempt to its end, with its timing, or `None`
+    /// without a primary worker. A setup allowance already spent before the
+    /// peer starts ends as a setup cutoff.
+    fn run_peer(
+        &mut self,
+        job: crate::analysis::managed::PeerJob,
+        offer: &crate::analysis::managed::DebugOffer,
+        hard: Instant,
+        published: Instant,
+    ) -> Result<
+        Option<(
+            crate::client::managed_decompile::PeerEnd,
+            Arc<crate::client::managed_decompile::PeerTiming>,
+        )>,
+        Error,
+    > {
+        use crate::client::managed_decompile as managed;
+        let Some(worker) = self.worker.as_ref() else {
+            return Ok(None);
+        };
+        let context = if let Some(context) = &self.peer_context {
+            Arc::clone(context)
+        } else {
+            let context = Arc::new(managed::PeerContext {
+                launch: worker.peer_launch(),
+                enabled: self.data.use_debug_info,
+                skip: self.data.debug_skip.clone(),
+                info: Arc::new(self.data.info.clone()),
+                debug_state: self.data.debug_state.clone(),
+                functions: Arc::new(effective_functions(&self.data)),
+                long_names: Vec::new(),
+                signatures: Arc::new(self.data.session.signatures.clone()),
+                unapplied: self.unapplied_signatures.clone(),
+                signature_context: self.signature_context(),
+            });
+            self.peer_context = Some(Arc::clone(&context));
+            context
+        };
+        let floor = self.options.optional_floor;
+        let slot = context.launch.slot.clone();
+        let grace = self
+            .options
+            .optional_setup
+            .unwrap_or_else(|| managed::setup_grace(slot.setup_sample(), floor));
+        let timing = Arc::new(managed::PeerTiming::new(
+            published,
+            grace,
+            managed::render_allowance(offer.reference_us, floor),
+            hard,
+        ));
+        managed::trace_budget(&timing, published, hard, grace, slot.setup_sample());
+        // Host work since publication may already have spent the setup
+        // allowance (a slow host or a tiny test allowance): that is a setup
+        // cutoff before any peer, not an unverified settlement.
+        if let Some(end) = timing.spent_setup(Instant::now()) {
+            crate::performance::event("sibling_no_budget", 0);
+            return Ok(Some((end, timing)));
+        }
+        // A peer cancelled at an earlier cutoff may still be reaping; this
+        // synchronous host waits for it within the setup allowance, and a
+        // cancellation ends the wait without reserving.
+        let token = self.options.cancellation.clone();
+        let waiting = Instant::now();
+        let reservation = match slot.wait_reserve(timing.setup_until(), &|| token.is_cancelled()) {
+            managed::Reserve::Reserved(reservation) => reservation,
+            managed::Reserve::Cancelled => {
+                return Err(Error::new(ErrorCode::Cancelled, "Analysis cancelled"));
+            }
+            managed::Reserve::Deadline => {
+                return Ok(timing.expire(Instant::now()).map(|_| {
+                    (
+                        managed::PeerEnd::SetupCutoff(managed::SetupStage::Retirement),
+                        Arc::clone(&timing),
+                    )
+                }));
+            }
+        };
+        crate::performance::interval("sibling_retirement", waiting, Instant::now(), 0);
+        let cancelled: Arc<dyn Fn() -> bool + Send + Sync> = {
+            let token = token.clone();
+            Arc::new(move || token.is_cancelled())
+        };
+        let run = match managed::start_peer(
+            context,
+            job,
+            reservation,
+            Arc::clone(&timing),
+            Some(cancelled),
+            || {},
+        ) {
+            Ok(run) => run,
+            Err(error) => return Ok(Some((managed::PeerEnd::NotLaunched(error), timing))),
+        };
+        loop {
+            if token.is_cancelled() {
+                run.cancel();
+                // The attempt thread reports before it reaps the peer.
+                let _ = run.wait(Instant::now() + Duration::from_secs(10));
+                return Err(Error::new(ErrorCode::Cancelled, "Analysis cancelled"));
+            }
+            // Always the current phase's deadline: readiness moves it.
+            let now = Instant::now();
+            let deadline = run.deadline();
+            if now >= deadline
+                && let Some(end) = run.expire(now)
+            {
+                return Ok(Some((end, timing)));
+            }
+            // Before the deadline, or after an attempt that finished on its
+            // own (its end is on the way): wait in short steps.
+            let step = now + Duration::from_millis(20);
+            if let Some(end) = run.wait(if deadline > now {
+                deadline.min(step)
+            } else {
+                step
+            }) {
+                return Ok(Some((end, timing)));
+            }
+        }
     }
 
     /// One bounded discovery step. A failed step returns its error after
@@ -969,25 +1497,31 @@ impl Analyzer {
     /// signatures are replayed before any analysis. Each attempt, successful
     /// or not, spends one of the session's [`MAX_DISCOVERY_RESUMES`].
     fn restart(&mut self) -> Result<(), Error> {
-        if self.discovery_resumes >= MAX_DISCOVERY_RESUMES {
+        self.restart_worker(true)
+    }
+    fn restart_worker(&mut self, discovery: bool) -> Result<(), Error> {
+        if discovery && self.discovery_resumes >= MAX_DISCOVERY_RESUMES {
             return Err(Error::new(
                 ErrorCode::SessionClosed,
                 "Discovery worker restarts are exhausted; open a new analysis session",
             ));
         }
-        self.discovery_resumes += 1;
+        if discovery {
+            self.discovery_resumes += 1;
+        }
         self.worker_epoch = self.worker_epoch.wrapping_add(1);
-        let mut worker = ReapingWorker::start(&self.binary_path, &self.executable)?;
-        if !worker.protection().same_source(&self.protection) {
-            return Err(Error::new(
-                ErrorCode::WorkerFailed,
-                "Input binary identity changed; open a new analysis session",
-            ));
+        let (mut worker, opened, enabled) = start_open_worker(
+            &self.binary_path,
+            &self.executable,
+            self.source.as_ref(),
+            &self.options,
+            self.data.use_debug_info,
+            &self.data.debug_skip,
+        )?;
+        self.data.use_debug_info = enabled;
+        if crate::debug_info::has_open_fallback(&opened.info) {
+            crate::debug_info::record_open_fallback(&mut self.data.info);
         }
-        if let Some(binary) = &self.source {
-            worker.retain_source(Arc::new(binary.clone()));
-        }
-        let opened = open_worker(&mut worker, &self.options)?;
         if !opened.protection.same_source(&self.protection)
             || !crate::project::same_image(&self.data.info, &opened.info)
         {
@@ -996,9 +1530,21 @@ impl Analyzer {
                 "Binary changed on disk; open a new analysis session",
             ));
         }
+        self.protection
+            .inherit_debug_sources(&opened.protection)
+            .map_err(|e| Error::new(ErrorCode::WorkerFailed, e))?;
+        if self.data.debug_state != opened.debug_state {
+            self.data.debug_state = opened.debug_state;
+            self.data.debug_source = opened.debug_source;
+            self.data.decompiled = None;
+            self.data.mappings.clear();
+            self.data.semantics = Default::default();
+            self.results.set_debug_state(&self.data.debug_state);
+        }
         self.unapplied_signatures = replay(&mut worker, &self.data, &self.options)?;
         self.inventory = None;
         self.worker = Some(worker);
+        self.recover_optional_primary = false;
         Ok(())
     }
 
@@ -1077,32 +1623,70 @@ fn exchange(
     request: Request,
     options: &Options,
 ) -> Result<Response, Error> {
+    let deadline = Instant::now() + options.worker_timeout;
+    exchange_until(worker, request, deadline, options)
+}
+
+/// [`exchange`] bounded by an absolute deadline (never later than the
+/// worker timeout after sending).
+fn exchange_until(
+    worker: &mut WorkerClient,
+    request: Request,
+    deadline: Instant,
+    options: &Options,
+) -> Result<Response, Error> {
+    exchange_observing(worker, request, deadline, options, |_| {})
+}
+
+fn exchange_observing(
+    worker: &mut WorkerClient,
+    request: Request,
+    deadline: Instant,
+    options: &Options,
+    mut debug_started: impl FnMut(bool),
+) -> Result<Response, Error> {
     let id = worker
         .send(request)
         .map_err(|e| Error::new(ErrorCode::WorkerFailed, e))?;
     let started = Instant::now();
+    let deadline = deadline.min(started + options.worker_timeout);
     let mut progress = None;
     let mut events = 0;
     loop {
         if options.cancellation.is_cancelled() {
             return Err(Error::new(ErrorCode::Cancelled, "Analysis cancelled"));
         }
-        if started.elapsed() >= options.worker_timeout {
-            return Err(Error::new(
+        let expired = || {
+            Error::new(
                 ErrorCode::Timeout,
                 "Worker request exceeded its wall-time deadline",
-            ));
-        }
-        match worker.poll() {
-            Some(WorkerEvent::Failed(message)) => {
+            )
+        };
+        // A known rejection (a reply the client refused, or one for another
+        // request) is reported as such even when it arrives late; only an
+        // otherwise acceptable late event, or process loss, is the deadline.
+        match worker.poll_timed() {
+            Some((ready, WorkerEvent::Failed(message))) => {
+                if ready > deadline
+                    && worker.failure() != Some(crate::client::FailureKind::Rejected)
+                {
+                    return Err(expired());
+                }
                 return Err(Error::new(ErrorCode::WorkerFailed, message));
             }
-            Some(WorkerEvent::Reply(reply)) => {
+            Some((ready, WorkerEvent::Reply(reply))) => {
                 if reply.id != id {
                     return Err(Error::new(
                         ErrorCode::WorkerFailed,
                         "Worker replied to a different request",
                     ));
+                }
+                if ready > deadline {
+                    return Err(expired());
+                }
+                if let Response::DebugStarted { direct, .. } = reply.response {
+                    debug_started(direct);
+                    continue;
                 }
                 if let Response::Progress { progress: next } = reply.response {
                     events += 1;
@@ -1129,7 +1713,12 @@ fn exchange(
                 }
                 return Ok(reply.response);
             }
-            None => std::thread::sleep(Duration::from_millis(2)),
+            None => {
+                if Instant::now() >= deadline {
+                    return Err(expired());
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
         }
     }
 }

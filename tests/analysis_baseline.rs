@@ -204,6 +204,7 @@ fn profile_contained_analysis_client() {
             let (Response::Opened { info, .. }, open_ms, loaded_memory) = sampler.request(
                 &mut worker,
                 Request::Open {
+                    debug: Default::default(),
                     path: fixture.path.to_string_lossy().into_owned(),
                 },
             ) else {

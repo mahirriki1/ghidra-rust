@@ -35,6 +35,27 @@ documentation, and notices. Keep the notices with redistributed copies.
 Use `python3 scripts/package-linux.py` or `.\scripts\package-windows.ps1`
 to package an existing native release build.
 
+The scripts run tests with `--features test-hooks`, which adds worker fault
+hooks for tests only. The release executables they package are built
+without it. Each
+packager runs both staged executables with a test fault argument and stops
+before publishing anything unless each refuses it. A build made with
+`--features test-hooks` therefore cannot be packaged, even when you run a
+packager directly.
+
+Each packager reads executables from one Cargo target directory and one
+release layout, so the probed, archived, and standalone executables are the
+same build.
+
+- **Target directory:** `--target-directory` (`-TargetDirectory` on
+  Windows), then a nonempty `CARGO_TARGET_DIR`, then Cargo metadata, which
+  includes Cargo config. A relative path resolves against the current
+  directory, as Cargo does for `CARGO_TARGET_DIR`.
+- **Layout:** `--target` (`-Target`) names the native triple for builds made
+  with Cargo `--target`, or `host` for plain `release`. Without it, a nonempty
+  `CARGO_BUILD_TARGET` is used. Otherwise the packager takes the only
+  complete executable pair and fails if both layouts have one.
+
 ## Automatic releases after main updates
 
 **Automatic main release** runs after a push to `main`. It chooses the next

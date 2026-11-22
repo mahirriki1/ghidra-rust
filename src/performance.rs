@@ -352,6 +352,19 @@ mod enabled {
     pub fn event(phase: &'static str, value: u64) {
         emit(phase, REQUEST.get(), Instant::now(), value, None);
     }
+    /// A record of the interval from `start` to `end`, measured by the
+    /// caller (for phases whose bounds come from shared state).
+    pub fn interval(phase: &'static str, start: Instant, end: Instant, value: u64) {
+        if TRACE.get().is_some_and(Option::is_some) {
+            emit(
+                phase,
+                REQUEST.get(),
+                start,
+                value,
+                Some(end.saturating_duration_since(start)),
+            );
+        }
+    }
 }
 
 #[cfg(feature = "performance")]
@@ -378,6 +391,7 @@ mod disabled {
         pub fn finish(self, _: u64) {}
     }
     pub fn event(_: &'static str, _: u64) {}
+    pub fn interval(_: &'static str, _: std::time::Instant, _: std::time::Instant, _: u64) {}
     pub struct Accumulator;
     impl Accumulator {
         pub fn new(_: &'static str) -> Self {
@@ -401,7 +415,10 @@ pub fn operation(request: &crate::model::Request) -> &'static str {
     match request {
         Open { .. } => "open",
         Graph { .. } => "graph",
-        Decompile { .. } | DecompileWithLocals { .. } => "decompile",
+        Decompile { .. } | DecompileWithLocals { .. } | RefreshDecompile { .. } => "decompile",
+        PrepareDecompile { .. } => "prepare_decompile",
+        TryPreparedDebug { .. } => "try_prepared_debug",
+        RenderDebugOnce { .. } => "render_debug_once",
         Discover | DiscoverBatch { .. } => "discover",
         SyncFunctions { .. } => "sync_functions",
         SyncSignatures { .. } => "sync_signatures",

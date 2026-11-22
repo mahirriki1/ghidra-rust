@@ -46,6 +46,8 @@ the relevant source modules before changing behavior. Follow more specific
   and instruction-local direct memory-access evidence.
 - `src/packing.rs`: conservative packed-image diagnostics; detected conventional
   UPX PE stubs skip expensive decompilation/discovery while retaining inspection.
+- `src/debug_info/`: bounded worker-side DWARF indexing, prototype extraction,
+  ABI register vetoes and UUID-bound Mach-O companions.
 - `src/decompile.rs`: semantic emission through public engine APIs, including
   restoration of the original printer/action after errors or panics.
 - `src/selection.rs`, `highlight.rs`, `graph.rs`: validated instruction/pseudocode
@@ -128,10 +130,16 @@ Native Windows builds use x64 MSVC tools and a Windows SDK; see [the Windows gui
 ```sh
 cargo run --release --locked
 cargo fmt --all --check
-cargo test --locked
+cargo test --locked --features test-hooks
 cargo clippy --all-targets --locked -- -D warnings
 cargo build --release --locked
 ```
+
+The non-default `test-hooks` feature builds workers that accept the internal
+`--test-debug-fault=` argument for the fault tests; without it those tests are
+ignored. Never ship a `test-hooks` build. The build scripts rebuild without it.
+Both packagers then run their staged executables and fail unless each refuses
+the argument, including when a packager is run directly.
 
 For Rust behavior changes, add focused regression coverage where useful and run
 the applicable checks above. Tests run locally only: GitHub Actions builds, lints,
@@ -142,7 +150,10 @@ the application. Do not discard or regenerate `Cargo.lock` unnecessarily.
 
 Linux worker integration tests compile the C fixture using GCC.
 `scripts/build-windows.ps1` compiles it into PE and sets `GHIDRA_RUST_TEST_PE` for
-`tests/windows_worker.rs`; without that variable the PE integration test skips. Cross-compilation
+`tests/windows_worker.rs`; without that variable the PE integration test skips.
+It also builds the original DWARF PE fixture with bundled VS clang and sets
+`GHIDRA_RUST_TEST_PE_DWARF`; that test skips when run directly without its variable,
+while the build script requires clang and runs it in debug and release. Cross-compilation
 checks are not evidence that the native Windows GUI or worker was run.
 
 For GUI changes, exercise the native desktop with the safe fixture when a display

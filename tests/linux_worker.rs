@@ -250,6 +250,7 @@ fn sandboxed_linux_worker_and_embedded_project_round_trip() {
     let Response::Opened { info, .. } = request(
         &mut worker,
         Request::Open {
+            debug: Default::default(),
             path: binary.to_string_lossy().into_owned(),
         },
     ) else {
@@ -347,6 +348,10 @@ fn sandboxed_linux_worker_and_embedded_project_round_trip() {
         },
     );
     let mut project = ProjectData {
+        debug_source: None,
+        debug_state: String::new(),
+        use_debug_info: true,
+        debug_skip: Vec::new(),
         function_results: Vec::new(),
         semantics: Default::default(),
         info,
@@ -390,6 +395,7 @@ fn sandboxed_linux_worker_and_embedded_project_round_trip() {
     let Response::Opened { info: fresh, .. } = request(
         &mut reopened,
         Request::Open {
+            debug: Default::default(),
             path: extracted.to_string_lossy().into_owned(),
         },
     ) else {
@@ -453,6 +459,7 @@ fn semantic_local_rename_survives_sandboxed_worker_restart() {
         request(
             &mut worker,
             Request::Open {
+                debug: Default::default(),
                 path: binary.to_string_lossy().into_owned()
             }
         ),
@@ -512,6 +519,7 @@ fn semantic_local_rename_survives_sandboxed_worker_restart() {
         request(
             &mut worker,
             Request::Open {
+                debug: Default::default(),
                 path: binary.to_string_lossy().into_owned()
             }
         ),
@@ -580,6 +588,7 @@ fn open(binary: &Path) -> (WorkerClient, ghidra_rust::model::BinaryInfo) {
     let response = request(
         &mut worker,
         Request::Open {
+            debug: Default::default(),
             path: binary.to_string_lossy().into_owned(),
         },
     );
@@ -1101,6 +1110,7 @@ fn open_with_names(
     let response = request(
         &mut worker,
         Request::Open {
+            debug: Default::default(),
             path: binary.to_string_lossy().into_owned(),
         },
     );
@@ -1242,6 +1252,10 @@ fn demangled_cpp_names_keep_raw_identities_through_worker_and_project() {
         },
     );
     let project = ProjectData {
+        debug_source: None,
+        debug_state: String::new(),
+        use_debug_info: true,
+        debug_skip: Vec::new(),
         function_results: Vec::new(),
         semantics: Default::default(),
         info,
@@ -1292,6 +1306,7 @@ fn demangled_cpp_names_keep_raw_identities_through_worker_and_project() {
     } = request(
         &mut reopened,
         Request::Open {
+            debug: Default::default(),
             path: extracted.to_string_lossy().into_owned(),
         },
     )
@@ -1396,6 +1411,10 @@ fn plt_stubs_link_to_their_imports_in_classic_and_ibt_layouts() {
             .bind_snapshot(&info)
             .unwrap();
         let project = ProjectData {
+            debug_source: None,
+            debug_state: String::new(),
+            use_debug_info: true,
+            debug_skip: Vec::new(),
             function_results: Vec::new(),
             session: Session::new(info.sha256.clone()),
             info,
@@ -1531,6 +1550,7 @@ fn sandboxed_memory_search_validates_pages_and_immutable_markers() {
     let Response::Opened { info, .. } = request(
         &mut worker,
         Request::Open {
+            debug: Default::default(),
             path: binary.to_string_lossy().into_owned(),
         },
     ) else {

@@ -213,6 +213,224 @@ temporary preparation, and uncached results also contribute to memory use.
   floats, alternate calling conventions, and general storage editing are
   outside the supported subset.
 
+## Debug information
+
+The worker can read DWARF function prototypes: parameter names, parameter
+types, and return types. Functions without a usable prototype keep the
+decompiler's inferred signature.
+
+### What is read
+
+- **Sources:** DWARF inside an ELF, PE, or Mach-O binary on any supported
+  architecture. For arm64 Mach-O, also a dSYM companion (see
+  [Mach-O companions](#mach-o-companions)).
+- **Types:** integers, characters, booleans, floats, pointers, and typedefs.
+  A pointer to a named structure, union, or class shows the name with an
+  opaque one-byte pointee, so pointer arithmetic works as for `void *`.
+  Fields are not modeled.
+- **Not read:** aggregate values, variadic functions, compressed DWARF
+  sections, PDB, split DWARF, separate ELF debug files, and local variable
+  names and types.
+- Assembler, GCC/G++ `-g1`, and Rust `debuginfo=1` usually give names and
+  locations without types, so those functions keep inferred signatures. This
+  includes Rust's precompiled standard library when it ships limited debug
+  info. A missing return type means `void` only in a typed source unit, and
+  every parameter needs an explicit type. An LTO entry can take its types
+  from a matching typed source unit.
+
+### When a prototype applies
+
+A prototype needs an exact known function entry and a matching original
+function symbol of up to 256 bytes. DWARF supplies no storage. The engine
+assigns it from the binary's default ABI, so every register input the
+decompiler sees must lie inside a declared parameter's default storage. Stack,
+segment, and return-address registers are exempt. On x86-32, the decoded
+return stack adjustment must also match, including the Windows stdcall pop.
+
+Inference stays in place for:
+
+- GCC clones such as `.isra`, `.constprop`, `.part`, `.cold`, and
+  `.lto_priv`, and names that conflict with their abstract origin
+- constant-propagated parameters, ambiguous entries, and unsupported types
+- other calling conventions, including GCC conventions with no DWARF marker
+- malformed or unsupported records, and any exhausted budget
+
+Applied user signatures take precedence over DWARF. Verified local renames
+apply afterwards.
+
+### In the desktop
+
+The Decompiler shows the ordinary inferred render first. If DWARF could improve
+it, one optional render may then replace the text and mappings in place. The
+function, selected address, scroll position, and history stay put. If only
+callees improve, the function keeps its own inferred signature. The label
+above the Decompiler shows **Debug info signature** or **Inferred signature**.
+
+**Analysis → Use debug info** is on by default and saved per project.
+Changing it restarts the worker and recomputes pseudocode. A verified result
+that can be reused opens directly, as does a reopened project view.
+**Refresh function** renders anew with the current prototype decisions.
+Saving while optional work runs saves the inferred view shown at that moment.
+
+Projects bind pseudocode to the debug state, recorded as `debug-dwarf-v8`. A
+changed state, or pseudocode saved by earlier rules, is recomputed while
+graphs, discovery, and annotations are kept.
+
+### Mach-O companions
+
+For Mach-O the worker checks the adjacent
+`<binary>.dSYM/Contents/Resources/DWARF/<name>` file. Use **Analysis → Load
+debug info…** to choose another dSYM bundle or companion file. A companion
+must match the binary's LC_UUID and baseline arm64 slice and be at most
+128 MiB.
+
+- The desktop resolves candidates off the GUI thread and rejects links,
+  directories, and special files. On Linux the worker gets a read-only bind
+  of the file that was already opened, not its pathname.
+- Only the worker parses the companion. The desktop hashes it independently.
+- Projects save the companion's path, UUID, and SHA-256, which the signature
+  label shows. Reopening verifies an automatically found companion again.
+  Any other companion must be selected again; saved paths are hints.
+- With debug info off, no companion is opened or read.
+
+### How optional work runs
+
+A single-threaded Linux worker runs optional work in a disposable fork.
+Windows and threaded workers use a fresh, single-use sibling worker started by
+the desktop or headless controller. The sibling verifies the image and debug
+state, replays names and signatures, and checks that its own ordinary render
+and caller evidence match the primary's before applying any prototype. If they
+differ, the primary's render stays.
+
+| Budget | Limit |
+| --- | --- |
+| All optional work | Ends 3 seconds before the 30-second request deadline |
+| Fork | Also ends at 3× the ordinary render time, at least 3 seconds, after that render. Needs over 1 second of CPU allowance left |
+| Sibling setup | Covers waiting for an earlier sibling to exit, startup, Open, and replay. Starts when the inferred view is published: 2 seconds at first, then twice the image's measured setup time, between 1 and 5 seconds |
+| Sibling render | 3× the ordinary render time, at least 3 seconds, once the sibling is ready |
+
+A setup that uses its whole budget never shortens the next one. A phase with
+less than a millisecond left sends nothing. A result is accepted only before
+its render deadline. While an earlier sibling is still exiting, the desktop
+checks again on each repaint without blocking.
+
+A fork shares clean memory pages with the primary worker. A sibling holds its
+own copy of the binary, any companion, and engine state, so both processes
+count toward memory use. Linux callee probes can briefly add a third process.
+The opt-in `performance` host trace, enabled with `GHIDRA_RUST_PERF_DIR`,
+records each sibling phase and the one reason it was cut off.
+
+### Warnings
+
+Optional work that cannot finish keeps the inferred render and never saves a
+per-function skip.
+
+| Warning | Meaning |
+| --- | --- |
+| `Debug prototype is unverified` | Optional work did not finish. A later view or Refresh can apply the prototype |
+| `Some callee debug prototypes are unverified` | The same, for prototypes of called functions |
+| `Debug setup timed out` | The sibling's setup budget ran out. Nothing is recorded, and Refresh can still upgrade |
+| `Callee debug prototypes omitted because this render lost argument evidence` | Callee prototypes dropped a real argument, so they were removed |
+| `Debug prototype omitted because this render lost argument evidence` | The function's own prototype dropped a real argument |
+| `Debug prototypes not applied: no isolated debug render in this worker` | A raw worker request could not fork for optional work |
+| `Debug prototypes skipped for this function after a decompiler error` | The debug render failed in the engine; the inferred render is kept |
+| `Debug prototypes skipped for this function after a worker failure` | A skip saved by an earlier version |
+
+If Open fails or times out with debug info on, it is retried once with debug
+info off. The binary's warnings then say so, and projects keep the disabled
+setting until you turn it back on. If the retry also fails, nothing changes.
+
+If the worker stops (including at its CPU limit) or times out before it
+returns usable pseudocode, the function is rendered once more in a fresh
+worker with inference only. That stop doesn't show that debug info was the
+cause, so no skip is recorded and the project is not marked modified.
+Rejected replies, engine errors, and cancellations are not retried, and
+navigating away drops a pending retry. Skips saved by earlier versions, up to
+1,024 functions, still apply. Turning **Use debug info** back on clears them.
+
+### Caller evidence
+
+A callee's prototype can change how the engine recovers a caller's other call
+arguments. In libfprint-2, one callee prototype made
+`fp_device_async_initable_init_async` lose its fifth parameter and an
+argument of an unrelated `g_task_new` call. The ordinary render therefore
+records which entry inputs have a real use and where each call and return
+operand's value comes from.
+
+An operand counts as evidence only if the machine code in its block prepares
+its ABI slot, for example `mov rcx, r8`, a reload of a spilled value, or a
+matching immediate. A forwarded parameter with its own real use also counts.
+The scan starts at the block's first instruction, or at most 64 instructions
+before the call in a long block. A render with debug prototypes must keep
+every such operand at the same machine address and slot. Arguments past a
+newly locked callee's declared parameters may disappear.
+
+If callee prototypes lose evidence, or the evidence is incomplete, they are
+removed and the function renders once more with only its own prototype. A
+confirmed loss from the function's own prototype also removes it. In
+libssl.so.1.1, `SSL_enable_ct` lost the line-number argument of an
+`ERR_put_error` call this way. Stack-passed arguments, such as x86-32 and the
+fifth and later Win64 arguments, are not yet checked. Capture is bounded to
+16,384 def-use edges, depth 16, 4,096 operands, and 512 lifted instructions
+per scan window or 16,384 per function.
+
+### Decisions and reuse
+
+Each function with DWARF is undecided, provisional, verified, or rejected. A
+callee accepted while rendering a caller is provisional. Callers use it, but
+it shows **Debug info signature** only after its own render passes the locked
+input check. Two expired direct verifications or one engine error reject it.
+The locked render checks inputs a second time because return locks can erase
+the code that uses an input. A return-type difference alone keeps the DWARF
+type, since inference can misread a tail call.
+
+On Linux, callee probes batch up to 32 undecided direct callees into one
+child. The batch covers at most half the function's instruction count (512 to
+4,096), 1,024 instructions per callee, and 2 seconds of wall time. Each probe
+gets 250 ms of CPU and the child 2 seconds in total. A sibling uses only
+verified or provisional callees and leaves the rest until those functions are
+opened.
+
+The desktop and headless controllers hold the decisions and apply a result's
+changes only after accepting the current request. A cancelled or superseded
+result changes nothing. Clean, verified renders are kept for reuse, up to 64
+entries and 8 MiB, with a 2 MiB limit per entry. They are reused only while
+the function, its call dependencies, names, and signatures still match. PE
+images bypass reuse because import handling can change the engine's symbols.
+
+### DWARF limits
+
+| Item | Limit |
+| --- | --- |
+| Index | 65,536 units, 8,000,000 DIEs, nesting depth 255, function-inventory size |
+| Abbreviations | 1 MiB and 4,096 entries per table, 64 attributes each, 64 MiB of cached metadata |
+| Attribute work | 16,000,000 preflight specifications, 64,000,000 evaluations |
+| Encodings | 16 KiB and 64 attributes per DIE; 64 MiB, 8,000,000 attributes, and 8,000,000 records in total |
+| Per prototype | 32 parameters, 256 type nodes at depth 16, 4 reference hops, a 262,144-DIE child scan |
+| Names | 256 bytes for linkage and function names, 64 bytes for parameter and type names |
+| Parameter locations | 64 records and 8 KiB per list, 256 records and 32 KiB per function |
+| Lazy validation | 8 MiB, 1,000,000 attributes, and 262,144 records per prototype |
+
+Every unit's encodings are checked before any DIE is decoded, and a bad unit
+is skipped whole. Indirect forms and oversized strings, blocks, or numbers are
+rejected. Prototype work never reads line programs or file tables. A malformed
+abbreviation table loses only its own units. An exhausted budget reports
+**Partial** and keeps inference. Validation certificates take at most about
+77 MiB per image. [Form and encoding rules](../src/debug_info/encodings.rs)
+
+### Known limitations
+
+- After renaming a function while data is selected, the Decompiler keeps the
+  old name until that function is shown again.
+- Some functions make the engine loop when rendered a second time in the same
+  worker, with or without debug info, so debug renders run only in a child.
+- Caller pseudocode already rendered with a later rejected callee prototype
+  stays until refreshed.
+- On Linux, debug-on decompiling of every function in libssl.so.1.1 and
+  libfprint-2 took about 2.4× and 2.6× the debug-off time in raw-worker runs
+  on 2026-11-18. Most of the difference is the optional work after the
+  ordinary render. These numbers say nothing about Windows.
+
 ## Strings and byte inspection
 
 **Strings** scans ASCII and printable-ASCII UTF-16LE. The character minimum
@@ -270,8 +488,9 @@ session-only UI state are outside the snapshot.
 
 **File → Include binary in project** is on initially. For an external project,
 select the binary yourself on reopen. The app verifies its SHA-256. Saved
-source paths are display hints. Current saves use schema version 5 and can
-read versions 1–4. Older releases may reject newer projects. Incompatible
+source paths are display hints. Current saves use schema version 6, which
+adds the debug setting, debug state, and per-function debug skips. Versions
+1–5 remain readable. Older releases may reject newer projects. Incompatible
 analysis caches are dropped while annotations are retained.
 
 The saved Listing address reopens in its known function or lands on its
@@ -298,6 +517,7 @@ autosave or Ghidra/IDA project import.
 | Program-text search | 32 MiB of text scanned / 10,000 results |
 | Decode | 64 KiB input or key / 256 KiB output |
 | Pseudocode | 2 MiB per result |
+| Mach-O debug companion | 128 MiB |
 | Worker request | 30 seconds wall time, including progress messages |
 
 Linux isolates the analysis worker with bubblewrap. Windows jobs and watchdogs

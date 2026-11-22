@@ -278,81 +278,11 @@ pub fn apply(
                 .collect(),
             first_var_arg_slot: -1,
         };
-        let model = pieces.model.ok_or("Missing default calling convention")?;
-        let mut storage = Vec::new();
-        assign_storage_glb(model, &pieces, &mut storage, false, architecture)
-            .map_err(|e| e.to_string())?;
-        let expected = std::iter::once(outtype).chain(pieces.intypes.iter().copied());
-        if storage.len() != signature.parameters.len() + 1
-            || storage.iter().zip(expected).any(|(p, tp)| {
-                p.tp != Some(tp)
-                    || p.flags & (ParameterPieces::HIDDENRETPARM | ParameterPieces::INDIRECTSTORAGE)
-                        != 0
-                    || (architecture.types.as_ref().unwrap().get(tp).get_metatype()
-                        != TypeMetatype::Void
-                        && p.addr.is_invalid())
-            })
-        {
-            return Err(
-                "Signature requires unsupported hidden, indirect, or unassigned storage".into(),
-            );
-        }
+        let storage = preflight(architecture, &pieces)?;
         prepared.push((symbol, pieces, storage));
     }
     for (symbol, pieces, storage) in prepared {
-        architecture
-            .with_function(symbol, |data, architecture| {
-                if data.is_proc_started() {
-                    architecture.clear_analysis(data);
-                }
-                let proto = data.get_func_proto_mut();
-                // Previous inference errors must not survive a complete replacement.
-                proto.set_input_errors(false);
-                proto.set_output_errors(false);
-                proto.set_pieces(&pieces, architecture)?;
-                if proto.has_input_errors()
-                    || proto.has_output_errors()
-                    || proto.num_params(architecture) as usize != pieces.intypes.len()
-                    || proto.get_output_type(architecture) != pieces.outtype.unwrap()
-                    || proto.is_dotdotdot()
-                    || proto.get_model() != pieces.model
-                {
-                    return Err(Error::Lowlevel(
-                        "Engine did not accept the complete signature".into(),
-                    ));
-                }
-                if proto.get_output_ref().is_none_or(|p| {
-                    p.is_hidden_return(architecture)
-                        || p.is_indirect_storage(architecture)
-                        || p.get_address(architecture) != storage[0].addr
-                }) {
-                    return Err(Error::Lowlevel(
-                        "Engine returned unsupported return storage".into(),
-                    ));
-                }
-                for (i, &ty) in pieces.intypes.iter().enumerate() {
-                    let param = proto
-                        .get_param(i as i32, architecture)
-                        .ok_or_else(|| Error::Lowlevel("Missing applied parameter".into()))?;
-                    if param.get_type(architecture) != ty
-                        || param.get_name(architecture) != pieces.innames[i]
-                        || param.is_hidden_return(architecture)
-                        || param.is_indirect_storage(architecture)
-                        || param.get_address(architecture) != storage[i + 1].addr
-                    {
-                        return Err(Error::Lowlevel(
-                            "Engine changed signature parameter type, name, or storage".into(),
-                        ));
-                    }
-                    param.set_type_lock(true, architecture);
-                    param.set_name_lock(true, architecture);
-                }
-                proto.set_input_lock(true, architecture);
-                proto.set_output_lock(true, architecture);
-                proto.set_model_lock(true);
-                Ok(())
-            })
-            .map_err(|e| e.to_string())?;
+        install_prepared(architecture, symbol, &pieces, &storage)?;
     }
     Ok(())
 }
@@ -542,4 +472,406 @@ pub(crate) fn capture(
         result.parameters.push(InferredParameter { name, ty });
     }
     result
+}
+
+fn preflight(
+    architecture: &mut Architecture,
+    pieces: &PrototypePieces,
+) -> Result<Vec<ParameterPieces>, String> {
+    let model = pieces.model.ok_or("Missing default calling convention")?;
+    let mut storage = Vec::new();
+    assign_storage_glb(model, pieces, &mut storage, false, architecture)
+        .map_err(|e| e.to_string())?;
+    let expected = std::iter::once(pieces.outtype.ok_or("Missing output type")?)
+        .chain(pieces.intypes.iter().copied());
+    if storage.len() != pieces.intypes.len() + 1
+        || storage.iter().zip(expected).any(|(p, tp)| {
+            p.tp != Some(tp)
+                || p.flags & (ParameterPieces::HIDDENRETPARM | ParameterPieces::INDIRECTSTORAGE)
+                    != 0
+                || (architecture.types.as_ref().unwrap().get(tp).get_metatype()
+                    != TypeMetatype::Void
+                    && p.addr.is_invalid())
+        })
+    {
+        return Err(
+            "Signature requires unsupported hidden, indirect, or unassigned storage".into(),
+        );
+    }
+    Ok(storage)
+}
+
+fn install_prepared(
+    architecture: &mut Architecture,
+    symbol: ghidra_decompiler::database::SymbolId,
+    pieces: &PrototypePieces,
+    storage: &[ParameterPieces],
+) -> Result<(), String> {
+    architecture
+        .with_function(symbol, |data, architecture| {
+            if data.is_proc_started() {
+                architecture.clear_analysis(data);
+            }
+            let proto = data.get_func_proto_mut();
+            // Previous inference errors must not survive a complete replacement.
+            proto.set_input_errors(false);
+            proto.set_output_errors(false);
+            proto.set_pieces(pieces, architecture)?;
+            if proto.has_input_errors()
+                || proto.has_output_errors()
+                || proto.num_params(architecture) as usize != pieces.intypes.len()
+                || proto.get_output_type(architecture) != pieces.outtype.unwrap()
+                || proto.is_dotdotdot()
+                || proto.get_model() != pieces.model
+            {
+                return Err(Error::Lowlevel(
+                    "Engine did not accept the complete signature".into(),
+                ));
+            }
+            if proto.get_output_ref().is_none_or(|p| {
+                p.is_hidden_return(architecture)
+                    || p.is_indirect_storage(architecture)
+                    || p.get_address(architecture) != storage[0].addr
+            }) {
+                return Err(Error::Lowlevel(
+                    "Engine returned unsupported return storage".into(),
+                ));
+            }
+            for (i, &ty) in pieces.intypes.iter().enumerate() {
+                let param = proto
+                    .get_param(i as i32, architecture)
+                    .ok_or_else(|| Error::Lowlevel("Missing applied parameter".into()))?;
+                if param.get_type(architecture) != ty
+                    || param.get_name(architecture) != pieces.innames[i]
+                    || param.is_hidden_return(architecture)
+                    || param.is_indirect_storage(architecture)
+                    || param.get_address(architecture) != storage[i + 1].addr
+                {
+                    return Err(Error::Lowlevel(
+                        "Engine changed signature parameter type, name, or storage".into(),
+                    ));
+                }
+                param.set_type_lock(true, architecture);
+                param.set_name_lock(true, architecture);
+            }
+            proto.set_input_lock(true, architecture);
+            proto.set_output_lock(true, architecture);
+            proto.set_model_lock(true);
+            Ok(())
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Storage of each declared parameter, with its type size in bytes.
+type ParameterStorage = Vec<(Address, u64)>;
+
+/// Every register input the decompiler saw must lie inside a declared
+/// parameter's storage. Segment, stack and return-address registers are
+/// execution context, never C arguments.
+fn inputs_agree(
+    architecture: &Architecture,
+    storage: &[(Address, u64)],
+    evidence: &crate::debug_info::abi::Evidence,
+) -> Result<(), String> {
+    if !evidence.complete {
+        return Err("Incomplete ABI evidence".into());
+    }
+    let translate = architecture
+        .translate
+        .as_ref()
+        .ok_or("Missing translator")?;
+    for (address, size) in &evidence.inputs {
+        let name = translate.get_register_name(
+            address.get_space().ok_or("Missing register space")?,
+            address.get_offset(),
+            *size,
+        );
+        if matches!(
+            name.as_str(),
+            "FS_OFFSET"
+                | "GS_OFFSET"
+                | "tpidr_el0"
+                | "TPIDR_EL0"
+                | "RSP"
+                | "ESP"
+                | "RIP"
+                | "EIP"
+                | "sp"
+                | "SP"
+                | "x30"
+        ) {
+            continue;
+        }
+        let inside = storage.iter().any(|(start, length)| {
+            start
+                .get_space()
+                .zip(address.get_space())
+                .is_some_and(|(a, b)| std::sync::Arc::ptr_eq(a, b))
+                && address
+                    .get_offset()
+                    .checked_sub(start.get_offset())
+                    .and_then(|delta| delta.checked_add(u64::try_from(*size).ok()?))
+                    .is_some_and(|end| end <= *length)
+        });
+        if !inside {
+            return Err(format!(
+                "Unlocked inputs disagree with default ABI: {name} size {size}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn parameter_storage(
+    architecture: &Architecture,
+    storage: &[ParameterPieces],
+) -> Result<ParameterStorage, String> {
+    let types = architecture.types.as_ref().ok_or("Missing types")?;
+    storage
+        .iter()
+        .skip(1)
+        .map(|p| {
+            let size = types.get(p.tp.ok_or("Missing argument type")?).get_size();
+            Ok((
+                p.addr.clone(),
+                u64::try_from(size).map_err(|_| "Invalid argument size")?,
+            ))
+        })
+        .collect()
+}
+
+/// x86-32 only: the callee's proven `ret N` must match the default model.
+fn stack_pop_agrees(
+    architecture: &Architecture,
+    pieces: &PrototypePieces,
+    storage: &[ParameterPieces],
+    extra_pop: i32,
+) -> Result<(), String> {
+    let model = &architecture.proto_models[pieces.model.ok_or("Missing model")?];
+    let expected = if model.get_extra_pop()
+        == ghidra_decompiler::fspec::ProtoModel::EXTRAPOP_UNKNOWN
+        && model.get_name() == "__stdcall"
+    {
+        // stdcall's pop is prototype-dependent. AssignStorage already
+        // proved the ABI storage; include every padded stack argument.
+        let mut end = 4u64;
+        for piece in storage.iter().skip(1) {
+            if piece
+                .addr
+                .get_space()
+                .is_some_and(|s| s.get_name() == "stack")
+            {
+                let size = architecture
+                    .types
+                    .as_ref()
+                    .unwrap()
+                    .get(piece.tp.ok_or("Missing argument type")?)
+                    .get_size();
+                let size = u64::try_from(size).map_err(|_| "Invalid argument size")?;
+                let padded = size
+                    .checked_add(3)
+                    .map(|n| n & !3)
+                    .ok_or("Stack pop overflow")?;
+                end = end.max(
+                    piece
+                        .addr
+                        .get_offset()
+                        .checked_add(padded)
+                        .ok_or("Stack pop overflow")?,
+                );
+            }
+        }
+        i32::try_from(end).map_err(|_| "Stack pop overflow")?
+    } else {
+        model.get_extra_pop()
+    };
+    if extra_pop != expected {
+        return Err(format!(
+            "Return stack adjustment disagrees with default ABI: actual {extra_pop}, expected {expected}"
+        ));
+    }
+    Ok(())
+}
+
+fn function_symbol(
+    architecture: &mut Architecture,
+    entry: u64,
+) -> Result<ghidra_decompiler::database::SymbolId, String> {
+    let space = architecture
+        .manager
+        .get_default_code_space()
+        .ok_or("Missing code space")?;
+    let address = Address::new(space, entry);
+    let db = architecture.symboltab_ref().map_err(|e| e.to_string())?;
+    db.scope_query_function(
+        db.get_global_scope().ok_or("Missing global scope")?,
+        &address,
+    )
+    .ok_or_else(|| "Missing function".into())
+}
+
+/// A function prototype as it was before a debug install. The engine keeps
+/// analysis facts (flags, stack adjustment, effects) in the prototype; an
+/// exact copy is the only safe way back to inference.
+pub(crate) struct SavedPrototype(ghidra_decompiler::fspec::FuncProto, PrototypePieces);
+
+/// DWARF uses exactly the user-signature storage checks, with a register veto.
+/// `extra_pop` (x86-32) and `inputs` are checked when supplied; a pending
+/// install defers `inputs` to [`installed_inputs_agree`] on its own render.
+pub(crate) fn install_debug(
+    architecture: &mut Architecture,
+    entry: u64,
+    pieces: PrototypePieces,
+    registers: &[Option<u16>],
+    abi: &str,
+    extra_pop: Option<i32>,
+    inputs: Option<&crate::debug_info::abi::Evidence>,
+) -> Result<SavedPrototype, String> {
+    let storage = preflight(architecture, &pieces)?;
+    if let Some(evidence) = inputs {
+        inputs_agree(
+            architecture,
+            &parameter_storage(architecture, &storage)?,
+            evidence,
+        )?;
+    }
+    if let Some(extra_pop) = extra_pop {
+        stack_pop_agrees(architecture, &pieces, &storage, extra_pop)?;
+    }
+    if architecture.translate.is_none() {
+        return Err("Missing translator".into());
+    }
+    for (i, reg) in registers.iter().enumerate() {
+        if let Some(reg) = reg {
+            let name = crate::debug_info::abi::register(abi, *reg)
+                .ok_or("Unsupported DWARF entry register")?;
+            let actual = architecture
+                .translate
+                .as_ref()
+                .ok_or("Missing translator")?
+                .get_register(&name)
+                .map_err(|e| e.to_string())?;
+            let expected = &storage[i + 1].addr;
+            if expected.get_offset() != actual.offset
+                || expected.get_space().is_none_or(|s| {
+                    actual
+                        .space
+                        .as_ref()
+                        .is_none_or(|a| !std::sync::Arc::ptr_eq(s, a))
+                })
+            {
+                return Err("DWARF entry register disagrees with ABI".into());
+            }
+        }
+    }
+    let symbol = function_symbol(architecture, entry)?;
+    let saved = architecture
+        .with_function(symbol, |data, architecture| {
+            let mut saved = ghidra_decompiler::fspec::FuncProto::new();
+            saved.copy(data.get_func_proto())?;
+            let mut pieces = PrototypePieces {
+                model: None,
+                name: String::new(),
+                outtype: None,
+                intypes: vec![],
+                innames: vec![],
+                first_var_arg_slot: -1,
+            };
+            data.get_func_proto_mut()
+                .get_pieces(&mut pieces, architecture);
+            Ok(SavedPrototype(saved, pieces))
+        })
+        .map_err(|e| e.to_string())?;
+    // Preflight completes before prototype mutation. Post-install verification uses
+    // the same path as applied user signatures.
+    match install_prepared(architecture, symbol, &pieces, &storage) {
+        Ok(()) => Ok(saved),
+        Err(error) => {
+            restore(architecture, symbol, &saved)?;
+            Err(error)
+        }
+    }
+}
+
+/// Additional veto from a locked render. Independent unlocked evidence is
+/// checked before installation: locks can erase return-dependent input uses.
+pub(crate) fn installed_inputs_agree(
+    architecture: &mut Architecture,
+    entry: u64,
+    evidence: &crate::debug_info::abi::Evidence,
+) -> Result<(), String> {
+    let symbol = function_symbol(architecture, entry)?;
+    let mut storage = Vec::new();
+    architecture
+        .with_function(symbol, |data, architecture| {
+            let proto = data.get_func_proto_mut();
+            for i in 0..proto.num_params(architecture) {
+                let Some(param) = proto.get_param(i, architecture) else {
+                    return Err(Error::Lowlevel("Missing installed parameter".into()));
+                };
+                let size = architecture
+                    .types
+                    .as_ref()
+                    .ok_or_else(|| Error::Lowlevel("Missing types".into()))?
+                    .get(param.get_type(architecture))
+                    .get_size();
+                storage.push((param.get_address(architecture), size));
+            }
+            Ok(())
+        })
+        .map_err(|e| e.to_string())?;
+    let storage = storage
+        .into_iter()
+        .map(|(address, size)| {
+            u64::try_from(size)
+                .map(|size| (address, size))
+                .map_err(|_| "Invalid argument size".to_string())
+        })
+        .collect::<Result<ParameterStorage, _>>()?;
+    inputs_agree(architecture, &storage, evidence)
+}
+
+/// Removes a debug prototype, restoring the prototype saved before it.
+pub(crate) fn uninstall_debug(
+    architecture: &mut Architecture,
+    entry: u64,
+    saved: &SavedPrototype,
+) -> Result<(), String> {
+    let symbol = function_symbol(architecture, entry)?;
+    restore(architecture, symbol, saved)
+}
+
+/// Unlocks and removes the installed parameters (their scope symbols), then
+/// copies back everything else the prototype held before the install.
+fn restore(
+    architecture: &mut Architecture,
+    symbol: ghidra_decompiler::database::SymbolId,
+    saved: &SavedPrototype,
+) -> Result<(), String> {
+    architecture
+        .with_function(symbol, |data, arch| {
+            let proto = data.get_func_proto_mut();
+            for i in 0..proto.num_params(arch) {
+                if let Some(p) = proto.get_param(i, arch) {
+                    p.set_type_lock(false, arch);
+                    p.set_name_lock(false, arch);
+                }
+            }
+            proto.set_input_lock(false, arch);
+            proto.set_output_lock(false, arch);
+            proto.set_model_lock(false);
+            proto.clear_input(arch);
+            proto.clear_unlocked_output(arch)?;
+            proto.copy(&saved.0)?;
+            // copy shares symbol-backed scope; rebuild from owned pre-install
+            // pieces after removing installed symbols, rather than that scope.
+            proto.update_all_types(&saved.1, arch)?;
+            proto.set_input_lock(false, arch);
+            proto.set_output_lock(false, arch);
+            proto.set_model_lock(saved.0.is_model_locked());
+            arch.clear_analysis(data);
+            Ok(())
+        })
+        .map_err(|e| e.to_string())
 }

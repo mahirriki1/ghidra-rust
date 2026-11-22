@@ -227,6 +227,23 @@ impl SemanticSelection {
         self.update_ranges();
         Some(primary)
     }
+    /// Recomputes the highlighted ranges of the kept machine addresses in
+    /// new mappings; nothing is inferred from text or position.
+    pub fn rebind(&mut self, primary: Option<u64>) {
+        if self.addresses.len() > 1
+            && !self.mappings.iter().any(|mapping| {
+                mapping.addresses.len() == self.addresses.len()
+                    && mapping
+                        .addresses
+                        .iter()
+                        .all(|address| self.addresses.contains(address))
+            })
+        {
+            self.addresses.clear();
+            self.addresses.extend(primary);
+        }
+        self.update_ranges();
+    }
     fn update_ranges(&mut self) {
         self.ranges = self
             .mappings

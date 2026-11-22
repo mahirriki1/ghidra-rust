@@ -727,3 +727,109 @@ fn console_never_echoes_an_id_twice() {
     }
     assert_eq!(replies[3]["error"]["code"], "unsupported_version");
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn debug_default_and_explicit_disable_share_worker_provenance() {
+    use ghidra_rust::semantic::PrototypeSource;
+    let f = fixture().unwrap();
+    let mut enabled = Analyzer::open(
+        Input::Binary(f.path.clone()),
+        executable(),
+        Options::default(),
+    )
+    .unwrap();
+    let code = analyze(&mut enabled, f.a, false);
+    assert_eq!(code.semantics.prototype_source, PrototypeSource::DebugInfo);
+    assert!(
+        code.text.contains("uint4 branch_loop(uint4 count)"),
+        "{}",
+        code.text
+    );
+    let mut disabled = Analyzer::open(
+        Input::Binary(f.path.clone()),
+        executable(),
+        Options {
+            use_debug_info: Some(false),
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    let code = analyze(&mut disabled, f.a, false);
+    assert_eq!(code.semantics.prototype_source, PrototypeSource::Inferred);
+    assert!(
+        code.text.contains("uint4 branch_loop(uint4 param_1)"),
+        "{}",
+        code.text
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn console_use_debug_info_reenables_a_saved_project_and_clears_skips() {
+    let Some(f) = fixture() else {
+        return;
+    };
+    let path = f._directory.path().join("disabled.grproj");
+    let save = "{\"api_version\":1,\"id\":1,\"command\":{\"kind\":\"save_project\"}}\n";
+    let out = console(
+        &f,
+        &[
+            std::ffi::OsStr::new("--no-debug-info"),
+            std::ffi::OsStr::new("--output-project"),
+            path.as_os_str(),
+        ],
+        save.as_bytes(),
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut data = editable_project(&f, &path);
+    assert!(!data.use_debug_info);
+    data.debug_skip = vec![f.a];
+    write_project(&f, &path, &data);
+    let info = |extra: &[&str]| {
+        let mut child = Command::new(executable())
+            .arg("--project")
+            .arg(&path)
+            .args(extra)
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        stdin
+            .write_all(b"{\"api_version\":1,\"id\":1,\"command\":{\"kind\":\"info\"}}\n")
+            .unwrap();
+        drop(stdin);
+        let out = child.wait_with_output().unwrap();
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .map(|s| serde_json::from_str::<serde_json::Value>(s).unwrap())
+            .next()
+            .unwrap()
+    };
+    let saved = info(&[]);
+    assert_eq!(saved["result"]["use_debug_info"], false);
+    assert_eq!(saved["result"]["debug_skipped_functions"][0], f.a);
+    let enabled = info(&["--use-debug-info"]);
+    assert_eq!(enabled["result"]["use_debug_info"], true);
+    assert_eq!(enabled["result"]["debug_status"], "enabled");
+    assert_eq!(
+        enabled["result"]["debug_skipped_functions"],
+        serde_json::json!([])
+    );
+    let conflict = Command::new(executable())
+        .args(["--no-debug-info", "--use-debug-info", "--project"])
+        .arg(&path)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!conflict.status.success());
+}

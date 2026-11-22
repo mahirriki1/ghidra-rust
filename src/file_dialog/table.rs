@@ -94,9 +94,9 @@ impl TypeFilter {
     /// The choices for `kind`; the first is the default.
     pub(super) fn choices(kind: FileDialogKind) -> &'static [Self] {
         match kind {
-            FileDialogKind::OpenBinary | FileDialogKind::LocateProjectBinary => {
-                &[Self::All, Self::Pe]
-            }
+            FileDialogKind::OpenDebugInfo
+            | FileDialogKind::OpenBinary
+            | FileDialogKind::LocateProjectBinary => &[Self::All, Self::Pe],
             FileDialogKind::OpenProject | FileDialogKind::SaveProject => {
                 &[Self::Projects, Self::All]
             }
