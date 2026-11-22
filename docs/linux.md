@@ -10,6 +10,27 @@ You need a glibc-based x86-64 system, an X11 or Wayland desktop with OpenGL,
 and bubblewrap (`bwrap`) with working unprivileged user namespaces. Keep the
 archive's licenses and notices when redistributing the app.
 
+## Menu entry and icon
+
+Each time the desktop starts, it adds itself to your application menu, so
+KDE Plasma and other Wayland desktops can show its icon. It writes two files
+in your own data folder (`$XDG_DATA_HOME`, usually `~/.local/share`):
+
+- `applications/io.github.mahirriki1.GhidraRust.desktop`
+- `icons/hicolor/256x256/apps/io.github.mahirriki1.GhidraRust.png`
+
+The menu entry starts the executable you last ran. The app rewrites a file
+only when its content is out of date, for example after you move the app.
+It never needs root, skips folders that are symlinks, and keeps running if
+it cannot write. The headless tool and analysis workers write nothing.
+
+To remove the entry, delete both files. They come back the next time you
+start the desktop. If a system package already installs the entry under
+`/usr/share`, the app leaves your data folder alone.
+
+The archive's `share/` folder has the same two files for packagers. Its
+entry runs `ghidra-rust` from `PATH`.
+
 ## Runtime compatibility
 
 Release packages are built on Ubuntu 24.04. Check `BUILD-INFO.json` in the

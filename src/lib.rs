@@ -15,6 +15,8 @@ pub mod debug_info;
 pub mod decode;
 pub mod decoder_ui;
 pub mod decompile;
+#[cfg(target_os = "linux")]
+pub mod desktop_entry;
 pub mod discovery;
 mod elf_function_metadata;
 mod elf_startup;

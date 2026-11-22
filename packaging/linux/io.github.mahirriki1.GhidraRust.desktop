@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Ghidra Rust
+GenericName=Reverse Engineering Tool
+Comment=Native reverse engineering desktop
+Keywords=decompiler;disassembler;reverse engineering;binary;
+Icon=io.github.mahirriki1.GhidraRust
+Exec=ghidra-rust %f
+TryExec=ghidra-rust
+Terminal=false
+Categories=Development;
+StartupNotify=true
+StartupWMClass=io.github.mahirriki1.GhidraRust

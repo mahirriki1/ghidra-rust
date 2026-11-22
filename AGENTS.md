@@ -32,6 +32,9 @@ the relevant source modules before changing behavior. Follow more specific
   row/table helpers; `file_dialog/` owns the in-app chooser.
 - `src/window_chrome.rs`: Windows menu-row window controls and resize borders;
   other platforms retain native decorations.
+- `src/brand.rs`, `desktop_entry.rs`: the logo, app id, and Linux per-user
+  `.desktop`/icon registration (template in `packaging/linux/`). `build.rs`
+  embeds `docs/images/ghidra-rust-icon.ico` in Windows MSVC executables.
 - `src/client.rs`, `worker.rs`, `model.rs`: disposable worker lifecycle, bounded
   JSON transport, request/response types, and shared result limits.
 - `src/architecture.rs`: supported architecture/ABI selection and validation.

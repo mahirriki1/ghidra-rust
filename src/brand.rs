@@ -3,15 +3,21 @@
 use eframe::egui;
 use std::sync::{Arc, OnceLock};
 
+/// Window app id (Wayland `app_id`, X11 `WM_CLASS`) and the matching desktop
+/// entry and icon name. Reverse-DNS of the project's home on GitHub, in the
+/// form desktop-entry IDs and D-Bus names both accept.
+pub const APP_ID: &str = "io.github.mahirriki1.GhidraRust";
+
+/// The 256x256 PNG export of docs/images/ghidra-rust-logo.svg.
+pub const ICON_PNG: &[u8] = include_bytes!("../docs/images/ghidra-rust-icon.png");
+
 /// The bundled icon is decoded once and shared by native viewports.
 pub fn icon() -> Arc<egui::IconData> {
     static ICON: OnceLock<Arc<egui::IconData>> = OnceLock::new();
     Arc::clone(ICON.get_or_init(|| {
         Arc::new(
-            eframe::icon_data::from_png_bytes(include_bytes!(
-                "../docs/images/ghidra-rust-icon.png"
-            ))
-            .expect("bundled Ghidra Rust icon must be a valid PNG"),
+            eframe::icon_data::from_png_bytes(ICON_PNG)
+                .expect("bundled Ghidra Rust icon must be a valid PNG"),
         )
     }))
 }

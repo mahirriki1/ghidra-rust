@@ -28,6 +28,9 @@ cargo +1.98.1-x86_64-pc-windows-msvc build --release --locked --target x86_64-pc
 .\target\x86_64-pc-windows-msvc\release\ghidra-rust.exe
 ```
 
+The app icon is built into both EXEs, so Explorer, Start, and pinned taskbar
+entries show it.
+
 The menu bar contains window controls. Drag an empty part to move the window
 or double-click it to maximize or restore. Drag the edges to resize.
 

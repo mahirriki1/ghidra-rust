@@ -77,7 +77,10 @@ fn run_desktop(initial_path: Option<PathBuf>) -> eframe::Result<()> {
     let size = egui::vec2(1440.0, 920.0);
     let minimum = egui::vec2(1000.0, 640.0);
     let placement = ghidra_rust::window_chrome::initial_placement(size, minimum);
+    #[cfg(target_os = "linux")]
+    ghidra_rust::desktop_entry::register_in_background();
     let mut viewport = egui::ViewportBuilder::default()
+        .with_app_id(ghidra_rust::brand::APP_ID)
         .with_icon(ghidra_rust::brand::icon())
         .with_inner_size(size)
         .with_min_inner_size(minimum);
