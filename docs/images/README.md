@@ -6,6 +6,17 @@ Regenerate the native window icon from the SVG in this directory.
 rsvg-convert --width 256 --height 256 docs/images/ghidra-rust-logo.svg -o docs/images/ghidra-rust-icon.png
 ```
 
+`ghidra-rust-icon.ico` is the Windows EXE icon. It holds 16, 24, 32, 48, 64,
+and 256 pixel PNG images drawn from the SVG. `build.rs` embeds it in MSVC
+builds. Regenerate it with:
+
+```sh
+python3 scripts/make-windows-icon.py
+```
+
+The Linux desktop entry and its icon also use `ghidra-rust-icon.png`.
+[Menu entry and icon](../linux.md#menu-entry-and-icon)
+
 To refresh the Listing and selection-sync screenshots:
 
 1. Build the C fixture and run `cargo build --release --locked --features capture`.

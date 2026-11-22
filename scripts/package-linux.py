@@ -17,6 +17,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parent.parent
 TARGET = "x86_64-unknown-linux-gnu"
+APP_ID = "io.github.mahirriki1.GhidraRust"
 NOTICE_NAME = re.compile(r"LICENSE|COPYRIGHT|COPYING|NOTICE|^OFL(?:[._-]|$)", re.I)
 CODE_NOTICE_NAME = re.compile(r"LICENSE|COPYING|^OFL(?:[._-]|$)", re.I)
 SAFE_NAME = re.compile(r"[A-Za-z0-9_.+-]+")
@@ -347,6 +348,12 @@ def main():
         for relative in ("docs/linux.md", "docs/windows.md"):
             if (ROOT / relative).exists():
                 copy_file(package_file(ROOT, relative), bundle / relative)
+        # The desktop also registers these per user at startup; packagers can
+        # install them under /usr/share instead.
+        copy_file(package_file(ROOT, f"packaging/linux/{APP_ID}.desktop"),
+                  bundle / f"share/applications/{APP_ID}.desktop")
+        copy_file(package_file(ROOT, "docs/images/ghidra-rust-icon.png"),
+                  bundle / f"share/icons/hicolor/256x256/apps/{APP_ID}.png")
         images = ROOT / "docs/images"
         if images.is_dir():
             for directory, dirs, files in os.walk(images, followlinks=False):
