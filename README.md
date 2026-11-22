@@ -78,6 +78,7 @@ Browse the full guide set online if you are reading from a portable archive.
 | If you want to… | Read |
 | --- | --- |
 | Analyze without a desktop window | [Headless API](docs/headless.md) |
+| Try the Linux live debugger backend from source | [Live debugger](docs/debugger.md) |
 | Understand what discovery can recover | [Analysis coverage](docs/analysis.md) |
 | Interpret C++, Rust, or MSVC names | [Demangled display names](docs/demangling.md) |
 | Decode bytes or identify crypto constants | [Decode and FindCrypt](docs/crypto-signatures.md) |
