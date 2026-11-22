@@ -45,7 +45,9 @@ GHIDRA_RUST_EMBEDDED_NOTICES=$(python3 scripts/embed-notices.py --target x86_64-
 cargo fmt --all --check
 if ((run_tests)); then
     python3 -m unittest discover -s scripts -p 'test_*.py'
-    cargo test --locked
+    # Tests use workers with the test-only fault hook; distributables never do.
+    cargo test --locked --features test-hooks
+    cargo clippy --workspace --all-targets --locked --features test-hooks -- -D warnings
 fi
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo build --release --locked
@@ -56,4 +58,9 @@ if ((run_tests)); then
     cargo test --release --locked --test aarch64
     cargo test --release --locked --test headless
 fi
-python3 scripts/package-linux.py
+# The final distributable build (no test hooks) names the exact pair to
+# package; the packager probes its staged copies for the test-only fault hook.
+artifacts=$(mktemp)
+trap 'rm -f -- "$artifacts"' EXIT
+cargo build --release --locked --bins --message-format=json-render-diagnostics >"$artifacts"
+python3 scripts/package-linux.py --cargo-artifacts "$artifacts"

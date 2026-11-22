@@ -257,6 +257,20 @@ mod tests {
             applied_signatures: BTreeSet::new(),
             signature_state: None,
             analysis_started: false,
+            debug: Default::default(),
+            debug_calls: std::collections::VecDeque::new(),
+            debug_large: BTreeSet::new(),
+            debug_skip: BTreeSet::new(),
+            debug_failed: BTreeSet::new(),
+            debug_large_journal: None,
+            results: super::ResultCache::default(),
+            result_epoch: 0,
+            pending_debug: None,
+            debug_nonce: 0,
+            debug_inventory_digest: None,
+            debug_program_digest: None,
+            debug_long_names: Default::default(),
+            debug_long_names_complete: true,
         }
     }
 

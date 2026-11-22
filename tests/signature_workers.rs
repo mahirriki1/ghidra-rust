@@ -150,6 +150,7 @@ fn open(worker: &mut WorkerClient, fixture: &Fixture) -> BinaryInfo {
     match request(
         worker,
         Request::Open {
+            debug: Default::default(),
             path: fixture.binary.to_string_lossy().into_owned(),
         },
     ) {
@@ -774,6 +775,7 @@ fn wrong_binary_digest_or_nonexecutable_entry_fails_closed_at_worker_boundary() 
     let mut worker = ProtocolWorker::start();
     for fault in 0..3 {
         let Response::Opened { info, .. } = worker.request(Request::Open {
+            debug: Default::default(),
             path: fixture.binary.to_string_lossy().into_owned(),
         }) else {
             panic!("Open original protocol fixture");
@@ -824,6 +826,7 @@ fn wrong_binary_digest_or_nonexecutable_entry_fails_closed_at_worker_boundary() 
         // A subsequent Open recovers this same process, but carries no partial
         // prototype state from the rejected batch.
         let Response::Opened { info, .. } = worker.request(Request::Open {
+            debug: Default::default(),
             path: fixture.binary.to_string_lossy().into_owned(),
         }) else {
             panic!("Fresh Open after rejection");

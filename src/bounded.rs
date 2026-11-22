@@ -172,6 +172,14 @@ fn reply_nodes(kind: &str) -> Option<usize> {
                 + 16 * crate::signatures::MAX_PARAMETERS
                 + crate::signatures::MAX_INFERRED_NOTES
         }
+        // A baseline, or a candidate body, plus bounded call lists and a
+        // decision record per job entry.
+        "prepared_decompile" | "debug_finished" => {
+            reply_nodes("decompiled")?
+                + 6 * MAX_GRAPH_CALLS
+                + 24 * crate::analysis::managed::MAX_JOB_ENTRIES
+                + crate::semantic::MAX_FUNCTION_RENAMES
+        }
         "signatures_synced" => 5 * crate::signatures::MAX_SIGNATURES,
         "memory_search" => 7 * MAX_SEARCH_PAGE_RESULTS + 96,
         "bytes" => MAX_BYTE_READ,
@@ -182,10 +190,26 @@ fn reply_nodes(kind: &str) -> Option<usize> {
         "linkage" => {
             25 * crate::linkage::MAX_LINKAGE_PAGE_RECORDS + crate::linkage::MAX_LINKAGE_GAPS + 32
         }
-        "progress" | "renamed" | "error" | "functions_synced" => 0,
+        "progress" | "renamed" | "error" | "functions_synced" | "debug_started"
+        | "debug_unavailable" => 0,
         _ => return None,
     };
     Some(nodes + OBJECT_SLACK)
+}
+
+/// The isolated fork returns one bounded outcome frame, without the
+/// primary's outer response envelope.
+#[cfg(target_os = "linux")]
+pub(crate) fn check_debug_frame(line: &[u8]) -> Result<(), String> {
+    let mut budget = Budget {
+        nodes: reply_nodes("debug_finished").expect("debug reply kind"),
+        max_string: MAX_DECOMPILED_BYTES + crate::decompile::TRUNCATION_TRAILER.len(),
+    };
+    let mut deserializer = serde_json::Deserializer::from_slice(line);
+    Count(&mut budget)
+        .deserialize(&mut deserializer)
+        .and_then(|()| deserializer.end())
+        .map_err(|error| format!("Invalid isolated debug frame: {error}"))
 }
 
 /// Kind and id of a worker reply line that passed its shape preflight.
@@ -303,6 +327,64 @@ mod tests {
     struct Pair {
         #[serde(deserialize_with = "vec::<_, _, 2>")]
         values: Vec<u8>,
+    }
+
+    /// The largest legal managed replies pass the shape preflight; one
+    /// element past a job list fails while decoding.
+    #[test]
+    fn managed_replies_fit_preflight_and_bound_their_lists() {
+        use crate::analysis::managed::{Binding, DebugOffer, Executor};
+        let calls: Vec<u64> = (0..MAX_GRAPH_CALLS as u64)
+            .map(|i| u64::MAX - i)
+            .rev()
+            .collect();
+        let offer = DebugOffer {
+            logical_id: 1,
+            nonce: u64::MAX,
+            executor: Executor::Sibling,
+            reference_us: u64::MAX,
+            elapsed_us: u64::MAX,
+            binding: Binding {
+                program: "f".repeat(64),
+                context: "f".repeat(64),
+                baseline: "f".repeat(64),
+                facts: "f".repeat(64),
+            },
+            calls: calls.clone(),
+            target_work: true,
+            graph_prepared: false,
+            callees: calls.clone(),
+            cacheable: true,
+        };
+        let reply = WorkerResponse {
+            id: 1,
+            response: Response::PreparedDecompile {
+                address: 1,
+                text: String::new(),
+                mappings: Vec::new(),
+                semantics: Default::default(),
+                offer: offer.clone(),
+            },
+        };
+        let line = serde_json::to_vec(&reply).unwrap();
+        assert_eq!(check_reply(&line).unwrap().kind, "prepared_decompile");
+        serde_json::from_slice::<WorkerResponse>(&line).unwrap();
+        let mut value = serde_json::to_value(&reply).unwrap();
+        value["response"]["offer"]["callees"]
+            .as_array_mut()
+            .unwrap()
+            .push(0.into());
+        assert!(serde_json::from_value::<WorkerResponse>(value.clone()).is_err());
+        value["response"]["offer"]["callees"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+        value["response"]["offer"]["unknown"] = 1.into();
+        assert!(serde_json::from_value::<WorkerResponse>(value).is_err());
+        for kind in ["debug_started", "debug_unavailable"] {
+            let line = format!(r#"{{"id":1,"response":{{"kind":"{kind}","nonce":1}}}}"#);
+            assert_eq!(check_reply(line.as_bytes()).unwrap().kind, kind);
+        }
     }
 
     #[test]

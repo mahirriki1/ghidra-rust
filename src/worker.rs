@@ -1,19 +1,145 @@
 //! Newline-delimited JSON protocol. Never write diagnostic text to stdout.
 use crate::analysis::LoadedProgram;
 use crate::model::{Request, Response, WorkerRequest, WorkerResponse};
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 
-pub fn run_worker() -> Result<(), String> {
-    crate::limits::configure_worker()?;
-    protocol(io::stdin().lock(), io::stdout().lock(), true)
+/// The worker's role, chosen by its host on the command line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Role {
+    /// The long-lived analysis worker.
+    Primary,
+    /// A disposable sibling for one optional debug render: one Open, then
+    /// name and signature replay, then one `RenderDebugOnce`, then exit.
+    Peer,
 }
 
-fn protocol(
-    mut input: impl BufRead,
+/// Exact internal arguments after `--analysis-worker`.
+pub const PEER_ARGUMENT: &str = "--debug-peer-once";
+pub(crate) const BOUND_ARGUMENT: &str = "--bound-worker-inputs";
+/// Treats this worker like one without process isolation (Windows or a
+/// threaded worker): no fork for optional or callee work. Hosts pass it
+/// only to test the sibling executor on Linux.
+pub const NO_FORK_ARGUMENT: &str = "--no-fork";
+/// Test hook `--test-debug-fault=KIND@ADDRESS`: the optional debug render
+/// of the function at the hexadecimal ADDRESS stalls (`stall`), spins on
+/// the CPU (`spin`) or aborts (`abort`) after it has started. With
+/// `prepare-exit`, every normal managed preparation of that function exits
+/// as at the CPU limit after its ordinary render, before its baseline frame;
+/// an inference-only recovery is unaffected. `prepare-exit-always` stops
+/// the recovery too. Hosts pass it only from tests, never from project data.
+/// Only workers built with the `test-hooks` feature accept it; distributed
+/// builds refuse it like any unknown worker argument.
+pub const FAULT_ARGUMENT: &str = "--test-debug-fault=";
+
+/// Whether `argument` is one of the internal worker arguments above.
+pub fn internal_argument(argument: &std::ffi::OsStr) -> bool {
+    argument.to_str().is_some_and(|argument| {
+        argument == PEER_ARGUMENT
+            || argument == BOUND_ARGUMENT
+            || argument == NO_FORK_ARGUMENT
+            || argument.starts_with(FAULT_ARGUMENT)
+    })
+}
+
+pub fn run_worker() -> Result<(), String> {
+    run_worker_with(std::iter::empty())
+}
+
+/// Runs a worker with the internal arguments that followed
+/// `--analysis-worker`; any other argument is refused before startup.
+pub fn run_worker_with(
+    arguments: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Result<(), String> {
+    let mut role = Role::Primary;
+    let mut bound_inputs = false;
+    for argument in arguments {
+        match argument.to_str() {
+            Some(PEER_ARGUMENT) if role == Role::Primary => role = Role::Peer,
+            Some(BOUND_ARGUMENT) if !bound_inputs => bound_inputs = true,
+            Some(NO_FORK_ARGUMENT) => crate::decompile::disable_isolation(),
+            #[cfg(feature = "test-hooks")]
+            Some(fault) if fault.starts_with(FAULT_ARGUMENT) => {
+                crate::analysis::set_debug_fault(&fault[FAULT_ARGUMENT.len()..])?;
+            }
+            _ => return Err("Unexpected analysis worker argument".into()),
+        }
+    }
+    if role == Role::Peer {
+        // The nonfork executor uses the same deferred-callee policy on
+        // Windows and Linux, even when this particular process has one thread.
+        crate::decompile::disable_isolation();
+    }
+    crate::limits::configure_worker()?;
+    // A buffer larger than stdin's own makes every read bypass it, so the
+    // bytes of a pipelined request are visible to `input_pending`.
+    let input = BufReader::with_capacity(256 * 1024, io::stdin().lock());
+    protocol(input, io::stdout().lock(), true, role, bound_inputs)
+}
+
+/// Whether host input is waiting: a buffered or readable request (or the
+/// host closed the pipe). A managed optional render yields to it.
+fn input_pending<R>(input: &BufReader<R>, poll_stdin: bool) -> bool {
+    if !input.buffer().is_empty() {
+        return true;
+    }
+    #[cfg(unix)]
+    if poll_stdin {
+        let mut descriptor = libc::pollfd {
+            fd: libc::STDIN_FILENO,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one valid pollfd for the lifetime of the call; a zero
+        // timeout never blocks. Errors read as "nothing pending".
+        let ready = unsafe { libc::poll(&mut descriptor, 1, 0) };
+        return ready > 0 && descriptor.revents != 0;
+    }
+    #[cfg(not(unix))]
+    let _ = poll_stdin;
+    false
+}
+
+/// Whether `request` is legal for a worker in `role` after `state`.
+fn admit(role: Role, request: &Request, peer: &mut PeerState) -> Result<(), String> {
+    match (role, request) {
+        (Role::Primary, Request::RenderDebugOnce { .. }) => {
+            Err("Only a debug peer renders a single debug job".into())
+        }
+        (Role::Primary, _) => Ok(()),
+        (Role::Peer, Request::Open { .. }) if !peer.opened => {
+            peer.opened = true;
+            Ok(())
+        }
+        (Role::Peer, Request::SyncFunctions { .. } | Request::Rename { .. })
+            if peer.opened && !peer.signatures =>
+        {
+            Ok(())
+        }
+        (Role::Peer, Request::SyncSignatures { .. }) if peer.opened && !peer.signatures => {
+            peer.signatures = true;
+            Ok(())
+        }
+        (Role::Peer, Request::RenderDebugOnce { .. }) if peer.opened => Ok(()),
+        (Role::Peer, _) => Err("Request is not part of a debug peer's replay".into()),
+    }
+}
+
+#[derive(Default)]
+struct PeerState {
+    opened: bool,
+    signatures: bool,
+}
+
+fn protocol<R: Read>(
+    mut input: BufReader<R>,
     mut output: impl Write,
     enforce_limits: bool,
+    role: Role,
+    bound_inputs: bool,
 ) -> Result<(), String> {
     let mut loaded: Option<LoadedProgram> = None;
+    let mut peer = PeerState::default();
+    let mut last_id = 0;
     const MAX_REQUEST_BYTES: u64 = 64 * 1024;
     loop {
         let mut line = Vec::new();
@@ -37,6 +163,9 @@ fn protocol(
             )?;
             return Err("Oversized worker request; process stopped.".into());
         }
+        if line.last() != Some(&b'\n') {
+            return Err("Truncated worker request.".into());
+        }
         let request: WorkerRequest = match serde_json::from_slice(&line) {
             Ok(request) => request,
             Err(error) => {
@@ -54,32 +183,100 @@ fn protocol(
                         },
                     },
                 )?;
+                if role == Role::Peer {
+                    return Err("Invalid debug peer request; process stopped.".into());
+                }
                 continue;
             }
         };
-        if enforce_limits {
+        if request.id <= last_id {
+            return Err("Worker request IDs must be nonzero and increasing.".into());
+        }
+        last_id = request.id;
+        if let Err(message) = admit(role, &request.request, &mut peer) {
+            send(
+                &mut output,
+                WorkerResponse {
+                    id: request.id,
+                    response: Response::Error { message },
+                },
+            )?;
+            if role == Role::Peer {
+                return Err("Unexpected debug peer request; process stopped.".into());
+            }
+            continue;
+        }
+        // An optional render never replenishes the CPU allowance its
+        // prepared request started with, and a peer's replay never
+        // replenishes the allowance of its one transaction.
+        let replenish = match (&request.request, role) {
+            (Request::TryPreparedDebug { .. }, _) => false,
+            (Request::Open { .. }, Role::Peer) => true,
+            (_, Role::Peer) => false,
+            _ => true,
+        };
+        if enforce_limits && replenish {
             crate::limits::begin_request()?;
         }
         let request_id = request.id;
         let signature_sync = matches!(request.request, Request::SyncSignatures { .. });
+        let render_once = matches!(request.request, Request::RenderDebugOnce { .. });
         let _trace_context = crate::performance::context(request_id);
         let execution = crate::performance::span(crate::performance::operation(&request.request));
         let result =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match request.request {
-                Request::Open { path } => {
+                Request::Open { path, debug } => {
                     // An unsuccessful replacement must never leave a previous image active.
                     loaded = None;
-                    let program = LoadedProgram::open(&path)?;
+                    let mut program = LoadedProgram::open_with_companion_policy(
+                        &path,
+                        &debug,
+                        role == Role::Primary && !bound_inputs,
+                    )?;
+                    program.bind_open(request_id);
+                    let debug = program.debug_summary().cloned();
                     let info = program.info.clone();
                     let symbols = Some(program.symbol_names().clone());
                     let macho_legacy = program.macho_legacy.clone();
                     loaded = Some(program);
                     Ok(Response::Opened {
+                        debug,
                         info,
                         symbols,
                         macho_legacy,
                     })
                 }
+                Request::TryPreparedDebug { job } => {
+                    let ticket = job.ticket;
+                    Ok(loaded
+                        .as_mut()
+                        .ok_or_else(|| "Open a binary first.".to_string())?
+                        .try_prepared(
+                            job,
+                            &mut || input_pending(&input, enforce_limits),
+                            &mut |direct| {
+                                send(
+                                    &mut output,
+                                    WorkerResponse {
+                                        id: request_id,
+                                        response: Response::DebugStarted { ticket, direct },
+                                    },
+                                )
+                            },
+                        ))
+                }
+                Request::RenderDebugOnce { job } => loaded
+                    .as_mut()
+                    .ok_or_else(|| "Open a binary first.".to_string())?
+                    .render_debug_once(job, &mut |ticket, direct| {
+                        send(
+                            &mut output,
+                            WorkerResponse {
+                                id: request_id,
+                                response: Response::DebugStarted { ticket, direct },
+                            },
+                        )
+                    }),
                 request => loaded
                     .as_mut()
                     .ok_or_else(|| "Open a binary first.".to_string())?
@@ -114,11 +311,9 @@ fn protocol(
         if signature_sync && matches!(response, Response::Error { .. }) {
             loaded = None;
         }
+        let failed = matches!(response, Response::Error { .. });
         execution.finish(0);
-        crate::performance::event(
-            "request_result_error",
-            u64::from(matches!(response, Response::Error { .. })),
-        );
+        crate::performance::event("request_result_error", u64::from(failed));
         send(
             &mut output,
             WorkerResponse {
@@ -127,6 +322,14 @@ fn protocol(
             },
         )?;
         crate::performance::event("request_published", request.id);
+        // A peer exits after its one transaction, or after any failure.
+        if role == Role::Peer && (render_once || failed) {
+            return if failed {
+                Err("Debug peer request failed; process stopped.".into())
+            } else {
+                Ok(())
+            };
+        }
     }
     Ok(())
 }
@@ -144,18 +347,45 @@ fn send(output: &mut impl Write, response: WorkerResponse) -> Result<(), String>
         limit: Some(limit),
         ..Default::default()
     };
+    let response_id = response.id;
     if serde_json::to_writer(&mut encoded, &response).is_err() {
         encoded.bytes.clear();
-        let fallback = WorkerResponse {
-            id: response.id,
-            response: Response::Error {
+        let response = if let Response::PreparedDecompile {
+            address,
+            text,
+            mappings,
+            semantics,
+            ..
+        } = response.response
+        {
+            Response::Decompiled {
+                address,
+                text,
+                mappings,
+                semantics,
+            }
+        } else {
+            Response::Error {
                 message: format!(
                     "Analysis response exceeds its {limit}-byte protocol limit; narrow the requested analysis."
                 ),
-            },
+            }
         };
-        serde_json::to_writer(&mut encoded, &fallback)
-            .map_err(|e| format!("Worker error response encoding failed: {e}"))?;
+        let fallback = WorkerResponse {
+            id: response_id,
+            response,
+        };
+        if serde_json::to_writer(&mut encoded, &fallback).is_err() {
+            encoded.bytes.clear();
+            let fallback = WorkerResponse {
+                id: response_id,
+                response: Response::Error {
+                    message: "Analysis response exceeds its protocol limit.".into(),
+                },
+            };
+            serde_json::to_writer(&mut encoded, &fallback)
+                .map_err(|e| format!("Worker error response encoding failed: {e}"))?;
+        }
     }
     encoding.finish(encoded.bytes.len() as u64);
     let _writing = crate::performance::span("reply_write_flush");
@@ -283,6 +513,22 @@ mod tests {
             executable: true,
         };
         assert!(reply(Response::Opened {
+            debug: Some(crate::debug_info::DebugSummary {
+                state: "a".repeat(96),
+                functions: crate::model::MAX_FUNCTIONS,
+                format: crate::debug_info::DebugFormat::Dwarf,
+                status: crate::debug_info::DebugStatus::Partial,
+                source: Some(crate::debug_info::companion::DebugSource {
+                    path: "x".repeat(4096),
+                    uuid: "f".repeat(32),
+                    sha256: "f".repeat(64),
+                    identity: Some(FileIdentity {
+                        device: u64::MAX,
+                        inode: u64::MAX,
+                        inode_high: u64::MAX
+                    }),
+                })
+            }),
             macho_legacy: Some(crate::model::MachoLegacySections {
                 indices: (0..crate::model::MAX_SECTIONS).collect(),
                 entry: u64::MAX,
@@ -325,6 +571,7 @@ mod tests {
             WorkerRequest {
                 id: 1,
                 request: Request::Open {
+                    debug: Default::default(),
                     path: binary.to_string_lossy().into_owned(),
                 },
             },
@@ -345,7 +592,14 @@ mod tests {
             .map(|request| format!("{}\n", serde_json::to_string(request).unwrap()))
             .collect::<String>();
         let mut output = Vec::new();
-        protocol(io::Cursor::new(input), &mut output, false).unwrap();
+        protocol(
+            BufReader::new(io::Cursor::new(input)),
+            &mut output,
+            false,
+            Role::Primary,
+            false,
+        )
+        .unwrap();
         let replies: Vec<WorkerResponse> = output
             .split(|byte| *byte == b'\n')
             .filter(|line| !line.is_empty())
@@ -416,12 +670,14 @@ mod tests {
             WorkerRequest {
                 id: 1,
                 request: Request::Open {
+                    debug: Default::default(),
                     path: path.to_string_lossy().into_owned(),
                 },
             },
             WorkerRequest {
                 id: 2,
                 request: Request::Open {
+                    debug: Default::default(),
                     path: "/nonexistent/ghidra-rust-state-test".into(),
                 },
             },
@@ -438,7 +694,14 @@ mod tests {
             .map(|r| format!("{}\n", serde_json::to_string(r).unwrap()))
             .collect::<String>();
         let mut output = Vec::new();
-        protocol(io::Cursor::new(input), &mut output, false).unwrap();
+        protocol(
+            BufReader::new(io::Cursor::new(input)),
+            &mut output,
+            false,
+            Role::Primary,
+            false,
+        )
+        .unwrap();
         let responses: Vec<WorkerResponse> = output
             .split(|byte| *byte == b'\n')
             .filter(|line| !line.is_empty())
@@ -457,12 +720,75 @@ mod tests {
         let mut output = Vec::new();
         let input = vec![b'x'; 70 * 1024];
         assert!(
-            protocol(io::Cursor::new(input), &mut output, false)
-                .unwrap_err()
-                .contains("Oversized")
+            protocol(
+                BufReader::new(io::Cursor::new(input)),
+                &mut output,
+                false,
+                Role::Primary,
+                false,
+            )
+            .unwrap_err()
+            .contains("Oversized")
         );
         let response: WorkerResponse = serde_json::from_slice(&output).unwrap();
         assert!(matches!(response.response, Response::Error { .. }));
+    }
+
+    fn run(role: Role, input: &str) -> (Result<(), String>, Vec<WorkerResponse>) {
+        let mut output = Vec::new();
+        let result = protocol(
+            BufReader::new(io::Cursor::new(input.as_bytes().to_vec())),
+            &mut output,
+            false,
+            role,
+            false,
+        );
+        let replies = output
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
+        (result, replies)
+    }
+
+    /// A debug peer accepts only Open, then replay, then one render; any
+    /// other request ends the process after one error reply. A primary
+    /// refuses the peer-only render and continues.
+    #[test]
+    fn worker_roles_enforce_the_debug_peer_state_machine() {
+        let render = r#"{"id":2,"request":{"kind":"render_debug_once","job":{"ticket":{"nonce":1,"logical_id":1,"book_version":1},"address":4096,"remaining_ms":1000,"renames":[],"binding":{"program":"","context":"","baseline":"","facts":""},"target_work":true,"graph_prepared":false,"callees":[],"seed":{"states":[],"large":[]}}}}"#;
+        let (result, replies) = run(Role::Primary, &format!("{render}\n"));
+        assert!(result.is_ok());
+        assert!(
+            matches!(&replies[0].response, Response::Error { message } if message.contains("Only a debug peer"))
+        );
+        // Before Open, analysis and render requests stop a peer.
+        for line in [
+            render,
+            r#"{"id":2,"request":{"kind":"graph","address":4096}}"#,
+        ] {
+            let (result, replies) = run(Role::Peer, &format!("{line}\n{line}\n"));
+            assert!(result.is_err(), "{line}");
+            assert_eq!(replies.len(), 1, "the process stops after one error");
+            assert!(matches!(replies[0].response, Response::Error { .. }));
+        }
+        // A malformed line stops a peer instead of being skipped.
+        let (result, replies) = run(Role::Peer, "{\n");
+        assert!(result.is_err());
+        assert_eq!(replies.len(), 1);
+    }
+
+    #[test]
+    fn pending_input_counts_buffered_requests() {
+        let mut input = BufReader::new(io::Cursor::new(b"one\ntwo\n".to_vec()));
+        assert!(!input_pending(&input, false));
+        let mut line = String::new();
+        input.read_line(&mut line).unwrap();
+        // The second, pipelined request is already buffered.
+        assert!(input_pending(&input, false));
+        line.clear();
+        input.read_line(&mut line).unwrap();
+        assert!(!input_pending(&input, false));
     }
 
     #[test]
@@ -473,7 +799,14 @@ mod tests {
             "{\"id\":9,\"request\":{\"kind\":\"open\",\"path\":\"/nonexistent/ghidra-rust-binary\"}}\n",
         );
         let mut output = Vec::new();
-        protocol(io::Cursor::new(input), &mut output, false).unwrap();
+        protocol(
+            BufReader::new(io::Cursor::new(input)),
+            &mut output,
+            false,
+            Role::Primary,
+            false,
+        )
+        .unwrap();
         let responses: Vec<WorkerResponse> = String::from_utf8(output)
             .unwrap()
             .lines()
@@ -488,5 +821,18 @@ mod tests {
                 .iter()
                 .all(|r| matches!(r.response, Response::Error { .. }))
         );
+    }
+
+    /// A distributed worker refuses every fault hook before it starts.
+    #[cfg(not(feature = "test-hooks"))]
+    #[test]
+    fn distributed_worker_rejects_the_fault_hook() {
+        for kind in ["stall", "abort", "prepare-exit", "prepare-exit-always"] {
+            let argument = format!("{FAULT_ARGUMENT}{kind}@0x1000");
+            assert_eq!(
+                run_worker_with([std::ffi::OsString::from(argument)]),
+                Err("Unexpected analysis worker argument".into())
+            );
+        }
     }
 }

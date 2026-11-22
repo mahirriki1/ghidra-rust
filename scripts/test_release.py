@@ -440,5 +440,216 @@ class PackageVerificationTests(unittest.TestCase):
             assets.verify(self.root, self.version)
 
 
+package_spec = importlib.util.spec_from_file_location("package_linux", SCRIPTS / "package-linux.py")
+packager = importlib.util.module_from_spec(package_spec)
+package_spec.loader.exec_module(packager)
+
+
+class LinuxPackagingSelectionTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name) / "target dïr"
+
+    def pair(self, directory, members=packager.MEMBERS):
+        directory.mkdir(parents=True, exist_ok=True)
+        for member in members:
+            (directory / member).write_bytes(b"\x7fELF")
+        return directory
+
+    def stub(self, body):
+        path = Path(self.temporary.name) / "probe stub"
+        path.write_text("#!/bin/sh\n" + body + "\n")
+        path.chmod(0o755)
+        return path
+
+    def test_refusal_probe_requires_a_nonzero_exit_and_the_exact_diagnostic(self):
+        script = 'test "$1 $2" = "--analysis-worker --test-debug-fault=stall@0x0" || exit 9\n'
+        packager.assert_refuses_test_hooks(self.stub(script + 'echo "Unexpected analysis worker argument" >&2; exit 1'))
+        packager.assert_refuses_test_hooks(self.stub(script + 'printf "Unexpected analysis worker argument\\r\\n" >&2; exit 1'))
+        cases = {
+            "exit 0": "exited successfully",
+            'echo "Unexpected analysis worker argument" >&2; exit 0': "exited successfully",
+            'echo "Error: Unexpected analysis worker argument" >&2; exit 1': "without the refusal",
+            'echo "Unexpected analysis worker argument"; exit 1': "without the refusal",
+            'echo "Cannot raise the address-space limit" >&2; exit 1': "without the refusal",
+            'echo "Unexpected analysis worker argument" >&2; kill -KILL $$': "signal 9",
+        }
+        for body, reason in cases.items():
+            with self.subTest(body=body), self.assertRaisesRegex(ValueError, f"Staged probe stub .*{reason}"):
+                packager.assert_refuses_test_hooks(self.stub(script + body))
+
+    def test_refusal_probe_fails_on_timeout_or_start_failure(self):
+        timeout = packager.HOOK_PROBE_TIMEOUT
+        packager.HOOK_PROBE_TIMEOUT = 0.5
+        self.addCleanup(setattr, packager, "HOOK_PROBE_TIMEOUT", timeout)
+        with self.assertRaisesRegex(ValueError, "did not refuse .* within"):
+            packager.assert_refuses_test_hooks(self.stub("exec sleep 30"))
+        with self.assertRaisesRegex(ValueError, "could not run the test-hook probe"):
+            packager.assert_refuses_test_hooks(Path(self.temporary.name) / "missing")
+
+    def test_target_root_prefers_argument_then_environment_then_metadata(self):
+        self.assertEqual(packager.target_root("/a", "/b", "/c"), Path("/a"))
+        self.assertEqual(packager.target_root(None, "/b", "/c"), Path("/b"))
+        self.assertEqual(packager.target_root("", "", "/c"), Path("/c"))
+        # Relative overrides follow Cargo: the current directory, not the repository.
+        previous = os.getcwd()
+        os.chdir(self.temporary.name)
+        try:
+            self.assertEqual(packager.target_root(None, "relative", "/c"),
+                             Path(os.path.abspath("relative")))
+            self.assertEqual(packager.target_root("relative", None, "/c"),
+                             Path(os.path.abspath("relative")))
+        finally:
+            os.chdir(previous)
+        self.assertNotEqual(Path(self.temporary.name).resolve(), packager.ROOT.resolve())
+
+    def test_release_pair_comes_from_one_layout(self):
+        host = self.root / "release"
+        native = self.root / packager.TARGET / "release"
+        with self.assertRaisesRegex(ValueError, "No complete release pair"):
+            packager.select_release(self.root, None)
+        self.pair(native, ["ghidra-rust"])
+        self.pair(host)
+        # A partial native pair is never combined with the host pair.
+        self.assertEqual(packager.select_release(self.root, None), host)
+        with self.assertRaisesRegex(ValueError, "missing: .*ghidra-rust-headless"):
+            packager.select_release(self.root, packager.TARGET)
+        self.pair(native)
+        with self.assertRaisesRegex(ValueError, "Both .* hold a release pair"):
+            packager.select_release(self.root, None)
+        self.assertEqual(packager.select_release(self.root, "host"), host)
+        self.assertEqual(packager.select_release(self.root, packager.TARGET), native)
+        (host / "ghidra-rust-headless").unlink()
+        self.assertEqual(packager.select_release(self.root, None), native)
+        with self.assertRaisesRegex(ValueError, "Unsupported packaging target"):
+            packager.select_release(self.root, "aarch64-unknown-linux-gnu")
+
+    def test_cargo_artifacts_select_the_built_pair(self):
+        def artifact(name, path, manifest=packager.ROOT / "Cargo.toml", kind="bin"):
+            return json.dumps({"reason": "compiler-artifact", "manifest_path": str(manifest),
+                               "target": {"kind": [kind], "name": name}, "executable": str(path)})
+        native = self.root / packager.TARGET / "release"
+        messages = "\n".join([
+            json.dumps({"reason": "build-script-executed"}),
+            artifact("ghidra-rust", self.root / "elsewhere/ghidra-rust", manifest=Path("/other/Cargo.toml")),
+            artifact("ghidra-rust", native / "ghidra-rust"),
+            artifact("ghidra-rust-headless", native / "ghidra-rust-headless"),
+            json.dumps({"reason": "build-finished", "success": True}),
+        ])
+        self.assertEqual(packager.select_from_artifacts(messages), (self.root, packager.TARGET))
+        host = self.root / "release"
+        flat = artifact("ghidra-rust", host / "ghidra-rust") + "\n" + artifact(
+            "ghidra-rust-headless", host / "ghidra-rust-headless")
+        self.assertEqual(packager.select_from_artifacts(flat), (self.root, "host"))
+        mixed = artifact("ghidra-rust", host / "ghidra-rust") + "\n" + artifact(
+            "ghidra-rust-headless", native / "ghidra-rust-headless")
+        with self.assertRaisesRegex(ValueError, "different directories"):
+            packager.select_from_artifacts(mixed)
+        with self.assertRaisesRegex(ValueError, "did not report .*ghidra-rust-headless"):
+            packager.select_from_artifacts(artifact("ghidra-rust", host / "ghidra-rust"))
+
+
+# Opt-in: directories holding real release pairs built with and without
+# `--features test-hooks`. The pairs are copied into private roots.
+HOOKED_RELEASE = os.environ.get("GHIDRA_RUST_TEST_HOOKED_RELEASE")
+CLEAN_RELEASE = os.environ.get("GHIDRA_RUST_TEST_CLEAN_RELEASE")
+
+
+@unittest.skipUnless(HOOKED_RELEASE and CLEAN_RELEASE and sys.platform == "linux",
+                     "set GHIDRA_RUST_TEST_HOOKED_RELEASE and GHIDRA_RUST_TEST_CLEAN_RELEASE")
+class LinuxPackagingGateTests(unittest.TestCase):
+    """Runs the real packager on real release pairs in private roots whose
+    paths contain spaces and non-ASCII characters."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="package gäte ")
+        self.addCleanup(self.temporary.cleanup)
+        self.base = Path(self.temporary.name)
+        self.hooked = Path(HOOKED_RELEASE)
+        self.clean = Path(CLEAN_RELEASE)
+
+    def place(self, root, layout, desktop, headless):
+        release = root / "release" if layout == "host" else root / packager.TARGET / "release"
+        release.mkdir(parents=True, exist_ok=True)
+        for source, name in ((desktop, "ghidra-rust"), (headless, "ghidra-rust-headless")):
+            shutil.copy2(source / name, release / name)
+        return root
+
+    def package(self, *arguments, env=None):
+        environment = {k: v for k, v in os.environ.items()
+                       if k not in ("CARGO_TARGET_DIR", "CARGO_BUILD_TARGET", "CARGO_BUILD_TARGET_DIR")}
+        environment.update(env or {})
+        return subprocess.run([sys.executable, str(SCRIPTS / "package-linux.py"), *arguments],
+                              cwd=self.base, env=environment, capture_output=True, text=True)
+
+    def public(self, root):
+        dist = root / "dist"
+        return {p.name: p.read_bytes() for p in dist.iterdir()} if dist.is_dir() else {}
+
+    def assert_published(self, root):
+        dist = root / "dist"
+        names = sorted(p.name for p in dist.iterdir())
+        self.assertFalse([n for n in names if n.startswith(".package-")], names)
+        [archive] = [dist / n for n in names if n.endswith(".tar.gz")]
+        standalone = dist / archive.name[:-len(".tar.gz")]
+        for file in (archive, standalone):
+            digest = hashlib.sha256(file.read_bytes()).hexdigest()
+            self.assertEqual((dist / (file.name + ".sha256")).read_text(), f"{digest}  {file.name}\n")
+        with tarfile.open(archive) as members:
+            desktop = members.extractfile(f"{standalone.name}/ghidra-rust").read()
+            members.extractfile(f"{standalone.name}/ghidra-rust-headless").read()
+        self.assertEqual(hashlib.sha256(desktop).digest(), hashlib.sha256(standalone.read_bytes()).digest())
+
+    def test_hooked_members_fail_on_the_named_staged_executable(self):
+        root = self.base / "röot one"
+        self.place(root, "host", self.clean, self.clean)
+        self.assertEqual(self.package("--target-directory", str(root)).returncode, 0)
+        previous = self.public(root)
+        for desktop, headless, named in ((self.hooked, self.hooked, "ghidra-rust"),
+                                         (self.clean, self.hooked, "ghidra-rust-headless"),
+                                         (self.hooked, self.clean, "ghidra-rust")):
+            with self.subTest(desktop=desktop.name, headless=headless.name):
+                self.place(root, "host", desktop, headless)
+                result = self.package("--target-directory", str(root))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"Staged {named} failed the test-hook refusal gate", result.stderr)
+                self.assertEqual(self.public(root), previous)
+
+    def test_clean_pair_is_packaged_from_the_requested_root_and_layout(self):
+        root = self.base / "röot two"
+        decoy = self.base / "decöy"
+        self.place(root, packager.TARGET, self.clean, self.clean)
+        # Decoys: a hooked pair in the other layout and under the environment.
+        self.place(root, "host", self.hooked, self.hooked)
+        self.place(decoy, "host", self.hooked, self.hooked)
+        ambiguous = self.package("--target-directory", str(root))
+        self.assertNotEqual(ambiguous.returncode, 0)
+        self.assertIn("hold a release pair", ambiguous.stderr)
+        result = self.package("--target-directory", str(root), "--target", packager.TARGET,
+                              env={"CARGO_TARGET_DIR": str(decoy), "CARGO_BUILD_TARGET": "host"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_published(root)
+        self.assertFalse((decoy / "dist").exists())
+        # The environment, then Cargo config, select the root when no argument does.
+        for env in ({"CARGO_TARGET_DIR": str(root), "CARGO_BUILD_TARGET": packager.TARGET},
+                    {"CARGO_BUILD_TARGET_DIR": str(root), "CARGO_BUILD_TARGET": packager.TARGET}):
+            with self.subTest(env=sorted(env)):
+                result = self.package(env=env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assert_published(root)
+
+    def test_missing_second_member_fails_without_combining_layouts(self):
+        root = self.base / "röot three"
+        self.place(root, "host", self.clean, self.clean)
+        native = root / packager.TARGET / "release"
+        native.mkdir(parents=True)
+        shutil.copy2(self.clean / "ghidra-rust", native / "ghidra-rust")
+        result = self.package("--target-directory", str(root), "--target", packager.TARGET)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing", result.stderr)
+        self.assertFalse((root / "dist").exists() and any((root / "dist").iterdir()))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -174,27 +174,155 @@ def checksum(path):
     path.with_name(path.name + ".sha256").write_text(f"{digest.hexdigest()}  {path.name}\n", encoding="utf-8")
 
 
+# The test-only worker fault hook (`--features test-hooks`) must never ship.
+# A distributed worker refuses it as an unknown argument before startup.
+HOOK_PROBE = ("--analysis-worker", "--test-debug-fault=stall@0x0")
+HOOK_REFUSAL = "Unexpected analysis worker argument"
+HOOK_PROBE_TIMEOUT = 15
+MEMBERS = ("ghidra-rust", "ghidra-rust-headless")
+HOST_LAYOUT = "host"
+
+
+def assert_refuses_test_hooks(path):
+    """Run a staged executable in worker mode with a valid fault argument and
+    require the distributed refusal: a normal nonzero exit and the exact
+    diagnostic line. Anything else (acceptance, a signal, a timeout, a start
+    failure or an unrelated error) fails packaging."""
+    path = Path(path).absolute()
+    try:
+        result = subprocess.run([str(path), *HOOK_PROBE], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                timeout=HOOK_PROBE_TIMEOUT, check=False)
+    except subprocess.TimeoutExpired as error:
+        raise ValueError(f"Staged {path.name} did not refuse the test-only worker fault hook "
+                         f"within {HOOK_PROBE_TIMEOUT} s") from error
+    except OSError as error:
+        raise ValueError(f"Staged {path.name} could not run the test-hook probe: {error}") from error
+    lines = [line.rstrip("\r") for line in result.stderr.decode("utf-8", "replace").split("\n")]
+    if result.returncode < 0:
+        reason = f"it was stopped by signal {-result.returncode}"
+    elif result.returncode == 0:
+        reason = "it exited successfully, so the fault hook may have been accepted"
+    elif HOOK_REFUSAL not in lines:
+        detail = next((line.strip() for line in reversed(lines) if line.strip()), "no diagnostic")
+        reason = f"it exited {result.returncode} without the refusal ({detail[:200]})"
+    else:
+        return
+    raise ValueError(f"Staged {path.name} failed the test-hook refusal gate: {reason}")
+
+
+def target_root(explicit, environment, metadata_directory):
+    """The Cargo target directory: an explicit argument, then a nonempty
+    CARGO_TARGET_DIR, then Cargo metadata (which includes Cargo config).
+    Relative overrides resolve against the current directory, as Cargo
+    resolves CARGO_TARGET_DIR."""
+    for value in (explicit, environment):
+        if value:
+            return Path(os.path.abspath(value))
+    return Path(os.path.abspath(metadata_directory))
+
+
+def release_directory(root, selector):
+    if selector == HOST_LAYOUT:
+        return root / "release"
+    if selector == TARGET:
+        return root / TARGET / "release"
+    raise ValueError(f"Unsupported packaging target {selector!r}; use {TARGET} or {HOST_LAYOUT}")
+
+
+def has_member(directory, member):
+    path = directory / member
+    return path.is_file() and not path.is_symlink()
+
+
+def select_release(root, selector):
+    """One release directory holding both executables. A selector names one
+    layout; without one, the sole complete pair of the host and native-triple
+    layouts is used. Members are never combined across layouts."""
+    if selector:
+        directory = release_directory(root, selector)
+        for member in MEMBERS:
+            if not has_member(directory, member):
+                raise ValueError(f"Release executable is missing: {directory / member}")
+        return directory
+    candidates = [release_directory(root, layout) for layout in (HOST_LAYOUT, TARGET)]
+    complete = [d for d in candidates if all(has_member(d, member) for member in MEMBERS)]
+    if len(complete) == 1:
+        return complete[0]
+    if complete:
+        raise ValueError(f"Both {complete[0]} and {complete[1]} hold a release pair; pass "
+                         f"--target {HOST_LAYOUT} or --target {TARGET} to select one")
+    raise ValueError(f"No complete release pair ({', '.join(MEMBERS)}) under {candidates[0]} "
+                     f"or {candidates[1]}; run cargo build --release --locked --bins first")
+
+
+def select_from_artifacts(messages):
+    """The target root and layout selector of the release pair a Cargo build
+    just produced, from its JSON compiler-artifact messages. Both bin targets
+    of this package must come from one profile directory."""
+    executables = {}
+    for line in messages.splitlines():
+        if not line.startswith("{"):
+            continue
+        message = json.loads(line)
+        if (message.get("reason") != "compiler-artifact"
+                or Path(message.get("manifest_path", "")) != ROOT / "Cargo.toml"
+                or "bin" not in message.get("target", {}).get("kind", ())
+                or message["target"].get("name") not in MEMBERS
+                or not message.get("executable")):
+            continue
+        name = message["target"]["name"]
+        if name in executables and executables[name] != Path(message["executable"]):
+            raise ValueError(f"Cargo reported two {name} executables")
+        executables[name] = Path(message["executable"])
+    missing = [member for member in MEMBERS if member not in executables]
+    if missing:
+        raise ValueError(f"Cargo did not report the release executables: {', '.join(missing)}")
+    directories = {executables[member].parent for member in MEMBERS}
+    if len(directories) != 1:
+        raise ValueError(f"The release executables were built in different directories: {sorted(map(str, directories))}")
+    release = directories.pop()
+    if release.name != "release":
+        raise ValueError(f"The executables are not in a release profile directory: {release}")
+    if release.parent.name == TARGET:
+        return release.parent.parent, TARGET
+    return release.parent, HOST_LAYOUT
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--target-directory", default=os.environ.get("CARGO_TARGET_DIR"))
+    parser.add_argument("--target-directory",
+                        help="Cargo target directory (default: CARGO_TARGET_DIR, then Cargo metadata)")
+    parser.add_argument("--target",
+                        help=f"release layout: {TARGET} (TARGET/release) or {HOST_LAYOUT} (release)")
+    parser.add_argument("--cargo-artifacts", type=Path,
+                        help="JSON messages of the release build to package (selects its root and layout)")
     args = parser.parse_args()
-    if sys.platform != "linux" or os.environ.get("CARGO_BUILD_TARGET", TARGET) != TARGET:
+    if args.cargo_artifacts:
+        if args.target_directory or args.target:
+            raise ValueError("--cargo-artifacts already selects the target directory and layout")
+        args.target_directory, args.target = select_from_artifacts(
+            args.cargo_artifacts.read_text(encoding="utf-8"))
+    # The option takes precedence over the environment's build target.
+    selector = args.target or os.environ.get("CARGO_BUILD_TARGET") or None
+    if sys.platform != "linux":
         raise ValueError(f"Package natively on Linux with the {TARGET} toolchain and build target")
+    if selector not in (None, TARGET, HOST_LAYOUT):
+        raise ValueError(f"Unsupported packaging target {selector!r}; use {TARGET} or {HOST_LAYOUT}")
     for command in ("cargo", "rustc", "strip", "readelf"):
         if not shutil.which(command):
             raise ValueError(f"Required build tool is missing: {command}")
     compiler = run("rustc", "-vV").strip()
     if f"host: {TARGET}" not in compiler.splitlines():
         raise ValueError(f"Use the native {TARGET} Rust toolchain")
-    env = os.environ.copy()
-    if args.target_directory:
-        env["CARGO_TARGET_DIR"] = str((ROOT / args.target_directory).absolute())
-    metadata = json.loads(run("cargo", "metadata", "--locked", "--format-version", "1", "--filter-platform", TARGET, env=env))
+    metadata = json.loads(run("cargo", "metadata", "--locked", "--format-version", "1", "--filter-platform", TARGET))
     application = next(p for p in metadata["packages"] if Path(p["manifest_path"]) == ROOT / "Cargo.toml")
-    target = Path(metadata["target_directory"])
-    executable = target / TARGET / "release/ghidra-rust" if os.environ.get("CARGO_BUILD_TARGET") else target / "release/ghidra-rust"
-    executable = package_file(executable.parent, executable.name)
+    target = target_root(args.target_directory, os.environ.get("CARGO_TARGET_DIR"), metadata["target_directory"])
+    release = select_release(target, selector)
+    executable = package_file(release, "ghidra-rust")
+    headless = package_file(release, "ghidra-rust-headless")
     assert_executable(executable)
+    assert_executable(headless)
     name = f'ghidra-rust-{application["version"]}-linux-x64'
     if not SAFE_NAME.fullmatch(name):
         raise ValueError("Application version cannot be used safely in an archive filename")
@@ -204,17 +332,15 @@ def main():
         staging = Path(temporary)
         bundle = staging / name
         bundled_binary = bundle / "ghidra-rust"
-        copy_file(executable, bundled_binary)
-        run("strip", "--strip-unneeded", str(bundled_binary))
-        bundled_binary.chmod(0o755)
-        assert_executable(bundled_binary)
-        headless = package_file(executable.parent, "ghidra-rust-headless")
-        assert_executable(headless)
         bundled_headless = bundle / "ghidra-rust-headless"
-        copy_file(headless, bundled_headless)
-        run("strip", "--strip-unneeded", str(bundled_headless))
-        bundled_headless.chmod(0o755)
-        assert_executable(bundled_headless)
+        for source, staged in ((executable, bundled_binary), (headless, bundled_headless)):
+            copy_file(source, staged)
+            run("strip", "--strip-unneeded", str(staged))
+            staged.chmod(0o755)
+            assert_executable(staged)
+        # Probe the exact staged bytes that are archived and published.
+        for staged in (bundled_binary, bundled_headless):
+            assert_refuses_test_hooks(staged)
         write_json(bundle / "HEADLESS-BUILD-INFO.json", build_info(bundled_headless, compiler, headless=True))
         for relative in ("README.md", "LICENSE", "NOTICE", "docs/releases.md", "docs/crypto-signatures.md", "docs/architectures.md", "docs/headless.md"):
             copy_file(package_file(ROOT, relative), bundle / relative)

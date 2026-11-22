@@ -95,6 +95,7 @@ fn stripped_pe_runtime_functions_load_without_explicit_discovery() {
     let Response::Opened { info, .. } = request(
         &mut worker,
         Request::Open {
+            debug: Default::default(),
             path: binary.to_string_lossy().into_owned(),
         },
     ) else {
@@ -140,6 +141,7 @@ fn real_windows_worker_and_embedded_project_round_trip() {
     let Response::Opened { info, .. } = request(
         &mut worker,
         Request::Open {
+            debug: Default::default(),
             path: binary.to_string_lossy().into_owned(),
         },
     ) else {
@@ -349,6 +351,10 @@ fn real_windows_worker_and_embedded_project_round_trip() {
         },
     );
     let mut project = ProjectData {
+        debug_source: None,
+        debug_state: String::new(),
+        use_debug_info: true,
+        debug_skip: Vec::new(),
         function_results: vec![additional],
         semantics,
         info,
@@ -438,6 +444,7 @@ fn real_windows_worker_and_embedded_project_round_trip() {
     let Response::Opened { info: fresh, .. } = request(
         &mut reopened,
         Request::Open {
+            debug: Default::default(),
             path: extracted.to_string_lossy().into_owned(),
         },
     ) else {
@@ -545,6 +552,7 @@ fn open_names(
     let response = request(
         &mut worker,
         Request::Open {
+            debug: Default::default(),
             path: binary.to_string_lossy().into_owned(),
         },
     );
@@ -846,6 +854,7 @@ fn windows_memory_search_uses_the_contained_worker_and_original_markers() {
     let Response::Opened { info, .. } = request(
         &mut worker,
         Request::Open {
+            debug: Default::default(),
             path: binary.to_string_lossy().into_owned(),
         },
     ) else {

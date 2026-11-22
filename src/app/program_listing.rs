@@ -1384,7 +1384,7 @@ impl DesktopApp {
             let decompile = |request: &Request| {
                 matches!(request, Request::Decompile { address: a } if *a == address)
             };
-            self.queue.iter().any(decompile)
+            self.queue.iter().any(|queued| decompile(queued))
                 || self.pending.as_ref().is_some_and(|p| decompile(&p.request))
         });
         self.program_scope()
@@ -2268,7 +2268,7 @@ mod tests {
         assert!(
             app.queue
                 .iter()
-                .any(|request| matches!(request, Request::Graph { address: 0x1040 }))
+                .any(|request| matches!(request.request, Request::Graph { address: 0x1040 }))
         );
         assert_eq!(app.program.reveal, Some(Reveal::Entry(0x1040)));
     }
@@ -2439,11 +2439,11 @@ mod tests {
         app.settle_graph();
         assert_eq!(app.view().map(|view| view.address), Some(0x1040));
         assert!(matches!(
-            app.queue.front(),
+            app.queue.front().map(|queued| &queued.request),
             Some(Request::Decompile { address: 0x1040 })
         ));
         assert!(!app.listing_may_dispatch(), "decompilation goes next");
-        let request = app.queue.pop_front().unwrap();
+        let request = app.queue.pop_front().unwrap().request;
         app.pending = Some(function_pending(&app, request, 0x1040));
         assert!(!app.listing_may_dispatch());
         let pending = app.pending.take().unwrap();
@@ -2651,6 +2651,12 @@ mod tests {
             );
         };
         crash(&mut app, vec![0x1040, 0x1080, 0x10c0]);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while app.file_job.is_some() {
+            assert!(Instant::now() < deadline);
+            app.poll_files(&context);
+            std::thread::sleep(Duration::from_millis(1));
+        }
         assert_eq!(app.discovery_resumes, 0);
         let current = app.results.current_context().unwrap().clone();
         for entry in [0x1040, 0x1080, 0x10c0] {
@@ -2862,7 +2868,7 @@ mod tests {
         h.app.pending = None;
         h.app
             .queue
-            .push_back(Request::Decompile { address: 0x1000 });
+            .push_back(Request::Decompile { address: 0x1000 }.into());
         assert_eq!(h.app.next_listing_page(), None);
         h.app.queue.clear();
         h.app.discovery_bytes = Some((
@@ -2918,7 +2924,7 @@ mod tests {
             h.app
                 .queue
                 .iter()
-                .any(|request| matches!(request, Request::Graph { address: 0x1040 }))
+                .any(|request| matches!(request.request, Request::Graph { address: 0x1040 }))
         );
         // A Hex read the user starts meanwhile waits for the page and is
         // dispatched still current once the page arrives.

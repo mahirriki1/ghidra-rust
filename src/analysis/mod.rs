@@ -16,12 +16,15 @@ use crate::model::*;
 mod cfg;
 mod function_candidates;
 pub(crate) mod linkage;
+#[doc(hidden)]
+pub mod managed;
 mod patterns;
 mod pointers;
 mod search;
 mod strings;
 
 use cfg::*;
+use managed::Report;
 use strings::*;
 
 const MAX_INSTRUCTIONS: usize = 2048;
@@ -94,6 +97,542 @@ pub struct LoadedProgram {
     applied_signatures: BTreeSet<u64>,
     signature_state: Option<String>,
     analysis_started: bool,
+    debug: crate::debug_info::DebugIndex,
+    /// Recent graphs' call hints.
+    debug_calls: VecDeque<(u64, CallHints)>,
+    /// Callees too large (or too irregular) to probe for another render.
+    debug_large: BTreeSet<u64>,
+    /// Client-chosen functions rendered without any debug prototype.
+    debug_skip: BTreeSet<u64>,
+    /// Functions whose render failed with debug prototypes installed.
+    debug_failed: BTreeSet<u64>,
+    /// While a debug render runs: callees it found too large to probe.
+    debug_large_journal: Option<Vec<u64>>,
+    /// Verified final renders; see [`ResultCache`].
+    results: ResultCache,
+    /// Changes whenever names, signatures, inventory or discovery may have
+    /// changed what a render prints.
+    result_epoch: u64,
+    /// The last managed request's unconsumed offer; see [`managed`].
+    pending_debug: Option<managed::Pending>,
+    /// Nonces of managed offers, never reused within this worker.
+    debug_nonce: u64,
+    debug_inventory_digest: Option<String>,
+    debug_program_digest: Option<String>,
+    debug_long_names: BTreeMap<u64, String>,
+    debug_long_names_complete: bool,
+}
+
+/// Callees above this many instructions are never probed for another
+/// function's render; their own render decides them.
+const PROBE_CALLEE_INSTRUCTIONS: usize = 1024;
+/// Probe allowance relative to the rendered function, so evidence for its
+/// callees costs a fraction of the render itself. The floor lets small
+/// callers cover their typical direct callees; at 64 instructions about a
+/// fifth of libfprint renders left a callee unverified.
+const PROBE_MIN_INSTRUCTIONS: usize = 512;
+const PROBE_MAX_INSTRUCTIONS: usize = 4096;
+const PROBE_MAX_COUNT: usize = 32;
+/// Debug-prototype work for one Decompile is optional. The worker first
+/// renders the function exactly as without debug info (the reference),
+/// with nothing else running. Only then, on a single-threaded Linux worker,
+/// does one disposable child try callee and target debug prototypes; the
+/// request publishes the child's result if it arrives and is valid by the
+/// optional cutoff, and the reference with a warning otherwise. The cutoff
+/// is the earlier of this point after dispatch and the reference's end plus
+/// `OPTIONAL_RATIO` times its duration (at least `OPTIONAL_FLOOR`).
+const DEBUG_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(crate::model::WORKER_REQUEST_TIMEOUT.as_secs() - 3);
+const OPTIONAL_RATIO: u32 = 3;
+const OPTIONAL_FLOOR: std::time::Duration = std::time::Duration::from_secs(3);
+/// CPU the worker keeps for decoding, validating and publishing a reply
+/// after optional work; the optional child never starts with less left.
+const PUBLICATION_RESERVE: std::time::Duration = std::time::Duration::from_secs(1);
+/// Published when a candidate with callee debug prototypes lost a
+/// corroborated input or call argument of the reference render.
+pub const CALLER_EVIDENCE_WARNING: &str =
+    "Callee debug prototypes omitted because this render lost argument evidence";
+/// Published when the function's own debug prototype lost such evidence.
+pub const OWN_EVIDENCE_WARNING: &str =
+    "Debug prototype omitted because this render lost argument evidence";
+/// Published when debug prototypes could apply but this worker has no
+/// isolated executor for them (Windows and multithreaded workers until the
+/// managed executor is available).
+pub const UNVERIFIED_WARNING: &str = "Debug prototype is unverified";
+pub const CALLEE_UNVERIFIED_WARNING: &str = "Some callee debug prototypes are unverified";
+pub const OPTIONAL_UNAVAILABLE_WARNING: &str =
+    "Debug prototypes not applied: no isolated debug render in this worker";
+/// Published when a sibling's setup used up its allowance before any
+/// optional render; the inferred baseline stands.
+pub const SETUP_CUTOFF_WARNING: &str = "Debug setup timed out";
+/// Wall-clock stop for pathological inputs, far below the worker CPU limit.
+const PROBE_MAX_TIME: std::time::Duration = std::time::Duration::from_secs(2);
+
+struct ProbeBudget {
+    target: u64,
+    instructions: usize,
+    probes: usize,
+    deadline: std::time::Instant,
+}
+impl ProbeBudget {
+    fn for_target(target: u64, instructions: usize) -> Self {
+        Self {
+            target,
+            instructions: (instructions / 2).clamp(PROBE_MIN_INSTRUCTIONS, PROBE_MAX_INSTRUCTIONS),
+            probes: PROBE_MAX_COUNT,
+            deadline: std::time::Instant::now() + PROBE_MAX_TIME,
+        }
+    }
+    fn take_probe(&mut self) -> bool {
+        if self.probes == 0 || self.instructions == 0 || std::time::Instant::now() >= self.deadline
+        {
+            return false;
+        }
+        self.probes -= 1;
+        true
+    }
+}
+
+fn instruction_count(view: &FunctionView) -> usize {
+    view.blocks.iter().map(|b| b.instructions.len()).sum()
+}
+
+/// A function's estimated instruction count and direct call targets.
+type CallHints = (usize, Vec<u64>);
+
+/// Hints from a recovered graph whose walk decoded `decoded` instructions;
+/// the view can omit some of them at its block limit.
+fn call_hints(recovered: &cfg::GraphRecovery, decoded: usize) -> CallHints {
+    (
+        instruction_count(&recovered.view).max(decoded),
+        recovered
+            .view
+            .calls
+            .iter()
+            .filter_map(|c| c.target)
+            .collect(),
+    )
+}
+
+/// One Decompile's debug-prototype work; see [`DEBUG_DEADLINE`].
+struct DebugJob<'a> {
+    address: u64,
+    renames: &'a [crate::semantic::LocalRename],
+    context: &'a str,
+    owned: bool,
+    /// Whether the target's own prototype may be installed or probed.
+    target_work: bool,
+    /// Eligible direct callees the reference render called, sorted.
+    callees: Vec<u64>,
+    /// Facts of the reference render, captured before any lock.
+    reference: Option<&'a crate::debug_info::caller::Facts>,
+}
+
+/// A render's text, mappings, semantics and direct call targets.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Published {
+    pub(crate) text: String,
+    #[serde(deserialize_with = "crate::bounded::vec::<_, _, { crate::model::MAX_CODE_MAPPINGS }>")]
+    pub(crate) mappings: Vec<CodeMapping>,
+    pub(crate) semantics: crate::semantic::SemanticInfo,
+    #[serde(deserialize_with = "crate::bounded::vec::<_, _, { crate::model::MAX_GRAPH_CALLS }>")]
+    pub(crate) calls: Vec<u64>,
+    pub(crate) calls_complete: bool,
+}
+
+/// The owned state of one request between its reference render and its
+/// optional debug render; a managed offer retains it until consumed.
+pub(crate) struct PreparedJob {
+    address: u64,
+    renames: Vec<crate::semantic::LocalRename>,
+    context: String,
+    owned: bool,
+    active: bool,
+    client_skip: bool,
+    engine_failure: bool,
+    cacheable: bool,
+    /// Direct calls of the last displayed graph, when known.
+    cached_hints: Option<Vec<u64>>,
+    target_work: bool,
+    /// Eligible direct callees the reference render called, sorted.
+    callees: Vec<u64>,
+    /// Facts of the reference render, captured before any lock.
+    caller: Option<crate::debug_info::caller::Facts>,
+    /// Whether any optional debug work may change the render.
+    work: bool,
+    started: std::time::Instant,
+    reference_end: std::time::Instant,
+    reference_time: std::time::Duration,
+    /// Trace label when no optional work runs.
+    label: &'static str,
+}
+
+impl PreparedJob {
+    fn job(&self) -> DebugJob<'_> {
+        DebugJob {
+            address: self.address,
+            renames: &self.renames,
+            context: &self.context,
+            owned: self.owned,
+            target_work: self.target_work,
+            callees: self.callees.clone(),
+            reference: self.caller.as_ref(),
+        }
+    }
+}
+
+/// What the final render of one request shows after optional work.
+#[derive(Default)]
+struct Settled {
+    /// A validated candidate replaces the reference.
+    candidate: bool,
+    debug_owned: bool,
+    /// Whether the final render carries the eligible callee prototypes.
+    callees_shown: bool,
+    vetoed: bool,
+    own_vetoed: bool,
+    unavailable: bool,
+    engine_failure: bool,
+}
+
+fn optional_window_available(wall: std::time::Duration, cpu: Option<std::time::Duration>) -> bool {
+    !wall.is_zero() && cpu.is_some_and(|left| left > PUBLICATION_RESERVE)
+}
+
+fn duration_us(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
+/// Clips an oversized render at a character boundary, dropping mappings and
+/// tokens past the cut. Idempotent.
+fn clip(
+    text: &mut String,
+    mappings: &mut Vec<CodeMapping>,
+    semantics: &mut crate::semantic::SemanticInfo,
+) {
+    if text.len() > MAX_DECOMPILED_BYTES {
+        let mut end = MAX_DECOMPILED_BYTES - 100;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        mappings.retain(|mapping| mapping.end <= end);
+        semantics.tokens.retain(|token| token.end <= end);
+        text.push_str(crate::decompile::TRUNCATION_TRAILER);
+    }
+}
+
+/// A final render: debug warnings appended after the engine's and local
+/// warnings (which keep their order), the
+/// prototype's provenance, and clipping.
+pub(crate) fn compose(
+    published: Published,
+    warnings: &[impl AsRef<str>],
+    debug_owned: bool,
+) -> (String, Vec<CodeMapping>, crate::semantic::SemanticInfo) {
+    let Published {
+        mut text,
+        mut mappings,
+        mut semantics,
+        ..
+    } = published;
+    let slots = crate::semantic::MAX_FUNCTION_RENAMES.saturating_sub(semantics.warnings.len());
+    semantics.warnings.extend(
+        warnings
+            .iter()
+            .take(slots)
+            .map(|warning| warning.as_ref().to_owned()),
+    );
+    if debug_owned {
+        semantics.prototype_source = crate::semantic::PrototypeSource::DebugInfo;
+    }
+    clip(&mut text, &mut mappings, &mut semantics);
+    (text, mappings, semantics)
+}
+
+/// Why a debug render left the reference as the result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Unchanged {
+    /// No debug prototype could be installed.
+    NothingInstalled,
+    /// Callee prototypes lost evidence of the reference render.
+    EvidenceLost,
+    /// The function's own prototype lost evidence of the reference render.
+    OwnEvidenceLost,
+}
+
+/// A debug render's result for the worker that started it. Every variant
+/// carries the decision changes it made (target and eligible callees only)
+/// and callees found too large to probe.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum DebugOutcome {
+    Candidate {
+        render: Box<Published>,
+        /// The target's own debug prototype owns this render.
+        target_owns: bool,
+        #[serde(
+            deserialize_with = "crate::bounded::vec::<_, _, { crate::model::MAX_GRAPH_CALLS }>"
+        )]
+        installed_callees: Vec<u64>,
+        /// A callee lock was installed and the caller comparison passed.
+        compared: bool,
+        /// A veto removed callee prototypes from this render.
+        vetoed: bool,
+        #[serde(deserialize_with = "crate::bounded::vec::<_, _, { managed::MAX_JOB_ENTRIES }>")]
+        changes: Vec<crate::debug_info::Change>,
+        #[serde(
+            deserialize_with = "crate::bounded::vec::<_, _, { crate::model::MAX_GRAPH_CALLS }>"
+        )]
+        large: Vec<u64>,
+    },
+    UseReference {
+        reason: Unchanged,
+        #[serde(deserialize_with = "crate::bounded::vec::<_, _, { managed::MAX_JOB_ENTRIES }>")]
+        changes: Vec<crate::debug_info::Change>,
+        #[serde(
+            deserialize_with = "crate::bounded::vec::<_, _, { crate::model::MAX_GRAPH_CALLS }>"
+        )]
+        large: Vec<u64>,
+    },
+    /// The engine failed with debug prototypes installed.
+    Failed {
+        #[serde(deserialize_with = "crate::bounded::vec::<_, _, { managed::MAX_JOB_ENTRIES }>")]
+        changes: Vec<crate::debug_info::Change>,
+        #[serde(
+            deserialize_with = "crate::bounded::vec::<_, _, { crate::model::MAX_GRAPH_CALLS }>"
+        )]
+        large: Vec<u64>,
+    },
+}
+
+/// Test hook: a disposable debug render never finishes, so each request
+/// takes the expiry path deterministically. A hexadecimal address limits
+/// the stall to that target.
+fn debug_render_stalled(address: u64) -> bool {
+    static STALLED: std::sync::OnceLock<Option<Option<u64>>> = std::sync::OnceLock::new();
+    match STALLED.get_or_init(|| {
+        let value = std::env::var("GHIDRA_RUST_TEST_STALL_DEBUG_RENDER").ok()?;
+        Some(
+            value
+                .strip_prefix("0x")
+                .and_then(|hex| u64::from_str_radix(hex, 16).ok()),
+        )
+    }) {
+        None => false,
+        Some(None) => true,
+        Some(Some(only)) => *only == address,
+    }
+}
+
+/// A host-test-only fault in one function's optional debug render, or in
+/// its managed preparation, set by the worker argument
+/// [`crate::worker::FAULT_ARGUMENT`]. Compiled only with `test-hooks`.
+#[cfg(feature = "test-hooks")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fault {
+    Stall,
+    Spin,
+    Abort,
+    /// A normal `PrepareDecompile` exits as at the CPU limit after its
+    /// ordinary render and before its baseline is written.
+    PrepareExit,
+    /// [`Self::PrepareExit`] that also stops an inference-only recovery.
+    PrepareExitAlways,
+}
+
+#[cfg(feature = "test-hooks")]
+static DEBUG_FAULT: std::sync::OnceLock<(Fault, u64)> = std::sync::OnceLock::new();
+
+/// Parses `KIND@ADDRESS` for [`crate::worker::FAULT_ARGUMENT`].
+#[cfg(feature = "test-hooks")]
+pub fn set_debug_fault(spec: &str) -> Result<(), String> {
+    let invalid = || "Invalid debug fault argument".to_string();
+    let (kind, address) = spec.split_once('@').ok_or_else(invalid)?;
+    let kind = match kind {
+        "stall" => Fault::Stall,
+        "spin" => Fault::Spin,
+        "abort" => Fault::Abort,
+        "prepare-exit" => Fault::PrepareExit,
+        "prepare-exit-always" => Fault::PrepareExitAlways,
+        _ => return Err(invalid()),
+    };
+    let address = address
+        .strip_prefix("0x")
+        .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+        .ok_or_else(invalid)?;
+    DEBUG_FAULT
+        .set((kind, address))
+        .map_err(|_| "Repeated debug fault argument".to_string())
+}
+
+/// Runs the configured fault for `address` in an optional render that has
+/// started, if any. Stall and spin never return; the host's deadline (or
+/// the CPU limit) stops the process.
+#[cfg(feature = "test-hooks")]
+fn debug_fault(address: u64) {
+    let Some(&(fault, only)) = DEBUG_FAULT.get() else {
+        return;
+    };
+    if only != address || matches!(fault, Fault::PrepareExit | Fault::PrepareExitAlways) {
+        return;
+    }
+    {
+        use std::io::Write;
+        let _ = std::io::stderr().write_all(b"debug-order: optional started\n");
+    }
+    match fault {
+        Fault::Stall => loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        },
+        Fault::Spin => loop {
+            std::hint::spin_loop();
+        },
+        Fault::Abort => std::process::abort(),
+        Fault::PrepareExit | Fault::PrepareExitAlways => unreachable!(),
+    }
+}
+
+/// Without `test-hooks` no fault can be configured.
+#[cfg(not(feature = "test-hooks"))]
+fn debug_fault(_address: u64) {}
+
+/// Runs a configured preparation fault for `address`: the worker stops
+/// exactly as at its CPU limit, with this platform's CPU-limit exit status
+/// ([`crate::limits::cpu_limit_stop`]), before any baseline frame is written.
+#[cfg(feature = "test-hooks")]
+fn prepare_fault(address: u64, inference_only: bool) {
+    let Some(&(fault, only)) = DEBUG_FAULT.get() else {
+        return;
+    };
+    let fires = match fault {
+        Fault::PrepareExit => !inference_only,
+        Fault::PrepareExitAlways => true,
+        _ => false,
+    };
+    if !fires || only != address {
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    // SAFETY: _exit ends the process at once, as the SIGXCPU handler does;
+    // no Rust or engine state is used afterwards.
+    unsafe {
+        libc::_exit(crate::limits::CPU_LIMIT_EXIT)
+    }
+    #[cfg(windows)]
+    std::process::exit(crate::limits::WATCHDOG_EXIT as i32);
+    #[cfg(not(any(target_os = "linux", windows)))]
+    std::process::exit(crate::limits::CPU_LIMIT_EXIT)
+}
+
+#[cfg(not(feature = "test-hooks"))]
+fn prepare_fault(_address: u64, _inference_only: bool) {}
+
+/// Opt-in diagnostics on stderr (`GHIDRA_RUST_DEBUG_TRACE`): optional
+/// renders started, caller vetoes with their reason, and result reuse. Used
+/// by tests and corpus audits; never written to the protocol stream.
+fn debug_trace(event: std::fmt::Arguments<'_>) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ENABLED.get_or_init(|| std::env::var_os("GHIDRA_RUST_DEBUG_TRACE").is_some()) {
+        // One write per line: the optional child traces to the same pipe
+        // concurrently, and a short write to a pipe is never interleaved.
+        use std::io::Write;
+        let line = format!("debug-trace: {event}\n");
+        let _ = std::io::stderr().lock().write_all(line.as_bytes());
+    }
+}
+
+/// Complete final renders of verified debug work, keyed by everything they
+/// depend on. Repeated ordinary requests reuse them; Refresh renders anew.
+#[derive(Default)]
+struct ResultCache {
+    entries: VecDeque<CachedResult>,
+    bytes: usize,
+}
+
+struct CachedResult {
+    address: u64,
+    renames: Vec<crate::semantic::LocalRename>,
+    context: String,
+    epoch: u64,
+    /// The decision state of the target and every callee considered, and
+    /// whether each was too large to probe, when the result was committed.
+    dependencies: Vec<(u64, crate::debug_info::EntryState, bool)>,
+    text: String,
+    mappings: Vec<CodeMapping>,
+    semantics: crate::semantic::SemanticInfo,
+    bytes: usize,
+}
+
+/// How the optional debug render of one request ended.
+enum Optional {
+    /// No isolated executor here (Windows or a multithreaded worker).
+    Unavailable,
+    /// No optional window or CPU reserve was left, or no child started.
+    NoWindow,
+    /// No valid reply by the cutoff (late, crashed or malformed).
+    Expired,
+    /// Malformed isolated reply.
+    Invalid,
+    /// Newer host input arrived first; nothing is charged.
+    Superseded,
+    Replied(DebugOutcome),
+}
+
+/// What the worker publishes after adopting a debug render.
+enum Adopted {
+    Candidate { target_owns: bool, vetoed: bool },
+    Reference { vetoed: bool, own: bool },
+    Failed,
+    Invalid,
+}
+
+/// [`DebugOutcome`] before its decision changes are attached.
+enum Inner {
+    Candidate {
+        render: Box<Published>,
+        target_owns: bool,
+        installed_callees: Vec<u64>,
+        compared: bool,
+        vetoed: bool,
+    },
+    Reference(Unchanged),
+    Failed,
+}
+
+pub(crate) const RESULT_CACHE_ENTRIES: usize = 64;
+pub(crate) const RESULT_CACHE_BYTES: usize = 8 * 1024 * 1024;
+/// Larger results are not retained at all.
+pub(crate) const RESULT_CACHE_MAX_ENTRY: usize = 2 * 1024 * 1024;
+
+impl ResultCache {
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.bytes = 0;
+    }
+    fn insert(&mut self, entry: CachedResult) {
+        if entry.bytes > RESULT_CACHE_MAX_ENTRY {
+            return;
+        }
+        if let Some(index) = self.entries.iter().position(|e| {
+            e.address == entry.address && e.renames == entry.renames && e.context == entry.context
+        }) && let Some(old) = self.entries.remove(index)
+        {
+            self.bytes -= old.bytes;
+        }
+        while self.entries.len() >= RESULT_CACHE_ENTRIES
+            || self.bytes.saturating_add(entry.bytes) > RESULT_CACHE_BYTES
+        {
+            let Some(old) = self.entries.pop_front() else {
+                break;
+            };
+            self.bytes -= old.bytes;
+        }
+        self.bytes += entry.bytes;
+        self.entries.push_back(entry);
+    }
 }
 
 /// Engine functions a discovery pass named, and whether it changed the engine
@@ -411,8 +950,75 @@ fn macho_entry(offset: u64, sections: &[SectionInfo]) -> Result<u64, String> {
     Ok(entry.unwrap_or(0))
 }
 
+/// Positive x86 cdecl check independent of DWARF locations and inferred locks.
+pub(crate) fn debug_return_pop(
+    program: &Program,
+    entry: u64,
+    sections: &[SectionInfo],
+) -> Result<i32, String> {
+    let mut remaining = MAX_INSTRUCTIONS;
+    let recovered = recover_graph_budgeted(
+        program,
+        &Bounds {
+            tail_entry: None,
+            sections,
+            is_function: &|_| false,
+            pe_ranges: &[],
+        },
+        entry,
+        &mut remaining,
+        &Arc::default(),
+        None,
+    )?;
+    if recovered.partial {
+        return Err("Incomplete return-stack evidence".into());
+    }
+    let mut pop = None;
+    for instruction in recovered.view.blocks.iter().flat_map(|b| &b.instructions) {
+        if !instruction.mnemonic.eq_ignore_ascii_case("RET")
+            && !instruction.mnemonic.eq_ignore_ascii_case("RETF")
+        {
+            continue;
+        }
+        let bytes = &instruction.bytes;
+        let amount = if bytes.last().is_some_and(|&b| b == 0xc3 || b == 0xcb) {
+            4
+        } else if bytes.len() >= 3 && matches!(bytes[bytes.len() - 3], 0xc2 | 0xca) {
+            4 + i32::from(u16::from_le_bytes([
+                bytes[bytes.len() - 2],
+                bytes[bytes.len() - 1],
+            ]))
+        } else {
+            return Err("Unsupported return opcode".into());
+        };
+        if pop.is_some_and(|old| old != amount) {
+            return Err("Inconsistent return-stack adjustment".into());
+        }
+        pop = Some(amount);
+    }
+    pop.ok_or_else(|| "No proven return-stack adjustment".into())
+}
+
+#[cfg(test)]
+std::thread_local! {static DEBUG_HINT_FAILURE: std::cell::Cell<bool> = const {std::cell::Cell::new(false)};}
+
 impl LoadedProgram {
     pub fn open(path: &str) -> Result<Self, String> {
+        Self::open_debug(path, &Default::default())
+    }
+
+    pub fn open_debug(
+        path: &str,
+        debug_options: &crate::debug_info::DebugOptions,
+    ) -> Result<Self, String> {
+        Self::open_with_companion_policy(path, debug_options, true)
+    }
+
+    pub(crate) fn open_with_companion_policy(
+        path: &str,
+        debug_options: &crate::debug_info::DebugOptions,
+        automatic_companion: bool,
+    ) -> Result<Self, String> {
         let path = Path::new(path);
         #[cfg(windows)]
         crate::windows::validate_local_path(path)
@@ -556,6 +1162,52 @@ impl LoadedProgram {
         {
             info.warnings.push("The binary entry point is not a supported aligned file-backed instruction address; select a function from the list.".into());
         }
+        let debug = if debug_options.enabled {
+            {
+                let companion = debug_options
+                    .companion_path
+                    .as_ref()
+                    .map(std::path::PathBuf::from)
+                    .or_else(|| {
+                        automatic_companion
+                            .then(|| crate::debug_info::companion::automatic(path))
+                            .flatten()
+                    });
+                if let Some(path) = companion {
+                    crate::debug_info::DebugIndex::with_companion(&snapshot, &info, &path)
+                } else {
+                    crate::debug_info::DebugIndex::build(&snapshot, &info)
+                }
+            }
+        } else {
+            Default::default()
+        };
+        if debug_options.enabled
+            && debug_options.companion_path.is_some()
+            && debug
+                .summary
+                .as_ref()
+                .and_then(|s| s.source.as_ref())
+                .is_none()
+        {
+            warning(
+                &mut info.warnings,
+                "Debug companion rejected: UUID, architecture, file format, or file validation did not match.",
+            );
+        }
+        if let Some(summary) = &debug.summary {
+            match summary.status {
+                crate::debug_info::DebugStatus::Partial => warning(
+                    &mut info.warnings,
+                    "DWARF indexing is partial; unsupported functions retain inference.",
+                ),
+                crate::debug_info::DebugStatus::Unsupported => warning(
+                    &mut info.warnings,
+                    "Compressed DWARF is unsupported; functions retain inference.",
+                ),
+                _ => (),
+            }
+        }
         Ok(Self {
             macho_legacy,
             program,
@@ -576,7 +1228,35 @@ impl LoadedProgram {
             applied_signatures: BTreeSet::new(),
             signature_state: None,
             analysis_started: false,
+            debug,
+            debug_calls: VecDeque::new(),
+            debug_large: BTreeSet::new(),
+            debug_skip: debug_options.skip.iter().copied().collect(),
+            debug_failed: BTreeSet::new(),
+            debug_large_journal: None,
+            results: ResultCache::default(),
+            result_epoch: 0,
+            pending_debug: None,
+            debug_nonce: 0,
+            debug_inventory_digest: None,
+            debug_program_digest: None,
+            debug_long_names: BTreeMap::new(),
+            debug_long_names_complete: true,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_index_mut(&mut self) -> &mut crate::debug_info::DebugIndex {
+        &mut self.debug
+    }
+
+    pub(crate) fn bind_open(&mut self, request_id: u64) {
+        // The physical Open follows every earlier offer on this transport.
+        self.debug_nonce = request_id;
+    }
+
+    pub fn debug_summary(&self) -> Option<&crate::debug_info::DebugSummary> {
+        self.debug.summary.as_ref()
     }
 
     pub fn symbol_names(&self) -> &crate::model::SymbolNameSummary {
@@ -587,11 +1267,53 @@ impl LoadedProgram {
         self.handle_with_progress(request, &mut |_| Ok(()))
     }
 
+    /// The ordinary single-terminal request: the reference render, then on
+    /// a single-threaded Linux worker the optional debug render in a
+    /// disposable child, both before one reply. Managed hosts use
+    /// [`Self::prepare_decompile`] instead.
     fn decompile(
         &mut self,
         address: u64,
         renames: &[crate::semantic::LocalRename],
+        refresh: bool,
     ) -> Result<Response, String> {
+        self.pending_debug = None;
+        let (job, mut published) =
+            match self.reference(address, renames, Some(refresh), false, false)? {
+                Ok(prepared) => prepared,
+                Err(hit) => return Ok(hit),
+            };
+        let mut settled = Settled::default();
+        let mut label = job.label;
+        if job.work {
+            let optional = self.run_optional(&job, None, None, None, None);
+            let (adopted, candidate) = self.adopt_optional(&job, optional, &mut settled);
+            label = adopted;
+            if let Some(candidate) = candidate {
+                published = *candidate;
+            }
+        }
+        self.trace_request(&job, label);
+        Ok(self.finish(&job, &settled, published))
+    }
+
+    /// Everything before optional debug work: validation, import resolution,
+    /// cheap decisions, a verified cached result and the reference render,
+    /// which is exactly the render without debug information. Nothing
+    /// optional runs before the reference is complete. `capture` records
+    /// caller evidence whatever the decisions (a sibling's recapture) and
+    /// never uses or fills the result cache. A cache hit is the final reply.
+    /// `inference_only` renders exactly as with no optional debug work: no
+    /// cache, candidate or hint search, and no caller-evidence capture.
+    fn reference(
+        &mut self,
+        address: u64,
+        renames: &[crate::semantic::LocalRename],
+        raw_refresh: Option<bool>,
+        capture: bool,
+        inference_only: bool,
+    ) -> Result<Result<(PreparedJob, Published), Response>, String> {
+        let started = std::time::Instant::now();
         crate::semantic::validate_renames(renames, Some(address))?;
         self.check_unpacked()?;
         self.check_code(address)?;
@@ -607,7 +1329,59 @@ impl LoadedProgram {
             crate::signatures::state_digest(&self.signatures)
         };
         let owned = self.applied_signatures.contains(&address);
-        let (mut text, mut mappings, mut semantics) = crate::decompile::render_named(
+        let active = self.debug.active();
+        let client_skip = active && self.debug_skip.contains(&address);
+        let engine_failure =
+            active && raw_refresh.is_some() && self.debug_failed.contains(&address);
+        let optional = active && !client_skip && !engine_failure && !inference_only;
+        // Import registration can change engine symbols in ways a cached
+        // render cannot see, so PE images are never cached.
+        let cacheable = optional && !capture && self.pe_imports.is_empty();
+        if cacheable && raw_refresh == Some(false) {
+            if let Some(hit) = self.cached_result(address, renames, &context) {
+                crate::performance::event("debug_result_cache_hit", address);
+                debug_trace(format_args!("cache-hit {address:#x}"));
+                return Ok(Err(hit));
+            }
+        } else if raw_refresh == Some(true) {
+            crate::performance::event("debug_result_cache_bypass", address);
+        }
+        // Cheap decisions first: known graph hints with no eligible target
+        // or callee mean no debug work, and no evidence to collect. A
+        // recovery does no debug work, so it never looks them up.
+        let cached_hints = if inference_only {
+            None
+        } else {
+            self.debug_calls
+                .iter()
+                .find(|(entry, _)| *entry == address)
+                .map(|(_, hints)| hints.1.clone())
+        };
+        let callee_eligible = |program: &Self, callee| {
+            callee != address
+                && !program.applied_signatures.contains(&callee)
+                && if raw_refresh.is_some() {
+                    program.callee_eligible(address, callee)
+                } else {
+                    program.debug.indexed(callee)
+                }
+        };
+        let target_work = optional
+            && !owned
+            && if raw_refresh.is_some() {
+                self.target_eligible(address)
+            } else {
+                self.debug.indexed(address)
+            };
+        let maybe_work = optional
+            && (target_work
+                || cached_hints
+                    .as_ref()
+                    .is_none_or(|hints| hints.iter().any(|&callee| callee_eligible(self, callee))));
+        // The reference render is exactly the render without debug info, and
+        // nothing else runs until it is complete.
+        let reference_started = std::time::Instant::now();
+        let reference = crate::decompile::render_full(
             &mut self.program,
             address,
             &self.info.sections,
@@ -615,31 +1389,1285 @@ impl LoadedProgram {
             &context,
             owned,
             Some(Arc::clone(&self.symbol_names)),
+            maybe_work || capture,
         )
         .map_err(engine_error)?;
-        if text.len() > MAX_DECOMPILED_BYTES {
-            let mut end = MAX_DECOMPILED_BYTES - 100;
-            while !text.is_char_boundary(end) {
-                end -= 1;
-            }
-            text.truncate(end);
-            mappings.retain(|mapping| mapping.end <= end);
-            semantics.tokens.retain(|token| token.end <= end);
-            text.push_str(crate::decompile::TRUNCATION_TRAILER);
-        }
-        Ok(Response::Decompiled {
-            address,
+        let reference_end = std::time::Instant::now();
+        let reference_time = reference_end - reference_started;
+        let crate::decompile::Render {
             text,
             mappings,
             semantics,
+            calls,
+            caller,
+            calls_complete,
+            ..
+        } = reference;
+        let published = Published {
+            text,
+            mappings,
+            semantics,
+            calls,
+            calls_complete,
+        };
+        let callees = if maybe_work {
+            published
+                .calls
+                .iter()
+                .copied()
+                .filter(|&callee| {
+                    callee_eligible(self, callee)
+                        && cached_hints
+                            .as_ref()
+                            .is_none_or(|hints| hints.contains(&callee))
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let work = calls_complete && maybe_work && (target_work || !callees.is_empty());
+        let label = if !active {
+            "inactive"
+        } else if inference_only && !client_skip {
+            "recovery"
+        } else if !optional {
+            "skipped"
+        } else if !maybe_work {
+            "no-work-hints"
+        } else {
+            "no-work"
+        };
+        Ok(Ok((
+            PreparedJob {
+                address,
+                renames: renames.to_vec(),
+                context,
+                owned,
+                active,
+                client_skip,
+                engine_failure,
+                cacheable: cacheable && calls_complete && raw_refresh.is_some(),
+                cached_hints,
+                target_work,
+                callees,
+                caller,
+                work,
+                started,
+                reference_end,
+                reference_time,
+                label,
+            },
+            published,
+        )))
+    }
+
+    fn trace_request(&self, job: &PreparedJob, label: &str) {
+        debug_trace(format_args!(
+            "request {:#x} reference_us={} optional_us={} outcome={label}",
+            job.address,
+            job.reference_time.as_micros(),
+            if job.work {
+                job.reference_end.elapsed().as_micros()
+            } else {
+                0
+            }
+        ));
+    }
+
+    /// Adopts how the optional render of `job` ended: decisions are
+    /// committed only from a reply valid as a whole. Returns the outcome
+    /// label and an accepted candidate's render.
+    fn adopt_optional(
+        &mut self,
+        job: &PreparedJob,
+        optional: Optional,
+        settled: &mut Settled,
+    ) -> (&'static str, Option<Box<Published>>) {
+        let address = job.address;
+        match optional {
+            Optional::Unavailable => {
+                debug_trace(format_args!("unavailable {address:#x}"));
+                settled.unavailable = true;
+                ("unavailable", None)
+            }
+            // No time or CPU left, or no child: nothing was attempted.
+            Optional::NoWindow => ("no-window", None),
+            Optional::Invalid => ("invalid", None),
+            // Newer host input arrived: abandoned without any charge.
+            Optional::Superseded => {
+                debug_trace(format_args!("superseded {address:#x}"));
+                ("superseded", None)
+            }
+            Optional::Expired => {
+                // Expired, crashed or malformed: one direct attempt.
+                crate::performance::event("debug_optional_expired", address);
+                debug_trace(format_args!("expired {address:#x}"));
+                if job.target_work {
+                    self.debug.defer_target(address);
+                }
+                ("expired", None)
+            }
+            Optional::Replied(outcome) => {
+                let (report, render) = outcome.split();
+                let label = self.adopt_report(job, &report, render.as_deref(), settled);
+                (label, render.filter(|_| settled.candidate))
+            }
+        }
+    }
+
+    /// Commits a checked debug report and records what the final render
+    /// shows. `render` is the candidate's body when this worker has it.
+    fn adopt_report(
+        &mut self,
+        job: &PreparedJob,
+        report: &Report,
+        render: Option<&Published>,
+        settled: &mut Settled,
+    ) -> &'static str {
+        Self::describe_adoption(job.address, self.adopt_debug(job, report, render), settled)
+    }
+
+    fn describe_adoption(address: u64, adopted: Adopted, settled: &mut Settled) -> &'static str {
+        match adopted {
+            Adopted::Candidate {
+                target_owns,
+                vetoed,
+            } => {
+                crate::performance::event("debug_candidate_published", address);
+                settled.candidate = true;
+                settled.debug_owned = target_owns;
+                settled.callees_shown = !vetoed;
+                settled.vetoed = vetoed;
+                if vetoed {
+                    "veto-target-only"
+                } else {
+                    "candidate"
+                }
+            }
+            Adopted::Reference { vetoed, own } => {
+                crate::performance::event("debug_reference_published", address);
+                settled.callees_shown = true;
+                settled.vetoed = vetoed;
+                settled.own_vetoed = own;
+                if own {
+                    "veto-own"
+                } else if vetoed {
+                    "veto"
+                } else {
+                    "reference"
+                }
+            }
+            Adopted::Failed => {
+                settled.engine_failure = true;
+                "failed"
+            }
+            Adopted::Invalid => {
+                crate::performance::event("debug_reply_invalid", address);
+                "invalid"
+            }
+        }
+    }
+
+    /// Debug warnings of a final render whose direct calls are `calls`,
+    /// from the committed decisions.
+    fn debug_warnings(
+        &self,
+        job: &PreparedJob,
+        settled: &Settled,
+        calls: &[u64],
+        changes: &[crate::debug_info::Change],
+    ) -> Vec<&'static str> {
+        use crate::debug_info::Decision;
+        let address = job.address;
+        let decision = |entry| match changes.binary_search_by_key(&entry, |change| change.entry) {
+            Ok(index) => changes[index].new.decision(),
+            Err(_) => self.debug.decision(entry),
+        };
+        let mut warnings = Vec::new();
+        if job.client_skip {
+            warnings.push(crate::debug_info::SKIPPED_FUNCTION_WARNING);
+        } else if job.engine_failure || settled.engine_failure {
+            warnings.push(crate::debug_info::ENGINE_FAILURE_WARNING);
+        } else if job.active {
+            if settled.unavailable {
+                warnings.push(OPTIONAL_UNAVAILABLE_WARNING);
+            }
+            if settled.vetoed {
+                warnings.push(CALLER_EVIDENCE_WARNING);
+            }
+            if settled.own_vetoed {
+                warnings.push(OWN_EVIDENCE_WARNING);
+            } else if !job.owned
+                && !settled.debug_owned
+                && matches!(decision(address), Decision::Undecided | Decision::Accepted)
+            {
+                warnings.push(UNVERIFIED_WARNING);
+            }
+            if !settled.vetoed
+                && calls.iter().any(|&callee| {
+                    callee != address
+                        && job
+                            .cached_hints
+                            .as_ref()
+                            .is_none_or(|hints| hints.contains(&callee))
+                        && !self.applied_signatures.contains(&callee)
+                        && match decision(callee) {
+                            Decision::Undecided => true,
+                            Decision::Accepted => !settled.callees_shown,
+                            _ => false,
+                        }
+                })
+            {
+                warnings.push(CALLEE_UNVERIFIED_WARNING);
+            }
+        }
+        warnings
+    }
+
+    /// The final reply of an ordinary request, cached when it is clean.
+    fn finish(&mut self, job: &PreparedJob, settled: &Settled, published: Published) -> Response {
+        let warnings = self.debug_warnings(job, settled, &published.calls, &[]);
+        let clean = warnings.is_empty();
+        let cacheable = published.calls_complete;
+        let calls = published.calls.clone();
+        let (text, mappings, semantics) = compose(published, &warnings, settled.debug_owned);
+        if job.cacheable && clean && cacheable {
+            self.cache_final(job, &calls, &text, &mappings, &semantics);
+        }
+        Response::Decompiled {
+            address: job.address,
+            text,
+            mappings,
+            semantics,
+        }
+    }
+
+    /// Only a final result is reused: no pending or provisional decision
+    /// and no warning about unverified or unavailable debug work.
+    fn cache_final(
+        &mut self,
+        job: &PreparedJob,
+        calls: &[u64],
+        text: &str,
+        mappings: &[CodeMapping],
+        semantics: &crate::semantic::SemanticInfo,
+    ) {
+        let mut dependencies = std::iter::once(job.address)
+            .chain(calls.iter().copied())
+            .chain(job.callees.iter().copied())
+            .collect::<Vec<_>>();
+        dependencies.sort_unstable();
+        dependencies.dedup();
+        if dependencies
+            .iter()
+            .all(|&entry| !self.debug.provisional(entry))
+        {
+            self.cache_result(
+                job.address,
+                &job.renames,
+                &job.context,
+                &dependencies,
+                text,
+                mappings,
+                semantics,
+            );
+        }
+    }
+
+    /// Renders ordinary inference and offers immutable indexed membership.
+    /// Managed preparation never reads or writes the raw decisions or LRU.
+    /// An `inference_only` recovery is the same ordinary render with no
+    /// evidence, digest, offer or pending optional job, and always final.
+    fn prepare_decompile(
+        &mut self,
+        logical_id: u64,
+        address: u64,
+        renames: &[crate::semantic::LocalRename],
+        inference_only: bool,
+    ) -> Result<Response, String> {
+        if logical_id == 0 {
+            return Err("Invalid logical decompile ID".into());
+        }
+        self.pending_debug = None;
+        let (job, mut published) =
+            match self.reference(address, renames, None, false, inference_only)? {
+                Ok(prepared) => prepared,
+                Err(_) => unreachable!("Managed reference never reads the raw cache"),
+            };
+        prepare_fault(address, inference_only);
+        if inference_only || !job.work || !self.debug_long_names_complete {
+            self.trace_request(&job, job.label);
+            let warnings = if job.client_skip {
+                vec![crate::debug_info::SKIPPED_FUNCTION_WARNING]
+            } else if inference_only {
+                // Debug data of the target itself stays unverified.
+                if job.active && !job.owned && self.debug.indexed(address) {
+                    vec![UNVERIFIED_WARNING]
+                } else {
+                    Vec::new()
+                }
+            } else if job.active && (!published.calls_complete || !self.debug_long_names_complete) {
+                vec![UNVERIFIED_WARNING]
+            } else {
+                Vec::new()
+            };
+            let (text, mappings, semantics) = compose(published, &warnings, false);
+            return Ok(Response::Decompiled {
+                address,
+                text,
+                mappings,
+                semantics,
+            });
+        }
+        let executor = if crate::decompile::callee_probes_available() {
+            managed::Executor::ForkHere
+        } else {
+            managed::Executor::Sibling
+        };
+        clip(
+            &mut published.text,
+            &mut published.mappings,
+            &mut published.semantics,
+        );
+        let binding = self.managed_binding(&job, &published);
+        self.debug_nonce = self
+            .debug_nonce
+            .checked_add(1)
+            .ok_or("Debug offer counter overflow")?;
+        let offer = managed::DebugOffer {
+            logical_id,
+            nonce: self.debug_nonce,
+            executor,
+            reference_us: duration_us(job.reference_time),
+            elapsed_us: duration_us(job.reference_end - job.started),
+            binding,
+            calls: published.calls,
+            target_work: job.target_work,
+            graph_prepared: job.cached_hints.is_some(),
+            callees: job.callees.clone(),
+            cacheable: self.info.format != "PE"
+                && self.pe_imports.is_empty()
+                && !published
+                    .text
+                    .ends_with(crate::decompile::TRUNCATION_TRAILER),
+        };
+        debug_trace(format_args!(
+            "prepared {address:#x} executor={executor:?} reference_us={}",
+            job.reference_time.as_micros()
+        ));
+        if executor == managed::Executor::ForkHere {
+            self.pending_debug = Some(managed::Pending {
+                offer: offer.clone(),
+                job,
+            });
+        }
+        Ok(Response::PreparedDecompile {
+            address,
+            text: published.text,
+            mappings: published.mappings,
+            semantics: published.semantics,
+            offer,
         })
+    }
+
+    pub(crate) fn try_prepared(
+        &mut self,
+        submitted: managed::PeerJob,
+        preempt: &mut dyn FnMut() -> bool,
+        started: &mut dyn FnMut(bool) -> Result<(), String>,
+    ) -> Response {
+        let ticket = submitted.ticket;
+        let unavailable = |reason| managed::unavailable(ticket, reason);
+        let Some(managed::Pending { offer, mut job }) = self.pending_debug.take_if(|pending| {
+            pending.offer.nonce == ticket.nonce && pending.offer.logical_id == ticket.logical_id
+        }) else {
+            return unavailable("stale");
+        };
+        if submitted.check().is_err()
+            || submitted.address != job.address
+            || submitted.renames != job.renames
+            || submitted.binding != offer.binding
+            || submitted.graph_prepared != offer.graph_prepared
+            || !self.check_seed(&submitted, offer.target_work, &offer.callees, true)
+        {
+            return unavailable("manifest");
+        }
+        job.target_work = submitted.target_work;
+        job.callees = submitted.callees;
+        let limit =
+            std::time::Instant::now() + std::time::Duration::from_millis(submitted.remaining_ms);
+        let optional = self.run_optional(
+            &job,
+            Some(limit),
+            Some(preempt),
+            Some(started),
+            Some(&submitted.seed),
+        );
+        match optional {
+            Optional::Replied(outcome) => managed::finished(ticket, offer.binding, outcome),
+            Optional::Expired => unavailable("expired"),
+            Optional::Invalid => unavailable("invalid"),
+            Optional::Unavailable => unavailable("unavailable"),
+            Optional::NoWindow => unavailable("deadline"),
+            Optional::Superseded => unavailable("superseded"),
+        }
+    }
+
+    /// Recaptures a fresh peer's ordinary output before accepting its job.
+    pub(crate) fn render_debug_once(
+        &mut self,
+        job: managed::PeerJob,
+        started: &mut dyn FnMut(managed::Ticket, bool) -> Result<(), String>,
+    ) -> Result<Response, String> {
+        let ticket = job.ticket;
+        let unavailable = |reason| Ok(managed::unavailable(ticket, reason));
+        job.check()?;
+        let cutoff = std::time::Instant::now() + std::time::Duration::from_millis(job.remaining_ms);
+        if !self.debug.active() {
+            return unavailable("inactive");
+        }
+        let (prepared, mut published) =
+            match self.reference(job.address, &job.renames, None, true, false)? {
+                Ok(prepared) => prepared,
+                Err(_) => unreachable!("Peer reference never reads the raw cache"),
+            };
+        clip(
+            &mut published.text,
+            &mut published.mappings,
+            &mut published.semantics,
+        );
+        let measured = self.managed_binding(&prepared, &published);
+        if measured != job.binding {
+            let reason = if measured.program != job.binding.program
+                || measured.context != job.binding.context
+            {
+                "digest-context"
+            } else if measured.baseline != job.binding.baseline {
+                "digest-baseline"
+            } else {
+                "digest-facts"
+            };
+            debug_trace(format_args!("peer-mismatch {:#x} {reason}", job.address));
+            return unavailable(reason);
+        }
+        if !published.calls_complete
+            || !self.check_seed(&job, prepared.target_work, &prepared.callees, false)
+            || !self.seed_job(&job.seed)
+        {
+            return unavailable("eligibility");
+        }
+        if std::time::Instant::now() >= cutoff {
+            return unavailable("deadline");
+        }
+        started(ticket, job.target_work)?;
+        debug_fault(job.address);
+        let debug_job = DebugJob {
+            address: job.address,
+            renames: &job.renames,
+            context: &prepared.context,
+            owned: prepared.owned,
+            target_work: job.target_work,
+            callees: job.callees,
+            reference: prepared.caller.as_ref(),
+        };
+        let mut outcome = self.debug_render(&debug_job);
+        Self::clip_outcome(&mut outcome);
+        Ok(managed::finished(ticket, measured, outcome))
+    }
+
+    fn check_seed(
+        &self,
+        job: &managed::PeerJob,
+        indexed_target: bool,
+        indexed_callees: &[u64],
+        exact: bool,
+    ) -> bool {
+        let eligible = |entry: u64| {
+            if entry == job.address {
+                indexed_target
+            } else {
+                indexed_callees.binary_search(&entry).is_ok()
+            }
+        };
+        job.seed
+            .states
+            .iter()
+            .all(|&(entry, _)| eligible(entry) && self.debug.indexed(entry))
+            && job.seed.large.iter().all(|&entry| eligible(entry))
+            && job.target_work == (indexed_target && job.seed.target_eligible(job.address))
+            && job.callees.iter().all(|&entry| eligible(entry))
+            && (!exact
+                || indexed_callees
+                    .iter()
+                    .copied()
+                    .filter(|&entry| job.seed.callee_eligible(entry))
+                    .eq(job.callees.iter().copied()))
+    }
+
+    fn seed_job(&mut self, seed: &managed::Seed) -> bool {
+        // Called only inside a disposable executor. The fork may inherit a
+        // primary that previously served raw requests on the same transport.
+        self.debug.reset_decisions();
+        self.debug_large = seed.large.iter().copied().collect();
+        seed.states
+            .iter()
+            .all(|&(entry, state)| self.debug.seed(entry, state))
+    }
+
+    fn clip_outcome(outcome: &mut DebugOutcome) {
+        if let DebugOutcome::Candidate { render, .. } = outcome {
+            clip(
+                &mut render.text,
+                &mut render.mappings,
+                &mut render.semantics,
+            );
+        }
+    }
+
+    fn managed_binding(&mut self, job: &PreparedJob, published: &Published) -> managed::Binding {
+        let inventory = self
+            .debug_inventory_digest
+            .get_or_insert_with(|| managed::inventory_digest(&self.info.functions));
+        let program = self
+            .debug_program_digest
+            .get_or_insert_with(|| {
+                managed::program_digest(
+                    &self.info,
+                    self.target.language,
+                    inventory,
+                    self.debug.summary.as_ref(),
+                    &self.debug_skip,
+                    &job.context,
+                    &self.applied_signatures,
+                    &self.debug_long_names,
+                )
+            })
+            .clone();
+        managed::Binding {
+            context: managed::context_digest(&program, job.address, &job.renames),
+            program,
+            baseline: managed::baseline_digest(
+                job.address,
+                &published.text,
+                &published.mappings,
+                &published.semantics,
+                &published.calls,
+            ),
+            facts: managed::facts_digest(job.caller.as_ref()),
+        }
+    }
+
+    /// Whether the target's own debug prototype may still apply.
+    fn target_eligible(&self, address: u64) -> bool {
+        use crate::debug_info::Decision;
+        match self.debug.decision(address) {
+            Decision::Accepted => true,
+            Decision::Undecided => self.debug.target_attempts_left(address),
+            _ => false,
+        }
+    }
+
+    /// Whether a debug prototype of `callee` may change `address`'s render:
+    /// accepted, or undecided and still probeable.
+    fn callee_eligible(&self, address: u64, callee: u64) -> bool {
+        use crate::debug_info::Decision;
+        callee != address
+            && !self.applied_signatures.contains(&callee)
+            && match self.debug.decision(callee) {
+                Decision::Accepted => true,
+                Decision::Undecided => {
+                    !self.debug_large.contains(&callee) && self.debug.callee_attempts_left(callee)
+                }
+                _ => false,
+            }
+    }
+
+    /// Runs [`Self::debug_render`] in a disposable child after the reference
+    /// render, until the request's optional cutoff (and `limit`). A managed
+    /// request also stops at once, charging nothing, when `preempt` reports
+    /// newer host input.
+    fn run_optional(
+        &mut self,
+        job: &PreparedJob,
+        limit: Option<std::time::Instant>,
+        mut preempt: Option<&mut dyn FnMut() -> bool>,
+        started: Option<&mut dyn FnMut(bool) -> Result<(), String>>,
+        seed: Option<&managed::Seed>,
+    ) -> Optional {
+        if !crate::decompile::callee_probes_available() {
+            return Optional::Unavailable;
+        }
+        let now = std::time::Instant::now();
+        let mut cutoff = (job.started + DEBUG_DEADLINE).min(
+            job.reference_end
+                + OPTIONAL_FLOOR.max(job.reference_time.saturating_mul(OPTIONAL_RATIO)),
+        );
+        if let Some(limit) = limit {
+            cutoff = cutoff.min(limit);
+        }
+        let window = cutoff.saturating_duration_since(now);
+        // The worker's own CPU allowance must still cover publishing; the
+        // child's CPU is limited separately.
+        if !optional_window_available(window, crate::limits::cpu_headroom()) {
+            return Optional::NoWindow;
+        }
+        if preempt.as_mut().is_some_and(|check| check()) {
+            return Optional::Superseded;
+        }
+        let stalled = debug_render_stalled(job.address);
+        if stalled {
+            use std::io::Write;
+            let _ = std::io::stderr().write_all(b"debug-order: reference complete\n");
+        }
+        let debug_job = job.job();
+        let Some(child) = crate::decompile::isolate(window, || {
+            if stalled {
+                use std::io::Write;
+                let _ = std::io::stderr().write_all(b"debug-order: optional started\n");
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+            }
+            if let Some(seed) = seed
+                && !self.seed_job(seed)
+            {
+                return None;
+            }
+            debug_fault(debug_job.address);
+            let mut outcome = self.debug_render(&debug_job);
+            if seed.is_some() {
+                Self::clip_outcome(&mut outcome);
+            }
+            Some(outcome)
+        }) else {
+            return Optional::NoWindow;
+        };
+        if let Some(started) = started
+            && started(job.target_work).is_err()
+        {
+            return Optional::Superseded;
+        }
+        crate::performance::event("debug_optional_forked", job.address);
+        debug_trace(format_args!("fork {:#x}", job.address));
+        let mut never = || false;
+        match child.reply::<DebugOutcome>(cutoff, preempt.unwrap_or(&mut never)) {
+            Ok(outcome) => Optional::Replied(outcome),
+            Err(crate::decompile::Ended::Preempted) => Optional::Superseded,
+            Err(crate::decompile::Ended::Expired) => Optional::Expired,
+            Err(crate::decompile::Ended::Invalid) if seed.is_none() => Optional::Expired,
+            Err(crate::decompile::Ended::Invalid) => Optional::Invalid,
+        }
+    }
+
+    /// Checks a debug report as a whole before committing anything, then
+    /// commits its decision changes. A candidate's `render`, when this
+    /// worker has it, is checked too; a sibling's is checked by the host.
+    /// A malformed report commits nothing.
+    fn adopt_debug(
+        &mut self,
+        job: &PreparedJob,
+        report: &Report,
+        render: Option<&Published>,
+    ) -> Adopted {
+        let adopted = self.check_debug(job, report, render);
+        if !matches!(adopted, Adopted::Invalid) {
+            let (changes, large) = report.decisions();
+            self.apply_debug_changes(
+                changes,
+                large,
+                matches!(adopted, Adopted::Failed).then_some(job.address),
+            );
+        }
+        adopted
+    }
+
+    fn check_debug(
+        &self,
+        job: &PreparedJob,
+        report: &Report,
+        render: Option<&Published>,
+    ) -> Adopted {
+        let mut allowed = job.callees.clone();
+        allowed.push(job.address);
+        let (changes, large) = report.decisions();
+        if changes.len() > allowed.len()
+            || !self.debug.check_changes(changes, &allowed)
+            || (!job.target_work && changes.iter().any(|change| change.entry == job.address))
+            || large.len() > job.callees.len()
+            || !large.windows(2).all(|pair| pair[0] < pair[1])
+            || large.iter().any(|entry| !job.callees.contains(entry))
+        {
+            return Adopted::Invalid;
+        }
+        // The target's state after this render, for its provenance.
+        let state_after = |entry| match changes.binary_search_by_key(&entry, |change| change.entry)
+        {
+            Ok(index) => changes[index].new,
+            Err(_) => self.debug.state(entry),
+        };
+        let target_after = state_after(job.address);
+        if let Report::Candidate {
+            calls,
+            target_owns,
+            installed_callees,
+            compared,
+            vetoed,
+            ..
+        } = report
+        {
+            let body = render.is_none_or(|render| {
+                render.text.len()
+                    <= MAX_DECOMPILED_BYTES + crate::decompile::TRUNCATION_TRAILER.len()
+                    && crate::selection::validate_mappings(
+                        &render.text,
+                        &render.mappings,
+                        &self.info.sections,
+                    )
+                    .is_ok()
+                    && render
+                        .semantics
+                        .validate(&render.text, job.address, &self.info.sections)
+                        .is_ok()
+                    && render.semantics.locals.iter().all(|local| {
+                        local.identity.engine == crate::semantic::local_fingerprint(&job.context)
+                    })
+                    && render.calls == *calls
+                    && render.semantics.prototype_source
+                        == crate::semantic::PrototypeSource::Inferred
+            });
+            let valid = body
+                && calls.len() <= crate::model::MAX_GRAPH_CALLS
+                && calls.windows(2).all(|pair| pair[0] < pair[1])
+                && calls
+                    .iter()
+                    .all(|&entry| crate::call_analysis::code_address(&self.info, entry))
+                && installed_callees.len() <= job.callees.len()
+                && installed_callees.windows(2).all(|pair| pair[0] < pair[1])
+                && installed_callees.iter().all(|entry| {
+                    job.callees.contains(entry)
+                        && state_after(*entry).decision() == crate::debug_info::Decision::Accepted
+                })
+                && *compared
+                && (*target_owns || !installed_callees.is_empty())
+                && (!*vetoed || (*target_owns && installed_callees.is_empty()))
+                && (!*target_owns
+                    || (job.target_work
+                        && target_after.status == crate::debug_info::Status::Verified));
+            if !valid {
+                return Adopted::Invalid;
+            }
+        }
+        match report {
+            Report::Candidate {
+                target_owns,
+                vetoed,
+                ..
+            } => Adopted::Candidate {
+                target_owns: *target_owns,
+                vetoed: *vetoed,
+            },
+            Report::UseReference { reason, .. } => Adopted::Reference {
+                vetoed: *reason == Unchanged::EvidenceLost,
+                own: *reason == Unchanged::OwnEvidenceLost,
+            },
+            Report::Failed { .. } => Adopted::Failed,
+        }
+    }
+
+    fn apply_debug_changes(
+        &mut self,
+        changes: &[crate::debug_info::Change],
+        large: &[u64],
+        failed: Option<u64>,
+    ) {
+        self.debug.apply_changes(changes);
+        for &entry in large {
+            if self.debug_large.len() < crate::model::MAX_FUNCTIONS {
+                self.debug_large.insert(entry);
+            }
+        }
+        if let Some(address) = failed
+            && self.debug_failed.len() < crate::model::MAX_FUNCTIONS
+        {
+            self.debug_failed.insert(address);
+        }
+    }
+
+    /// The debug render of `job`, in a disposable child: the target's
+    /// unlocked probe, then accepted and newly proven callee prototypes, the
+    /// target's prototype, one locked render, the caller comparison against
+    /// the reference and the target's verification. Returns the decision
+    /// changes it made, which the worker adopts.
+    fn debug_render(&mut self, job: &DebugJob<'_>) -> DebugOutcome {
+        self.debug.begin_journal();
+        self.debug_large_journal = Some(Vec::new());
+        let outcome = self.debug_render_inner(job);
+        let changes = self.debug.take_journal();
+        let large = self.debug_large_journal.take().unwrap_or_default();
+        match outcome {
+            Inner::Candidate {
+                render,
+                target_owns,
+                installed_callees,
+                compared,
+                vetoed,
+            } => DebugOutcome::Candidate {
+                render,
+                target_owns,
+                installed_callees,
+                compared,
+                vetoed,
+                changes,
+                large,
+            },
+            Inner::Reference(reason) => DebugOutcome::UseReference {
+                reason,
+                changes,
+                large,
+            },
+            Inner::Failed => DebugOutcome::Failed { changes, large },
+        }
+    }
+
+    fn debug_render_inner(&mut self, job: &DebugJob<'_>) -> Inner {
+        use crate::debug_info::Decision;
+        let address = job.address;
+        let started = std::time::Instant::now();
+        // Obligations come from the reference and the machine code alone,
+        // before any lock is installed.
+        let obligations = job.reference.map(|facts| {
+            let _timing = crate::performance::span("caller_evidence_corroborate");
+            let program = &self.program;
+            let executable = crate::selection::ExecutableRanges::new(&self.info.sections).ok();
+            crate::debug_info::caller::obligations(facts, &mut |pc| {
+                let executable = executable.as_ref()?;
+                let lifted = program.pcode(pc, 1).ok()?.into_iter().next()?;
+                let length = u64::try_from(lifted.length).ok()?;
+                (lifted.address == pc && executable.contains_span(pc, length)).then(|| {
+                    crate::debug_info::caller::RawInstruction {
+                        address: pc,
+                        length,
+                        ops: lifted
+                            .operations
+                            .iter()
+                            .map(|op| crate::debug_info::caller::RawOp {
+                                opcode: op.opcode,
+                                output: op
+                                    .output
+                                    .as_ref()
+                                    .map(crate::debug_info::caller::RawVarnode::from_engine),
+                                inputs: op
+                                    .inputs
+                                    .iter()
+                                    .map(crate::debug_info::caller::RawVarnode::from_engine)
+                                    .collect(),
+                            })
+                            .collect(),
+                    }
+                })
+            })
+        });
+        // The CFG's direct calls drop targets only the engine reports
+        // (flow past calls that never return, resolved indirect jumps).
+        let (target_size, callees) = match self.debug_call_hints(address) {
+            Ok((size, hints)) => (
+                size,
+                job.callees
+                    .iter()
+                    .copied()
+                    .filter(|callee| hints.contains(callee))
+                    .collect::<Vec<_>>(),
+            ),
+            Err(_) => (0, job.callees.clone()),
+        };
+        let mut budget = ProbeBudget::for_target(address, target_size);
+        let prepared = started.elapsed();
+        // The target's unlocked probe runs before any callee lock exists.
+        let mut probed = None;
+        if job.target_work && self.debug.decision(address) == Decision::Undecided {
+            probed = self.debug.probe_pending(&mut self.program, address);
+        }
+        let probed_at = started.elapsed();
+        self.debug_callees(&callees, &mut budget);
+        let callees_at = started.elapsed();
+        debug_trace(format_args!(
+            "child {address:#x} evidence_hints_us={} target_probe_us={} callees_us={}",
+            prepared.as_micros(),
+            (probed_at - prepared).as_micros(),
+            (callees_at - probed_at).as_micros()
+        ));
+        let mut target_owned = false;
+        let mut pending = false;
+        if job.target_work {
+            match self.debug.decision(address) {
+                Decision::Accepted => {
+                    target_owned = self.debug.install_accepted(&mut self.program, address);
+                    // A callee-only acceptance must pass its own locked render.
+                    pending = target_owned && self.debug.provisional(address);
+                }
+                Decision::Undecided => {
+                    if let Some(probed) = probed {
+                        target_owned =
+                            self.debug
+                                .install_probed(&mut self.program, address, probed);
+                        pending = target_owned;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut vetoed = false;
+        for attempt in 0..2 {
+            let installed_callees = self
+                .debug
+                .installed_entries()
+                .into_iter()
+                .filter(|&entry| entry != address && !self.applied_signatures.contains(&entry))
+                .collect::<Vec<_>>();
+            if installed_callees.is_empty() && !target_owned {
+                return Inner::Reference(if vetoed {
+                    Unchanged::EvidenceLost
+                } else {
+                    Unchanged::NothingInstalled
+                });
+            }
+            // Any lock, the function's own included, changes how the engine
+            // recovers every call's arguments: compare each candidate.
+            let compare = true;
+            let rendered = crate::decompile::render_full(
+                &mut self.program,
+                address,
+                &self.info.sections,
+                job.renames,
+                job.context,
+                job.owned,
+                Some(Arc::clone(&self.symbol_names)),
+                compare,
+            );
+            let Ok(render) = rendered else {
+                // A definitive engine failure: a provisional target is
+                // withdrawn for its callers.
+                if pending {
+                    self.debug.fail_direct(address);
+                }
+                self.withdraw_debug(address, false);
+                return Inner::Failed;
+            };
+            if compare {
+                // Callee locks need complete evidence. The function's own
+                // lock alone was previously never compared; it is vetoed
+                // only by a confirmed loss among the facts that exist.
+                let complete = !installed_callees.is_empty();
+                let verdict = match (&obligations, &render.caller) {
+                    (Some(obligations), Some(candidate)) => {
+                        crate::debug_info::caller::compare(obligations, candidate, complete)
+                    }
+                    _ if !complete => Ok(()),
+                    _ => Err(crate::debug_info::caller::Veto::IncompleteReference),
+                };
+                if let Err(veto) = verdict {
+                    crate::performance::event("debug_caller_veto", address);
+                    debug_trace(format_args!(
+                        "veto {address:#x} ({} callees{}): {veto}",
+                        installed_callees.len(),
+                        if target_owned { ", own" } else { "" }
+                    ));
+                    if attempt == 0 && !installed_callees.is_empty() {
+                        // Remove every callee prototype; the function's own
+                        // (if installed) renders once more alone.
+                        vetoed = true;
+                        for entry in installed_callees {
+                            self.debug.rollback(&mut self.program, entry, false);
+                        }
+                        continue;
+                    }
+                    if !installed_callees.is_empty() || !target_owned {
+                        return Inner::Reference(Unchanged::EvidenceLost);
+                    }
+                    // The function's own prototype lost evidence. It is not
+                    // verified by this render; a pending verification is
+                    // charged one attempt, and callers may still use it.
+                    if pending {
+                        self.debug.defer_target(address);
+                    }
+                    self.debug.rollback(&mut self.program, address, false);
+                    return Inner::Reference(Unchanged::OwnEvidenceLost);
+                }
+            }
+            if pending
+                && !self
+                    .debug
+                    .verify(&mut self.program, address, &render.evidence)
+            {
+                // Rejected (or unverifiable): the callees alone may still
+                // apply, verified afresh by one more render.
+                target_owned = false;
+                pending = false;
+                if attempt == 0 {
+                    continue;
+                }
+                break;
+            }
+            let target_owns = target_owned
+                && self.debug.state(address).status == crate::debug_info::Status::Verified;
+            return Inner::Candidate {
+                render: Box::new(Published {
+                    text: render.text,
+                    mappings: render.mappings,
+                    semantics: render.semantics,
+                    calls: render.calls,
+                    calls_complete: render.calls_complete,
+                }),
+                target_owns,
+                installed_callees: installed_callees.clone(),
+                compared: compare,
+                vetoed,
+            };
+        }
+        Inner::Reference(if vetoed {
+            Unchanged::EvidenceLost
+        } else {
+            Unchanged::NothingInstalled
+        })
+    }
+
+    /// A cached final render for exactly this request and current decisions.
+    fn cached_result(
+        &mut self,
+        address: u64,
+        renames: &[crate::semantic::LocalRename],
+        context: &str,
+    ) -> Option<Response> {
+        let index = self.results.entries.iter().position(|entry| {
+            entry.address == address
+                && entry.epoch == self.result_epoch
+                && entry.context == context
+                && entry.renames == renames
+        })?;
+        let current = |entry: u64| (self.debug.state(entry), self.debug_large.contains(&entry));
+        if self.results.entries[index]
+            .dependencies
+            .iter()
+            .any(|&(entry, state, large)| current(entry) != (state, large))
+        {
+            if let Some(stale) = self.results.entries.remove(index) {
+                self.results.bytes -= stale.bytes;
+            }
+            return None;
+        }
+        // Most recently used last.
+        let entry = self.results.entries.remove(index)?;
+        let response = Response::Decompiled {
+            address,
+            text: entry.text.clone(),
+            mappings: entry.mappings.clone(),
+            semantics: entry.semantics.clone(),
+        };
+        self.results.entries.push_back(entry);
+        Some(response)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn cache_result(
+        &mut self,
+        address: u64,
+        renames: &[crate::semantic::LocalRename],
+        context: &str,
+        dependencies: &[u64],
+        text: &str,
+        mappings: &[CodeMapping],
+        semantics: &crate::semantic::SemanticInfo,
+    ) {
+        let mut counter = EncodedLength(0);
+        if serde_json::to_writer(&mut counter, semantics).is_err() {
+            return;
+        }
+        let bytes = counter
+            .0
+            .saturating_add(text.len())
+            .saturating_add(
+                mappings
+                    .len()
+                    .saturating_mul(std::mem::size_of::<CodeMapping>()),
+            )
+            .saturating_add(dependencies.len().saturating_mul(std::mem::size_of::<(
+                u64,
+                crate::debug_info::EntryState,
+                bool,
+            )>()))
+            .saturating_add(context.len() + 256);
+        self.results.insert(CachedResult {
+            address,
+            renames: renames.to_vec(),
+            context: context.into(),
+            epoch: self.result_epoch,
+            dependencies: dependencies
+                .iter()
+                .map(|&entry| {
+                    (
+                        entry,
+                        self.debug.state(entry),
+                        self.debug_large.contains(&entry),
+                    )
+                })
+                .collect(),
+            text: text.into(),
+            mappings: mappings.to_vec(),
+            semantics: semantics.clone(),
+            bytes,
+        });
+    }
+
+    /// The instruction count and direct call targets of `address`, from the
+    /// last displayed graph or a bounded CFG walk.
+    fn debug_call_hints(&mut self, address: u64) -> Result<CallHints, String> {
+        #[cfg(test)]
+        if DEBUG_HINT_FAILURE.get() {
+            return Err("Injected CFG hint error".into());
+        }
+        if let Some((_, hints)) = self.debug_calls.iter().find(|(entry, _)| *entry == address) {
+            return Ok(hints.clone());
+        }
+        let mut remaining = MAX_INSTRUCTIONS;
+        let recovered = recover_graph_budgeted(
+            &self.program,
+            &Bounds {
+                tail_entry: None,
+                sections: &self.info.sections,
+                is_function: &|entry| function_at(&self.info.functions, entry).is_some(),
+                pe_ranges: &self.pe_ranges,
+            },
+            address,
+            &mut remaining,
+            &self.no_return,
+            None,
+        )?;
+        Ok(call_hints(&recovered, MAX_INSTRUCTIONS - remaining))
+    }
+
+    /// Reinstalls accepted callees and probes bounded undecided candidates
+    /// in one child. The child starts with only previously accepted locks.
+    fn debug_callees(&mut self, callees: &[u64], budget: &mut ProbeBudget) -> bool {
+        use crate::debug_info::Decision;
+
+        let mut changed = false;
+        let mut addresses = Vec::new();
+        let mut candidates = Vec::new();
+        let mut can_probe = None;
+        for &callee in callees {
+            if callee == budget.target || self.applied_signatures.contains(&callee) {
+                continue;
+            }
+            match self.debug.decision(callee) {
+                Decision::Accepted if !self.debug.is_installed(callee) => {
+                    changed |= self.debug.install_accepted(&mut self.program, callee);
+                }
+                Decision::Undecided
+                    if !addresses.contains(&callee)
+                        && !self.debug_large.contains(&callee)
+                        && *can_probe
+                            .get_or_insert_with(crate::decompile::callee_probes_available)
+                        && budget.take_probe() =>
+                {
+                    if let Some(prototype) = self.debug.prepare_callee(callee)
+                        && self.probe_shape(callee, budget)
+                    {
+                        addresses.push(callee);
+                        candidates.push(prototype);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if addresses.is_empty() || std::time::Instant::now() >= budget.deadline {
+            return changed;
+        }
+        let replies = crate::decompile::probe_callees(
+            &mut self.program,
+            &addresses,
+            &self.info.sections,
+            budget.deadline,
+        );
+        // Only charge an unavailable attempt for explicit failed results
+        // and the first missing result. Later candidates may not have run.
+        let evidence = replies.into_iter().chain(std::iter::once(None));
+        for ((entry, prototype), evidence) in addresses.into_iter().zip(candidates).zip(evidence) {
+            changed |=
+                self.debug
+                    .finish_callee(&mut self.program, entry, prototype, evidence.as_ref());
+        }
+        changed
+    }
+
+    /// Charge the shape walk even if the remaining allowance is too small.
+    /// The walk only estimates cost (the probe child's CPU limits bound it,
+    /// and evidence comes from the engine), so unresolved indirect jumps and
+    /// tail exits do not prevent a probe; a walk that needs the whole
+    /// allowance does. Cache a large shape only if this request gave it the
+    /// full per-callee allowance.
+    fn probe_shape(&mut self, entry: u64, budget: &mut ProbeBudget) -> bool {
+        let allowance = budget.instructions.min(PROBE_CALLEE_INSTRUCTIONS) + 1;
+        let mut remaining = allowance;
+        let shape = recover_graph_budgeted(
+            &self.program,
+            &Bounds {
+                tail_entry: None,
+                sections: &self.info.sections,
+                is_function: &|e| function_at(&self.info.functions, e).is_some(),
+                pe_ranges: &self.pe_ranges,
+            },
+            entry,
+            &mut remaining,
+            &self.no_return,
+            None,
+        )
+        .is_ok()
+            && remaining > 0;
+        budget.instructions = budget.instructions.saturating_sub(allowance - remaining);
+        if !shape
+            && allowance > PROBE_CALLEE_INSTRUCTIONS
+            && self.debug_large.len() < crate::model::MAX_FUNCTIONS
+            && self.debug_large.insert(entry)
+            && let Some(journal) = self.debug_large_journal.as_mut()
+        {
+            journal.push(entry);
+        }
+        shape
+    }
+
+    /// Removes every installed debug prototype, so the next render of
+    /// `address` uses none, its own or any callee's (including call targets
+    /// only the engine resolves). Other functions reinstall accepted
+    /// prototypes on demand without new evidence. `reject` also stops any
+    /// later install for `address` itself.
+    fn withdraw_debug(&mut self, address: u64, reject: bool) {
+        if reject && !self.applied_signatures.contains(&address) {
+            self.debug.rollback(&mut self.program, address, true);
+        }
+        for entry in self.debug.installed_entries() {
+            if !self.applied_signatures.contains(&entry) {
+                self.debug.rollback(&mut self.program, entry, false);
+            }
+        }
     }
 
     /// The displayed CFG. Known functions of unpacked images also resolve
     /// switch tables; other addresses keep raw instruction flow.
     fn graph(&mut self, address: u64) -> Result<FunctionView, String> {
         let mut remaining = MAX_INSTRUCTIONS;
-        self.graph_budgeted(address, &mut remaining, &mut SwitchBudget::new())
+        let recovered =
+            self.graph_recovery_budgeted(address, &mut remaining, &mut SwitchBudget::new())?;
+        if self.debug.active() {
+            self.debug_calls.retain(|(entry, _)| *entry != address);
+            if self.debug_calls.len() == 64 {
+                self.debug_calls.pop_front();
+            }
+            self.debug_calls.push_back((
+                address,
+                call_hints(&recovered, MAX_INSTRUCTIONS - remaining),
+            ));
+        }
+        Ok(recovered.view)
     }
 
     /// [`Self::graph`] charging decode attempts and engine switch recoveries
@@ -650,6 +2678,16 @@ impl LoadedProgram {
         remaining: &mut usize,
         switches: &mut SwitchBudget,
     ) -> Result<FunctionView, String> {
+        self.graph_recovery_budgeted(address, remaining, switches)
+            .map(|recovered| recovered.view)
+    }
+
+    fn graph_recovery_budgeted(
+        &mut self,
+        address: u64,
+        remaining: &mut usize,
+        switches: &mut SwitchBudget,
+    ) -> Result<cfg::GraphRecovery, String> {
         let functions = &self.info.functions;
         if !functions.is_sorted_by_key(|function| function.address) {
             return Err("Function inventory is not ordered by address".into());
@@ -685,7 +2723,7 @@ impl LoadedProgram {
                 None,
             )?
         };
-        Ok(recovered.view)
+        Ok(recovered)
     }
 
     /// Graph-path views of `entries` for the Program listing, an examined
@@ -755,10 +2793,41 @@ impl LoadedProgram {
                 | Request::Listing { .. }
                 | Request::Decompile { .. }
                 | Request::DecompileWithLocals { .. }
+                | Request::RefreshDecompile { .. }
+                | Request::PrepareDecompile { .. }
+                | Request::RenderDebugOnce { .. }
                 | Request::Discover
                 | Request::DiscoverBatch { .. }
         ) {
             self.analysis_started = true;
+        }
+        // Requests that can change names, signatures, the inventory or the
+        // engine's functions retire every cached render.
+        if !matches!(
+            request,
+            Request::Graph { .. }
+                | Request::Listing { .. }
+                | Request::Decompile { .. }
+                | Request::DecompileWithLocals { .. }
+                | Request::RefreshDecompile { .. }
+                | Request::PrepareDecompile { .. }
+                | Request::TryPreparedDebug { .. }
+                | Request::RenderDebugOnce { .. }
+                | Request::SearchMemory { .. }
+                | Request::Bytes { .. }
+                | Request::Strings
+                | Request::StringsWithOptions { .. }
+                | Request::Crypto
+                | Request::SymbolNames { .. }
+                | Request::Linkage { .. }
+        ) {
+            self.result_epoch = self.result_epoch.wrapping_add(1);
+            self.results.clear();
+            // An offer is bound to the names and signatures it was made under.
+            self.pending_debug = None;
+        }
+        if request.changes_managed_program() {
+            self.debug_program_digest = None;
         }
         match request {
             request @ Request::SearchMemory { .. } => self.search_memory(request),
@@ -769,8 +2838,24 @@ impl LoadedProgram {
             Request::Graph { address } => Ok(Response::Graph {
                 view: self.graph(address)?,
             }),
-            Request::Decompile { address } => self.decompile(address, &[]),
-            Request::DecompileWithLocals { address, renames } => self.decompile(address, &renames),
+            Request::Decompile { address } => self.decompile(address, &[], false),
+            Request::DecompileWithLocals { address, renames } => {
+                self.decompile(address, &renames, false)
+            }
+            Request::RefreshDecompile { address, renames } => {
+                self.decompile(address, &renames, true)
+            }
+            Request::PrepareDecompile {
+                logical_id,
+                address,
+                renames,
+                inference_only,
+                ..
+            } => self.prepare_decompile(logical_id, address, &renames, inference_only),
+            Request::TryPreparedDebug { job } => {
+                Ok(self.try_prepared(job, &mut || false, &mut |_| Ok(())))
+            }
+            Request::RenderDebugOnce { job } => self.render_debug_once(job, &mut |_, _| Ok(())),
             Request::Discover => {
                 self.check_unpacked()?;
                 // Selected-function analysis can materialize and name a callee
@@ -1022,9 +3107,15 @@ impl LoadedProgram {
                 }
                 self.inventory.take_certificate(&self.info.functions);
                 for function in functions {
+                    if function_at(&self.info.functions, function.address)
+                        .is_some_and(|current| current.name == function.name)
+                    {
+                        continue;
+                    }
                     self.program
                         .set_function_name(function.address, &function.name)
                         .map_err(engine_error)?;
+                    self.debug_long_names.remove(&function.address);
                 }
                 self.rebuild_inventory(&BTreeSet::new())?;
                 Ok(Response::FunctionsSynced)
@@ -1044,6 +3135,18 @@ impl LoadedProgram {
                     .map_err(engine_error)?;
                 self.synchronize_function_name(address, &name)?;
                 self.rebuild_inventory(&BTreeSet::new())?;
+                if name.len() > MAX_FUNCTION_NAME_BYTES {
+                    if self.debug_long_names.len() < crate::session::MAX_ANNOTATIONS
+                        || self.debug_long_names.contains_key(&address)
+                    {
+                        self.debug_long_names.insert(address, name.clone());
+                    } else {
+                        // An incomplete name projection cannot authorize a managed job.
+                        self.debug_long_names_complete = false;
+                    }
+                } else {
+                    self.debug_long_names.remove(&address);
+                }
                 Ok(Response::Renamed { address, name })
             }
             Request::Bytes { address, length } => {
@@ -1098,6 +3201,8 @@ impl LoadedProgram {
     fn set_inventory(&mut self, functions: Vec<FunctionInfo>) {
         self.inventory.record(&self.info.functions, &functions);
         self.info.functions = functions;
+        self.debug_inventory_digest = None;
+        self.debug_program_digest = None;
     }
 
     /// [`function_list`] for `required` owners, certifying ordinary selections.
@@ -2030,6 +4135,20 @@ pub(crate) mod tests {
             applied_signatures: BTreeSet::new(),
             signature_state: None,
             analysis_started: false,
+            debug: Default::default(),
+            debug_calls: VecDeque::new(),
+            debug_large: BTreeSet::new(),
+            debug_skip: BTreeSet::new(),
+            debug_failed: BTreeSet::new(),
+            debug_large_journal: None,
+            results: ResultCache::default(),
+            result_epoch: 0,
+            pending_debug: None,
+            debug_nonce: 0,
+            debug_inventory_digest: None,
+            debug_program_digest: None,
+            debug_long_names: BTreeMap::new(),
+            debug_long_names_complete: true,
         }
     }
 
@@ -3053,6 +5172,20 @@ pub(crate) mod tests {
             applied_signatures: BTreeSet::new(),
             signature_state: None,
             analysis_started: false,
+            debug: Default::default(),
+            debug_calls: VecDeque::new(),
+            debug_large: BTreeSet::new(),
+            debug_skip: BTreeSet::new(),
+            debug_failed: BTreeSet::new(),
+            debug_large_journal: None,
+            results: ResultCache::default(),
+            result_epoch: 0,
+            pending_debug: None,
+            debug_nonce: 0,
+            debug_inventory_digest: None,
+            debug_program_digest: None,
+            debug_long_names: BTreeMap::new(),
+            debug_long_names_complete: true,
         };
         loaded.resolve_import_thunks(0x1000).unwrap();
         assert!(
@@ -3744,5 +5877,564 @@ pub(crate) mod tests {
                 .join(",")
         );
         assert!(serde_json::from_str::<Request>(&oversized).is_err());
+    }
+    #[test]
+    fn failed_cfg_hint_does_not_fail_decompile() {
+        let (bytes, entry) = crate::architecture::fixtures::dwarf_prototype(false, 0);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fixture");
+        std::fs::write(&path, bytes).unwrap();
+        let mut loaded = LoadedProgram::open(path.to_str().unwrap()).unwrap();
+        DEBUG_HINT_FAILURE.set(true);
+        let response = loaded.handle(Request::Decompile { address: entry });
+        DEBUG_HINT_FAILURE.set(false);
+        assert!(
+            matches!(response, Ok(Response::Decompiled { .. })),
+            "{response:?}"
+        );
+    }
+
+    /// Compiles original C with GCC into a temporary directory.
+    #[cfg(target_os = "linux")]
+    fn gcc(source: &str, arguments: &[&str]) -> (tempfile::TempDir, std::path::PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("image");
+        let result = std::process::Command::new("gcc")
+            .args(arguments)
+            .arg(source)
+            .arg("-o")
+            .arg(&output)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        (directory, output)
+    }
+    #[cfg(target_os = "linux")]
+    fn decompiled(
+        loaded: &mut LoadedProgram,
+        name: &str,
+    ) -> (u64, String, crate::semantic::SemanticInfo) {
+        let address = loaded
+            .info
+            .functions
+            .iter()
+            .find(|f| f.name == name)
+            .unwrap()
+            .address;
+        match loaded.handle(Request::Decompile { address }) {
+            Ok(Response::Decompiled {
+                text, semantics, ..
+            }) => (address, text, semantics),
+            other => panic!("{name}: {other:?}"),
+        }
+    }
+    #[test]
+    fn managed_debug_fork_requires_known_cpu_and_nonempty_wall_headroom() {
+        use std::time::Duration;
+        let positive = Duration::from_millis(1);
+        let one = Duration::from_secs(1);
+        assert!(!optional_window_available(
+            Duration::ZERO,
+            Some(one + positive)
+        ));
+        assert!(!optional_window_available(positive, None));
+        assert!(!optional_window_available(positive, Some(one)));
+        assert!(optional_window_available(positive, Some(one + positive)));
+    }
+
+    /// An inference-only recovery renders exactly the debug-off result
+    /// under the same user signature and local names (apart from the
+    /// ordinary unverified warning for an indexed target), computes no
+    /// binding digest and leaves no offer or pending optional job; a normal
+    /// preparation on the same worker still offers its upgrade.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn managed_scheduler_inference_only_matches_debug_off_without_offer() {
+        use crate::client::managed_decompile::prepare_request;
+        use crate::signatures::*;
+        let (_directory, path) = gcc(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/sample.c"),
+            &["-O0", "-g", "-fno-pie", "-no-pie", "-fno-inline"],
+        );
+        let open = |enabled: bool| {
+            let mut loaded = LoadedProgram::open_debug(
+                path.to_str().unwrap(),
+                &crate::debug_info::DebugOptions {
+                    enabled,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let address = |name: &str| {
+                loaded
+                    .info
+                    .functions
+                    .iter()
+                    .find(|entry| entry.name == name)
+                    .unwrap()
+                    .address
+            };
+            let (main, branch) = (address("main"), address("branch_loop"));
+            let ty = SignatureType {
+                base: SignatureBase::U32,
+                pointer_depth: 0,
+            };
+            let signatures = vec![FunctionSignature {
+                function: branch,
+                engine: SIGNATURE_FINGERPRINT.into(),
+                abi: "x86:LE:64:default:gcc".into(),
+                return_type: ty,
+                parameters: vec![SignatureParameter {
+                    name: "limit".into(),
+                    ty,
+                }],
+            }];
+            let synced = loaded
+                .handle(Request::SyncSignatures {
+                    binary_sha256: loaded.info.sha256.clone(),
+                    context: state_digest(&signatures),
+                    signatures,
+                })
+                .unwrap();
+            assert!(matches!(synced, Response::SignaturesSynced { .. }));
+            (loaded, main)
+        };
+        let (mut off, main) = open(false);
+        let Response::Decompiled { semantics, .. } =
+            off.handle(Request::Decompile { address: main }).unwrap()
+        else {
+            panic!("ordinary inference")
+        };
+        let renames = vec![crate::semantic::LocalRename {
+            identity: semantics.locals.first().unwrap().identity.clone(),
+            name: "renamed_local".into(),
+        }];
+        let Response::Decompiled {
+            text,
+            mappings,
+            semantics,
+            ..
+        } = off
+            .handle(Request::DecompileWithLocals {
+                address: main,
+                renames: renames.clone(),
+            })
+            .unwrap()
+        else {
+            panic!("ordinary inference")
+        };
+        assert!(text.contains("renamed_local"), "{text}");
+        assert!(text.contains("branch_loop("), "{text}");
+        let (mut on, _) = open(true);
+        assert!(matches!(
+            on.handle(Request::Graph { address: main }).unwrap(),
+            Response::Graph { .. }
+        ));
+        // The Graph recorded main's call hints; a recovery never reads them.
+        let hints = |on: &mut LoadedProgram, inference_only| {
+            let Ok(Ok((job, _))) = on.reference(main, &renames, None, false, inference_only) else {
+                panic!("a reference render")
+            };
+            job.cached_hints
+        };
+        assert!(hints(&mut on, false).is_some());
+        assert!(hints(&mut on, true).is_none());
+        let reply = on
+            .handle(prepare_request(main, renames.clone(), false, true).unwrap())
+            .unwrap();
+        let Response::Decompiled {
+            text: recovered,
+            mappings: recovered_mappings,
+            semantics: mut recovered_semantics,
+            ..
+        } = reply
+        else {
+            panic!("an inference-only recovery is always final: {reply:?}")
+        };
+        assert_eq!(recovered, text);
+        assert_eq!(recovered_mappings, mappings);
+        assert_eq!(
+            recovered_semantics.warnings.pop().as_deref(),
+            Some(UNVERIFIED_WARNING)
+        );
+        assert_eq!(recovered_semantics, semantics);
+        assert_eq!(
+            recovered_semantics.prototype_source,
+            crate::semantic::PrototypeSource::Inferred
+        );
+        assert!(on.pending_debug.is_none());
+        assert!(on.debug_program_digest.is_none());
+        assert!(on.debug_inventory_digest.is_none());
+        assert!(on.results.entries.is_empty());
+        // The same worker still offers a normal upgrade.
+        let reply = on
+            .handle(prepare_request(main, renames, false, false).unwrap())
+            .unwrap();
+        let Response::PreparedDecompile { text: baseline, .. } = reply else {
+            panic!("{reply:?}")
+        };
+        assert_eq!(baseline, text);
+        assert!(on.debug_program_digest.is_some());
+    }
+
+    /// The managed baseline equals the debug-off render on the same image
+    /// (text, mappings, tokens, locals, prototype and warnings) and installs
+    /// nothing in the long-lived engine. A sibling's recapture reproduces
+    /// its binding; the primary commits its checked report exactly once.
+    /// Forged reports, flipped digests, executor mismatches and offers
+    /// retired by a mutating request change no decision.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn managed_debug_sibling_binds_exact_baseline_and_leaves_primary_raw_state_alone() {
+        use crate::client::managed_decompile::{DecisionBook, admit_prepared, prepare_request};
+        let (_directory, path) = gcc(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/sample.c"),
+            &["-O0", "-g", "-fno-pie", "-no-pie", "-fno-inline"],
+        );
+        let open = |enabled: bool| {
+            LoadedProgram::open_debug(
+                path.to_str().unwrap(),
+                &crate::debug_info::DebugOptions {
+                    enabled,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        };
+        let mut primary = open(true);
+        let address = primary
+            .info
+            .functions
+            .iter()
+            .find(|entry| entry.name == "branch_loop")
+            .unwrap()
+            .address;
+        let Response::Decompiled {
+            text,
+            mappings,
+            semantics,
+            ..
+        } = open(false).handle(Request::Decompile { address }).unwrap()
+        else {
+            panic!("ordinary inference")
+        };
+        let prepare = |loaded: &mut LoadedProgram| {
+            let reply = loaded
+                .handle(prepare_request(address, Vec::new(), false, false).unwrap())
+                .unwrap();
+            admit_prepared(address, reply, &loaded.info, "").unwrap()
+        };
+        let prepared = prepare(&mut primary);
+        assert_eq!(prepared.text, text);
+        assert_eq!(prepared.mappings, mappings);
+        assert_eq!(prepared.semantics, semantics);
+        assert_eq!(
+            prepared.offer.as_ref().unwrap().executor,
+            managed::Executor::Sibling
+        );
+        let cutoff = || std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut book = DecisionBook::default();
+        let tx = book.begin(&prepared, Vec::new(), cutoff()).unwrap();
+        let peer = |job| {
+            let mut sibling = open(true);
+            let mut started = 0;
+            let response = sibling
+                .render_debug_once(job, &mut |_, _| {
+                    started += 1;
+                    Ok(())
+                })
+                .unwrap();
+            (response, started)
+        };
+        for (field, expected) in [
+            (0, "digest-baseline"),
+            (1, "digest-facts"),
+            (2, "digest-context"),
+        ] {
+            let mut forged = tx.job.clone();
+            let digest = match field {
+                0 => &mut forged.binding.baseline,
+                1 => &mut forged.binding.facts,
+                _ => &mut forged.binding.context,
+            };
+            digest.replace_range(0..1, if digest.starts_with('0') { "1" } else { "0" });
+            let (response, started) = peer(forged);
+            assert!(
+                matches!(response, Response::DebugUnavailable { ref reason, .. } if reason == expected),
+                "{response:?}"
+            );
+            assert_eq!(started, 0);
+        }
+        let (reply, started) = peer(tx.job.clone());
+        assert_eq!(started, 1);
+        let mut bad = reply.clone();
+        if let Response::DebugFinished { outcome, .. } = &mut bad
+            && let DebugOutcome::Candidate { changes, .. } = &mut outcome.0
+        {
+            changes[0].entry = address + 1;
+        } else {
+            panic!("expected a candidate");
+        }
+        let mut bad = tx.stage_reply(&prepared, bad, true, &primary.info, "");
+        assert!(book.accept(&tx, &mut bad));
+        assert_eq!(bad.result.render(&prepared).0, prepared.text);
+        assert!(
+            book.cached(Some(&tx.job.binding.program), address, &[], false)
+                .is_none()
+        );
+        let prepared = prepare(&mut primary);
+        let tx = book.begin(&prepared, Vec::new(), cutoff()).unwrap();
+        let (reply, started) = peer(tx.job.clone());
+        assert_eq!(started, 1);
+        let mut staged = tx.stage_reply(&prepared, reply, true, &primary.info, "");
+        assert!(book.accept(&tx, &mut staged));
+        let (text, _, semantics) = staged.result.render(&prepared);
+        assert!(text.contains("uint4 branch_loop(uint4 count)"), "{text}");
+        assert_eq!(
+            semantics.prototype_source,
+            crate::semantic::PrototypeSource::DebugInfo
+        );
+        assert_eq!(
+            primary.debug.state(address),
+            crate::debug_info::EntryState::default()
+        );
+        assert!(primary.debug.installed_entries().is_empty());
+        assert!(primary.results.entries.is_empty());
+        for _ in 0..30 {
+            let Some(Response::Decompiled { text: cached, .. }) =
+                book.cached(Some(&tx.job.binding.program), address, &[], false)
+            else {
+                panic!("verified host hit")
+            };
+            assert_eq!(cached, text);
+        }
+        assert!(
+            book.cached(Some(&tx.job.binding.program), address, &[], true)
+                .is_none()
+        );
+        let mut replacement = open(true);
+        let next = prepare(&mut replacement);
+        let tx = book.begin(&next, Vec::new(), cutoff()).unwrap();
+        assert_eq!(
+            tx.job.seed.state(address).status,
+            crate::debug_info::Status::Verified
+        );
+        let (rendered, started) = peer(tx.job.clone());
+        assert_eq!(started, 1);
+        let mut staged = tx.stage_reply(&next, rendered, true, &replacement.info, "");
+        assert!(book.accept(&tx, &mut staged));
+        assert_eq!(staged.result.render(&next).0, text);
+        let different = replacement
+            .handle(Request::Rename {
+                address,
+                name: "changed_name".into(),
+            })
+            .unwrap();
+        assert!(matches!(different, Response::Renamed { .. }));
+        let next = prepare(&mut replacement);
+        let changed = book.begin(&next, Vec::new(), cutoff()).unwrap();
+        assert_ne!(changed.job.binding.program, tx.job.binding.program);
+        assert_eq!(
+            changed.job.seed.state(address),
+            crate::debug_info::EntryState::default()
+        );
+    }
+
+    /// A libtest process is multithreaded, so it can never fork the isolated
+    /// debug render. Its unmanaged fallback publishes exactly the inferred
+    /// render with a warning, runs no optional engine work (the injected
+    /// engine failure never happens) and changes no decision. The isolated
+    /// successful and failing renders are covered by real workers in
+    /// `tests/debug_info.rs`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unmanaged_fallback_never_runs_debug_work_in_process() {
+        let (_directory, path) = gcc(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/debug_opaque_session.c"
+            ),
+            &["-O2", "-g", "-fPIC", "-shared"],
+        );
+        let mut plain = LoadedProgram::open_debug(
+            path.to_str().unwrap(),
+            &crate::debug_info::DebugOptions {
+                enabled: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let (_, inferred, _) = decompiled(&mut plain, "decode_session");
+        let mut loaded = LoadedProgram::open(path.to_str().unwrap()).unwrap();
+        crate::debug_info::ZERO_SIZE_OPAQUE.set(true);
+        let (address, text, semantics) = decompiled(&mut loaded, "decode_session");
+        crate::debug_info::ZERO_SIZE_OPAQUE.set(false);
+        assert_eq!(text, inferred);
+        assert_eq!(
+            semantics.prototype_source,
+            crate::semantic::PrototypeSource::Inferred
+        );
+        assert!(
+            semantics
+                .warnings
+                .iter()
+                .any(|w| w == OPTIONAL_UNAVAILABLE_WARNING),
+            "{:?}",
+            semantics.warnings
+        );
+        assert!(
+            !semantics
+                .warnings
+                .iter()
+                .any(|w| w == crate::debug_info::ENGINE_FAILURE_WARNING)
+        );
+        assert!(!loaded.debug.is_installed(address));
+        assert!(loaded.debug.undecided(address));
+        assert_eq!(
+            loaded.debug.state(address),
+            crate::debug_info::EntryState::default()
+        );
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unmanaged_fallback_leaves_callee_decisions_for_an_isolated_render() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("callees.c");
+        let mut text = String::from(
+            "__attribute__((noinline)) int small_callee(char *name, int count) { return name[0] + count; }\n\
+             __attribute__((noinline)) int large_callee(char *name, int count) {\n volatile int total = count;\n",
+        );
+        for n in 0..400 {
+            text.push_str(&format!(
+                " total = total * {} + name[{}];\n",
+                n % 7 + 2,
+                n % 5
+            ));
+        }
+        text.push_str(
+            " return total;\n}\n\
+             int caller(char *name) { return small_callee(name, 1) + large_callee(name, 2); }\n\
+             int main(int argc, char **argv) { return caller(argv[argc - 1]); }\n",
+        );
+        std::fs::write(&source, text).unwrap();
+        let (_image, path) = gcc(
+            source.to_str().unwrap(),
+            &["-O0", "-g", "-fno-pie", "-no-pie"],
+        );
+        let mut loaded = LoadedProgram::open(path.to_str().unwrap()).unwrap();
+        let address = |name: &str| {
+            loaded
+                .info
+                .functions
+                .iter()
+                .find(|f| f.name == name)
+                .unwrap()
+                .address
+        };
+        let (small, large) = (address("small_callee"), address("large_callee"));
+        let (_, first, semantics) = decompiled(&mut loaded, "caller");
+        assert_eq!(
+            semantics.prototype_source,
+            crate::semantic::PrototypeSource::Inferred
+        );
+        assert!(
+            semantics
+                .warnings
+                .iter()
+                .any(|w| w == OPTIONAL_UNAVAILABLE_WARNING)
+        );
+        // A libtest process is multithreaded, even with one test running.
+        // The worker never forks and keeps both callees undecided.
+        assert_eq!(
+            loaded.debug.decision(small),
+            crate::debug_info::Decision::Undecided
+        );
+        assert_eq!(
+            loaded.debug.decision(large),
+            crate::debug_info::Decision::Undecided
+        );
+        assert!(
+            semantics
+                .warnings
+                .iter()
+                .any(|w| w == "Some callee debug prototypes are unverified")
+        );
+        // Unavailable callee evidence can be retried twice and is never a
+        // rejection, even once the separate callee attempt limit is reached.
+        for _ in 0..2 {
+            let prototype = loaded.debug.prepare_callee(small).unwrap();
+            assert!(
+                !loaded
+                    .debug
+                    .finish_callee(&mut loaded.program, small, prototype, None)
+            );
+            assert!(loaded.debug.undecided(small));
+        }
+        assert!(loaded.debug.prepare_callee(small).is_none());
+        // Direct renders fall back the same way and decide nothing.
+        let (_, _, own_small) = decompiled(&mut loaded, "small_callee");
+        assert_eq!(
+            own_small.prototype_source,
+            crate::semantic::PrototypeSource::Inferred
+        );
+        assert!(loaded.debug.undecided(large));
+        let (_, second, _) = decompiled(&mut loaded, "caller");
+        assert!(first.contains("large_callee"), "{first}");
+        assert!(second.contains("large_callee"), "{second}");
+    }
+
+    fn cached(address: u64, bytes: usize) -> CachedResult {
+        CachedResult {
+            address,
+            renames: Vec::new(),
+            context: String::new(),
+            epoch: 0,
+            dependencies: Vec::new(),
+            text: String::new(),
+            mappings: Vec::new(),
+            semantics: Default::default(),
+            bytes,
+        }
+    }
+
+    #[test]
+    fn result_cache_bounds_entries_and_bytes() {
+        let mut cache = ResultCache::default();
+        for address in 0..100 {
+            cache.insert(cached(address, 1024));
+        }
+        assert_eq!(cache.entries.len(), RESULT_CACHE_ENTRIES);
+        assert_eq!(cache.bytes, RESULT_CACHE_ENTRIES * 1024);
+        // The oldest entries were evicted first.
+        assert_eq!(cache.entries.front().unwrap().address, 36);
+        // Large entries evict by bytes; an oversized one is not retained.
+        for address in 200..210 {
+            cache.insert(cached(address, RESULT_CACHE_MAX_ENTRY));
+        }
+        assert!(cache.bytes <= RESULT_CACHE_BYTES);
+        assert_eq!(
+            cache.bytes,
+            cache.entries.iter().map(|entry| entry.bytes).sum::<usize>()
+        );
+        let before = cache.entries.len();
+        cache.insert(cached(300, RESULT_CACHE_MAX_ENTRY + 1));
+        assert_eq!(cache.entries.len(), before);
+        assert!(cache.entries.iter().all(|entry| entry.address != 300));
+        // A replacement for the same request keeps one entry.
+        cache.insert(cached(209, 10));
+        assert_eq!(
+            cache
+                .entries
+                .iter()
+                .filter(|entry| entry.address == 209)
+                .count(),
+            1
+        );
+        cache.clear();
+        assert_eq!((cache.entries.len(), cache.bytes), (0, 0));
     }
 }

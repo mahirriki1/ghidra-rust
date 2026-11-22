@@ -1325,6 +1325,7 @@ fn start_open(
     let Response::Opened { info, .. } = sampler.request(
         &mut worker,
         Request::Open {
+            debug: Default::default(),
             path: fixture
                 .path
                 .to_str()

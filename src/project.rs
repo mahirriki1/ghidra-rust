@@ -21,9 +21,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+fn default_use_debug_info() -> bool {
+    true
+}
+
 const APPLICATION_ID: i64 = 0x4752504a; // GRPJ
-/// Version 5 adds bounded per-function results; versions 1–4 still open.
-const VERSION: i64 = 5;
+/// Version 6 binds pseudocode to debug state; versions 1–5 still open.
+const VERSION: i64 = 6;
 pub const MAX_SAVED_FUNCTIONS: usize = 128;
 const MAX_FUNCTION_RESULTS: usize = 16 * 1024 * 1024;
 const LEGACY_ENGINE_FINGERPRINT: &str = "ghidra-rust-project-v3-semantic-v1-mapping-v1-pe-v1-aarch64-v1-calls-v1-arm64pe-v1-inventory-v2-elfcrt-v1-switch-v1-noreturn-v1:268c3a406d8d964bc00ae2ead4d3e1e1373aaa27";
@@ -37,6 +41,12 @@ const SCHEMA: &str = "CREATE TABLE project_data (key TEXT NOT NULL, value BLOB N
 
 #[derive(Clone, Debug)]
 pub struct ProjectData {
+    pub debug_source: Option<crate::debug_info::companion::DebugSource>,
+    pub debug_state: String,
+    pub use_debug_info: bool,
+    /// Sorted function entries rendered without debug prototypes after a
+    /// worker failure was attributed to them.
+    pub debug_skip: Vec<u64>,
     pub info: BinaryInfo,
     pub session: Session,
     pub view: Option<FunctionView>,
@@ -167,6 +177,18 @@ struct FunctionRecords {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Body {
+    #[serde(default)]
+    debug_source: Option<crate::debug_info::companion::DebugSource>,
+    #[serde(default)]
+    #[serde(deserialize_with = "crate::bounded::string::<_, 96>")]
+    debug_state: String,
+    #[serde(default = "default_use_debug_info")]
+    use_debug_info: bool,
+    #[serde(
+        default,
+        deserialize_with = "crate::bounded::vec::<_, u64, { crate::debug_info::MAX_SKIPPED_FUNCTIONS }>"
+    )]
+    debug_skip: Vec<u64>,
     engine: String,
     #[serde(default)]
     signature_fingerprint: String,
@@ -213,6 +235,20 @@ pub struct LoadedProject {
 }
 
 impl LoadedProject {
+    pub fn accept_debug(&mut self, state: &str) {
+        if self.data.debug_state != state {
+            self.data.decompiled = None;
+            self.data.mappings.clear();
+            self.data.semantics = Default::default();
+            for result in &mut self.data.function_results {
+                result.decompiled = None;
+                result.mappings.clear();
+                result.semantics = Default::default();
+            }
+            self.data.debug_state = state.into();
+        }
+    }
+
     /// Adopt only validated worker metadata; never parse binary bytes in the desktop.
     pub fn accept_opened(
         &mut self,
@@ -302,6 +338,10 @@ impl ProjectData {
         let mut persisted_info = self.info.clone();
         persisted_info.source_identity = None; // live file identities are not portable capabilities
         let body = Body {
+            debug_source: self.debug_source.clone(),
+            debug_state: self.debug_state.clone(),
+            use_debug_info: self.use_debug_info,
+            debug_skip: self.debug_skip.clone(),
             engine: ENGINE_FINGERPRINT.into(),
             signature_fingerprint: crate::signatures::SIGNATURE_FINGERPRINT.into(),
             signature_context: crate::signatures::state_digest(&self.session.signatures),
@@ -528,6 +568,10 @@ impl ProjectData {
                     v.identity.engine == crate::semantic::local_fingerprint(&local_context)
                 });
         let mut data = ProjectData {
+            debug_source: body.debug_source,
+            debug_state: body.debug_state,
+            use_debug_info: body.use_debug_info,
+            debug_skip: body.debug_skip,
             info: body.info,
             session,
             view: body.view,
@@ -625,6 +669,18 @@ impl ProjectData {
     }
 
     fn validate(&self) -> Result<(), String> {
+        if self.debug_state.len() > 96 {
+            return Err("Invalid debug state".into());
+        }
+        if self.debug_skip.len() > crate::debug_info::MAX_SKIPPED_FUNCTIONS
+            || !self.debug_skip.is_sorted_by(|a, b| a < b)
+        {
+            return Err("Invalid debug skip list".into());
+        }
+        if let Some(source) = &self.debug_source {
+            source.validate()?;
+        }
+
         // Legacy projects allowed 4 KiB names and no aggregate name budget.
         let ranges = validate_info(&self.info, 4096, false)?;
         self.session.validate_ranges_with(&ranges)?;
@@ -1406,6 +1462,10 @@ mod tests {
             },
         );
         let data = ProjectData {
+            debug_source: None,
+            debug_state: String::new(),
+            use_debug_info: true,
+            debug_skip: Vec::new(),
             semantics: Default::default(),
             info: info.clone(),
             session,
@@ -1530,7 +1590,7 @@ mod tests {
         loaded.data.save(&path, &protection, true).unwrap();
         assert_eq!(
             verify_database(&Connection::open(&path).unwrap()).unwrap(),
-            5
+            6
         );
     }
 
@@ -1638,7 +1698,7 @@ mod tests {
         assert_eq!(
             db.pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
                 .unwrap(),
-            5
+            6
         );
         drop(db);
 
@@ -1914,8 +1974,8 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(
-            version, 5,
-            "optional string lengths must not change the v5 project format"
+            version, 6,
+            "optional string lengths must not change the v6 project format"
         );
         for length in [0, 15, u32::MAX] {
             data.strings[0].length = Some(length);
@@ -2301,7 +2361,7 @@ mod tests {
         let path = directory.path().join("test.grproj");
         for mutation in [
             "PRAGMA user_version=0",
-            "PRAGMA user_version=6",
+            "PRAGMA user_version=7",
             // Version 1 never had discovery records.
             "DELETE FROM project_data WHERE key='functions'; PRAGMA user_version=1; INSERT INTO project_data VALUES ('discovery',x'7b7d')",
             "INSERT INTO project_data VALUES ('discovery',x'7b7d')",
@@ -2886,5 +2946,119 @@ mod tests {
         // Projects apply the same aggregate rule.
         data.view = Some(over);
         assert!(data.validate().unwrap_err().contains("Instruction count"));
+    }
+    #[test]
+    fn schema_five_migrates_debug_state_and_invalidates_only_pseudocode() {
+        let directory = tempfile::tempdir().unwrap();
+        // Reuse the independently populated project fixture, retaining its graph,
+        // strings and annotations while varying only the new debug binding.
+        let (mut data, protection) = sample(directory.path());
+        data.function_results.push(additional_function());
+        let path = directory.path().join("debug-migration.grproj");
+        data.save(&path, &protection, true).unwrap();
+        let db = Connection::open(&path).unwrap();
+        let body: Vec<u8> = db
+            .query_row("SELECT value FROM project_data WHERE key='body'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let mut json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        for key in ["debug_state", "use_debug_info", "debug_source"] {
+            json.as_object_mut().unwrap().remove(key);
+        }
+        db.execute(
+            "UPDATE project_data SET value=?1 WHERE key='body'",
+            [serde_json::to_vec(&json).unwrap()],
+        )
+        .unwrap();
+        db.pragma_update(None, "user_version", 5).unwrap();
+        drop(db);
+        let mut loaded = ProjectData::load(&path).unwrap();
+        assert!(loaded.data.debug_state.is_empty() && loaded.data.use_debug_info);
+        let graph = loaded.data.view.as_ref().unwrap().address;
+        let strings = loaded.data.strings.len();
+        let notes = serde_json::to_vec(&loaded.data.session.annotations).unwrap();
+        loaded.accept_debug(crate::debug_info::DEBUG_FINGERPRINT);
+        assert!(loaded.data.decompiled.is_none() && loaded.data.mappings.is_empty());
+        assert_eq!(loaded.data.function_results.len(), 1);
+        let additional = &loaded.data.function_results[0];
+        assert_eq!(additional.view.address, 0x1008);
+        assert!(
+            additional.decompiled.is_none()
+                && additional.mappings.is_empty()
+                && additional.semantics.prototype.is_none()
+        );
+        assert_eq!(loaded.data.view.as_ref().unwrap().address, graph);
+        assert_eq!(loaded.data.strings.len(), strings);
+        assert_eq!(
+            serde_json::to_vec(&loaded.data.session.annotations).unwrap(),
+            notes
+        );
+        assert!(loaded.cache_compatible);
+    }
+    #[test]
+    fn previous_dwarf_fingerprint_invalidates_only_pseudocode() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut data, protection) = sample(directory.path());
+        data.function_results.push(additional_function());
+        // A project saved by the previous DWARF prototype rules.
+        let previous = crate::debug_info::DEBUG_FINGERPRINT.replacen("-v8:", "-v7:", 1);
+        assert_ne!(previous, crate::debug_info::DEBUG_FINGERPRINT);
+        data.debug_state = previous.clone();
+        let path = directory.path().join("previous-dwarf.grproj");
+        data.save(&path, &protection, true).unwrap();
+        let mut loaded = ProjectData::load(&path).unwrap();
+        assert_eq!(loaded.data.debug_state, previous);
+        assert!(loaded.data.decompiled.is_some());
+        let graph = loaded.data.view.as_ref().unwrap().address;
+        let notes = serde_json::to_vec(&loaded.data.session.annotations).unwrap();
+        loaded.accept_debug(crate::debug_info::DEBUG_FINGERPRINT);
+        assert!(loaded.data.decompiled.is_none() && loaded.data.mappings.is_empty());
+        assert!(loaded.data.function_results[0].decompiled.is_none());
+        assert_eq!(loaded.data.view.as_ref().unwrap().address, graph);
+        assert_eq!(loaded.data.function_results[0].view.address, 0x1008);
+        assert_eq!(
+            serde_json::to_vec(&loaded.data.session.annotations).unwrap(),
+            notes
+        );
+        assert_eq!(
+            loaded.data.debug_state,
+            crate::debug_info::DEBUG_FINGERPRINT
+        );
+    }
+    #[test]
+    fn fallback_setting_and_warning_survive_project_roundtrip() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut data, protection) = sample(directory.path());
+        data.use_debug_info = false;
+        crate::debug_info::record_open_fallback(&mut data.info);
+        let path = directory.path().join("fallback.grproj");
+        data.save(&path, &protection, true).unwrap();
+        let loaded = ProjectData::load(&path).unwrap();
+        assert!(!loaded.data.use_debug_info);
+        assert!(crate::debug_info::has_open_fallback(&loaded.data.info));
+        assert_eq!(
+            crate::debug_info::DebugUseStatus::of(loaded.data.use_debug_info, &loaded.data.info),
+            crate::debug_info::DebugUseStatus::DisabledAfterOpenFailure
+        );
+    }
+    #[test]
+    fn debug_skip_lists_roundtrip_and_reject_unsorted_or_oversized_lists() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut data, protection) = sample(directory.path());
+        data.debug_skip = vec![0x1000, 0x1008];
+        let path = directory.path().join("skip.grproj");
+        data.save(&path, &protection, true).unwrap();
+        let loaded = ProjectData::load(&path).unwrap();
+        assert_eq!(loaded.data.debug_skip, [0x1000, 0x1008]);
+        assert!(loaded.data.use_debug_info);
+        for invalid in [
+            vec![0x1008, 0x1000],
+            vec![0x1000, 0x1000],
+            (0..=crate::debug_info::MAX_SKIPPED_FUNCTIONS as u64).collect(),
+        ] {
+            data.debug_skip = invalid;
+            assert!(data.validate().is_err());
+        }
     }
 }

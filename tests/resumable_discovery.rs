@@ -41,6 +41,7 @@ fn open(worker: &mut WorkerClient, path: &Path) -> BinaryInfo {
     let Response::Opened { info, .. } = request(
         worker,
         Request::Open {
+            debug: Default::default(),
             path: path.to_string_lossy().into_owned(),
         },
     ) else {

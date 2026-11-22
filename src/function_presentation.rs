@@ -233,14 +233,30 @@ pub fn view_bytes(view: &FunctionView) -> Option<usize> {
     bytes.total()
 }
 
+#[cfg(test)]
+thread_local! {
+    static PREPARED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Test counter: decompilations this thread prepared (lines and
+/// highlighting built).
+#[cfg(test)]
+pub(crate) fn prepared_count() -> usize {
+    PREPARED.get()
+}
+
 /// One indivisible decompilation: text, mappings, semantic tokens/locals,
 /// inferred prototype and warnings, with derived line ranges and highlighting.
 /// Text and mappings are never combined from different replies.
 pub struct PreparedDecompilation {
     address: u64,
-    text: String,
+    source: Arc<PreparedSource>,
     mappings: Arc<[CodeMapping]>,
     semantics: SemanticInfo,
+}
+
+struct PreparedSource {
+    text: String,
     lines: Box<[(usize, usize)]>,
     highlighted: HighlightedCode,
 }
@@ -274,6 +290,7 @@ impl PreparedDecompilation {
         semantics: &SemanticInfo,
     ) -> usize {
         let mut bytes = Bytes::of::<Self>()
+            .plus(std::mem::size_of::<PreparedSource>())
             .plus(text.capacity())
             .slots::<CodeMapping>(mappings.len())
             .slots::<(usize, usize)>(text.len().min(MAX_CODE_LINES))
@@ -292,6 +309,8 @@ impl PreparedDecompilation {
         mappings: Vec<CodeMapping>,
         semantics: SemanticInfo,
     ) -> Self {
+        #[cfg(test)]
+        PREPARED.set(PREPARED.get() + 1);
         let highlighting = crate::performance::span("gui_highlighting");
         let highlighted = HighlightedCode::new(&text);
         highlighting.finish(text.len() as u64);
@@ -307,12 +326,36 @@ impl PreparedDecompilation {
             .collect();
         Self {
             address,
-            text,
+            source: Arc::new(PreparedSource {
+                text,
+                lines,
+                highlighted,
+            }),
             mappings: mappings.into(),
             semantics,
-            lines,
-            highlighted,
         }
+    }
+
+    /// The same text with other mappings and semantics, validated against
+    /// it, reusing its line ranges and highlighting instead of preparing
+    /// them again.
+    pub(crate) fn rebind(
+        &self,
+        mappings: Vec<CodeMapping>,
+        semantics: SemanticInfo,
+        sections: &[SectionInfo],
+    ) -> Result<Self, DecompilationError> {
+        crate::selection::validate_mappings(self.text(), &mappings, sections)
+            .map_err(DecompilationError::Mappings)?;
+        semantics
+            .validate(self.text(), self.address, sections)
+            .map_err(DecompilationError::Mappings)?;
+        Ok(Self {
+            address: self.address,
+            source: Arc::clone(&self.source),
+            mappings: mappings.into(),
+            semantics,
+        })
     }
 
     pub fn address(&self) -> u64 {
@@ -320,7 +363,7 @@ impl PreparedDecompilation {
     }
 
     pub fn text(&self) -> &str {
-        &self.text
+        &self.source.text
     }
 
     pub fn mappings(&self) -> &Arc<[CodeMapping]> {
@@ -332,21 +375,24 @@ impl PreparedDecompilation {
     }
 
     pub fn lines(&self) -> &[(usize, usize)] {
-        &self.lines
+        &self.source.lines
     }
 
     pub fn highlighted(&self) -> &HighlightedCode {
-        &self.highlighted
+        &self.source.highlighted
     }
 }
 
 impl Retained for PreparedDecompilation {
     fn retained_bytes(&self) -> Option<usize> {
         let mut bytes = Bytes::of::<Self>()
-            .plus(self.text.capacity())
+            // Charge each retained result conservatively, even when its
+            // source is shared with a display-only baseline.
+            .plus(std::mem::size_of::<PreparedSource>())
+            .plus(self.source.text.capacity())
             .slots::<CodeMapping>(self.mappings.len())
-            .slots::<(usize, usize)>(self.lines.len())
-            .add_total(self.highlighted.retained_bytes())
+            .slots::<(usize, usize)>(self.source.lines.len())
+            .add_total(self.source.highlighted.retained_bytes())
             .add_total(semantic_bytes(&self.semantics));
         for mapping in self.mappings.iter() {
             bytes = bytes.slots::<u64>(mapping.addresses.capacity());

@@ -97,6 +97,7 @@ fn real_worker_publishes_declarations_from_its_immutable_snapshot() {
     );
     let mut worker = Process::start();
     let Response::Opened { info, .. } = worker.request(Request::Open {
+        debug: Default::default(),
         path: binary.to_string_lossy().into_owned(),
     }) else {
         panic!("Open original shared library");
@@ -168,6 +169,7 @@ fn real_worker_reads_section_pages_and_clipped_zero_filled_tails() {
     let original = std::fs::read(&binary).unwrap();
     let mut worker = Process::start();
     let Response::Opened { info, .. } = worker.request(Request::Open {
+        debug: Default::default(),
         path: binary.to_string_lossy().into_owned(),
     }) else {
         panic!("cannot open page fixture")
@@ -271,6 +273,7 @@ fn real_worker_sections_map_file_offsets_like_the_program_headers() {
     };
     let mut worker = Process::start();
     let Response::Opened { info, .. } = worker.request(Request::Open {
+        debug: Default::default(),
         path: binary.to_string_lossy().into_owned(),
     }) else {
         panic!("cannot open fixture")
@@ -382,6 +385,7 @@ fn real_worker_browses_decompiles_decodes_scans_and_recovers_from_bad_open() {
     let aes = address("aes_sbox_prefix");
     let mut worker = Process::start();
     let Response::Opened { info, .. } = worker.request(Request::Open {
+        debug: Default::default(),
         path: binary.to_string_lossy().into_owned(),
     }) else {
         panic!("cannot open fixture")
@@ -479,6 +483,10 @@ fn real_worker_browses_decompiles_decodes_scans_and_recovers_from_bad_open() {
         },
     );
     let project = ghidra_rust::project::ProjectData {
+        debug_source: None,
+        debug_state: String::new(),
+        use_debug_info: true,
+        debug_skip: Vec::new(),
         function_results: Vec::new(),
         semantics: Default::default(),
         info,
@@ -502,6 +510,7 @@ fn real_worker_browses_decompiles_decodes_scans_and_recovers_from_bad_open() {
         "project round-trip"
     );
     let Response::Opened { info: reopened, .. } = worker.request(Request::Open {
+        debug: Default::default(),
         path: loaded
             .binary
             .as_ref()
@@ -526,6 +535,7 @@ fn real_worker_browses_decompiles_decodes_scans_and_recovers_from_bad_open() {
     std::fs::write(&invalid, b"not an executable").unwrap();
     assert!(matches!(
         worker.request(Request::Open {
+            debug: Default::default(),
             path: invalid.to_string_lossy().into_owned()
         }),
         Response::Error { .. }
@@ -652,6 +662,7 @@ fn real_worker_searches_only_the_opened_snapshot_and_resumes_pages() {
     let original = std::fs::read(&binary).unwrap();
     let mut worker = Process::start();
     let Response::Opened { info, .. } = worker.request(Request::Open {
+        debug: Default::default(),
         path: binary.to_string_lossy().into_owned(),
     }) else {
         panic!("open");

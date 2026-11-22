@@ -32,6 +32,7 @@ pub struct BinaryProtection {
     original_path: PathBuf,
     identity: FileIdentity,
     snapshot_sha256: Option<String>,
+    debug_guards: Arc<std::sync::Mutex<Vec<BinaryProtection>>>,
 }
 
 impl BinaryProtection {
@@ -81,7 +82,61 @@ impl BinaryProtection {
             original_path: path.to_owned(),
             identity,
             snapshot_sha256: None,
+            debug_guards: Arc::new(std::sync::Mutex::new(Vec::new())),
         })
+    }
+
+    /// Retain the independently verified, already-opened companion inode.
+    pub(crate) fn retain_debug_file(
+        &self,
+        source: &crate::debug_info::companion::DebugSource,
+        file: &File,
+    ) -> Result<(), String> {
+        source.validate()?;
+        let guard = Self::from_open_file(
+            Path::new(&source.path),
+            file.try_clone().map_err(|e| e.to_string())?,
+        )?;
+        if source.identity != Some(guard.identity) {
+            return Err("Debug companion replaced while opening".into());
+        }
+        guard.verify_sha256(&source.sha256)?;
+        let mut guards = self
+            .debug_guards
+            .lock()
+            .map_err(|_| "Debug protection lock failed")?;
+        if guards.iter().any(|old| old.same_source(&guard)) {
+            return Ok(());
+        }
+        if guards.len() == 64 {
+            return Err("Debug companion protection limit reached".into());
+        }
+        guards.push(guard);
+        Ok(())
+    }
+
+    pub(crate) fn inherit_debug_sources(&self, other: &Self) -> Result<(), String> {
+        if Arc::ptr_eq(&self.debug_guards, &other.debug_guards) {
+            return Ok(());
+        }
+        let others = other
+            .debug_guards
+            .lock()
+            .map_err(|_| "Debug protection lock failed")?
+            .clone();
+        let mut guards = self
+            .debug_guards
+            .lock()
+            .map_err(|_| "Debug protection lock failed")?;
+        for guard in others {
+            if !guards.iter().any(|old| old.same_source(&guard)) {
+                if guards.len() == 64 {
+                    return Err("Debug companion protection limit reached".into());
+                }
+                guards.push(guard);
+            }
+        }
+        Ok(())
     }
 
     pub fn path(&self) -> &Path {
@@ -632,6 +687,14 @@ pub(crate) fn safe_destination(
     path: &Path,
     protection: &BinaryProtection,
 ) -> Result<PathBuf, String> {
+    let guards = protection
+        .debug_guards
+        .lock()
+        .map_err(|_| "Debug protection lock failed")?
+        .clone();
+    for guard in guards {
+        safe_destination(path, &guard)?;
+    }
     let directory = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())

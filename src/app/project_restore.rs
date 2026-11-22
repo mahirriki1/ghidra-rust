@@ -193,6 +193,10 @@ mod tests {
         displayed_entry: Option<u64>,
     ) -> ProjectOpen {
         let data = ProjectData {
+            debug_source: None,
+            debug_state: String::new(),
+            use_debug_info: true,
+            debug_skip: Vec::new(),
             function_results: Vec::new(),
             info: app.info.clone().unwrap(),
             session: app.session.clone().unwrap(),
@@ -232,8 +236,9 @@ mod tests {
     fn deliver_graph(app: &mut DesktopApp, view: FunctionView) {
         let context = egui::Context::default();
         let address = view.address;
-        app.queue
-            .retain(|request| !matches!(request, Request::Graph { address: a } if *a == address));
+        app.queue.retain(
+            |request| !matches!(&request.request, Request::Graph { address: a } if *a == address),
+        );
         let pending = Pending {
             id: 1,
             request: Request::Graph { address },
@@ -251,15 +256,15 @@ mod tests {
     }
 
     fn graph_requested(app: &DesktopApp, address: u64) -> bool {
-        app.queue
-            .iter()
-            .any(|request| matches!(request, Request::Graph { address: a } if *a == address))
+        app.queue.iter().any(
+            |request| matches!(&request.request, Request::Graph { address: a } if *a == address),
+        )
     }
 
     fn graph_requested_any(app: &DesktopApp) -> bool {
         app.queue
             .iter()
-            .any(|request| matches!(request, Request::Graph { .. }))
+            .any(|request| matches!(request.request, Request::Graph { .. }))
     }
 
     fn cursor(app: &DesktopApp) -> Option<Row> {

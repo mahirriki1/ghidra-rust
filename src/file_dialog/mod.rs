@@ -21,6 +21,7 @@ use std::time::Duration;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FileDialogKind {
     OpenBinary,
+    OpenDebugInfo,
     OpenProject,
     LocateProjectBinary,
     SaveProject,
@@ -36,6 +37,7 @@ impl FileDialogKind {
     fn title(self) -> &'static str {
         match self {
             Self::OpenBinary => "Open binary",
+            Self::OpenDebugInfo => "Load debug info",
             Self::OpenProject => "Open project (.grproj)",
             Self::LocateProjectBinary => "Locate project binary",
             Self::SaveProject => "Save project (.grproj)",
@@ -594,6 +596,12 @@ impl Picker {
                 }
                 self.confirmation = Confirmation::Idle;
                 match verdict {
+                    Verdict::Directory(path)
+                        if self.kind == FileDialogKind::OpenDebugInfo
+                            && path.extension().is_some_and(|e| e == "dSYM") =>
+                    {
+                        Some(path)
+                    }
                     Verdict::Directory(path) => {
                         if self.source == FilenameSource::Typed {
                             self.filename = self.kind.default_name().into();
@@ -706,6 +714,12 @@ impl Picker {
     fn activate(&mut self, io: &mut Io, index: usize) -> Option<PathBuf> {
         let entry = self.entry(index)?;
         match entry.kind {
+            EntryKind::Directory
+                if self.kind == FileDialogKind::OpenDebugInfo
+                    && entry.path.extension().is_some_and(|e| e == "dSYM") =>
+            {
+                Some(entry.path.clone())
+            }
             EntryKind::Directory => {
                 let path = entry.path.clone();
                 self.navigate(io, path, Intent::New, None);

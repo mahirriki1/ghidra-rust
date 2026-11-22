@@ -244,6 +244,7 @@ fn worker_cache_case(path: &std::path::Path, a: u64, b: u64) {
     let Response::Opened { info, .. } = request(
         &mut worker,
         Request::Open {
+            debug: Default::default(),
             path: path.to_string_lossy().into_owned(),
         },
         &mut count,
@@ -511,4 +512,24 @@ fn save_snapshot_pins_results_and_rejects_pending_or_changed_contexts() {
         results.snapshot().is_empty(),
         "old global context cannot be saved"
     );
+}
+
+#[test]
+fn debug_state_invalidates_cached_pseudocode_and_rejects_stale_bindings() {
+    let mut results = opened();
+    results.set_debug_state("debug-v1");
+    populate(&mut results, 0x1000, "debug text");
+    let stale = results.binding(0x1000, String::new()).unwrap();
+    assert!(results.lookup(0x1000, "").decompiled.is_some());
+    results.set_debug_state("");
+    assert!(results.lookup(0x1000, "").decompiled.is_none());
+    results.admit_decompilation(
+        Some(&stale),
+        code(0x1000, "late debug text"),
+        ResultOrigin::Computed,
+        None,
+    );
+    assert!(results.lookup(0x1000, "").decompiled.is_none());
+    results.set_debug_state("debug-v1");
+    assert!(results.lookup(0x1000, "").decompiled.is_none());
 }

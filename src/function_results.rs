@@ -145,6 +145,7 @@ pub struct FunctionResults {
     store: FunctionStore,
     binary_sha256: String,
     signature_state: String,
+    debug_state: String,
     inventory_state: String,
     function_name_state: String,
     local_states: BTreeMap<u64, String>,
@@ -170,6 +171,7 @@ impl FunctionResults {
             store: ResultStore::new(budget),
             binary_sha256: String::new(),
             signature_state: String::new(),
+            debug_state: String::new(),
             inventory_state: String::new(),
             function_name_state: String::new(),
             refresh: 0,
@@ -193,6 +195,14 @@ impl FunctionResults {
         self.binary_sha256 = binary_sha256.into();
         self.signature_state = crate::signatures::state_digest(signatures);
         self.publish_context();
+    }
+
+    pub fn set_debug_state(&mut self, state: &str) {
+        if self.debug_state != state {
+            self.debug_state = state.into();
+            self.refresh = self.refresh.wrapping_add(1);
+            self.publish_context();
+        }
     }
 
     pub fn close(&mut self) {
@@ -311,6 +321,7 @@ impl FunctionResults {
 
     fn publish_context(&mut self) -> bool {
         self.store.set_context(Arc::new(ProgramContext {
+            debug_state: self.debug_state.clone(),
             binary_sha256: self.binary_sha256.clone(),
             engine_fingerprint: crate::project::ENGINE_FINGERPRINT,
             signature_fingerprint: crate::signatures::SIGNATURE_FINGERPRINT,

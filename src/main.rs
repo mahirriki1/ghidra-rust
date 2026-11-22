@@ -43,9 +43,20 @@ fn main() -> std::process::ExitCode {
         }
         return std::process::ExitCode::FAILURE;
     }
+    // Internal worker roles are legal only after `--analysis-worker`; they
+    // never reach desktop startup as a path to open.
+    if !worker
+        && argument
+            .as_deref()
+            .is_some_and(ghidra_rust::worker::internal_argument)
+    {
+        report_startup_error("Unexpected internal worker argument");
+        return std::process::ExitCode::FAILURE;
+    }
     let lifetime = ghidra_rust::performance::span("process_lifetime");
     let mut success = if worker {
-        ghidra_rust::worker::run_worker().map_err(|error| eprintln!("{error}"))
+        ghidra_rust::worker::run_worker_with(std::env::args_os().skip(2))
+            .map_err(|error| eprintln!("{error}"))
     } else {
         run_desktop(initial_path).map_err(|error| report_startup_error(&error.to_string()))
     }

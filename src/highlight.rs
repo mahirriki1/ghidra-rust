@@ -39,7 +39,7 @@ impl Kind {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Span {
     range: Range<usize>,
     kind: Kind,
@@ -52,7 +52,7 @@ struct Span {
 /// share a span. At most 65,536 spans are retained; exceeding that budget stops
 /// tokenization and replaces the cache with a single plain-text span covering
 /// the entire source. Display and copying preserve all original text.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct HighlightedCode {
     spans: Vec<Span>,
     source_len: usize,

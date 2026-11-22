@@ -2,7 +2,7 @@
 //! and sidecar I/O run on bounded background jobs, with generation-bound results.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
@@ -42,6 +42,58 @@ use crate::xrefs::{
 use context_menu::MenuSource;
 
 const DEADLINE: Duration = crate::model::WORKER_REQUEST_TIMEOUT;
+const FILE_BUSY: &str = "Wait for the current file operation";
+/// Status while a stopped Decompile is rendered once more without debug work.
+const RECOVERY_STATUS: &str = "Worker stopped; retrying with inferred prototypes";
+
+/// The analysis worker: this executable. Unit tests run in Cargo's harness,
+/// which is not a worker; they use [`test_worker`].
+fn worker_executable() -> std::io::Result<PathBuf> {
+    #[cfg(test)]
+    {
+        test_worker()
+    }
+    #[cfg(not(test))]
+    {
+        std::env::current_exe()
+    }
+}
+
+/// The application a full `cargo test` (or `cargo build`) places beside the
+/// unit-test harness, or an explicit worker executable named by
+/// `GHIDRA_RUST_TEST_WORKER` (test builds only). A lib-only run without it
+/// fails clearly instead of starting the harness as a worker.
+#[cfg(test)]
+pub(crate) fn test_worker() -> std::io::Result<PathBuf> {
+    if let Some(explicit) = std::env::var_os("GHIDRA_RUST_TEST_WORKER") {
+        let explicit = PathBuf::from(explicit);
+        return if explicit.is_file() {
+            Ok(explicit)
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "GHIDRA_RUST_TEST_WORKER does not name a built worker executable",
+            ))
+        };
+    }
+    std::env::current_exe()?
+        .parent()
+        .and_then(Path::parent)
+        .map(|dir| {
+            dir.join(if cfg!(windows) {
+                "ghidra-rust.exe"
+            } else {
+                "ghidra-rust"
+            })
+        })
+        .filter(|app| app.is_file())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "unit tests need the built ghidra-rust worker: run `cargo build` or a full `cargo test`",
+            )
+        })
+}
 /// Decompiler line pitch: denser than table rows, like a code editor.
 const CODE_ROW_HEIGHT: f32 = 18.0;
 const HISTORY_LIMIT: usize = 32;
@@ -54,6 +106,7 @@ mod context_menu;
 mod graph_preparation;
 mod listing_cursor;
 mod listing_destinations;
+mod managed_upgrade;
 mod program_cursor;
 mod program_listing;
 mod project_restore;
@@ -240,11 +293,7 @@ fn info_without_functions(info: &BinaryInfo) -> BinaryInfo {
 
 /// UI annotation labels can be longer than worker inventory names.
 fn inventory_name(name: &str) -> &str {
-    let mut end = name.len().min(MAX_FUNCTION_NAME_BYTES);
-    while !name.is_char_boundary(end) {
-        end -= 1;
-    }
-    &name[..end]
+    crate::model::inventory_spelling(name)
 }
 
 /// Addresses whose displayed inventory entry a freshly opened worker lacks.
@@ -299,6 +348,7 @@ fn replay_addresses(worker: &[FunctionInfo], desired: &[FunctionInfo]) -> VecDeq
 }
 
 static NO_SEMANTICS: SemanticInfo = SemanticInfo {
+    prototype_source: crate::semantic::PrototypeSource::Inferred,
     prototype: None,
     tokens: Vec::new(),
     locals: Vec::new(),
@@ -473,10 +523,110 @@ fn pending_task(pending: &Pending) -> &'static str {
     }
 }
 
+/// The one inference-only recovery of a Decompile whose worker stopped
+/// before its baseline, bound to that request and its context. It exists
+/// only inside its own queued action ([`ScheduledAction::Recover`]), which is the
+/// one-shot authority: moving it is the only way it can be sent.
+#[derive(Clone)]
+struct DebugRetry {
+    address: u64,
+    generation: u64,
+    /// The replacement worker's epoch, bound when its Open is installed.
+    epoch: Option<u64>,
+    /// The stopped request's origin; the recovery is sent with it.
+    origin: RequestOrigin,
+    result: Option<ResultBinding>,
+    /// Whether the stopped request was a Refresh.
+    refresh: bool,
+    /// The stopped request's wire id and worker epoch, for diagnostics
+    /// (wire ids restart in every worker).
+    stopped: (u64, u64),
+}
+
+/// What a function request is for beyond its wire form. It travels with the
+/// request through the Open follow-up, the foreground queue, the sent
+/// request and a Graph's presentation, and is never inferred later from an
+/// address.
+#[derive(Clone, Default)]
+enum ScheduledAction {
+    #[default]
+    Ordinary,
+    /// An explicit Refresh: the function's Decompile bypasses reuse of
+    /// verified renders, once.
+    Refresh,
+    /// The one inference-only recovery of a stopped Decompile.
+    Recover(Box<DebugRetry>),
+}
+
+impl ScheduledAction {
+    fn refresh(&self) -> bool {
+        match self {
+            Self::Ordinary => false,
+            Self::Refresh => true,
+            Self::Recover(retry) => retry.refresh,
+        }
+    }
+}
+
+/// A request waiting in the foreground queue or as an Open follow-up,
+/// with its intent.
+#[derive(Clone)]
+struct Queued {
+    request: Request,
+    intent: ScheduledAction,
+}
+
+impl From<Request> for Queued {
+    fn from(request: Request) -> Self {
+        Self {
+            request,
+            intent: ScheduledAction::Ordinary,
+        }
+    }
+}
+
+impl std::fmt::Debug for Queued {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let intent = match &self.intent {
+            ScheduledAction::Ordinary => "ordinary",
+            ScheduledAction::Refresh => "refresh",
+            ScheduledAction::Recover(_) => "recover",
+        };
+        write!(f, "{:?} ({intent})", self.request)
+    }
+}
+
+impl std::ops::Deref for Queued {
+    type Target = Request;
+    fn deref(&self) -> &Request {
+        &self.request
+    }
+}
+
+/// One logical Decompile dispatch, recorded at the physical Prepare seam
+/// for tests: a wire Prepare, or (`cached`) an adopted verified result.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SentDecompile {
+    address: u64,
+    refresh: bool,
+    inference_only: bool,
+    epoch: u64,
+    cached: bool,
+}
+
+/// Whether `queued` is function work (a Graph or Decompile).
+fn function_work(queued: &Queued) -> bool {
+    matches!(
+        queued.request,
+        Request::Graph { .. } | Request::Decompile { .. }
+    )
+}
+
 struct Opening {
     path: PathBuf,
     preserve: bool,
-    follow: Option<Request>,
+    follow: Option<Queued>,
     revision: u64,
     follow_origin: RequestOrigin,
 }
@@ -618,7 +768,12 @@ fn request_task(request: &Request) -> &'static str {
     match request {
         Request::Open { .. } => "Opening binary",
         Request::Graph { .. } => "Building graph",
-        Request::Decompile { .. } | Request::DecompileWithLocals { .. } => "Decompiling",
+        Request::Decompile { .. }
+        | Request::DecompileWithLocals { .. }
+        | Request::RefreshDecompile { .. }
+        | Request::PrepareDecompile { .. }
+        | Request::TryPreparedDebug { .. }
+        | Request::RenderDebugOnce { .. } => "Decompiling",
         Request::Discover | Request::DiscoverBatch { .. } => "Discovering functions",
         Request::SyncFunctions { .. } => "Restoring function context",
         Request::SyncSignatures { .. } => "Applying function signatures",
@@ -646,6 +801,16 @@ enum Intent {
 }
 
 enum FileEvent {
+    WorkerStarted {
+        epoch: u64,
+        options: crate::debug_info::DebugOptions,
+        result: Result<Box<WorkerClient>, String>,
+    },
+    DebugChosen {
+        generation: u64,
+        revision: u64,
+        path: Option<PathBuf>,
+    },
     Chosen(Option<PathBuf>),
     ProjectChosen(Option<PathBuf>),
     Saved {
@@ -716,7 +881,7 @@ pub struct DesktopApp {
     client: Option<WorkerClient>,
     pending: Option<Pending>,
     opening: Option<Opening>,
-    queue: VecDeque<Request>,
+    queue: VecDeque<Queued>,
     applied_names: BTreeMap<u64, String>,
     reset_names: std::collections::BTreeSet<u64>,
     info: Option<BinaryInfo>,
@@ -790,6 +955,8 @@ pub struct DesktopApp {
     xref_choices: Option<XrefChoices>,
     /// Direct target of a decompiler call token chosen by the user.
     selected_call: Option<u64>,
+    selected_call_byte: Option<usize>,
+    code_text_revision: u64,
     /// Generation and exact start of the string row chosen for X.
     string_focus: Option<(u64, u64)>,
     analysis_progress: Option<AnalysisProgress>,
@@ -819,6 +986,25 @@ pub struct DesktopApp {
     /// Widest decompiler display row, in monospace characters.
     code_chars: usize,
     auto_decompile: bool,
+    debug_source: Option<crate::debug_info::companion::DebugSource>,
+    debug_path: Option<PathBuf>,
+    debug_open_override: Option<bool>,
+    debug_fallback_pending: bool,
+    /// `use_debug_info` before an Open fallback, restored if it fails too.
+    debug_open_restore: Option<bool>,
+    use_debug_info: bool,
+    debug_state: String,
+    /// Functions rendered without debug prototypes (saved in the project by
+    /// earlier versions; a worker stop no longer adds one).
+    debug_skip: Vec<u64>,
+    /// The intent of the sent request with this wire id on the current
+    /// worker (a Refresh or the recovery). Cleared with the worker, since
+    /// wire ids restart. A second stop of a sent recovery is reported as
+    /// the ordinary error.
+    sent_intent: Option<(u64, ScheduledAction)>,
+    /// Test record of every logical Decompile dispatch (bounded).
+    #[cfg(test)]
+    sent_decompiles: Vec<SentDecompile>,
     selected: Option<u64>,
     history: Vec<crate::linkage_ui::Place>,
     data_location: Option<(u64, u64)>,
@@ -879,6 +1065,15 @@ pub struct DesktopApp {
     signature_replay: Option<SignatureReplay>,
     signature_change: Option<SignatureChange>,
     signature_unapplied: Vec<SignatureStatus>,
+    /// The displayed baseline's optional debug render, if any.
+    upgrade: Option<managed_upgrade::DisplayedUpgrade>,
+    /// Abandoned optional exchanges whose replies are dropped.
+    abandoned_replies: VecDeque<u64>,
+    /// Effective names a debug peer replays, by name/inventory revision.
+    peer_functions: Option<managed_upgrade::PeerFunctions>,
+    decision_book: crate::client::managed_decompile::DecisionBook,
+    code_preparation: managed_upgrade::CodePreparation,
+    preparing_baseline: Option<managed_upgrade::PreparingBaseline>,
     signature_error: Option<String>,
     signature_restore_pc: Option<(u64, u64)>,
     signature_recovery: Option<u64>,
@@ -960,6 +1155,8 @@ impl DesktopApp {
             reference_revision: 0,
             xref_choices: None,
             selected_call: None,
+            selected_call_byte: None,
+            code_text_revision: 0,
             string_focus: None,
             analysis_progress: None,
             progress_events: 0,
@@ -984,6 +1181,17 @@ impl DesktopApp {
             discovery_resumes: 0,
             code_chars: 0,
             auto_decompile: true,
+            debug_source: None,
+            debug_path: None,
+            debug_open_override: None,
+            debug_fallback_pending: false,
+            debug_open_restore: None,
+            use_debug_info: true,
+            debug_state: String::new(),
+            debug_skip: Vec::new(),
+            sent_intent: None,
+            #[cfg(test)]
+            sent_decompiles: Vec::new(),
             selected: None,
             history: Vec::new(),
             data_location: None,
@@ -1037,6 +1245,12 @@ impl DesktopApp {
             signature_replay: None,
             signature_change: None,
             signature_unapplied: Vec::new(),
+            upgrade: None,
+            abandoned_replies: VecDeque::new(),
+            peer_functions: None,
+            decision_book: Default::default(),
+            code_preparation: Default::default(),
+            preparing_baseline: None,
             signature_error: None,
             signature_restore_pc: None,
             signature_recovery: None,
@@ -1186,6 +1400,7 @@ impl DesktopApp {
         self.reference_access = AccessFilter::All;
         self.xref_choices = None;
         self.selected_call = None;
+        self.selected_call_byte = None;
         self.string_focus = None;
         self.reference_focus = None;
         self.undisplayed_call = None;
@@ -1197,6 +1412,7 @@ impl DesktopApp {
         self.reset_names.clear();
         self.result_scope = None;
         self.results.close();
+        self.decision_book = Default::default();
         self.graph = None;
         self.canvas = None;
         self.graph_preparation.cancel();
@@ -1300,6 +1516,10 @@ impl DesktopApp {
     /// Restarting to verify a retained snapshot may carry a deferred byte origin over
     /// the disposable worker boundary. Explicit stops use `stop_worker` above.
     fn stop_worker_inner(&mut self) {
+        // Reply ids restart with the next worker; nothing optional survives.
+        self.cancel_upgrade();
+        self.sent_intent = None;
+        self.abandoned_replies.clear();
         self.signature_replay = None;
         if let Some(change) = self.signature_change.take() {
             self.signature_recovery = Some(
@@ -1354,17 +1574,51 @@ impl DesktopApp {
         context: &egui::Context,
     ) {
         let follow_origin = self.request_origin();
-        self.start_open_at(path, preserve, follow, follow_origin, context);
+        self.start_open_at(
+            path,
+            preserve,
+            follow.map(Queued::from),
+            follow_origin,
+            context,
+        );
     }
 
     fn start_open_at(
         &mut self,
         path: PathBuf,
         preserve: bool,
-        follow: Option<Request>,
+        mut follow: Option<Queued>,
         follow_origin: RequestOrigin,
         context: &egui::Context,
     ) {
+        if self.file_job.is_some() {
+            self.status = FILE_BUSY.into();
+            return;
+        }
+        if !preserve {
+            self.debug_path = None;
+        }
+        let project = self.opening_project.take();
+        if self.debug_open_override.is_none() {
+            self.debug_fallback_pending = false;
+        }
+        let enabled = self.debug_open_override.take().unwrap_or_else(|| {
+            if preserve {
+                self.use_debug_info
+            } else {
+                project
+                    .as_ref()
+                    .is_none_or(|p| p.project.data.use_debug_info)
+            }
+        });
+        let skip = if preserve {
+            self.debug_skip.clone()
+        } else {
+            project
+                .as_ref()
+                .map(|p| p.project.data.debug_skip.clone())
+                .unwrap_or_default()
+        };
         let bytes = preserve.then(|| self.discovery_bytes.take()).flatten();
         // Only carry remaining queued work when dispatch itself needs to
         // recreate an absent worker. Navigation that preempts a live request
@@ -1375,7 +1629,9 @@ impl DesktopApp {
             // A pending page interrupted by function navigation needs an
             // explicit Retry; a newer deferred page survives the restart.
             if bytes.is_none()
-                && !matches!(follow, Some(Request::Bytes { .. }))
+                && !follow
+                    .as_ref()
+                    .is_some_and(|follow| matches!(follow.request, Request::Bytes { .. }))
                 && self.hex.is_loading()
             {
                 self.hex
@@ -1389,29 +1645,124 @@ impl DesktopApp {
         if let Some(queued) = queued {
             self.queue = queued;
         }
-        match WorkerClient::start(context.clone(), &path) {
-            Ok(mut client) => {
-                if preserve && let Some(binary) = &self.project_binary {
-                    client.retain_source(std::sync::Arc::new(binary.clone()));
+        self.opening_project = project;
+        self.worker_epoch = self.worker_epoch.wrapping_add(1);
+        let epoch = self.worker_epoch;
+        // A recovery is bound to the first replacement installed for it; a
+        // later Open (such as the debug-disabled fallback) cannot send it.
+        if let Some(Queued {
+            intent: ScheduledAction::Recover(retry),
+            ..
+        }) = &mut follow
+        {
+            retry.epoch.get_or_insert(epoch);
+        }
+        self.opening = Some(Opening {
+            path: path.clone(),
+            preserve,
+            follow,
+            revision: self.revision,
+            follow_origin,
+        });
+        self.status = format!("Opening {}…", path.display());
+        let options = crate::debug_info::DebugOptions {
+            enabled,
+            companion_path: self
+                .debug_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+            skip,
+        };
+        let ctx = context.clone();
+        let source = if preserve {
+            self.project_binary.clone()
+        } else {
+            self.opening_project
+                .as_ref()
+                .and_then(|p| p.project.binary.clone())
+        };
+        self.file_task(context, move || {
+            let result = worker_executable()
+                .map_err(|e| e.to_string())
+                .and_then(|exe| {
+                    WorkerClient::start_using_executable_options(
+                        ctx,
+                        &path,
+                        &exe,
+                        options.companion_path.as_deref().map(Path::new),
+                        enabled,
+                    )
+                })
+                .map(Box::new);
+            let result = result.map(|mut client| {
+                if let Some(source) = source {
+                    client.retain_source(Arc::new(source));
                 }
-                self.worker_epoch = self.worker_epoch.wrapping_add(1);
-                self.client = Some(client);
-                self.opening = Some(Opening {
-                    path: path.clone(),
-                    preserve,
-                    follow,
-                    revision: self.revision,
-                    follow_origin,
-                });
-                self.status = format!("Opening {}…", path.display());
-                self.send_direct(Request::Open {
-                    path: path.to_string_lossy().into_owned(),
-                });
+                client
+            });
+            FileEvent::WorkerStarted {
+                epoch,
+                options,
+                result,
             }
-            Err(error) => {
-                self.stop_worker();
-                self.status = error;
+        });
+    }
+
+    fn debug_actions_enabled(&self) -> bool {
+        self.info.is_some()
+            && self.file_job.is_none()
+            && self.opening.is_none()
+            && self.signature_change.is_none()
+            && self.signature_replay.is_none()
+    }
+
+    fn choose_debug_info(&mut self, context: &egui::Context) {
+        if !self.debug_actions_enabled() || self.info.as_ref().is_none_or(|i| i.format != "Mach-O")
+        {
+            return;
+        }
+        let sender = self.file_dialogs.sender();
+        let generation = self.generation;
+        let revision = self.revision;
+        let name = self
+            .binary_path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_owned());
+        self.file_task(context, move || {
+            let path =
+                request_file(&sender, FileDialogKind::OpenDebugInfo, None).and_then(|path| {
+                    if path.extension().is_some_and(|e| e == "dSYM") {
+                        name.map(|name| path.join("Contents/Resources/DWARF").join(name))
+                    } else {
+                        Some(path)
+                    }
+                });
+            FileEvent::DebugChosen {
+                generation,
+                revision,
+                path,
             }
+        });
+    }
+
+    fn set_debug_info(&mut self, enabled: bool, context: &egui::Context) {
+        if !self.debug_actions_enabled() {
+            return;
+        }
+        self.use_debug_info = enabled;
+        if enabled {
+            // Re-enabling also withdraws every per-function skip.
+            self.debug_skip.clear();
+        }
+        self.revision = self.revision.wrapping_add(1);
+        self.results.set_debug_state("debug-toggle-pending");
+        self.clear_decompilation();
+        if let Some(path) = self.binary_path.clone() {
+            let follow = self
+                .view()
+                .map(|v| Queued::from(Request::Graph { address: v.address }));
+            self.start_open_at(path, true, follow, self.request_origin(), context);
         }
     }
 
@@ -1421,8 +1772,40 @@ impl DesktopApp {
     }
 
     fn send_direct_at(&mut self, request: Request, origin: RequestOrigin) {
-        self.analysis_progress = None;
-        self.progress_events = 0;
+        self.send_action(request.into(), origin);
+    }
+
+    /// Whether `retry`, about to be sent as `request` with the current
+    /// optional result binding `result`, is still the recovery of what is
+    /// displayed: the same generation, replacement worker, selection,
+    /// annotation revision, displayed code function and result key. The
+    /// key, not the store's invalidation counter, is compared: replaying the
+    /// same names on the replacement bumps the counter without changing the
+    /// program context, and the send binds the current counter.
+    fn recovery_current(
+        &self,
+        retry: &DebugRetry,
+        request: &Request,
+        result: Option<&ResultBinding>,
+    ) -> bool {
+        matches!(request, Request::Decompile { address } if *address == retry.address)
+            && retry.generation == self.generation
+            && retry.epoch == Some(self.worker_epoch)
+            && retry.origin.selection == self.selection_generation
+            && retry.origin.revision == self.revision
+            && self.data_location.is_none()
+            && self
+                .view()
+                .is_some_and(|view| view.address == retry.address)
+            && retry.result.as_ref().map(|binding| &binding.key)
+                == result.map(|binding| &binding.key)
+    }
+
+    /// Sends one request with its intent. A recovery goes out only while it
+    /// is current, with its own saved origin; a stale one is dropped before
+    /// anything is cancelled, looked up or sent.
+    fn send_action(&mut self, queued: Queued, origin: RequestOrigin) {
+        let Queued { request, intent } = queued;
         // Results computed while a signature state is staged or awaiting
         // acknowledgement are never stored under the committed context.
         let result = match &request {
@@ -1443,13 +1826,32 @@ impl DesktopApp {
             }
             _ => None,
         };
+        let origin = match &intent {
+            ScheduledAction::Recover(retry) => {
+                if !self.recovery_current(retry, &request, result.as_ref()) {
+                    crate::performance::event("debug_recovery_dropped", retry.address);
+                    return;
+                }
+                // The stopped request, as the diagnostics' (id, epoch) pair.
+                crate::performance::event("debug_recovery_stopped_id", retry.stopped.0);
+                crate::performance::event("debug_recovery_stopped_epoch", retry.stopped.1);
+                retry.origin
+            }
+            _ => origin,
+        };
+        self.analysis_progress = None;
+        self.progress_events = 0;
+        if matches!(request, Request::Decompile { .. }) {
+            self.cancel_upgrade();
+        }
+        let inference_only = matches!(intent, ScheduledAction::Recover(_));
         let Some(client) = &mut self.client else {
             return;
         };
-        let wire_request = match &request {
-            Request::Decompile { address } => Request::DecompileWithLocals {
-                address: *address,
-                renames: self
+        let started = Instant::now();
+        let sent = match &request {
+            Request::Decompile { address } => {
+                let renames = self
                     .session
                     .as_ref()
                     .map(|session| {
@@ -1458,14 +1860,48 @@ impl DesktopApp {
                             .iter()
                             .filter(|r| r.identity.function == *address)
                             .cloned()
-                            .collect()
+                            .collect::<Vec<_>>()
                     })
-                    .unwrap_or_default(),
-            },
-            _ => request.clone(),
+                    .unwrap_or_default();
+                let refresh = intent.refresh();
+                let cached =
+                    (!inference_only && result.is_some() && client.can_queue_verified_result())
+                        .then(|| {
+                            self.decision_book.cached(
+                                client.managed_program.as_deref(),
+                                *address,
+                                &renames,
+                                refresh,
+                            )
+                        })
+                        .flatten();
+                #[cfg(test)]
+                if self.sent_decompiles.len() < 64 {
+                    self.sent_decompiles.push(SentDecompile {
+                        address: *address,
+                        refresh,
+                        inference_only,
+                        epoch: self.worker_epoch,
+                        cached: cached.is_some(),
+                    });
+                }
+                match cached {
+                    Some(response) => client.queue_verified_result(response),
+                    None => crate::client::managed_decompile::prepare_request(
+                        *address,
+                        renames,
+                        refresh,
+                        inference_only,
+                    )
+                    .and_then(|wire| client.send(wire)),
+                }
+            }
+            _ => client.send(request.clone()),
         };
-        match client.send(wire_request) {
+        match sent {
             Ok(id) => {
+                self.sent_intent =
+                    (!matches!(intent, ScheduledAction::Ordinary)).then_some((id, intent));
                 let _context = crate::performance::context(id);
                 crate::performance::event("generation", self.generation);
                 crate::performance::event("epoch", self.worker_epoch);
@@ -1474,7 +1910,7 @@ impl DesktopApp {
                 self.pending = Some(Pending {
                     id,
                     request,
-                    started: Instant::now(),
+                    started,
                     selection: origin.selection,
                     revision: origin.revision,
                     byte_origin: origin.byte_origin,
@@ -1495,6 +1931,7 @@ impl DesktopApp {
     }
 
     fn update_result_inputs(&mut self, reason: crate::function_results::Invalidation) {
+        self.peer_functions = None;
         self.results.inputs_changed(reason);
         let Some(info) = &self.info else {
             return;
@@ -1517,6 +1954,13 @@ impl DesktopApp {
     }
 
     fn request(&mut self, request: Request, context: &egui::Context) {
+        self.request_action(request.into(), context);
+    }
+
+    /// [`Self::request`] with the request's intent, which every deferral
+    /// keeps with it.
+    fn request_action(&mut self, queued: Queued, context: &egui::Context) {
+        let request = &queued.request;
         if matches!(request, Request::Discover)
             && self
                 .info
@@ -1529,30 +1973,34 @@ impl DesktopApp {
         {
             self.begin_discovery_activity(Instant::now());
         }
-        if let Request::Bytes { address, length } = request {
+        if let Request::Bytes { address, length } = *request {
             self.request_bytes(address, length, ByteDestination::Decode, context);
             return;
         }
         if self.opening.is_some() {
             // The new client must first prove it opened the intended binary.
+            // A newer action replaces its follow-up, a recovery included.
             let origin = self.request_origin();
             if let Some(opening) = &mut self.opening {
-                if matches!(opening.follow, Some(Request::Bytes { .. }))
+                if opening
+                    .follow
+                    .as_ref()
+                    .is_some_and(|follow| matches!(follow.request, Request::Bytes { .. }))
                     && self.discovery_bytes.is_none()
                 {
                     self.discovery_bytes = opening
                         .follow
                         .take()
-                        .map(|read| (read, opening.follow_origin));
+                        .map(|read| (read.request, opening.follow_origin));
                 }
-                opening.follow = Some(request);
+                opening.follow = Some(queued);
                 opening.follow_origin = origin;
             }
             return;
         }
         if self.signature_replay.is_some() || self.results.preparing() {
             if self.queue.len() < HISTORY_LIMIT {
-                self.queue.push_back(request);
+                self.queue.push_back(queued);
             }
             return;
         }
@@ -1581,12 +2029,10 @@ impl DesktopApp {
             // Interactive work runs between bounded batches. Keep only the
             // newest navigation requests, and bound queued user actions.
             if matches!(request, Request::Graph { .. }) {
-                self.queue.retain(|queued| {
-                    !matches!(queued, Request::Graph { .. } | Request::Decompile { .. })
-                });
+                self.queue.retain(|queued| !function_work(queued));
             }
             if self.queue.len() < HISTORY_LIMIT {
-                self.queue.push_back(request);
+                self.queue.push_back(queued);
             }
             return;
         }
@@ -1600,27 +2046,37 @@ impl DesktopApp {
             }
             if let Some(path) = self.binary_path.clone() {
                 let continue_discovery = self.discovery_running;
-                self.start_open(path, true, Some(request), context);
+                let origin = self.request_origin();
+                self.start_open_at(path, true, Some(queued), origin, context);
                 self.discovery_running = continue_discovery && self.client.is_some();
                 self.update_discovery_summary();
             }
         } else {
-            self.schedule_request(request);
+            self.schedule_action(queued);
         }
     }
 
-    fn schedule_request(&mut self, request: Request) {
-        if self.signature_replay.is_some() || self.results.preparing() {
+    /// Sends `queued` now, or defers it with its intent while the program
+    /// context is still being prepared or replayed. A recovery also waits
+    /// for an inventory replay to be acknowledged.
+    fn schedule_action(&mut self, queued: Queued) {
+        if self.signature_replay.is_some()
+            || self.results.preparing()
+            || matches!(queued.intent, ScheduledAction::Recover(_)) && self.discovery_sync.is_some()
+        {
             if self.queue.len() < HISTORY_LIMIT {
-                self.queue.push_back(request);
+                self.queue.push_back(queued);
+            }
+            if self.signature_replay.is_none() && !self.results.preparing() {
+                self.send_inventory_sync();
             }
             return;
         }
-        if matches!(request, Request::Discover) {
+        if matches!(queued.request, Request::Discover) {
             self.discovery_running = true;
             return;
         }
-        let address = match &request {
+        let address = match &queued.request {
             Request::Graph { address } | Request::Decompile { address } => Some(*address),
             _ => None,
         };
@@ -1634,12 +2090,35 @@ impl DesktopApp {
             if let Some(name) = name
                 && self.applied_names.get(&address) != Some(&name)
             {
-                self.queue.push_front(request);
+                // The label Rename goes first; the request keeps its intent.
+                self.queue.push_front(queued);
                 self.send_direct(Request::Rename { address, name });
                 return;
             }
         }
-        self.send_direct(request);
+        let origin = self.request_origin();
+        self.send_action(queued, origin);
+    }
+
+    /// Sends the next inventory replay batch, if one is due. Whether one was
+    /// sent.
+    fn send_inventory_sync(&mut self) -> bool {
+        if self.pending.is_some() || self.opening.is_some() || self.client.is_none() {
+            return false;
+        }
+        let Some(addresses) = &mut self.discovery_sync else {
+            return false;
+        };
+        let Some(info) = &self.info else {
+            return false;
+        };
+        let functions = next_sync_batch(addresses, &info.functions);
+        if functions.is_empty() {
+            self.discovery_sync = None;
+            return false;
+        }
+        self.send_direct(Request::SyncFunctions { functions });
+        true
     }
 
     fn request_origin(&self) -> RequestOrigin {
@@ -1796,7 +2275,8 @@ impl DesktopApp {
         }
     }
 
-    fn schedule_open_follow(&mut self, request: Request, origin: RequestOrigin) {
+    fn schedule_open_follow(&mut self, follow: Queued, origin: RequestOrigin) {
+        let Queued { request, intent } = follow;
         if matches!(request, Request::Bytes { .. }) {
             if !self.byte_request_current(&request, origin) {
                 self.retire_byte_request(&request, origin);
@@ -1819,14 +2299,23 @@ impl DesktopApp {
                 if let Some((code, origin)) = hit.decompiled {
                     self.adopt_decompilation(code, origin);
                 }
+                // Each expanded request keeps the action's intent.
                 for request in requests {
-                    self.schedule_request(request);
+                    self.schedule_action(Queued {
+                        request,
+                        intent: intent.clone(),
+                    });
                 }
             } else {
-                self.schedule_request(Request::Graph { address });
+                self.schedule_action(Queued {
+                    request: Request::Graph { address },
+                    intent,
+                });
             }
         } else {
-            self.schedule_request(request);
+            // The bounded foreground path, with the follow-up's intent (a
+            // recovery included).
+            self.schedule_action(Queued { request, intent });
         }
     }
 
@@ -1850,6 +2339,18 @@ impl DesktopApp {
         record: bool,
         context: &egui::Context,
     ) {
+        self.navigate_action(address, focus, record, ScheduledAction::Ordinary, context);
+    }
+
+    /// [`Self::navigate_to`] whose resulting requests carry `intent`.
+    fn navigate_action(
+        &mut self,
+        address: u64,
+        focus: Option<u64>,
+        record: bool,
+        intent: ScheduledAction,
+        context: &egui::Context,
+    ) {
         if self.result_scope != Some(address) {
             self.result_revision = self.result_revision.wrapping_add(1);
         }
@@ -1858,6 +2359,7 @@ impl DesktopApp {
         self.string_focus = None;
         self.linkage_focus = false;
         self.selected_call = None;
+        self.selected_call_byte = None;
         self.undisplayed_call = None;
         self.selection_generation = self.selection_generation.wrapping_add(1);
         crate::performance::navigation_begin(self.selection_generation);
@@ -1909,22 +2411,30 @@ impl DesktopApp {
         if let Some((code, origin)) = hit.decompiled {
             self.adopt_decompilation(code, origin);
         }
-        // Retire queued work for superseded selections. A full hit never sends
-        // or restarts a worker, even while another request is finishing.
-        self.queue.retain(|request| {
-            !matches!(request, Request::Graph { .. } | Request::Decompile { .. })
-        });
-        if let Some(opening) = &mut self.opening
-            && matches!(
-                opening.follow,
-                Some(Request::Graph { .. } | Request::Decompile { .. })
-            )
-        {
-            opening.follow = None;
-        }
+        // Retire queued work for superseded selections, a recovery included,
+        // even when a cache hit sends nothing. A full hit never sends or
+        // restarts a worker, even while another request is finishing.
+        self.retire_function_work();
         for request in requests {
             self.status = format!("Loading function {address:#x}…");
-            self.request(request, context);
+            self.request_action(
+                Queued {
+                    request,
+                    intent: intent.clone(),
+                },
+                context,
+            );
+        }
+    }
+
+    /// Drops queued and follow-up function work of a superseded selection,
+    /// including a recovery, and keeps everything else.
+    fn retire_function_work(&mut self) {
+        self.queue.retain(|queued| !function_work(queued));
+        if let Some(opening) = &mut self.opening
+            && opening.follow.as_ref().is_some_and(function_work)
+        {
+            opening.follow = None;
         }
     }
 
@@ -1935,7 +2445,9 @@ impl DesktopApp {
         };
         self.results.refresh(address);
         self.result_revision = self.result_revision.wrapping_add(1);
-        self.navigate(address, false, context);
+        // The refresh travels with the requests this action makes (initially
+        // the Graph) to its Decompile.
+        self.navigate_action(address, None, false, ScheduledAction::Refresh, context);
     }
 
     /// Decompiler Refresh: recompute only the pseudocode, bypassing the store.
@@ -1947,11 +2459,23 @@ impl DesktopApp {
             .refresh_decompilation(address, crate::function_results::Invalidation::Refresh);
         self.result_revision = self.result_revision.wrapping_add(1);
         self.clear_decompilation();
-        self.request(Request::Decompile { address }, context);
+        // An explicit Refresh replaces an earlier action for this function,
+        // including one waiting in the queue during a replay.
+        self.queue.retain(
+            |queued| !matches!(queued.request, Request::Decompile { address: a } if a == address),
+        );
+        self.request_action(
+            Queued {
+                request: Request::Decompile { address },
+                intent: ScheduledAction::Refresh,
+            },
+            context,
+        );
     }
 
-    /// Shows the stored decompilation of the displayed graph, or requests it.
-    fn load_decompilation(&mut self, address: u64) {
+    /// Shows the stored decompilation of the displayed graph, or requests it
+    /// (as a Refresh when the graph was requested by one).
+    fn load_decompilation(&mut self, address: u64, refresh: bool) {
         let state = self.local_override_state(address);
         if let Some((code, origin)) = self.results.lookup(address, &state).decompiled {
             self.adopt_decompilation(code, origin);
@@ -1960,19 +2484,28 @@ impl DesktopApp {
             // Presentation can finish while linkage/search maintenance owns
             // the worker. Never replace that request's pending reply binding.
             if self.queue.len() < HISTORY_LIMIT {
-                self.queue.push_front(Request::Decompile { address });
+                self.queue.push_front(Queued {
+                    request: Request::Decompile { address },
+                    intent: if refresh {
+                        ScheduledAction::Refresh
+                    } else {
+                        ScheduledAction::Ordinary
+                    },
+                });
             }
         }
     }
 
     /// Drops the displayed decompilation and every selection derived from it.
     fn clear_decompilation(&mut self) {
+        self.cancel_upgrade();
         self.code = None;
         self.saved_analysis = false;
         self.semantic.clear();
         self.comment_rows_key = None;
         self.selected_local = None;
         self.selected_call = None;
+        self.selected_call_byte = None;
         self.decompiler_rename_context = false;
         self.pending_code_scroll = None;
         self.pending_comment_scroll = None;
@@ -2031,6 +2564,7 @@ impl DesktopApp {
         let _adoption = crate::performance::span("function_result_adopt_decompilation");
         self.selected_local = None;
         self.selected_call = None;
+        self.selected_call_byte = None;
         self.decompiler_rename_context = false;
         self.semantic.mappings = code.mappings().clone();
         self.comment_rows_key = None;
@@ -2084,6 +2618,7 @@ impl DesktopApp {
         self.string_focus = None;
         self.linkage_focus = false;
         self.selected_call = None;
+        self.selected_call_byte = None;
         self.xref_choices = None;
         self.pending_comment_scroll = None;
         self.pending_code_scroll = None;
@@ -2113,6 +2648,9 @@ impl DesktopApp {
             Some(TokenKind::Call { target }) => Some(*target),
             _ => None,
         };
+        self.selected_call_byte = self
+            .selected_call
+            .and_then(|_| self.semantics().token_at(byte).map(|token| token.start));
         let Some(primary) = self.semantic.select_code(byte) else {
             self.semantic.addresses.clear();
             self.semantic.ranges.clear();
@@ -2565,7 +3103,173 @@ impl DesktopApp {
             .is_some_and(|plan| plan.current == Some(step))
     }
 
+    fn record_debug_open_outcome(&mut self, info: &mut BinaryInfo, enabled: bool, preserve: bool) {
+        if !enabled {
+            if self.debug_fallback_pending {
+                crate::debug_info::record_open_fallback(info);
+            } else if let Some(project) = &self.opening_project {
+                crate::debug_info::inherit_fallback(info, &project.project.data.info);
+            } else if preserve && let Some(old) = &self.info {
+                crate::debug_info::inherit_fallback(info, old);
+            }
+        } else {
+            info.warnings
+                .retain(|w| !crate::debug_info::is_fallback_warning(w));
+        }
+        self.debug_fallback_pending = false;
+    }
+
+    /// After the worker stopped (`stopped`: it exited or missed the
+    /// deadline) before a debug-enabled Decompile had its baseline, renders
+    /// that one function once more in a fresh worker with ordinary inference
+    /// only. A stop says nothing about debug work, so no skip is recorded,
+    /// and the project and annotation revision are unchanged.
+    fn retry_debug_decompile(&mut self, stopped: bool, context: &egui::Context) -> bool {
+        // The restart needs the file worker; otherwise report the failure.
+        if !stopped
+            || !self.use_debug_info
+            || self.debug_state.is_empty()
+            || self.file_job.is_some()
+        {
+            return false;
+        }
+        let Some(pending) = &self.pending else {
+            return false;
+        };
+        let sent = self
+            .sent_intent
+            .as_ref()
+            .filter(|(id, _)| *id == pending.id)
+            .map(|(_, intent)| intent);
+        // A second stop, of the recovery itself, is terminal.
+        if matches!(sent, Some(ScheduledAction::Recover(_))) {
+            return false;
+        }
+        let refresh = sent.is_some_and(ScheduledAction::refresh);
+        let address = match pending.request {
+            Request::Decompile { address } | Request::DecompileWithLocals { address, .. } => {
+                address
+            }
+            _ => return false,
+        };
+        let Some(path) = self.binary_path.clone() else {
+            return false;
+        };
+        // Only a function still shown, in the context it was requested in,
+        // is retried; otherwise the failure is reported normally.
+        if pending.selection != self.selection_generation
+            || pending.revision != self.revision
+            || self.view().is_none_or(|v| v.address != address)
+        {
+            return false;
+        }
+        // The recovery is the follow-up itself, carrying the stopped
+        // request's origin, binding and refresh bit (a stopped Refresh
+        // re-sends its refresh once); the replacement's epoch is bound when
+        // its Open is installed.
+        let origin = RequestOrigin {
+            selection: pending.selection,
+            revision: pending.revision,
+            byte_origin: pending.byte_origin,
+            bytes: None,
+        };
+        let follow = Queued {
+            request: Request::Decompile { address },
+            intent: ScheduledAction::Recover(Box::new(DebugRetry {
+                address,
+                generation: self.generation,
+                epoch: None,
+                origin,
+                result: pending.result.clone(),
+                refresh,
+                stopped: (pending.id, self.worker_epoch),
+            })),
+        };
+        self.stop_worker();
+        self.start_open_at(path, true, Some(follow), origin, context);
+        self.status = RECOVERY_STATUS.into();
+        true
+    }
+
+    /// Whether a recovery is waiting for its replacement's startup, Open,
+    /// replay or final dispatch.
+    fn recovery_waiting(&self) -> bool {
+        let recovery = |queued: &Queued| matches!(queued.intent, ScheduledAction::Recover(_));
+        self.opening
+            .as_ref()
+            .and_then(|opening| opening.follow.as_ref())
+            .is_some_and(recovery)
+            || self.queue.iter().any(recovery)
+    }
+
+    /// Whether Analysis → Cancel analysis has work to stop, including a
+    /// recovery whose replacement worker is still starting.
+    fn analysis_cancellable(&self) -> bool {
+        self.pending.is_some()
+            || self.discovery_running
+            || self.discovery_job.is_some()
+            || self.analysis_plan.is_some()
+            || self.recovery_waiting()
+    }
+
+    fn cancel_analysis(&mut self) {
+        // Stopping the worker also cancels a memory search and abandons a
+        // starting replacement worker with its recovery.
+        self.end_memory_search(SearchState::Canceled);
+        self.stop_worker();
+        self.analysis_plan = None;
+        self.status = "Analysis cancelled".into();
+    }
+
+    /// A failure that no retry handled ends any recovery; a recovery that
+    /// failed too is the ordinary error and changes no saved state.
+    fn debug_retry_failed(&mut self) {
+        self.sent_intent = None;
+        if let Some(previous) = self.debug_open_restore.take() {
+            self.use_debug_info = previous;
+            self.debug_fallback_pending = false;
+        }
+    }
+
+    fn retry_debug_open(&mut self, context: &egui::Context) -> bool {
+        if self.file_job.is_some()
+            || !self
+                .pending
+                .as_ref()
+                .is_some_and(|p| matches!(&p.request, Request::Open {debug, ..} if debug.enabled))
+        {
+            return false;
+        }
+        let Some(opening) = self.opening.take() else {
+            return false;
+        };
+        let project = self.opening_project.take();
+        self.stop_worker_inner();
+        self.opening_project = project;
+        self.debug_open_restore = Some(self.use_debug_info);
+        self.use_debug_info = false;
+        if opening.preserve {
+            self.revision = self.revision.wrapping_add(1);
+        }
+        self.debug_open_override = Some(false);
+        self.debug_fallback_pending = true;
+        // A recovery bound to the lost replacement expires with it.
+        let follow = opening
+            .follow
+            .filter(|follow| !matches!(follow.intent, ScheduledAction::Recover(_)));
+        self.start_open_at(
+            opening.path,
+            opening.preserve,
+            follow,
+            opening.follow_origin,
+            context,
+        );
+        self.status = "Worker stopped during Open; retrying with debug info disabled".into();
+        true
+    }
+
     fn poll_worker(&mut self, context: &egui::Context) {
+        self.poll_files(context);
         if self.results.poll_inputs()
             && self.data_location.is_none()
             && let Some(address) = self.view().map(|view| view.address)
@@ -2598,30 +3302,33 @@ impl DesktopApp {
                 context,
             );
         }
-        if self
-            .pending
-            .as_ref()
-            .is_some_and(|pending| pending.started.elapsed() > DEADLINE)
-        {
-            let resumable = self
-                .pending
-                .as_ref()
-                .is_some_and(|pending| resumes_discovery(&pending.request));
-            self.fail_pending_linkage();
-            self.fail_pending_search();
-            self.fail_pending_listing();
-            self.stop_after_failure(resumable, context);
-            self.status =
-                "Analysis exceeded 30 seconds and was stopped. Choose an action to restart.".into();
-        }
         // Each WorkerClient owns a fresh event channel; dropped clients cannot
         // deliver replies into this generation's queue.
         for _ in 0..8 {
-            let Some(event) = self.client.as_mut().and_then(WorkerClient::poll) else {
+            let Some((ready, event)) = self.client.as_mut().and_then(WorkerClient::poll_timed)
+            else {
                 break;
             };
             match event {
                 WorkerEvent::Failed(error) => {
+                    if self.preparing_baseline.is_some() {
+                        self.poll_baseline(context);
+                        if self.preparing_baseline.is_some() {
+                            self.defer_baseline_failure(error);
+                            break;
+                        }
+                    }
+                    let stopped = self
+                        .client
+                        .as_ref()
+                        .and_then(WorkerClient::failure)
+                        .is_some_and(|kind| kind != crate::client::FailureKind::Rejected);
+                    if self.retry_debug_open(context)
+                        || self.retry_debug_decompile(stopped, context)
+                    {
+                        break;
+                    }
+                    self.debug_retry_failed();
                     let signature_failure = self.signature_change.is_some();
                     let resumable = self
                         .pending
@@ -2637,10 +3344,45 @@ impl DesktopApp {
                     self.status = error;
                     break;
                 }
-                WorkerEvent::Reply(reply) => self.receive_worker_reply(*reply, context),
+                WorkerEvent::Reply(reply) => {
+                    if self.pending.as_ref().is_some_and(|pending| {
+                        pending.id == reply.id && ready > pending.started + DEADLINE
+                    }) {
+                        break;
+                    }
+                    self.receive_worker_reply(*reply, context);
+                }
             }
         }
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.started.elapsed() > DEADLINE)
+        {
+            if self.retry_debug_open(context) || self.retry_debug_decompile(true, context) {
+                return;
+            }
+            self.debug_retry_failed();
+            let resumable = self
+                .pending
+                .as_ref()
+                .is_some_and(|pending| resumes_discovery(&pending.request));
+            self.fail_pending_linkage();
+            self.fail_pending_search();
+            self.fail_pending_listing();
+            self.stop_after_failure(resumable, context);
+            self.status =
+                "Analysis exceeded 30 seconds and was stopped. Choose an action to restart.".into();
+        }
+        self.poll_baseline(context);
+        self.poll_upgrade(context);
         self.dispatch_queued(context);
+        // Foreground navigation can preempt a fork. Maintenance waits for
+        // its bounded exchange so an idle table page cannot cancel it.
+        if self.managed_preempts_maintenance() {
+            context.request_repaint_after(Duration::from_millis(50));
+            return;
+        }
         self.pump_worker_turns(context);
         // Whole-image automatic scans wait until a memory search ends.
         if !self.searches.memory_searching() {
@@ -2667,6 +3409,11 @@ impl DesktopApp {
     }
 
     fn receive_worker_reply(&mut self, reply: WorkerResponse, context: &egui::Context) {
+        // Optional exchanges answer in send order like any request, but
+        // never through the ordinary pending slot.
+        let Some(reply) = self.take_optional_reply(reply) else {
+            return;
+        };
         let Some(pending) = &self.pending else { return };
         if pending.id != reply.id {
             self.stop_worker();
@@ -2836,8 +3583,11 @@ impl DesktopApp {
         }
         match (pending.request, response) {
             (
-                Request::Open { .. },
+                Request::Open {
+                    debug: open_debug, ..
+                },
                 Response::Opened {
+                    debug,
                     mut info,
                     symbols,
                     macho_legacy,
@@ -2884,7 +3634,20 @@ impl DesktopApp {
                     self.status = "Binary changed on disk. Existing notes were retained; save them, then reopen explicitly.".into();
                     return;
                 }
+                self.record_debug_open_outcome(&mut info, open_debug.enabled, opening.preserve);
+                self.debug_open_restore = None;
+                self.debug_source = debug.as_ref().and_then(|d| d.source.clone());
+                self.debug_state = debug.as_ref().map_or_else(String::new, |d| d.state.clone());
                 let mut project = self.opening_project.take();
+                if let Some(p) = &mut project {
+                    if p.project.data.debug_state != self.debug_state {
+                        for saved in &mut p.function_results {
+                            saved.code = None;
+                        }
+                    }
+                    p.project.accept_debug(&self.debug_state);
+                }
+
                 if let Some(project) = &mut project
                     && let Err(error) = project.project.accept_opened(&info, macho_legacy.as_ref())
                 {
@@ -2898,6 +3661,8 @@ impl DesktopApp {
                     project.discovery_index = None;
                 }
                 if !opening.preserve {
+                    self.use_debug_info = open_debug.enabled;
+                    self.debug_skip = open_debug.skip.clone();
                     self.generation = self.generation.wrapping_add(1);
                     self.clear_views();
                     self.undo.clear();
@@ -2905,6 +3670,12 @@ impl DesktopApp {
                     self.saved_revision = 0;
                     self.result_revision = 0;
                     self.saved_result_revision = 0;
+                    if project
+                        .as_ref()
+                        .is_some_and(|p| p.project.data.use_debug_info != open_debug.enabled)
+                    {
+                        self.revision = self.revision.wrapping_add(1);
+                    }
                     self.session = Some(Session::new(info.sha256.clone()));
                     self.session_path = None;
                     self.project_path = None;
@@ -2959,7 +3730,15 @@ impl DesktopApp {
                     replay.then(|| replay_addresses(&worker_functions, &info.functions));
                 let first = start_address(&info);
                 self.binary_path = Some(opening.path);
-                if !opening.preserve {
+                if opening.preserve
+                    && let Some(previous) = &self.binary_protection
+                {
+                    if let Err(error) = previous.inherit_debug_sources(&protection) {
+                        self.stop_worker();
+                        self.status = error;
+                        return;
+                    }
+                } else {
                     self.binary_protection = Some(protection);
                 }
                 self.cached_functions = (opening.preserve && self.cached_functions)
@@ -2969,6 +3748,7 @@ impl DesktopApp {
                 self.worker_inventory = None;
                 self.inventory_synced = false;
                 self.info = Some(info);
+                self.results.set_debug_state(&self.debug_state);
                 // A replacement worker for the same verified image keeps the
                 // stored results; a newly opened binary starts empty.
                 if !opening.preserve
@@ -2979,6 +3759,7 @@ impl DesktopApp {
                         .as_ref()
                         .map_or(&[][..], |session| session.signatures.as_slice());
                     self.results.open(&info.sha256, committed);
+                    self.results.set_debug_state(&self.debug_state);
                     self.update_result_inputs(crate::function_results::Invalidation::Inventory);
                 } else if reset {
                     self.update_result_inputs(crate::function_results::Invalidation::FunctionNames);
@@ -3019,18 +3800,34 @@ impl DesktopApp {
                     memory.interrupted = false;
                 }
                 self.rebuild_filter();
-                self.status = "Binary loaded".into();
+                self.status = if self
+                    .info
+                    .as_ref()
+                    .is_some_and(crate::debug_info::has_fallback)
+                {
+                    self.info
+                        .as_ref()
+                        .unwrap()
+                        .warnings
+                        .iter()
+                        .find(|w| crate::debug_info::is_fallback_warning(w))
+                        .unwrap()
+                        .as_str()
+                } else {
+                    "Binary loaded"
+                }
+                .into();
                 if let Some(project) = project {
                     if self.results.preparing() {
                         self.deferred_restore = Some(project);
                     } else {
                         self.restore_project(*project, context);
                     }
-                } else if let Some(request) = opening.follow {
-                    if matches!(request, Request::Discover) {
+                } else if let Some(follow) = opening.follow {
+                    if matches!(follow.request, Request::Discover) {
                         self.start_discovery(context);
                     } else {
-                        self.schedule_open_follow(request, opening.follow_origin);
+                        self.schedule_open_follow(follow, opening.follow_origin);
                     }
                 } else if !opening.preserve {
                     // Like Ghidra, offer analysis when a binary is first opened.
@@ -3056,12 +3853,18 @@ impl DesktopApp {
                 }
                 // Indexes and geometry are prepared off this thread; adoption
                 // repeats these checks.
+                // A Refresh's Graph carries the refresh to its Decompile.
+                let refresh = self
+                    .sent_intent
+                    .as_ref()
+                    .is_some_and(|(id, intent)| *id == pending.id && intent.refresh());
                 let continuation = graph_preparation::Continuation::Live {
                     generation: self.generation,
                     selection: pending.selection,
                     revision: pending.revision,
                     result: pending.result,
                     address,
+                    refresh,
                 };
                 self.prepare_graph(view, continuation, 0, context);
             }
@@ -3074,6 +3877,13 @@ impl DesktopApp {
                     semantics,
                 },
             ) if address == expected => {
+                if self
+                    .sent_intent
+                    .as_ref()
+                    .is_some_and(|(id, _)| *id == pending.id)
+                {
+                    self.sent_intent = None;
+                }
                 if pending.selection == self.selection_generation
                     && pending.revision == self.revision
                     && self.view().is_some_and(|view| view.address == address)
@@ -3114,6 +3924,22 @@ impl DesktopApp {
                     );
                     self.adopt_decompilation(code, ResultOrigin::Computed);
                 }
+            }
+            (
+                request @ Request::Decompile { .. },
+                response @ Response::PreparedDecompile { .. },
+            ) => {
+                let pending = Pending {
+                    id: pending.id,
+                    request,
+                    started: pending.started,
+                    selection: pending.selection,
+                    revision: pending.revision,
+                    byte_origin: pending.byte_origin,
+                    bytes: pending.bytes,
+                    result: pending.result,
+                };
+                self.receive_prepared(pending, response, context);
             }
             (Request::SyncFunctions { .. }, Response::FunctionsSynced) => {}
             (
@@ -3378,7 +4204,10 @@ impl DesktopApp {
                 self.update_result_inputs(crate::function_results::Invalidation::FunctionNames);
                 self.rebuild_filter();
                 self.status = "Function renamed".into();
+                // Data navigation superseded the displayed function: it is
+                // re-resolved when shown again, not reopened over the data.
                 if self.queue.is_empty()
+                    && self.data_location.is_none()
                     && let Some(current) = self.view().map(|view| view.address)
                 {
                     self.reopen_after_rename(current, context);
@@ -3463,11 +4292,11 @@ impl DesktopApp {
         {
             return;
         }
-        if let Some(request) = self.queue.pop_front() {
-            if self.client.is_none() || matches!(request, Request::Discover) {
-                self.request(request, context);
+        if let Some(queued) = self.queue.pop_front() {
+            if self.client.is_none() || matches!(queued.request, Request::Discover) {
+                self.request_action(queued, context);
             } else {
-                self.schedule_request(request);
+                self.schedule_action(queued);
             }
         }
         if self.pending.is_some() || self.opening.is_some() || !self.queue.is_empty() {
@@ -3477,12 +4306,12 @@ impl DesktopApp {
             if !self.byte_request_current(&request, origin) {
                 self.retire_byte_request(&request, origin);
             } else if self.client.is_some() {
-                self.schedule_open_follow(request, origin);
+                self.schedule_open_follow(request.into(), origin);
             } else if let Some(path) = self.binary_path.clone() {
                 // Open still proves retained identity and hash before this
                 // original consumer/context is allowed to receive anything.
                 let continue_discovery = self.discovery_running;
-                self.start_open_at(path, true, Some(request), origin, context);
+                self.start_open_at(path, true, Some(request.into()), origin, context);
                 self.discovery_running = continue_discovery && self.client.is_some();
                 self.update_discovery_summary();
             } else {
@@ -3798,16 +4627,21 @@ impl DesktopApp {
         };
         // The displayed function and a pinned snapshot share the save job lifetime.
         let function_snapshot = self.results.snapshot();
+        let displayed_code = self.code.clone();
         let view = self
             .view()
             .map(|view| crate::project::persistable_view(view, &info.sections));
         let mut data = ProjectData {
+            debug_source: self.debug_source.clone(),
+            debug_state: self.debug_state.clone(),
+            use_debug_info: self.use_debug_info,
+            debug_skip: self.debug_skip.clone(),
             info,
             session,
             view,
-            decompiled: (!self.decompiled().is_empty()).then(|| self.decompiled().to_owned()),
-            mappings: self.semantic.mappings.to_vec(),
-            semantics: self.semantics().clone(),
+            decompiled: None,
+            mappings: Vec::new(),
+            semantics: SemanticInfo::default(),
             strings: self.strings.clone(),
             strings_truncated: self.strings_truncated,
             crypto: self.crypto.clone(),
@@ -3824,6 +4658,11 @@ impl DesktopApp {
         let sender = self.file_dialogs.sender();
         let initial_dir = self.dialog_directory();
         self.file_task(context, move || {
+            if let Some(code) = displayed_code {
+                data.decompiled = (!code.text().is_empty()).then(|| code.text().to_owned());
+                data.mappings = code.mappings().to_vec();
+                data.semantics = code.semantics().clone();
+            }
             data.function_results = crate::project::SavedFunction::capture(
                 function_snapshot,
                 data.view.as_ref().map(|view| view.address),
@@ -3907,14 +4746,15 @@ impl DesktopApp {
                 generation,
                 selection,
                 address,
+                refresh,
                 ..
             } = continuation
                 && generation == self.generation
                 && selection == self.selection_generation
                 && self.graph.is_none()
             {
-                let queued = self.queue.iter().any(|request| {
-                    matches!(request, Request::Graph { address: target } if *target == address)
+                let queued = self.queue.iter().any(|queued| {
+                    matches!(queued.request, Request::Graph { address: target } if target == address)
                 });
                 let in_flight = self.pending.as_ref().is_some_and(|pending| {
                     matches!(pending.request, Request::Graph { address: target } if target == address)
@@ -3928,7 +4768,14 @@ impl DesktopApp {
                     if self.queue.len() >= HISTORY_LIMIT {
                         self.queue.pop_back();
                     }
-                    self.queue.push_front(Request::Graph { address });
+                    self.queue.push_front(Queued {
+                        request: Request::Graph { address },
+                        intent: if refresh {
+                            ScheduledAction::Refresh
+                        } else {
+                            ScheduledAction::Ordinary
+                        },
+                    });
                 }
             }
             return;
@@ -3936,7 +4783,10 @@ impl DesktopApp {
         match (continuation, output) {
             (
                 Continuation::Live {
-                    result, address, ..
+                    result,
+                    address,
+                    refresh,
+                    ..
                 },
                 Output::Base(graph),
             ) => {
@@ -3949,7 +4799,7 @@ impl DesktopApp {
                     Some(address),
                 );
                 self.adopt_graph(graph, ResultOrigin::Computed);
-                self.load_decompilation(address);
+                self.load_decompilation(address, refresh);
             }
             (Continuation::Saved(restore), Output::Base(graph)) => {
                 drop(charge);
@@ -4045,7 +4895,7 @@ impl DesktopApp {
             );
             self.adopt_decompilation(code, ResultOrigin::Saved);
         } else if self.should_auto_decompile() && self.queue.len() < HISTORY_LIMIT {
-            self.queue.push_front(Request::Decompile { address });
+            self.queue.push_front(Request::Decompile { address }.into());
         }
         self.saved_result_revision = self.result_revision;
         self.status = "Project opened · saved analysis".into();
@@ -4283,7 +5133,9 @@ impl DesktopApp {
         context: &egui::Context,
         task: impl FnOnce() -> FileEvent + Send + 'static,
     ) {
+        // One file job at a time; a dropped request must still say so.
         if self.file_job.is_some() {
+            self.status = FILE_BUSY.into();
             return;
         }
         let (sender, receiver) = mpsc::sync_channel(1);
@@ -4389,7 +5241,59 @@ impl DesktopApp {
             }
         };
         self.file_job = None;
+        self.apply_file_event(event, context);
+    }
+
+    fn apply_file_event(&mut self, event: FileEvent, context: &egui::Context) {
         match event {
+            FileEvent::WorkerStarted {
+                epoch,
+                options,
+                result,
+            } => {
+                if epoch != self.worker_epoch || self.opening.is_none() {
+                    return;
+                }
+                match result {
+                    Ok(mut client) => {
+                        let opening = self.opening.as_ref().unwrap();
+                        let source = if opening.preserve {
+                            self.project_binary.as_ref()
+                        } else {
+                            self.opening_project
+                                .as_ref()
+                                .and_then(|p| p.project.binary.as_ref())
+                        };
+                        if let Some(binary) = source {
+                            client.retain_source(Arc::new(binary.clone()));
+                        }
+                        let path = opening.path.to_string_lossy().into_owned();
+                        self.client = Some(*client);
+                        self.send_direct(Request::Open {
+                            path,
+                            debug: options,
+                        });
+                    }
+                    Err(error) => {
+                        self.stop_worker();
+                        self.status = error;
+                    }
+                }
+            }
+            FileEvent::DebugChosen {
+                generation,
+                revision,
+                path,
+            } => {
+                if generation == self.generation
+                    && revision == self.revision
+                    && self.debug_actions_enabled()
+                    && let Some(path) = path
+                {
+                    self.debug_path = Some(path);
+                    self.set_debug_info(true, context);
+                }
+            }
             FileEvent::Chosen(Some(path)) => self.request_intent(Intent::OpenPath(path), context),
             FileEvent::ProjectChosen(Some(path)) => {
                 self.request_intent(Intent::OpenProjectPath(path), context)
@@ -4402,8 +5306,10 @@ impl DesktopApp {
             } if generation == self.generation && revision == self.revision => match result {
                 Ok(Some(project)) => {
                     let path = project.binary_path.clone();
+                    self.opening_project = Some(project);
                     self.start_open(path, false, None, context);
                     if self.opening.is_some() {
+                        let project = self.opening_project.take().unwrap();
                         if let Some(binary) = &project.project.binary
                             && let Some(client) = &mut self.client
                         {
@@ -5871,6 +6777,30 @@ impl DesktopApp {
             });
             ui.menu_button("Analysis", |ui| {
                 ui.add_enabled_ui(loaded, |ui| {
+                    let debug_enabled = self.debug_actions_enabled();
+                    let macho = self.info.as_ref().is_some_and(|i| i.format == "Mach-O");
+                    if ui
+                        .add_enabled(
+                            debug_enabled && macho,
+                            egui::Button::new("Load debug info…"),
+                        )
+                        .clicked()
+                    {
+                        self.choose_debug_info(&context);
+                        ui.close();
+                    }
+                    let mut enabled = self.use_debug_info;
+                    if ui
+                        .add_enabled(
+                            debug_enabled,
+                            egui::Checkbox::new(&mut enabled, "Use debug info"),
+                        )
+                        .changed()
+                    {
+                        self.set_debug_info(enabled, &context);
+                        ui.close();
+                    }
+
                     if ui.button("Auto analyze…").clicked() {
                         self.analyze_prompt = Some(AnalyzePrompt {
                             generation: self.generation,
@@ -5910,19 +6840,12 @@ impl DesktopApp {
                 });
                 if ui
                     .add_enabled(
-                        self.pending.is_some()
-                            || self.discovery_running
-                            || self.discovery_job.is_some()
-                            || self.analysis_plan.is_some(),
+                        self.analysis_cancellable(),
                         egui::Button::new("Cancel analysis"),
                     )
                     .clicked()
                 {
-                    // Stopping the worker also cancels a memory search.
-                    self.end_memory_search(SearchState::Canceled);
-                    self.stop_worker();
-                    self.analysis_plan = None;
-                    self.status = "Analysis cancelled".into();
+                    self.cancel_analysis();
                     ui.close();
                 }
             });
@@ -6903,7 +7826,21 @@ impl DesktopApp {
                     "Applied signature override"
                 });
             } else if self.semantics().prototype.is_some() {
-                ui.weak("Inferred signature");
+                let label = ui.weak(
+                    if self.semantics().prototype_source
+                        == crate::semantic::PrototypeSource::DebugInfo
+                    {
+                        "Debug info signature"
+                    } else {
+                        "Inferred signature"
+                    },
+                );
+                if let Some(source) = &self.debug_source {
+                    label.on_hover_text(format!(
+                        "{}\n{}\n{}",
+                        source.path, source.uuid, source.sha256
+                    ));
+                }
             }
         }
         if self.code.is_none() {
@@ -6949,7 +7886,7 @@ impl DesktopApp {
             comment_target.or(code_target),
             |ui, display_row, rect| {
                 let builder = egui::UiBuilder::new()
-                    .id_salt(("code-row", display_row))
+                    .id_salt(("code-row", display_row, self.code_text_revision))
                     .max_rect(rect.with_min_x(rect.left() + 6.0))
                     .layout(egui::Layout::left_to_right(egui::Align::Center));
                 ui.scope_builder(builder, |ui| {
@@ -7581,6 +8518,7 @@ impl DesktopApp {
     fn select_linkage(&mut self, item: crate::linkage_ui::LinkageItem) {
         self.string_focus = None;
         self.selected_call = None;
+        self.selected_call_byte = None;
         self.xref_choices = None;
         self.selected_local = None;
         self.decompiler_rename_context = false;
@@ -7643,9 +8581,9 @@ impl DesktopApp {
             self.code_selection = self.selected;
         }
         self.selection_generation = self.selection_generation.wrapping_add(1);
-        self.queue.retain(|request| {
-            !matches!(request, Request::Graph { .. } | Request::Decompile { .. })
-        });
+        // Data navigation supersedes function work, a recovery included,
+        // before any Hex bytes are requested.
+        self.retire_function_work();
         self.reference_focus = None;
         self.set_selected_address(address);
         self.semantic.addresses.clear();
@@ -9409,6 +10347,7 @@ impl DesktopApp {
         self.unsaved_window(&context);
         self.analyze_window(&context);
         self.file_dialogs.show(&context);
+
         self.browser_dialog(&context);
         self.search_dialog_window(&context);
         self.signature_window(&context);
@@ -11252,6 +12191,7 @@ mod tests {
                 });
                 let info = info.clone();
                 app.validate_reply(&Response::Opened {
+                    debug: None,
                     macho_legacy: None,
                     info: info.clone(),
                     symbols: None,
@@ -11282,6 +12222,7 @@ mod tests {
                     forged.functions.truncate(1);
                     assert!(
                         app.validate_reply(&Response::Opened {
+                            debug: None,
                             macho_legacy: None,
                             info: forged,
                             symbols: None
@@ -14153,7 +15094,11 @@ mod tests {
         assert_eq!(app.data_location, Some((0x1020, 1)));
         assert_eq!(app.view().unwrap().address, 0x1000);
         assert_eq!(app.result_scope, Some(0x1000));
-        assert!(!app.queue.iter().any(|r| matches!(r, Request::Graph { .. })));
+        assert!(
+            !app.queue
+                .iter()
+                .any(|r| matches!(r.request, Request::Graph { .. }))
+        );
         assert!(
             app.pending
                 .as_ref()
@@ -15375,6 +16320,10 @@ mod tests {
         );
         let source = "int restored_entry() { return 7; }\n";
         let data = ProjectData {
+            debug_source: None,
+            debug_state: String::new(),
+            use_debug_info: true,
+            debug_skip: Vec::new(),
             info: info.clone(),
             session: session.clone(),
             view: Some(FunctionView {
@@ -15538,6 +16487,10 @@ mod tests {
         crate::discovery::commit_replacement(&mut state, &info, &batch).unwrap();
         let saved = Arc::new(state.save());
         let data = ProjectData {
+            debug_source: None,
+            debug_state: String::new(),
+            use_debug_info: true,
+            debug_skip: Vec::new(),
             info: info.clone(),
             session: app.session.clone().unwrap(),
             view: None,
@@ -16239,6 +17192,8 @@ mod tests {
 
     #[test]
     fn run_progress_survives_recovery_open_but_terminal_failure_ends_it() {
+        // The recovery Open starts a real worker.
+        test_worker().unwrap_or_else(|error| panic!("{error}"));
         let context = egui::Context::default();
         let start = Instant::now();
         let now = start + Duration::from_secs(3);
@@ -16251,6 +17206,12 @@ mod tests {
         };
         app.start_auto_analysis_at(start);
         app.stop_after_failure(true, &context);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while app.file_job.is_some() {
+            assert!(Instant::now() < deadline);
+            app.poll_files(&context);
+            std::thread::sleep(Duration::from_millis(1));
+        }
         assert!(app.client.is_some(), "recovery must start successfully");
         let display = app.analysis_presentation(now).unwrap();
         assert_eq!(display.phase, "Restoring");
@@ -16789,7 +17750,7 @@ mod tests {
         let (request, origin) = app.discovery_bytes.take().unwrap();
         app.selection_generation += 1;
         app.pending = None;
-        app.schedule_open_follow(request, origin);
+        app.schedule_open_follow(request.into(), origin);
         assert!(
             app.pending.is_none(),
             "A stale queued read must not be rebound to the new selection"
@@ -16860,7 +17821,7 @@ mod tests {
         });
         app.navigate(0x1040, true, &context);
         assert!(matches!(
-            app.queue.front(),
+            app.queue.front().map(|queued| &queued.request),
             Some(Request::Graph { address: 0x1040 })
         ));
         assert!(app.discovery_running);
@@ -17582,7 +18543,8 @@ mod tests {
             let mut app = hex_app();
             app.pending.as_mut().unwrap().request = request;
             app.worker_epoch = 17;
-            app.queue.push_back(Request::Decompile { address: 0x1000 });
+            app.queue
+                .push_back(Request::Decompile { address: 0x1000 }.into());
             let selection = app.selection_generation;
             let revision = app.revision;
             let selected = app.selected;
@@ -17614,7 +18576,7 @@ mod tests {
             let (request, origin) = app.discovery_bytes.take().unwrap();
             app.selection_generation += 1;
             app.pending = None;
-            app.schedule_open_follow(request, origin);
+            app.schedule_open_follow(request.into(), origin);
             assert!(app.pending.is_none());
             assert!(!app.hex.is_loading());
             assert!(app.tab == Tab::Crypto);
@@ -17630,7 +18592,7 @@ mod tests {
                 app.opening = Some(Opening {
                     path: PathBuf::from("retained-image"),
                     preserve: true,
-                    follow: Some(Request::Decompile { address: 0x1000 }),
+                    follow: Some(Request::Decompile { address: 0x1000 }.into()),
                     revision: app.revision,
                     follow_origin: app.request_origin(),
                 });
@@ -17652,8 +18614,13 @@ mod tests {
             ));
             if opening {
                 assert!(matches!(
-                    app.opening.as_ref().unwrap().follow,
-                    Some(Request::Decompile { address: 0x1000 })
+                    app.opening
+                        .as_ref()
+                        .unwrap()
+                        .follow
+                        .as_ref()
+                        .map(|follow| &follow.request),
+                    Some(&Request::Decompile { address: 0x1000 })
                 ));
             } else {
                 assert!(app.discovery_job.is_some());
@@ -17669,7 +18636,7 @@ mod tests {
         app.opening = Some(Opening {
             path: PathBuf::from("retained-image"),
             preserve: true,
-            follow: Some(read),
+            follow: Some(read.into()),
             revision: app.revision,
             follow_origin: origin,
         });
@@ -17976,6 +18943,10 @@ mod tests {
         );
         assert_eq!(functions.len(), 1);
         let mut data = ProjectData {
+            debug_source: None,
+            debug_state: String::new(),
+            use_debug_info: true,
+            debug_skip: Vec::new(),
             info: info.clone(),
             session: source.session.clone().unwrap(),
             view: Some(source.view().unwrap().clone()),
@@ -18207,13 +19178,13 @@ mod tests {
         app.opening = Some(Opening {
             path: "fixture".into(),
             preserve: true,
-            follow: Some(Request::Graph { address: 0x1000 }),
+            follow: Some(Request::Graph { address: 0x1000 }.into()),
             revision: app.revision,
             follow_origin: origin,
         });
         app.navigate(0x1040, true, &context);
         assert!(app.opening.as_ref().unwrap().follow.is_none());
-        app.schedule_open_follow(Request::Graph { address: 0x1000 }, origin);
+        app.schedule_open_follow(Request::Graph { address: 0x1000 }.into(), origin);
         assert_eq!(app.view().unwrap().address, 0x1040);
         assert_eq!(app.decompiled(), "return;");
         assert!(app.pending.is_none() && app.queue.is_empty());
@@ -18226,7 +19197,7 @@ mod tests {
         app.graph = None;
         app.clear_decompilation();
         let origin = app.request_origin();
-        app.schedule_open_follow(Request::Graph { address: 0x1000 }, origin);
+        app.schedule_open_follow(Request::Graph { address: 0x1000 }.into(), origin);
         assert!(Arc::ptr_eq(app.code.as_ref().unwrap(), &code));
         assert!(app.saved_analysis && app.cached_graph);
         assert!(app.pending.is_none() && app.queue.is_empty());
@@ -18338,7 +19309,7 @@ mod tests {
             assert!(
                 !app.queue
                     .iter()
-                    .any(|request| matches!(request, Request::Graph { .. }))
+                    .any(|request| matches!(request.request, Request::Graph { .. }))
             );
         };
         // A data export opens Hex at its exact address.
@@ -19222,17 +20193,7 @@ mod tests {
         let (bytes, base) = crate::architecture::fixtures::macho_with_stubs();
         let binary = directory.path().join("legacy-macho");
         std::fs::write(&binary, bytes).unwrap();
-        let executable = std::env::current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join(if cfg!(windows) {
-                "ghidra-rust.exe"
-            } else {
-                "ghidra-rust"
-            });
+        let executable = test_worker().unwrap_or_else(|error| panic!("{error}"));
         let context = egui::Context::default();
         let start = |app: &mut DesktopApp, path: &std::path::Path| {
             let mut client =
@@ -19254,6 +20215,7 @@ mod tests {
                 follow_origin: app.request_origin(),
             });
             app.send_direct(Request::Open {
+                debug: Default::default(),
                 path: path.to_string_lossy().into_owned(),
             });
         };
@@ -19286,6 +20248,10 @@ mod tests {
             },
         );
         let data = ProjectData {
+            debug_source: None,
+            debug_state: String::new(),
+            use_debug_info: true,
+            debug_skip: Vec::new(),
             info,
             session,
             view: Some(FunctionView {
@@ -19393,22 +20359,7 @@ mod tests {
             Some(path) => PathBuf::from(path),
             None => return, // scripts/build-windows.ps1 supplies the native fixture.
         };
-        let executable = std::env::current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join(if cfg!(windows) {
-                "ghidra-rust.exe"
-            } else {
-                "ghidra-rust"
-            });
-        assert!(
-            executable.is_file(),
-            "full cargo test builds the worker executable: {}",
-            executable.display()
-        );
+        let executable = test_worker().unwrap_or_else(|error| panic!("{error}"));
         let context = egui::Context::default();
         let mut app = DesktopApp::empty(None);
         // Function scope first: linkage data opens Hex, and reopening keeps
@@ -19433,6 +20384,7 @@ mod tests {
                 follow_origin: app.request_origin(),
             });
             app.send_direct(Request::Open {
+                debug: Default::default(),
                 path: path.to_string_lossy().into_owned(),
             });
         };
@@ -19443,6 +20395,7 @@ mod tests {
                 app.poll_worker(&context);
                 if app.linkage.status() == Status::Ready
                     && app.pending.is_none()
+                    && app.file_job.is_none()
                     && app.queue.is_empty()
                     && !app.results.preparing()
                     && app.deferred_restore.is_none()
@@ -19532,7 +20485,7 @@ mod tests {
             let opening = app
                 .opening
                 .as_ref()
-                .expect("project starts worker verification")
+                .unwrap_or_else(|| panic!("project starts worker verification: {}", app.status))
                 .path
                 .clone();
             // Replace only Cargo's harness process; keep the real file-load,
@@ -19588,18 +20541,7 @@ mod tests {
                 .unwrap()
                 .success()
         );
-        let executable = std::env::current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("ghidra-rust");
-        assert!(
-            executable.is_file(),
-            "full cargo test builds the worker executable: {}",
-            executable.display()
-        );
+        let executable = test_worker().unwrap_or_else(|error| panic!("{error}"));
         let context = egui::Context::default();
         let mut app = DesktopApp::empty(None);
         app.client = Some(
@@ -19614,6 +20556,7 @@ mod tests {
             follow_origin: app.request_origin(),
         });
         app.send_direct(Request::Open {
+            debug: Default::default(),
             path: binary.to_string_lossy().into_owned(),
         });
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -19683,6 +20626,10 @@ mod tests {
         app.function_filter = "shared".into();
         app.restart_filter();
         let data = ProjectData {
+            debug_source: None,
+            debug_state: String::new(),
+            use_debug_info: true,
+            debug_skip: Vec::new(),
             info: app.info.clone().unwrap(),
             session: app.session.clone().unwrap(),
             view: None,
@@ -20848,5 +21795,676 @@ mod tests {
             app.semantic.addresses,
             std::collections::BTreeSet::from([pc(31)])
         );
+    }
+    #[test]
+    fn debug_actions_respect_file_open_and_signature_guards() {
+        let context = egui::Context::default();
+        for guard in 0..4 {
+            let mut app = keyboard_app();
+            let revision = app.revision;
+            let (_tx, rx) = mpsc::sync_channel(1);
+            match guard {
+                0 => app.file_job = Some(rx),
+                1 => {
+                    app.opening = Some(Opening {
+                        path: PathBuf::from("pending"),
+                        preserve: false,
+                        follow: None,
+                        revision,
+                        follow_origin: app.request_origin(),
+                    })
+                }
+                2 => {
+                    app.signature_replay = Some(SignatureReplay {
+                        signatures: vec![],
+                        context: String::new(),
+                        generation: app.generation,
+                        revision,
+                        epoch: 0,
+                        sent: false,
+                    })
+                }
+                _ => {
+                    app.signature_change = Some(SignatureChange {
+                        function: 0x1000,
+                        before: None,
+                        signatures: vec![],
+                        generation: app.generation,
+                        revision,
+                        selection: 0,
+                        epoch: 0,
+                        undone: None,
+                    })
+                }
+            }
+            assert!(!app.debug_actions_enabled());
+            app.set_debug_info(false, &context);
+            app.choose_debug_info(&context);
+            assert!(app.use_debug_info);
+            assert_eq!(app.revision, revision);
+            assert!(app.debug_path.is_none());
+        }
+    }
+
+    #[test]
+    fn debug_toggle_discards_late_pseudocode_and_chooser_results() {
+        let mut app = keyboard_app();
+        let context = egui::Context::default();
+        app.results.open(&"a".repeat(64), &[]);
+        app.results.set_debug_state("debug-v1");
+        let stale = app.results.binding(0x1000, String::new());
+        app.set_debug_info(false, &context);
+        assert!(!app.use_debug_info);
+        let pending = Pending {
+            id: 1,
+            request: Request::Decompile { address: 0x1000 },
+            started: Instant::now(),
+            selection: app.selection_generation,
+            revision: app.revision,
+            byte_origin: (app.selected, app.tab),
+            bytes: None,
+            result: stale,
+        };
+        app.receive(
+            pending,
+            Response::Decompiled {
+                address: 0x1000,
+                text: "late debug result".into(),
+                mappings: vec![],
+                semantics: Default::default(),
+            },
+            &context,
+        );
+        assert!(app.decompiled().is_empty());
+        let (tx, rx) = mpsc::sync_channel(1);
+        tx.send(FileEvent::DebugChosen {
+            generation: app.generation.wrapping_sub(1),
+            revision: app.revision,
+            path: Some(PathBuf::from("untrusted")),
+        })
+        .unwrap();
+        app.file_job = Some(rx);
+        app.poll_files(&context);
+        assert!(app.debug_path.is_none());
+    }
+
+    fn receive_worker_start(app: &mut DesktopApp, context: &egui::Context) {
+        let event = app
+            .file_job
+            .take()
+            .expect("expected a worker startup job")
+            .recv_timeout(DEADLINE)
+            .expect("worker startup job did not return an event");
+        let FileEvent::WorkerStarted { result: Ok(_), .. } = &event else {
+            panic!(
+                "worker startup failed: {:?}",
+                match event {
+                    FileEvent::WorkerStarted {
+                        result: Err(error), ..
+                    } => error,
+                    _ => "unexpected file event".into(),
+                }
+            );
+        };
+        app.apply_file_event(event, context);
+    }
+
+    #[test]
+    fn managed_scheduler_desktop_timeout_recovers_inference_only_without_a_skip() {
+        // The recovery starts a real worker.
+        test_worker().unwrap_or_else(|error| panic!("{error}"));
+        let mut app = keyboard_app();
+        let context = egui::Context::default();
+        show_view(
+            &mut app,
+            FunctionView {
+                address: 0x1000,
+                blocks: Vec::new(),
+                edges: Vec::new(),
+                calls: Vec::new(),
+                warnings: Vec::new(),
+            },
+        );
+        app.binary_path = Some(std::env::current_exe().unwrap());
+        app.debug_state = "debug-v5".into();
+        app.use_debug_info = true;
+        // A legacy saved skip of another function is carried unchanged.
+        app.debug_skip = vec![0x2000];
+        let revision = app.revision;
+        app.pending = Some(Pending {
+            id: 1,
+            request: Request::Decompile { address: 0x1000 },
+            started: Instant::now() - DEADLINE - Duration::from_millis(1),
+            selection: app.selection_generation,
+            revision: app.revision,
+            byte_origin: (app.selected, app.tab),
+            bytes: None,
+            result: None,
+        });
+        app.poll_worker(&context);
+        // Debug info stays on; a stop records no skip and dirties nothing.
+        assert!(app.use_debug_info);
+        assert_eq!(app.debug_skip, [0x2000]);
+        assert!(app.recovery_waiting());
+        assert!(
+            app.analysis_cancellable(),
+            "Cancel stays available while starting"
+        );
+        assert_eq!(app.revision, revision);
+        assert_eq!(app.status, RECOVERY_STATUS);
+        receive_worker_start(&mut app, &context);
+        assert!(matches!(
+            app.pending.as_ref().map(|p| &p.request),
+            Some(Request::Open { debug, .. }) if debug.enabled && debug.skip == [0x2000]
+        ));
+        // Only one recovery is in flight at a time.
+        assert!(!app.retry_debug_decompile(true, &context));
+        // The recovery is the follow-up itself, bound to this replacement.
+        let follow = app.opening.as_mut().unwrap().follow.take().unwrap();
+        assert!(matches!(
+            &follow.intent,
+            ScheduledAction::Recover(retry) if retry.epoch == Some(app.worker_epoch)
+                && retry.address == 0x1000 && !retry.refresh
+        ));
+        // Another function's Decompile is an ordinary request.
+        app.pending = None;
+        app.send_direct(Request::Decompile { address: 0x3000 });
+        assert!(app.sent_intent.is_none());
+        app.pending = None;
+        let origin = app.request_origin();
+        app.send_action(follow, origin);
+        let id = app.pending.as_ref().unwrap().id;
+        assert!(matches!(app.sent_intent, Some((sent, ScheduledAction::Recover(_))) if sent == id));
+        assert_eq!(
+            app.sent_decompiles
+                .iter()
+                .map(|sent| (sent.address, sent.inference_only, sent.refresh))
+                .collect::<Vec<_>>(),
+            [(0x3000, false, false), (0x1000, true, false)]
+        );
+        // The recovery failing too is the ordinary error: no second
+        // recovery, and the saved skips and revision are unchanged.
+        assert!(!app.retry_debug_decompile(true, &context));
+        app.debug_retry_failed();
+        assert!(app.sent_intent.is_none() && !app.recovery_waiting());
+        assert_eq!(app.debug_skip, [0x2000]);
+        assert_eq!(app.revision, revision);
+        assert!(app.use_debug_info);
+        app.client.take().unwrap().stop_and_wait().unwrap();
+        app.stop_worker();
+        app.opening = None;
+        app.info = Some(crate::linkage_ui::fixture::info(&"a".repeat(64)));
+        assert!(app.debug_actions_enabled());
+        app.set_debug_info(true, &context);
+        assert!(app.debug_skip.is_empty(), "re-enabling withdraws skips");
+        receive_worker_start(&mut app, &context);
+        app.client.take().unwrap().stop_and_wait().unwrap();
+    }
+
+    #[test]
+    fn managed_scheduler_desktop_rejected_failures_never_start_a_recovery() {
+        let mut app = keyboard_app();
+        let context = egui::Context::default();
+        show_view(
+            &mut app,
+            FunctionView {
+                address: 0x1000,
+                blocks: Vec::new(),
+                edges: Vec::new(),
+                calls: Vec::new(),
+                warnings: Vec::new(),
+            },
+        );
+        app.binary_path = Some(PathBuf::from("binary"));
+        app.debug_state = "debug-v5".into();
+        app.use_debug_info = true;
+        app.pending = Some(Pending {
+            id: 1,
+            request: Request::Decompile { address: 0x1000 },
+            started: Instant::now(),
+            selection: app.selection_generation,
+            revision: app.revision,
+            byte_origin: (app.selected, app.tab),
+            bytes: None,
+            result: None,
+        });
+        // A rejected reply (not a stop) is never retried.
+        assert!(!app.retry_debug_decompile(false, &context));
+        // A function no longer shown is reported normally.
+        app.selection_generation = app.selection_generation.wrapping_add(1);
+        assert!(!app.retry_debug_decompile(true, &context));
+        assert!(app.debug_skip.is_empty() && !app.recovery_waiting());
+        assert!(app.pending.is_some(), "the current worker is kept");
+    }
+
+    /// A recovery renders inference-only only as the follow-up its own
+    /// replacement worker dispatches, in its original context. Refresh,
+    /// navigation (also to cached functions), data navigation and annotation
+    /// edits retire it; Cancel stops it while its worker is still starting.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn managed_scheduler_desktop_recovery_is_bound_through_reopen_and_dispatch() {
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("sample");
+        assert!(
+            std::process::Command::new("gcc")
+                .args(["-O0", "-g", "tests/fixtures/sample.c", "-o"])
+                .arg(&binary)
+                .status()
+                .unwrap()
+                .success()
+        );
+        test_worker().unwrap_or_else(|error| panic!("{error}"));
+        let context = egui::Context::default();
+        let mut app = DesktopApp::empty(None);
+        let settle = |app: &mut DesktopApp| {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                // A settlement is applied only after its baseline's pass.
+                context
+                    .run_ui(egui::RawInput::default(), |_| {})
+                    .textures_delta
+                    .clear();
+                app.poll_graph_preparation(&context);
+                app.poll_worker(&context);
+                if app.pending.is_none()
+                    && app.opening.is_none()
+                    && app.file_job.is_none()
+                    && app.queue.is_empty()
+                    && app.preparing_baseline.is_none()
+                    && app.upgrade.is_none()
+                    && app.signature_replay.is_none()
+                    && !app.results.preparing()
+                    && !app.graph_preparation.awaits(|_| true)
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "did not settle: {} {:?}",
+                    app.status,
+                    (
+                        app.pending.as_ref().map(|p| request_task(&p.request)),
+                        app.opening.is_some(),
+                        app.file_job.is_some(),
+                        app.queue.len(),
+                        app.preparing_baseline.is_some(),
+                        app.upgrade.is_some(),
+                        app.signature_replay.is_some(),
+                        app.results.preparing(),
+                        app.graph_preparation.awaits(|_| true),
+                    )
+                );
+                assert!(app.client.is_some(), "worker stopped: {}", app.status);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        app.start_open(binary, false, None, &context);
+        receive_worker_start(&mut app, &context);
+        settle(&mut app);
+        app.analyze_prompt = None;
+        assert!(app.use_debug_info && !app.debug_state.is_empty());
+        let function = |app: &DesktopApp, name: &str| {
+            app.info
+                .as_ref()
+                .unwrap()
+                .functions
+                .iter()
+                .find(|f| f.name == name)
+                .unwrap()
+                .address
+        };
+        let main = function(&app, "main");
+        let other = function(&app, "decode_xor");
+        for address in [other, main] {
+            app.navigate(address, true, &context);
+            settle(&mut app);
+        }
+        // Main's Decompiles recorded at the physical send seam since `mark`:
+        // `(inference_only, refresh)` of each wire Prepare, and how many were
+        // adopted from the decision cache instead.
+        let sends = |app: &DesktopApp, mark: usize| -> (Vec<(bool, bool)>, usize) {
+            let main_sends = app.sent_decompiles[mark..]
+                .iter()
+                .filter(|sent| sent.address == main);
+            (
+                main_sends
+                    .clone()
+                    .filter(|sent| !sent.cached)
+                    .map(|sent| (sent.inference_only, sent.refresh))
+                    .collect(),
+                main_sends.filter(|sent| sent.cached).count(),
+            )
+        };
+        // Stops main's Decompile before a baseline (a missed deadline), which
+        // starts the replacement worker with the recovery as its follow-up.
+        // A Refresh stop uses the real sent Refresh; the other a stand-in
+        // ordinary request.
+        let stop = |app: &mut DesktopApp, refresh: Option<fn(&mut DesktopApp, &egui::Context)>| {
+            assert_eq!(app.view().map(|v| v.address), Some(main));
+            match refresh {
+                Some(refresh) => {
+                    refresh(app, &context);
+                    // A full Refresh first sends its Graph; step to the Decompile.
+                    let deadline = Instant::now() + Duration::from_secs(60);
+                    while !app.pending.as_ref().is_some_and(
+                        |p| matches!(p.request, Request::Decompile { address } if address == main),
+                    ) {
+                        assert!(Instant::now() < deadline, "no refresh: {}", app.status);
+                        app.poll_graph_preparation(&context);
+                        app.poll_worker(&context);
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    assert!(matches!(
+                        app.sent_decompiles.last(),
+                        Some(sent) if sent.address == main && sent.refresh && !sent.cached
+                    ));
+                    app.pending.as_mut().unwrap().started =
+                        Instant::now() - DEADLINE - Duration::from_millis(1);
+                }
+                None => {
+                    app.pending = Some(Pending {
+                        id: u64::MAX,
+                        request: Request::Decompile { address: main },
+                        started: Instant::now() - DEADLINE - Duration::from_millis(1),
+                        selection: app.selection_generation,
+                        revision: app.revision,
+                        byte_origin: (app.selected, app.tab),
+                        bytes: None,
+                        result: app.results.binding(main, app.local_override_state(main)),
+                    });
+                }
+            }
+            app.poll_worker(&context);
+            assert_eq!(app.status, RECOVERY_STATUS);
+            assert!(app.recovery_waiting() && app.analysis_cancellable());
+            app.sent_decompiles.len()
+        };
+        let skips = app.debug_skip.clone();
+        let decompiler_refresh: fn(&mut DesktopApp, &egui::Context) =
+            |app, context| app.refresh_decompilation(context);
+        let full_refresh: fn(&mut DesktopApp, &egui::Context) =
+            |app, context| app.refresh_function(context);
+
+        // Undisturbed, the replacement sends the recovery: exactly one
+        // inference-only, non-refresh Prepare.
+        let mark = stop(&mut app, None);
+        receive_worker_start(&mut app, &context);
+        settle(&mut app);
+        assert_eq!(sends(&app, mark), (vec![(true, false)], 0));
+        assert!(!app.recovery_waiting());
+
+        // A stopped Refresh (decompiler-only, then full-function through the
+        // Graph continuation) resends its refresh exactly once.
+        for refresh in [decompiler_refresh, full_refresh] {
+            let before = app.sent_decompiles.len();
+            let mark = stop(&mut app, Some(refresh));
+            assert_eq!(sends(&app, before).0.len(), 1, "the stopped Refresh");
+            receive_worker_start(&mut app, &context);
+            settle(&mut app);
+            assert_eq!(sends(&app, mark), (vec![(true, true)], 0));
+        }
+
+        // A new Refresh while the replacement starts replaces the recovery:
+        // one ordinary refresh Prepare.
+        let mark = stop(&mut app, None);
+        app.refresh_decompilation(&context);
+        assert!(!app.recovery_waiting());
+        receive_worker_start(&mut app, &context);
+        settle(&mut app);
+        assert_eq!(sends(&app, mark), (vec![(false, true)], 0));
+
+        // Navigating away (to a cached function) and back retires it; a later
+        // Refresh of the same function is ordinary.
+        let mark = stop(&mut app, None);
+        app.navigate(other, true, &context);
+        app.navigate(main, true, &context);
+        assert!(!app.recovery_waiting());
+        receive_worker_start(&mut app, &context);
+        settle(&mut app);
+        assert!(
+            sends(&app, mark)
+                .0
+                .iter()
+                .all(|&(inference_only, _)| !inference_only)
+        );
+        let mark = app.sent_decompiles.len();
+        app.refresh_decompilation(&context);
+        settle(&mut app);
+        assert_eq!(sends(&app, mark), (vec![(false, true)], 0));
+
+        // Data navigation during startup drops the recovery before any Hex
+        // read: no Prepare and no other Decompile of main through Open,
+        // replay and the requested page; the displayed code is unchanged.
+        let data = app
+            .info
+            .as_ref()
+            .unwrap()
+            .sections
+            .iter()
+            .find(|section| section.name == ".rodata")
+            .unwrap()
+            .address;
+        let data_navigation = |app: &mut DesktopApp, mark: usize| {
+            let code = app.code.clone();
+            app.navigate_data(data, 1, &context);
+            assert!(!app.recovery_waiting());
+            if app.file_job.is_some() {
+                receive_worker_start(app, &context);
+            }
+            settle(app);
+            assert_eq!(sends(app, mark), (Vec::new(), 0));
+            assert_eq!(app.data_location, Some((data, 1)));
+            assert_eq!(app.tab, Tab::Hex);
+            assert!(!app.hex.is_loading());
+            assert!(match (&code, &app.code) {
+                (Some(before), Some(after)) => Arc::ptr_eq(before, after),
+                (None, None) => true,
+                _ => false,
+            });
+        };
+        let mark = stop(&mut app, None);
+        data_navigation(&mut app, mark);
+        app.navigate(main, true, &context);
+        settle(&mut app);
+
+        // With a label on main the replacement acknowledges its Rename first;
+        // data navigation while that acknowledgement is pending still drops
+        // the recovery waiting behind it.
+        app.edit_annotation(
+            main,
+            Annotation {
+                label: "main_label".into(),
+                ..Default::default()
+            },
+        );
+        settle(&mut app);
+        let mark = stop(&mut app, None);
+        receive_worker_start(&mut app, &context);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !app.pending.as_ref().is_some_and(
+            |p| matches!(p.request, Request::Rename { address, .. } if address == main),
+        ) {
+            assert!(Instant::now() < deadline, "no label replay: {}", app.status);
+            assert!(app.client.is_some(), "worker stopped: {}", app.status);
+            app.poll_graph_preparation(&context);
+            app.poll_worker(&context);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            app.recovery_waiting(),
+            "the recovery waits behind its label"
+        );
+        data_navigation(&mut app, mark);
+        app.navigate(main, true, &context);
+        settle(&mut app);
+
+        // An annotation edit while the label replay is pending changes the
+        // context the recovery was started for: it never sends.
+        let mark = stop(&mut app, None);
+        receive_worker_start(&mut app, &context);
+        while !app.pending.as_ref().is_some_and(
+            |p| matches!(p.request, Request::Rename { address, .. } if address == main),
+        ) {
+            assert!(app.client.is_some(), "worker stopped: {}", app.status);
+            app.poll_graph_preparation(&context);
+            app.poll_worker(&context);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        app.edit_annotation(
+            main,
+            Annotation {
+                label: "main_label".into(),
+                comment: "note".into(),
+                ..Default::default()
+            },
+        );
+        settle(&mut app);
+        assert!(
+            sends(&app, mark)
+                .0
+                .iter()
+                .all(|&(inference_only, _)| !inference_only),
+            "{:?}",
+            sends(&app, mark)
+        );
+
+        // A second stop, of the recovery itself, is terminal: the ordinary
+        // error, no third worker.
+        let mark = stop(&mut app, None);
+        receive_worker_start(&mut app, &context);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while sends(&app, mark).0.is_empty() {
+            assert!(Instant::now() < deadline, "no recovery: {}", app.status);
+            app.poll_graph_preparation(&context);
+            app.poll_worker(&context);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(sends(&app, mark), (vec![(true, false)], 0));
+        app.pending.as_mut().unwrap().started =
+            Instant::now() - DEADLINE - Duration::from_millis(1);
+        app.poll_worker(&context);
+        assert_ne!(app.status, RECOVERY_STATUS);
+        assert!(app.opening.is_none() && app.file_job.is_none() && !app.recovery_waiting());
+
+        // Cancel during the recovery of a Refresh: no send, a late startup
+        // cannot revive it, and the next forced ordinary miss of the same
+        // function is a plain Prepare.
+        app.navigate(main, true, &context);
+        if app.file_job.is_some() {
+            receive_worker_start(&mut app, &context);
+        }
+        settle(&mut app);
+        let mark = stop(&mut app, Some(decompiler_refresh));
+        assert!(app.pending.is_none() && app.file_job.is_some());
+        app.cancel_analysis();
+        assert!(!app.recovery_waiting() && app.opening.is_none());
+        receive_worker_start(&mut app, &context);
+        assert!(app.client.is_none() && app.pending.is_none());
+        assert!(!app.analysis_cancellable());
+        assert_eq!(sends(&app, mark), (Vec::new(), 0));
+        app.results
+            .refresh_decompilation(main, crate::function_results::Invalidation::Refresh);
+        app.request(Request::Decompile { address: main }, &context);
+        receive_worker_start(&mut app, &context);
+        settle(&mut app);
+        assert_eq!(sends(&app, mark), (vec![(false, false)], 0));
+        // No outcome records a skip.
+        assert_eq!(app.debug_skip, skips);
+    }
+
+    #[test]
+    fn file_requests_during_a_file_job_report_busy_instead_of_vanishing() {
+        let mut app = keyboard_app();
+        let context = egui::Context::default();
+        let (_sender, receiver) = mpsc::sync_channel(1);
+        app.file_job = Some(receiver);
+        app.open_project(PathBuf::from("pending.grproj"), &context);
+        assert_eq!(app.status, FILE_BUSY);
+        assert!(app.opening.is_none() && app.file_job.is_some());
+        // A debug retry that could not start its replacement worker must not
+        // stop the current one or record a skip; the failure is reported.
+        show_view(
+            &mut app,
+            FunctionView {
+                address: 0x1000,
+                blocks: Vec::new(),
+                edges: Vec::new(),
+                calls: Vec::new(),
+                warnings: Vec::new(),
+            },
+        );
+        app.binary_path = Some(PathBuf::from("binary"));
+        app.debug_state = "debug-v5".into();
+        app.use_debug_info = true;
+        app.pending = Some(Pending {
+            id: 1,
+            request: Request::Decompile { address: 0x1000 },
+            started: Instant::now(),
+            selection: app.selection_generation,
+            revision: app.revision,
+            byte_origin: (app.selected, app.tab),
+            bytes: None,
+            result: None,
+        });
+        assert!(!app.retry_debug_decompile(true, &context));
+        assert!(app.debug_skip.is_empty() && !app.recovery_waiting());
+    }
+
+    #[test]
+    fn open_failure_retries_once_with_debug_disabled() {
+        // The retry starts a real worker.
+        test_worker().unwrap_or_else(|error| panic!("{error}"));
+        let mut app = keyboard_app();
+        let context = egui::Context::default();
+        let origin = app.request_origin();
+        app.opening = Some(Opening {
+            path: std::env::current_exe().unwrap(),
+            preserve: false,
+            follow: None,
+            revision: app.revision,
+            follow_origin: origin,
+        });
+        app.pending = Some(Pending {
+            id: 1,
+            request: Request::Open {
+                path: "fixture".into(),
+                debug: Default::default(),
+            },
+            started: Instant::now(),
+            selection: app.selection_generation,
+            revision: app.revision,
+            byte_origin: (app.selected, app.tab),
+            bytes: None,
+            result: None,
+        });
+        assert!(app.retry_debug_open(&context));
+        assert!(!app.use_debug_info);
+        receive_worker_start(&mut app, &context);
+        assert!(
+            matches!(app.pending.as_ref().map(|p| &p.request),Some(Request::Open {debug,..}) if !debug.enabled)
+        );
+        assert!(!app.retry_debug_open(&context));
+        app.client.take().unwrap().stop_and_wait().unwrap();
+        let mut fresh = app.info.as_ref().unwrap().clone();
+        fresh.warnings.clear();
+        app.record_debug_open_outcome(&mut fresh, false, true);
+        assert!(crate::debug_info::has_open_fallback(&fresh));
+        app.info = Some(fresh.clone());
+        app.status = "Decompiled".into();
+        assert!(
+            app.status_notes()
+                .any(|note| note == crate::debug_info::OPEN_FALLBACK_WARNING)
+        );
+        fresh.warnings.clear();
+        app.record_debug_open_outcome(&mut fresh, false, true);
+        assert!(crate::debug_info::has_open_fallback(&fresh));
+        app.record_debug_open_outcome(&mut fresh, true, true);
+        assert!(!crate::debug_info::has_open_fallback(&fresh));
+        // A fallback Open that fails too restores the previous setting.
+        app.debug_open_restore = Some(true);
+        app.use_debug_info = false;
+        app.debug_retry_failed();
+        assert!(app.use_debug_info && !app.debug_fallback_pending);
     }
 }

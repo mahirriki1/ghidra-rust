@@ -11,6 +11,7 @@ pub mod client;
 mod code_pointers;
 pub mod crypto;
 pub mod data_analysis;
+pub mod debug_info;
 pub mod decode;
 pub mod decoder_ui;
 pub mod decompile;

@@ -21,6 +21,9 @@ startup syntax.
 | `--binary PATH` | Analyze a binary, or provide the matching image for an external project |
 | `--project PATH` | Reopen a project. Embedded projects supply their own image and reject `--binary`. |
 | `--output-project PATH` | Allow commands to save a checkpoint at this path |
+| `--no-debug-info` | Open without reading debug info or any companion file |
+| `--use-debug-info` | Re-enable debug info for a saved project and clear its saved per-function skips |
+| `--debug-info PATH` | Use this Mach-O dSYM companion. Project paths never select one. |
 
 A session belongs to one verified image. Start a new process to change it.
 Project source hints never select a file automatically.
@@ -40,7 +43,7 @@ Startup and transport failures return a failing process exit status.
 
 | Command kind | Fields | Result |
 | --- | --- | --- |
-| `info` | — | Verified image metadata, known functions, unapplied saved signatures |
+| `info` | — | Verified image metadata, debug setting and status, known functions, unapplied saved signatures |
 | `annotations` | — | Session annotations, local overrides, and signatures |
 | `function` | `address`, optional `refresh` (false) | Listing/CFG, pseudocode, mappings, semantic data, origins, cache status |
 | `discover` | — | One bounded discovery step, committed snapshot, and `complete` |
@@ -70,6 +73,59 @@ In a session started with `--output-project PATH`, send these lines after
 - **Linkage** starts at cursor 0 without a digest. Pass each response's
   `next` cursor and summary digest until `next` is null. Start at 0 to
   restart a failed or unfinished fetch.
+
+## Debug information
+
+Debug info is on for a new binary. A reopened project keeps its saved
+setting. The Rust `Options` equivalents of the startup options are
+`use_debug_info: Some(false)`, `use_debug_info: Some(true)`, and
+`debug_info: Some(path)`. These additions keep the API at version 1.
+
+- **Function** semantics include `prototype_source`: `inferred` or
+  `debug_info`.
+- **Info** adds `use_debug_info` (the effective setting), `debug_status`
+  (`enabled`, `disabled`, or `disabled_after_open_failure`), and
+  `debug_skipped_functions`. The status describes the setting, not whether
+  a given function has usable DWARF.
+- If Open fails or times out with debug info on, the controller retries once
+  with it off and adds a warning to `info.warnings`. Checkpoints save the
+  disabled setting and the warning, so later opens keep both. A successful
+  Open with debug info explicitly enabled clears the warning. Nothing turns
+  debug info back on automatically.
+
+Each `function` command still returns one response. The worker finishes the
+ordinary inferred render first. Optional DWARF work then runs in a disposable
+fork on a single-threaded Linux worker, or in a separate single-use sibling
+worker on Windows and with threaded workers. The response carries the checked
+debug render if it was accepted in time, or the inferred render with a
+warning. A sibling has its own setup budget before its render budget. When
+setup runs out, the result keeps inference with `Debug setup timed out`, and a
+later `refresh: true` can still upgrade it. Cancelling while an earlier
+sibling is still being reaped ends the command at once with `cancelled`.
+[Budgets and warnings](analysis.md#debug-information)
+
+The controller keeps verified prototype decisions and can reuse a clean
+debug render while the program context and its call dependencies still match.
+PE requests bypass this reuse. `refresh: true` renders anew with the current
+decisions. A later `save_project` saves the result with its origin and
+signature provenance.
+
+If the worker exits (including at its CPU limit) or misses its deadline
+before it returns usable pseudocode, the controller starts one fresh worker
+for the same verified image and context. That worker renders the function once
+with inference only. No skip is recorded, and Info, the project, and later
+opens are unchanged. The function keeps `Debug prototype is unverified` when it
+has debug data, and a later `function` or `refresh` can still apply the
+prototype. If the retry also fails, the command reports the ordinary error and
+the worker stays stopped. Rejected or mismatched replies, engine errors, and
+cancellations are never retried this way. A command that needs this retry can
+take longer than one worker timeout.
+
+`debug_skipped_functions` lists skips saved by earlier versions, at most
+1,024. They still apply, and those functions report `Debug prototypes skipped
+for this function after a worker failure`. `--use-debug-info` clears the list.
+An engine error in a debug render keeps the function's inferred render, with
+`Debug prototypes skipped for this function after a decompiler error`.
 
 ## Limits and lifecycle
 

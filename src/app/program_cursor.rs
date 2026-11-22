@@ -720,7 +720,7 @@ mod tests {
             h.app
                 .queue
                 .iter()
-                .any(|r| matches!(r, Request::Graph { address: 0x1080 }))
+                .any(|r| matches!(r.request, Request::Graph { address: 0x1080 }))
         );
         assert_eq!(h.app.result_scope, Some(0x1080));
         assert_eq!(h.app.selected, Some(0x1084), "the cursor stays");
@@ -1636,7 +1636,7 @@ mod tests {
                 .pending
                 .iter()
                 .map(|p| &p.request)
-                .chain(&h.app.queue)
+                .chain(h.app.queue.iter().map(|queued| &queued.request))
                 .all(|r| !matches!(r, Request::Bytes { .. }))
         );
     }

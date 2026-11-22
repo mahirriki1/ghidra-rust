@@ -12,6 +12,15 @@ struct Fixture {
 }
 
 fn executable() -> PathBuf {
+    // Test builds may name an explicit headless worker.
+    if let Some(explicit) = std::env::var_os("GHIDRA_RUST_TEST_WORKER") {
+        let explicit = PathBuf::from(explicit);
+        assert!(
+            explicit.is_file(),
+            "GHIDRA_RUST_TEST_WORKER does not name a built worker executable"
+        );
+        return explicit;
+    }
     std::env::current_exe()
         .unwrap()
         .parent()
@@ -352,4 +361,539 @@ fn replacement_workers_must_match_the_retained_image() {
     );
     assert!(api.worker.is_none());
     assert_eq!(api.discovery_resumes, 1);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn debug_disabled_is_persisted_and_preserved_on_verified_restart() {
+    let f = fixture().unwrap();
+    let checkpoint = f.directory.path().join("debug-off.grproj");
+    let mut api = Analyzer::open(
+        Input::Binary(f.path.clone()),
+        &executable(),
+        Options {
+            use_debug_info: Some(false),
+            output_project: Some(checkpoint.clone()),
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    assert!(!api.data.use_debug_info && api.data.debug_state.is_empty());
+    let first = analyze(&mut api, f.a, false);
+    api.restart().unwrap();
+    let refreshed = analyze(&mut api, f.a, true);
+    assert_eq!(first.text, refreshed.text);
+    assert_eq!(
+        refreshed.semantics.prototype_source,
+        crate::semantic::PrototypeSource::Inferred
+    );
+    // Checkpoint the setting itself, alongside the retained pseudocode.
+    api.execute(Command::SaveProject { embed_binary: true })
+        .unwrap();
+    let loaded = ProjectData::load(&checkpoint).unwrap();
+    assert!(!loaded.data.use_debug_info);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn worker_exit_during_debug_open_retries_without_debug() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = fixture().unwrap();
+    let info = crate::analysis::LoadedProgram::open(f.path.to_str().unwrap())
+        .unwrap()
+        .info;
+    let executable = f.directory.path().join("retry-worker.py");
+    let info = serde_json::to_string(&info).unwrap();
+    let script = format!(
+        r#"#!/usr/bin/python3
+import sys,json,os
+info=json.loads({info:?})
+for line in sys.stdin:
+    msg=json.loads(line); req=msg['request']; kind=req['kind']
+    if kind=='open':
+        if req.get('debug',{{}}).get('enabled',True): os._exit(9)
+        st=os.stat('/input/binary')
+        info['source_identity']={{'device':st.st_dev,'inode':st.st_ino,'inode_high':0}}
+        reply={{'kind':'opened','info':info}}
+    elif kind=='sync_functions': reply={{'kind':'functions_synced'}}
+    elif kind=='sync_signatures': reply={{'kind':'signatures_synced','binary_sha256':req['binary_sha256'],'context':req['context'],'unapplied':[]}}
+    else: reply={{'kind':'error','message':'unsupported test request'}}
+    print(json.dumps({{'id':msg['id'],'response':reply}}),flush=True)
+"#
+    );
+    std::fs::write(&executable, script).unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let checkpoint = f.directory.path().join("fallback.grproj");
+    let mut api = Analyzer::open(
+        Input::Binary(f.path),
+        &executable,
+        Options {
+            output_project: Some(checkpoint.clone()),
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    assert!(!api.data.use_debug_info && api.data.debug_state.is_empty());
+    let Output::Info {
+        info,
+        use_debug_info,
+        debug_status,
+        ..
+    } = api.execute(Command::Info {}).unwrap()
+    else {
+        panic!()
+    };
+    assert!(!use_debug_info);
+    assert_eq!(
+        debug_status,
+        crate::debug_info::DebugUseStatus::DisabledAfterOpenFailure
+    );
+    assert!(crate::debug_info::has_open_fallback(&info));
+    api.execute(Command::SaveProject { embed_binary: true })
+        .unwrap();
+    let saved = ProjectData::load(&checkpoint).unwrap();
+    assert!(!saved.data.use_debug_info);
+    assert!(crate::debug_info::has_open_fallback(&saved.data.info));
+    drop(api);
+    let mut reopened = Analyzer::open(
+        Input::Project {
+            path: checkpoint.clone(),
+            external_binary: None,
+        },
+        &executable,
+        Options::default(),
+    )
+    .unwrap();
+    let Output::Info {
+        info,
+        use_debug_info,
+        debug_status,
+        ..
+    } = reopened.execute(Command::Info {}).unwrap()
+    else {
+        panic!()
+    };
+    assert!(!use_debug_info);
+    assert_eq!(
+        debug_status,
+        crate::debug_info::DebugUseStatus::DisabledAfterOpenFailure
+    );
+    assert!(crate::debug_info::has_open_fallback(&info));
+    drop(reopened);
+    let mut enabled = Analyzer::open(
+        Input::Project {
+            path: checkpoint,
+            external_binary: None,
+        },
+        &super::tests::executable(),
+        Options {
+            use_debug_info: Some(true),
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    let Output::Info {
+        info,
+        use_debug_info,
+        debug_status,
+        ..
+    } = enabled.execute(Command::Info {}).unwrap()
+    else {
+        panic!()
+    };
+    assert!(use_debug_info);
+    assert_eq!(debug_status, crate::debug_info::DebugUseStatus::Enabled);
+    assert!(!crate::debug_info::has_open_fallback(&info));
+}
+
+/// A worker double for managed preparation, driven only by each physical
+/// request's mode (never by Open's skip list): a normal `prepare_decompile`
+/// of `f.a` exits, stalls, answers with a mismatched reply, or exits in
+/// the middle of its reply (`cut`); an inference-only recovery answers with
+/// the ordinary render unless `always` stops it too. With `cancel:TAG` the
+/// recovery names its process TAG (visible in the host's `/proc`) when it
+/// arrives and answers only a second later. The sandboxed double cannot
+/// write host files, so it refuses any Open that carries a skip, and only a
+/// recovery succeeds.
+#[cfg(target_os = "linux")]
+fn prepare_double(f: &Fixture, failure: &str, always: bool) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let mut loaded = crate::analysis::LoadedProgram::open_debug(
+        f.path.to_str().unwrap(),
+        &crate::debug_info::DebugOptions {
+            enabled: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let info = serde_json::to_string(&loaded.info).unwrap();
+    let graph =
+        serde_json::to_string(&loaded.handle(Request::Graph { address: f.a }).unwrap()).unwrap();
+    let code = serde_json::to_string(&loaded.handle(Request::Decompile { address: f.a }).unwrap())
+        .unwrap();
+    let path = f
+        .directory
+        .path()
+        .join(format!("prepare-{}-{always}.py", failure.replace(':', "-")));
+    let script = format!(
+        r#"#!/usr/bin/python3
+import sys,json,os,time
+info=json.loads({info:?})
+graph=json.loads({graph:?})
+code=json.loads({code:?})
+for line in sys.stdin:
+    msg=json.loads(line); req=msg['request']; kind=req['kind']
+    if kind=='open':
+        enabled=req.get('debug',{{}}).get('enabled',True)
+        if req.get('debug',{{}}).get('skip',[]): os._exit(3)
+        st=os.stat('/input/binary')
+        info['source_identity']={{'device':st.st_dev,'inode':st.st_ino,'inode_high':0}}
+        reply={{'kind':'opened','info':info}}
+        if enabled: reply['debug']={{'state':'test-debug','functions':1,'format':'dwarf','status':'applied'}}
+    elif kind=='sync_functions': reply={{'kind':'functions_synced'}}
+    elif kind=='sync_signatures': reply={{'kind':'signatures_synced','binary_sha256':req['binary_sha256'],'context':req['context'],'unapplied':[]}}
+    elif kind=='graph': reply=graph
+    elif kind=='prepare_decompile':
+        recovery=req.get('inference_only',False)
+        failure={failure:?}
+        if req['address']=={a} and (not recovery or {always}):
+            if failure=='timeout': time.sleep(30)
+            if failure=='reject': reply=graph
+            elif failure=='cut':
+                sys.stdout.write(json.dumps({{'id':msg['id'],'response':code}})[:40]); sys.stdout.flush(); os._exit(152)
+            else: os._exit(152)
+        else:
+            if recovery and failure.startswith('cancel:'):
+                with open('/proc/self/comm','w') as comm: comm.write(failure[7:])
+                time.sleep(1)
+            reply=code
+    else: reply={{'kind':'error','message':'unsupported test request'}}
+    print(json.dumps({{'id':msg['id'],'response':reply}}),flush=True)
+"#,
+        a = f.a,
+        always = if always { "True" } else { "False" },
+    );
+    std::fs::write(&path, script).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    path
+}
+
+/// A stop before the managed baseline (an exit, including the CPU-limit
+/// status, or the wall deadline) is recovered once with an inference-only
+/// request on a fresh worker, and never records a per-function skip. A
+/// recovery that stops too is the command's ordinary error after exactly
+/// one restart; a mismatched reply is never recovered.
+#[cfg(target_os = "linux")]
+#[test]
+fn managed_scheduler_prepare_stop_recovers_once_without_a_skip() {
+    // The deadline case uses the one bounded real stall.
+    for (failure, always) in [
+        ("exit", false),
+        ("timeout", false),
+        // A reply cut off by the exit is process loss, not a rejection.
+        ("cut", false),
+        ("exit", true),
+        ("reject", false),
+    ] {
+        let order = format!("{failure} always={always}");
+        let f = fixture().unwrap();
+        let double = prepare_double(&f, failure, always);
+        let checkpoint = f.directory.path().join("recovery.grproj");
+        let mut api = Analyzer::open(
+            Input::Binary(f.path.clone()),
+            &double,
+            Options {
+                output_project: Some(checkpoint.clone()),
+                worker_timeout: Duration::from_secs(2),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let initial_epoch = api.worker_epoch;
+        let result = api.execute(Command::Function {
+            address: f.a,
+            refresh: false,
+        });
+        let expected_epoch = initial_epoch + u64::from(failure != "reject");
+        assert_eq!(api.worker_epoch, expected_epoch, "{order}: one restart");
+        assert_eq!(api.discovery_resumes, 0, "{order}: its own bound");
+        let Output::Info {
+            info,
+            use_debug_info,
+            debug_status,
+            debug_skipped_functions,
+            ..
+        } = api.execute(Command::Info {}).unwrap()
+        else {
+            panic!();
+        };
+        // The binary-wide setting and the skip list never change.
+        assert!(use_debug_info, "{order}");
+        assert_eq!(debug_status, crate::debug_info::DebugUseStatus::Enabled);
+        assert!(!crate::debug_info::has_fallback(&info));
+        assert!(debug_skipped_functions.is_empty(), "{order}");
+        if failure == "reject" {
+            let error = result.unwrap_err();
+            assert_eq!(error.code, ErrorCode::WorkerFailed);
+            assert!(error.message.contains("reply"), "{}", error.message);
+            assert!(api.worker.is_none());
+            continue;
+        }
+        if always {
+            let error = result.unwrap_err();
+            assert_eq!(error.code, ErrorCode::WorkerFailed, "{order}");
+            assert!(
+                error.message.contains("CPU time limit reached"),
+                "{order}: {}",
+                error.message
+            );
+            assert!(api.worker.is_none());
+            continue;
+        }
+        let Output::Function { analysis } = result.unwrap() else {
+            panic!();
+        };
+        assert_eq!(
+            analysis.semantics.prototype_source,
+            crate::semantic::PrototypeSource::Inferred
+        );
+        assert!(
+            analysis.text.contains("branch_loop(uint4 param_1)"),
+            "{}",
+            analysis.text
+        );
+        api.execute(Command::SaveProject { embed_binary: true })
+            .unwrap();
+        drop(api);
+        let saved = ProjectData::load(&checkpoint).unwrap();
+        assert!(saved.data.use_debug_info);
+        assert!(saved.data.debug_skip.is_empty(), "{order}");
+        drop(saved);
+        // A recovered function stays eligible: a real worker on the saved
+        // project upgrades it without re-enabling debug info.
+        let mut reopened = Analyzer::open(
+            Input::Project {
+                path: checkpoint,
+                external_binary: None,
+            },
+            &executable(),
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            analyze(&mut reopened, f.a, true).semantics.prototype_source,
+            crate::semantic::PrototypeSource::DebugInfo,
+            "{order}"
+        );
+    }
+}
+
+/// A cancellation while the recovery runs ends the command as cancelled:
+/// the recovered render is never adopted, nothing is saved as a skip, and
+/// the worker is stopped. The double names its process when the recovery
+/// request arrives, and the test cancels only then.
+#[cfg(target_os = "linux")]
+#[test]
+fn managed_scheduler_cancellation_during_recovery_is_terminal() {
+    let tag = format!("grcancel{}", std::process::id() % 1_000_000);
+    let f = fixture().unwrap();
+    let double = prepare_double(&f, &format!("cancel:{tag}"), false);
+    let options = Options {
+        worker_timeout: Duration::from_secs(10),
+        ..Default::default()
+    };
+    let cancellation = options.cancellation.clone();
+    let mut api = Analyzer::open(Input::Binary(f.path.clone()), &double, options).unwrap();
+    let initial_epoch = api.worker_epoch;
+    let watcher = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < deadline {
+            let arrived = std::fs::read_dir("/proc").unwrap().flatten().any(|entry| {
+                std::fs::read_to_string(entry.path().join("comm"))
+                    .is_ok_and(|comm| comm.trim_end() == tag)
+            });
+            if arrived {
+                cancellation.cancel();
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        false
+    });
+    let result = api.execute(Command::Function {
+        address: f.a,
+        refresh: false,
+    });
+    assert!(
+        watcher.join().unwrap(),
+        "the recovery request never arrived"
+    );
+    let Err(error) = result else {
+        panic!("a cancelled recovery is never adopted")
+    };
+    assert_eq!(error.code, ErrorCode::Cancelled, "{}", error.message);
+    assert_eq!(api.worker_epoch, initial_epoch + 1, "one replacement");
+    assert!(api.worker.is_none());
+    assert!(api.data.debug_skip.is_empty());
+}
+
+/// A reply the client already refused, or one for another request, is a
+/// rejection even when it is read after the deadline; only an otherwise
+/// acceptable late reply is the deadline.
+#[cfg(target_os = "linux")]
+#[test]
+fn managed_scheduler_late_rejection_is_not_a_deadline() {
+    use crate::client::{WorkerClient, WorkerEvent};
+    use crate::model::WorkerResponse;
+    let options = Options::default();
+    let late = || Instant::now() + Duration::from_secs(600);
+    let reply = |id| {
+        WorkerEvent::Reply(Box::new(WorkerResponse {
+            id,
+            response: Response::Error {
+                message: "late".into(),
+            },
+        }))
+    };
+    let exchange = |event| {
+        let mut worker = WorkerClient::with_events(vec![event]);
+        let error = exchange_until(
+            &mut worker,
+            Request::Graph { address: 0x1000 },
+            Instant::now() + Duration::from_secs(60),
+            &options,
+        )
+        .unwrap_err();
+        (error.code, worker.failure())
+    };
+    let refused = WorkerEvent::Failed("Worker reply does not match its sent request".into());
+    assert_eq!(
+        exchange((late(), refused)),
+        (
+            ErrorCode::WorkerFailed,
+            Some(crate::client::FailureKind::Rejected)
+        )
+    );
+    assert_eq!(exchange((late(), reply(7))).0, ErrorCode::WorkerFailed);
+    assert_eq!(exchange((late(), reply(1))).0, ErrorCode::Timeout);
+    assert_eq!(
+        exchange((Instant::now(), reply(1))).0,
+        ErrorCode::CommandFailed
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn managed_debug_verified_cache_serves_both_real_executors() {
+    use crate::semantic::PrototypeSource;
+    for sibling in [false, true] {
+        let fixture = fixture().unwrap();
+        let mut api = Analyzer::open(
+            Input::Binary(fixture.path.clone()),
+            &executable(),
+            Options {
+                use_debug_info: Some(true),
+                worker_arguments: sibling
+                    .then(|| crate::worker::NO_FORK_ARGUMENT.into())
+                    .into_iter()
+                    .collect(),
+                // Sibling startup is inside the window; host load must not
+                // decide these positive checks.
+                optional_floor: sibling.then_some(Duration::from_secs(10)),
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let cold = analyze(&mut api, fixture.a, false);
+        assert_eq!(cold.semantics.prototype_source, PrototypeSource::DebugInfo);
+        assert!(
+            cold.text.contains("branch_loop(uint4 count)"),
+            "{}",
+            cold.text
+        );
+        let hits = crate::client::managed_stats().cache_hits;
+        for _ in 0..30 {
+            // Remove only the presentation entry to exercise the lower
+            // verified result cache through the ordinary command route.
+            api.results
+                .refresh_decompilation(fixture.a, crate::function_results::Invalidation::Refresh);
+            let warm = analyze(&mut api, fixture.a, false);
+            assert_eq!(warm.text, cold.text);
+            assert_eq!(warm.mappings, cold.mappings);
+            assert_eq!(warm.semantics, cold.semantics);
+        }
+        assert!(crate::client::managed_stats().cache_hits >= hits + 30);
+        let refreshed = analyze(&mut api, fixture.a, true);
+        assert_eq!(refreshed.text, cold.text);
+        assert_eq!(refreshed.mappings, cold.mappings);
+        assert_eq!(refreshed.semantics, cold.semantics);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn managed_debug_sibling_replays_an_acknowledged_long_name() {
+    use crate::client::managed_decompile::PeerContext;
+    use crate::semantic::PrototypeSource;
+    let fixture = fixture().unwrap();
+    let name = format!("renamed_{}_suffix", "n".repeat(MAX_FUNCTION_NAME_BYTES));
+    let mut api = Analyzer::open(
+        Input::Binary(fixture.path.clone()),
+        &executable(),
+        Options {
+            use_debug_info: Some(true),
+            worker_arguments: vec![crate::worker::NO_FORK_ARGUMENT.into()],
+            optional_floor: Some(Duration::from_secs(10)),
+            ..Options::default()
+        },
+    )
+    .unwrap();
+
+    // The public console has no rename command and project labels are
+    // bounded to the inventory width. Exercise a real acknowledged Rename
+    // through the shared private client, then replay the desktop's exact
+    // acknowledged spelling in its ordinary sibling path.
+    let Response::Renamed {
+        address,
+        name: acknowledged,
+    } = api
+        .request(Request::Rename {
+            address: fixture.a,
+            name: name.clone(),
+        })
+        .unwrap()
+    else {
+        panic!("missing long name acknowledgement")
+    };
+    assert_eq!((address, &acknowledged), (fixture.a, &name));
+    let entry = api
+        .data
+        .info
+        .functions
+        .iter_mut()
+        .find(|entry| entry.address == address)
+        .unwrap();
+    entry.name.clone_from(&acknowledged);
+    api.peer_context = Some(Arc::new(PeerContext {
+        launch: api.worker.as_ref().unwrap().peer_launch(),
+        enabled: true,
+        skip: Vec::new(),
+        info: Arc::new(api.data.info.clone()),
+        debug_state: api.data.debug_state.clone(),
+        functions: Arc::new(effective_functions(&api.data)),
+        long_names: vec![FunctionInfo {
+            address,
+            name: acknowledged,
+        }],
+        signatures: Arc::new(Vec::new()),
+        unapplied: Vec::new(),
+        signature_context: String::new(),
+    }));
+    let settled = analyze(&mut api, fixture.a, true);
+    assert!(settled.text.contains(&name), "{}", settled.text);
+    assert_eq!(
+        settled.semantics.prototype_source,
+        PrototypeSource::DebugInfo
+    );
+    assert!(api.data.debug_skip.is_empty());
 }
