@@ -320,6 +320,7 @@ impl super::DesktopApp {
             || self.signature_editor.is_some()
             || self.signature_change.is_some()
             || self.search_dialog.is_some()
+            || self.live.prompt_open()
     }
 
     fn listing_view_key(&self) -> Option<ViewKey> {

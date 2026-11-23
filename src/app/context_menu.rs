@@ -73,6 +73,7 @@ pub(super) enum MenuCommand {
     Decode,
     Expand,
     Collapse,
+    ToggleBreakpoint,
 }
 
 /// The state a capture was resolved against. Snapshots are held weakly, so
@@ -158,8 +159,8 @@ impl MenuItem {
     }
 }
 
-/// Navigation/view, edit/xrefs, then copy/byte tools.
-type MenuGroups = [Vec<MenuItem>; 3];
+/// Navigation/view, edit/xrefs, copy/byte tools, then live debugging.
+type MenuGroups = [Vec<MenuItem>; 4];
 
 /// Explicit xref choices, then the displayed function when it is distinct.
 /// An omitted-count disclosure moves to the last choice's tooltip.
@@ -449,6 +450,11 @@ impl DesktopApp {
                 self.open_xrefs(target);
             }
             MenuCommand::GoTo => self.menu_go_to(source, context),
+            MenuCommand::ToggleBreakpoint => {
+                if let MenuSource::Instruction { entry, pc } = source {
+                    self.toggle_breakpoint_at(pc, entry);
+                }
+            }
             MenuCommand::ShowGraph => {
                 if let MenuSource::Instruction { entry, pc } = source {
                     if self.view().is_some_and(|view| view.address == entry) {
@@ -650,7 +656,7 @@ impl DesktopApp {
 
     fn menu_items(&self, source: MenuSource) -> MenuGroups {
         let mut groups: MenuGroups = Default::default();
-        let [navigation, edit, copy] = &mut groups;
+        let [navigation, edit, copy, debug] = &mut groups;
         let Some(info) = self.info.as_ref() else {
             return groups;
         };
@@ -700,6 +706,18 @@ impl DesktopApp {
                 copy.push(
                     MenuItem::new(MenuCommand::Decode, "Decode bytes").enabled(bytes, "No bytes"),
                 );
+                if crate::debugger::SUPPORTED && self.live_gutter() {
+                    let label = if self.live_breakpoint_set(pc) {
+                        "Remove breakpoint"
+                    } else {
+                        "Set breakpoint"
+                    };
+                    let available = self.live_debuggable();
+                    debug.push(
+                        MenuItem::new(MenuCommand::ToggleBreakpoint, label)
+                            .enabled(available.is_ok(), available.err().unwrap_or("")),
+                    );
+                }
             }
             MenuSource::Code { entry, line, byte } => {
                 if self.menu_line(line).is_none() {

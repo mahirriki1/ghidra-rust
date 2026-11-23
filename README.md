@@ -57,6 +57,7 @@ See the architecture guide for exclusions and platform validation.
 | `L` / `;` | Rename / edit a comment |
 | `Alt+Left` / `Alt+Right` | Go back / forward |
 | `Ctrl+S` | Save a project |
+| `F5` / `F9` | Linux x86-64: start or continue debugging / toggle a breakpoint |
 
 The Listing starts in **Program** scope. Choose **Function** in its title row
 to focus on one function. See the analysis guide for navigation, search, byte
@@ -78,7 +79,7 @@ Browse the full guide set online if you are reading from a portable archive.
 | If you want to… | Read |
 | --- | --- |
 | Analyze without a desktop window | [Headless API](docs/headless.md) |
-| Try the Linux live debugger backend from source | [Live debugger](docs/debugger.md) |
+| Debug a Linux x86-64 executable under GDB | [Live debugger](docs/debugger.md) |
 | Understand what discovery can recover | [Analysis coverage](docs/analysis.md) |
 | Interpret C++, Rust, or MSVC names | [Demangled display names](docs/demangling.md) |
 | Decode bytes or identify crypto constants | [Decode and FindCrypt](docs/crypto-signatures.md) |
