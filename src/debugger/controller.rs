@@ -23,6 +23,7 @@ pub enum Command {
     /// Declarative: the complete desired set of static breakpoint addresses
     /// and the caller's revision for it. While the target runs, the latest
     /// set waits and applies at the next stop, before that stop's snapshot.
+    /// A set larger than [`super::MAX_BREAKPOINTS`] is refused unchanged.
     Breakpoints {
         revision: u64,
         addresses: BTreeSet<u64>,
@@ -62,7 +63,8 @@ pub enum BreakpointStatus {
 pub enum Event {
     Stopped(Box<Snapshot>),
     Running,
-    /// The status of every desired address of the applied revision.
+    /// The status of every desired address of the applied revision, plus any
+    /// undesired address that is still set because its removal failed.
     Breakpoints {
         revision: u64,
         status: BTreeMap<u64, BreakpointStatus>,
@@ -122,21 +124,30 @@ pub use supported::Controller;
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod supported {
+    use std::cell::Cell;
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::mpsc::{self, RecvTimeoutError, TryRecvError};
     use std::time::{Duration, Instant};
 
     use super::{BreakpointStatus, Command, Event, Launch, Snapshot, StepKind};
-    use crate::debugger::{Debugger, Error, State};
+    use crate::debugger::{Debugger, Error, MAX_BREAKPOINTS, State};
 
     /// How long a running session waits for GDB before checking commands.
     const RUN_POLL: Duration = Duration::from_millis(50);
+
+    /// How long a pause waits for its stop before reading further commands.
+    const PAUSE_WAIT: Duration = Duration::from_secs(1);
+
+    /// Reported when the session thread ended without sending `Ended`.
+    const UNEXPECTED_END: &str = "The debugger session stopped unexpectedly";
 
     /// Owns the command and event channels of one session thread. Dropping it
     /// never blocks: the thread notices the closed channel and ends the target.
     pub struct Controller {
         commands: mpsc::Sender<Command>,
         events: mpsc::Receiver<Event>,
+        /// Whether `try_recv` has returned an `Ended` event.
+        ended: Cell<bool>,
     }
 
     impl Controller {
@@ -153,7 +164,11 @@ mod supported {
                     }
                     .run(launch, command_receiver)
                 })?;
-            Ok(Self { commands, events })
+            Ok(Self {
+                commands,
+                events,
+                ended: Cell::new(false),
+            })
         }
 
         /// Returns `false` once the session thread has ended.
@@ -161,8 +176,24 @@ mod supported {
             self.commands.send(command).is_ok()
         }
 
+        /// The next queued event. `Ended` is always returned exactly once:
+        /// a thread that stopped without sending it, such as after a panic,
+        /// is reported with an error.
         pub fn try_recv(&self) -> Option<Event> {
-            self.events.try_recv().ok()
+            match self.events.try_recv() {
+                Ok(event) => {
+                    if matches!(event, Event::Ended { .. }) {
+                        self.ended.set(true);
+                    }
+                    Some(event)
+                }
+                Err(TryRecvError::Disconnected) if !self.ended.replace(true) => {
+                    Some(Event::Ended {
+                        error: Some(UNEXPECTED_END.into()),
+                    })
+                }
+                Err(_) => None,
+            }
         }
 
         /// Stops the session and waits up to `timeout` for `Ended`. Returns
@@ -249,8 +280,28 @@ mod supported {
                             self.emit(Event::Stopped(Box::new(snapshot)));
                             reported = true;
                         }
-                        let command = if std::mem::take(&mut run) {
-                            Command::Resume
+                        let command = if run {
+                            // Commands queued during the launch come before the
+                            // automatic resume, so an early stop or pause keeps
+                            // the target from running.
+                            match commands.try_recv() {
+                                Ok(Command::Stop) | Err(TryRecvError::Disconnected) => {
+                                    return Ok(());
+                                }
+                                Ok(Command::Pause) => {
+                                    run = false;
+                                    continue;
+                                }
+                                Ok(command @ (Command::Resume | Command::Step(_))) => {
+                                    run = false;
+                                    command
+                                }
+                                Ok(command) => command,
+                                Err(TryRecvError::Empty) => {
+                                    run = false;
+                                    Command::Resume
+                                }
+                            }
                         } else {
                             match commands.recv() {
                                 Ok(command) => command,
@@ -304,7 +355,19 @@ mod supported {
                             match commands.try_recv() {
                                 Ok(Command::Pause) => {
                                     let result = debugger.pause();
-                                    self.recoverable(debugger, result)?;
+                                    if self.recoverable(debugger, result)?.is_some() {
+                                        // The stop arrives after the interrupt
+                                        // is accepted. Later commands belong to
+                                        // that stop, so wait a bounded time for
+                                        // it before reading them.
+                                        let deadline = Instant::now() + PAUSE_WAIT;
+                                        while matches!(debugger.state(), State::Running)
+                                            && Instant::now() < deadline
+                                        {
+                                            debugger.wait(RUN_POLL)?;
+                                        }
+                                        break;
+                                    }
                                 }
                                 Ok(Command::Breakpoints {
                                     revision,
@@ -343,6 +406,12 @@ mod supported {
             revision: u64,
             addresses: &BTreeSet<u64>,
         ) -> Result<(), Error> {
+            if addresses.len() > MAX_BREAKPOINTS {
+                self.emit(Event::Refused {
+                    message: format!("A session holds up to {MAX_BREAKPOINTS} breakpoints"),
+                });
+                return Ok(());
+            }
             let current = debugger.breakpoint_ids().collect::<Vec<_>>();
             let mut status = BTreeMap::new();
             for &(address, id) in &current {
@@ -351,11 +420,11 @@ mod supported {
                 } else {
                     let result = debugger.remove_breakpoint(id);
                     if let Err(message) = fatal_or_message(debugger, result)? {
-                        self.emit(Event::Refused {
-                            message: format!(
-                                "Could not remove the breakpoint at {address:#x}: {message}"
-                            ),
-                        });
+                        // Still armed, so the caller must keep showing it.
+                        status.insert(
+                            address,
+                            BreakpointStatus::Failed(format!("Could not remove: {message}")),
+                        );
                     }
                 }
             }

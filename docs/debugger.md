@@ -43,9 +43,9 @@ that Linux loaded the expected file. That first stop can be in the ELF loader.
 Insert breakpoints using static addresses, then call `resume` or
 `step_instruction`. Each static address takes one breakpoint. Inserting it
 again is refused, and `breakpoint_ids` lists the inserted addresses with
-their GDB ids. A session holds up to 128 breakpoints. `wait` reports `Running`, a stop, or exit. A wait that
-expires leaves the running target available to `pause`. Individual GDB requests
-have a five-second deadline. Perform these calls on a background thread.
+their GDB ids. A session holds up to 128 breakpoints. `wait` reports
+`Running`, a stop, or exit. A wait that expires leaves the running target
+available to `pause`. Individual GDB requests have a five-second deadline. Perform these calls on a background thread.
 A stop caused by a signal names it, so a pause reports `SIGINT` rather than a
 fault such as `SIGSEGV`. An exit caused by a signal also names the signal.
 
@@ -75,19 +75,25 @@ request a repaint.
   revision. When the target is stopped, it applies immediately. While the
   target runs, the latest set waits and applies at the next stop, before
   that stop's snapshot. The reply lists every desired address as set or
-  failed with a reason.
+  failed with a reason. An address that could not be removed stays listed
+  as failed, because it is still set. A set of more than 128 addresses is
+  refused and leaves the breakpoints unchanged.
 - `ReadMemory` names the stop sequence it was made for. A read for an older
   stop is answered with `stale`, and one sent while running with `running`.
   The session stays usable in both cases.
 - Commands that do not fit the current state, such as pausing a stopped
-  target, are answered with `Refused`.
+  target, are answered with `Refused`. A pause, stop, or resume sent while
+  a running launch is still starting replaces its automatic resume, so the
+  target stays at the loader stop or ends there.
 - `Exited` reports the exit code or signal. `Ended` is always the last event.
   It carries an error when the session could not start or had to close, for
   example after an `exec` or a GDB failure. The target and GDB are gone when
-  it arrives.
+  it arrives. If the session thread stops without sending it, `try_recv`
+  reports `Ended` with an error instead.
 - `Stop` ends the session. Dropping the `Controller` also ends it without
-  blocking. A running session notices within 50 ms, and a stopped one at
-  once. `Controller::shutdown` sends `Stop` and waits a bounded time for
+  blocking. A running session normally notices within 50 ms, and a stopped
+  one at once. A GDB request already in progress can delay this by up to its
+  five-second deadline. `Controller::shutdown` sends `Stop` and waits a bounded time for
   `Ended`.
 
 ## Execution limits
