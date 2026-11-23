@@ -977,14 +977,23 @@ impl DesktopApp {
                         return;
                     };
                     let row_selected = cursor == Some(row.position());
+                    let related =
+                        displayed == Some(owner) && self.semantic.addresses.contains(&start);
                     let response = theme::row_response(
                         ui,
                         ui.scope_id().with(("program-row", start)),
                         rect,
                         row_selected,
-                        displayed == Some(owner) && self.semantic.addresses.contains(&start),
+                        related,
                     );
-                    self.paint_live_row(ui, rect, &columns, start, row_selected);
+                    self.paint_live_row(
+                        ui,
+                        rect,
+                        &columns,
+                        start,
+                        row_selected,
+                        related || response.hovered(),
+                    );
                     let call = view.calls.iter().find(|call| call.address == start);
                     let callee = call
                         .and_then(|call| call.target)

@@ -32,7 +32,8 @@ menu, and the keys below do nothing there.
 instruction, usually in the ELF loader. The toolbar's run, pause, step and
 stop buttons repeat these commands for a debuggable binary. Like the other
 shortcuts, the keys do nothing while you type in a field, while a dialog or
-menu is open, or during a file operation. A held key acts once.
+menu is open, or during a file operation. While a binary opens or reopens,
+only Pause and Stop respond. A held key acts once.
 
 The first start of each opened binary asks you to confirm **Run program**.
 Enter does not confirm it. The confirmation lasts until you open or reopen a
@@ -48,8 +49,9 @@ The Listing reserves a narrow gutter for debuggable binaries, so its columns
 do not move when a session starts or ends:
 
 - A filled red dot is a breakpoint, inserted when a session runs.
-- A red ring is a breakpoint changed while the target runs. It applies at the
-  next stop.
+- A red ring is a breakpoint added or removed while the target runs. The
+  change applies at the next stop, so a removed breakpoint can still stop
+  the target until then.
 - A grey ring with a cross could not be inserted or removed. Hover the row
   for the reason.
 - A green arrow and row fill mark the stopped PC.
@@ -57,7 +59,9 @@ do not move when a session starts or ends:
 At each stop, the Listing selects the PC when a known function's decoded
 listing contains it, and the Decompiler highlights the expressions that the
 engine maps to that instruction. An instruction with no engine mapping
-highlights nothing. These moves add no Back/Forward history. A stop outside
+highlights nothing. These moves add no Back/Forward history. A stop does not
+move the selection while a binary opens, while you type in a field, or while
+the Annotations editor holds an unsaved edit. A stop outside
 the analyzed executable, for example in the loader or libc, leaves the
 selection where it was. The status bar shows the state: **Launching**,
 **Running**, **Stopped @ address** (or the runtime address outside the image),
@@ -69,7 +73,7 @@ history.
 Run control takes one command at a time. Keys that do not apply to the
 current state, such as Pause while stopped, do nothing. Opening another binary
 or project, reopening a changed file, closing the binary, and quitting each end
-a live session without asking. Quitting waits up to 1.5 seconds for GDB and
+a live session without asking, and the status bar notes it. Quitting waits up to 1.5 seconds for GDB and
 the target to end.
 
 ## Try a breakpoint from the Rust API

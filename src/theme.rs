@@ -1907,9 +1907,9 @@ pub fn paint_live_gutter(
     }
 }
 
-/// The stopped PC's row fill; a selected row keeps its selection fill.
-pub fn paint_live_pc_row(ui: &Ui, rect: egui::Rect, selected: bool) {
-    if !selected && ui.is_rect_visible(rect) {
+/// The stopped PC's row fill; a selected or related row keeps its own fill.
+pub fn paint_live_pc_row(ui: &Ui, rect: egui::Rect, highlighted: bool) {
+    if !highlighted && ui.is_rect_visible(rect) {
         ui.painter().rect_filled(rect, 0, LIVE_PC);
     }
 }
@@ -1930,12 +1930,7 @@ pub fn run_control_button(
     enabled: bool,
     tooltip: &str,
 ) -> egui::Response {
-    let label = match icon {
-        RunIcon::Run => "Continue",
-        RunIcon::Pause => "Pause",
-        RunIcon::Step => "Step instruction",
-        RunIcon::Stop => "Stop",
-    };
+    let label = tooltip;
     let response = ui.add_enabled(
         enabled,
         egui::Button::new("")

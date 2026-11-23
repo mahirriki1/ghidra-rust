@@ -91,21 +91,26 @@ pub(super) struct LiveDebug {
 
 impl LiveDebug {
     /// Ends any session and forgets everything bound to the previous binary.
-    pub(super) fn end(&mut self, generation: u64) {
+    /// Returns whether a live session was ended.
+    pub(super) fn end(&mut self, generation: u64) -> bool {
+        let ended = self.session.is_some();
         *self = Self {
             generation,
             ..Self::default()
         };
+        ended
     }
 
     /// Keeps state only for the same binary generation and contents.
-    pub(super) fn bind(&mut self, generation: u64, sha256: &str) {
+    /// Returns whether a live session was ended.
+    pub(super) fn bind(&mut self, generation: u64, sha256: &str) -> bool {
         if self.generation != generation
             || self.session.as_ref().is_some_and(|s| s.sha256 != sha256)
             || self.trusted.as_ref().is_some_and(|(_, s)| s != sha256)
         {
-            self.end(generation);
+            return self.end(generation);
         }
+        false
     }
 
     pub(super) fn prompt_open(&self) -> bool {
@@ -145,9 +150,16 @@ impl LiveDebug {
     fn mark(&self, address: u64) -> Option<theme::BreakpointMark> {
         let status = self.breakpoint_status.get(&address);
         if !self.breakpoints.contains(&address) {
-            // An undesired address whose removal failed is still armed.
-            return matches!(status, Some(BreakpointStatus::Failed(_)))
-                .then_some(theme::BreakpointMark::Failed);
+            // An undesired address whose removal failed is still armed, and
+            // one removed since the applied revision stays armed until the
+            // removal applies at the next stop.
+            return match status {
+                Some(BreakpointStatus::Failed(_)) => Some(theme::BreakpointMark::Failed),
+                Some(BreakpointStatus::Set) if self.session.is_some() => {
+                    Some(theme::BreakpointMark::Pending)
+                }
+                _ => None,
+            };
         }
         if self.session.is_none() {
             return Some(theme::BreakpointMark::Set);
@@ -238,6 +250,10 @@ impl DesktopApp {
         Ok(())
     }
 
+    pub(super) fn live_session_active(&self) -> bool {
+        self.live.session.is_some()
+    }
+
     pub(super) fn live_debuggable(&self) -> Result<(), &'static str> {
         self.live_binary()?;
         if self.opening.is_some() {
@@ -273,13 +289,14 @@ impl DesktopApp {
         columns: &theme::ListingColumns,
         address: u64,
         selected: bool,
+        related: bool,
     ) {
         let Some(gutter) = columns.gutter else {
             return;
         };
         let (mark, pc) = self.live_marks(address);
         if pc {
-            theme::paint_live_pc_row(ui, rect, selected);
+            theme::paint_live_pc_row(ui, rect, selected || related);
         }
         theme::paint_live_gutter(ui, rect, gutter, mark, pc);
     }
@@ -450,7 +467,9 @@ impl DesktopApp {
             || self.live.generation != self.generation
             || sha_changed
         {
-            self.live.end(self.generation);
+            if self.live.end(self.generation) {
+                self.status = "Debug session ended".into();
+            }
             return;
         }
         let mut follow = false;
@@ -462,12 +481,38 @@ impl DesktopApp {
         {
             follow |= self.adopt_live_event(event);
         }
+        // An open in flight would take the navigation as its own follow-up,
+        // and moving the selection would replace an annotation draft. The
+        // marks still update; the next stop or Go to PC follows.
         if follow
+            && self.opening.is_none()
+            && !context.egui_wants_keyboard_input()
+            && !self.annotation_draft_pending()
             && self.live.stop.is_some()
             && let Some(pc) = self.live.pc()
         {
             self.follow_pc(pc, context);
         }
+    }
+
+    /// Whether the Annotations editor holds an edit that a selection change
+    /// would discard.
+    fn annotation_draft_pending(&self) -> bool {
+        let Some(address) = self.editor_address.filter(|_| self.annotations_open) else {
+            return false;
+        };
+        let comment = self
+            .session
+            .as_ref()
+            .and_then(|session| session.annotations.get(&address))
+            .map_or("", |annotation| annotation.comment.as_str());
+        let name = self
+            .view()
+            .and_then(|view| {
+                crate::model::function_at(&self.info.as_ref()?.functions, view.address)
+            })
+            .map_or("", |function| function.name.as_str());
+        self.comment_edit != comment || self.name_edit != name
     }
 
     /// Applies one event; returns whether it was a stop to follow.
@@ -501,6 +546,8 @@ impl DesktopApp {
                 false
             }
             Event::Memory { .. } => false,
+            // A pause that crossed a stop is moot, not an error.
+            Event::Refused { .. } if session.phase == Phase::Stopped => false,
             Event::Refused { message } => {
                 session.phase = match session.phase {
                     Phase::Stepping => Phase::Stopped,
@@ -713,6 +760,7 @@ impl DesktopApp {
                 !self.live.breakpoints.is_empty(),
                 egui::Button::new("Clear breakpoints"),
             )
+            .on_disabled_hover_text("No breakpoints")
             .clicked()
         {
             self.live_clear_breakpoints();
@@ -720,6 +768,7 @@ impl DesktopApp {
         }
         if ui
             .add_enabled(self.live.pc().is_some(), egui::Button::new("Go to PC"))
+            .on_disabled_hover_text("Not stopped in the image")
             .clicked()
         {
             self.live_go_to_pc(context);
@@ -1540,6 +1589,154 @@ mod tests {
                 .iter()
                 .any(|t| t == "Stopped @ 1006")
         );
+    }
+
+    fn opening(app: &DesktopApp, preserve: bool) -> super::super::Opening {
+        super::super::Opening {
+            path: "/nonexistent/ghidra-rust-live/other".into(),
+            preserve,
+            follow: None,
+            revision: app.revision,
+            follow_origin: app.request_origin(),
+        }
+    }
+
+    #[test]
+    fn a_stop_during_an_open_neither_moves_the_selection_nor_becomes_its_follow_up() {
+        if !SUPPORTED {
+            return;
+        }
+        let context = egui::Context::default();
+        for preserve in [false, true] {
+            let mut app = debuggable();
+            app.selected = Some(0x1001);
+            // Only the breakpoint's listing knows 0x1080's owner, which is
+            // not the displayed function: following would request its graph.
+            app.live.owners.insert(0x1080, 0x1060);
+            let wire = fake_session(&mut app, Phase::Running);
+            app.opening = Some(opening(&app, preserve));
+            wire.emit(stopped(2, Some(0x1080), None));
+            app.poll_live_debug(&context);
+            assert_eq!(app.live.pc(), Some(0x1080), "the stop itself is adopted");
+            let open = app.opening.as_ref().unwrap();
+            assert!(open.follow.is_none(), "preserve={preserve}");
+            assert_eq!(app.selected, Some(0x1001));
+            assert!(app.queue.is_empty() && app.pending.is_none());
+        }
+    }
+
+    #[test]
+    fn a_stop_keeps_an_unsaved_annotation_draft() {
+        if !SUPPORTED {
+            return;
+        }
+        let context = egui::Context::default();
+        let mut app = debuggable();
+        app.selected = Some(0x1001);
+        app.annotations_open = true;
+        app.editor_address = Some(0x1001);
+        app.name_edit = "entry".into();
+        app.comment_edit = "half-typed".into();
+        let wire = fake_session(&mut app, Phase::Running);
+        wire.emit(stopped(2, Some(0x1006), None));
+        app.poll_live_debug(&context);
+        assert_eq!(app.selected, Some(0x1001));
+        assert_eq!(app.comment_edit, "half-typed");
+        assert_eq!(app.live_marks(0x1006), (None, true));
+        // Without a draft the next stop follows.
+        app.comment_edit.clear();
+        app.live_run(&context);
+        wire.emit(Event::Running);
+        wire.emit(stopped(3, Some(0x1006), None));
+        app.poll_live_debug(&context);
+        assert_eq!(app.selected, Some(0x1006));
+    }
+
+    #[test]
+    fn a_breakpoint_removed_while_running_stays_marked_until_the_removal_applies() {
+        if !SUPPORTED {
+            return;
+        }
+        let context = egui::Context::default();
+        let mut app = debuggable();
+        app.toggle_breakpoint_at(0x1000, 0x1000);
+        let wire = fake_session(&mut app, Phase::Running);
+        wire.emit(Event::Breakpoints {
+            revision: app.live.breakpoint_revision,
+            status: BTreeMap::from([(0x1000, BreakpointStatus::Set)]),
+        });
+        app.poll_live_debug(&context);
+        app.toggle_breakpoint_at(0x1000, 0x1000);
+        assert_eq!(
+            app.live_marks(0x1000).0,
+            Some(theme::BreakpointMark::Pending)
+        );
+        wire.emit(Event::Breakpoints {
+            revision: app.live.breakpoint_revision,
+            status: BTreeMap::new(),
+        });
+        app.poll_live_debug(&context);
+        assert_eq!(app.live_marks(0x1000).0, None);
+    }
+
+    #[test]
+    fn pause_and_stop_keys_work_while_a_binary_reopens() {
+        if !SUPPORTED {
+            return;
+        }
+        let context = scaled_context();
+        let none = egui::Modifiers::NONE;
+        let mut app = debuggable();
+        let wire = fake_session(&mut app, Phase::Running);
+        app.opening = Some(opening(&app, true));
+        frame(&context, &mut app, vec![]);
+        for event in [
+            key(egui::Key::F9, none, false),
+            release(egui::Key::F9),
+            key(egui::Key::G, none, false),
+            release(egui::Key::G),
+        ] {
+            frame(&context, &mut app, vec![event]);
+        }
+        assert!(app.live.breakpoints.is_empty() && app.browser_dialog.is_none());
+        frame(&context, &mut app, vec![key(egui::Key::F6, none, false)]);
+        assert_eq!(wire.sent(), [Command::Pause]);
+        frame(&context, &mut app, vec![release(egui::Key::F6)]);
+        frame(
+            &context,
+            &mut app,
+            vec![key(egui::Key::F5, egui::Modifiers::SHIFT, false)],
+        );
+        assert_eq!(wire.sent(), [Command::Stop]);
+        // Without a session the reopen still blocks every key.
+        let mut app = debuggable();
+        app.opening = Some(opening(&app, true));
+        frame(&context, &mut app, vec![key(egui::Key::F5, none, false)]);
+        assert!(app.live.prompt.is_none());
+    }
+
+    #[test]
+    fn ending_a_session_with_its_binary_says_so_and_a_moot_pause_is_not_an_error() {
+        if !SUPPORTED {
+            return;
+        }
+        let context = egui::Context::default();
+        let mut app = debuggable();
+        let wire = fake_session(&mut app, Phase::Running);
+        app.status = "Ready".into();
+        app.live_pause();
+        // The target stopped at a breakpoint before the pause reached it.
+        wire.emit(stopped(2, Some(0x1006), None));
+        wire.emit(Event::Refused {
+            message: "The target is not running".into(),
+        });
+        app.poll_live_debug(&context);
+        assert_eq!(app.live.phase(), Some(Phase::Stopped));
+        assert_eq!(app.status, "Ready");
+        app.clear_binary();
+        assert_eq!(app.status, "Binary closed · Debug session ended");
+        app.clear_binary();
+        assert_eq!(app.status, "Binary closed");
     }
 
     /// Real GDB: a listing breakpoint stops the fixture and selects the PC.

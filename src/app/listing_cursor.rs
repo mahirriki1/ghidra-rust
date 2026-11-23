@@ -300,7 +300,13 @@ impl super::DesktopApp {
     /// Whether keyboard commands must leave input to dialogs, text fields,
     /// popups and file operations.
     pub(super) fn navigation_shortcuts_blocked(&self, context: &egui::Context) -> bool {
-        self.navigation_commands_blocked()
+        self.opening.is_some() || self.shortcuts_blocked_while_open(context)
+    }
+
+    /// [`Self::navigation_shortcuts_blocked`] apart from an open in progress,
+    /// which a live session's pause and stop keys do not depend on.
+    pub(super) fn shortcuts_blocked_while_open(&self, context: &egui::Context) -> bool {
+        self.dialog_commands_blocked()
             || context.egui_wants_keyboard_input()
             || egui::Popup::is_any_open(context)
             || self.menu_owns_input(context)
@@ -310,8 +316,11 @@ impl super::DesktopApp {
     /// The operation and dialog guards shared by the shortcuts and by menu
     /// commands, which run from a popup and so omit input ownership.
     pub(super) fn navigation_commands_blocked(&self) -> bool {
-        self.opening.is_some()
-            || self.file_job.is_some()
+        self.opening.is_some() || self.dialog_commands_blocked()
+    }
+
+    fn dialog_commands_blocked(&self) -> bool {
+        self.file_job.is_some()
             || self.intent.is_some()
             || self.browser_dialog.is_some()
             || self.help_dialog.is_some()

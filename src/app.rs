@@ -1384,7 +1384,7 @@ impl DesktopApp {
     fn clear_binary(&mut self) {
         self.stop_worker();
         self.generation = self.generation.wrapping_add(1);
-        self.live.end(self.generation);
+        let live_ended = self.live.end(self.generation);
         self.info = None;
         self.binary_path = None;
         self.binary_protection = None;
@@ -1399,7 +1399,12 @@ impl DesktopApp {
         self.saved_result_revision = 0;
         self.undo.clear();
         self.clear_views();
-        self.status = "Binary closed".into();
+        self.status = if live_ended {
+            "Binary closed · Debug session ended"
+        } else {
+            "Binary closed"
+        }
+        .into();
     }
 
     fn clear_views(&mut self) {
@@ -3715,7 +3720,7 @@ impl DesktopApp {
                 }
                 // A fresh open ends any live session; a preserving reopen
                 // keeps it only for the same contents.
-                self.live.bind(self.generation, &info.sha256);
+                let live_ended = self.live.bind(self.generation, &info.sha256);
                 // Replay only names the fresh worker inventory lacks or differs on.
                 let replay = project.is_some() || opening.preserve && self.info.is_some();
                 let worker_functions = if replay {
@@ -3852,6 +3857,9 @@ impl DesktopApp {
                     "Binary loaded"
                 }
                 .into();
+                if live_ended {
+                    self.status.push_str(" · Debug session ended");
+                }
                 if let Some(project) = project {
                     if self.results.preparing() {
                         self.deferred_restore = Some(project);
@@ -6514,12 +6522,20 @@ impl DesktopApp {
     }
 
     fn handle_shortcuts(&mut self, context: &egui::Context) {
-        if self.navigation_shortcuts_blocked(context) {
+        // While a binary (re)opens, only a live session's pause and stop keys
+        // stay available; they touch no worker state.
+        let live_only = self.navigation_shortcuts_blocked(context);
+        if live_only && (!self.live_session_active() || self.shortcuts_blocked_while_open(context))
+        {
             return;
         }
         let action = context.input_mut(|input| {
             let (index, action) = input.events.iter().enumerate().find_map(|(index, event)| {
                 let action = shortcut(event)?;
+                if live_only {
+                    return matches!(action, Shortcut::DebugPause | Shortcut::DebugStop)
+                        .then_some((index, action));
+                }
                 (self.info.is_some() || matches!(action, Shortcut::Help)).then_some((index, action))
             })?;
             input.events.remove(index);
@@ -9647,12 +9663,13 @@ impl DesktopApp {
                     |ui, index, rect| {
                         let instruction = listing.get(index)?;
                         let row_selected = self.selected == Some(instruction.address);
+                        let related = self.semantic.addresses.contains(&instruction.address);
                         let response = theme::row_response(
                             ui,
                             ui.scope_id().with(("listing-row", instruction.address)),
                             rect,
                             row_selected,
-                            self.semantic.addresses.contains(&instruction.address),
+                            related,
                         );
                         let call = view
                             .calls
@@ -9668,7 +9685,14 @@ impl DesktopApp {
                             ui.pixels_per_point(),
                             gutter,
                         );
-                        self.paint_live_row(ui, rect, &columns, instruction.address, row_selected);
+                        self.paint_live_row(
+                            ui,
+                            rect,
+                            &columns,
+                            instruction.address,
+                            row_selected,
+                            related || response.hovered(),
+                        );
                         let elided = theme::listing_cells(
                             ui,
                             rect,
