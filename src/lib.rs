@@ -35,6 +35,7 @@ pub mod limits;
 pub mod linkage;
 mod linkage_ui;
 pub mod listing_evidence;
+mod live_debug_ui;
 mod local_symbols;
 pub mod model;
 mod no_return;

@@ -2361,8 +2361,79 @@ pub fn sort_menu(
 
 /// A muted placeholder centered in an empty view.
 pub fn empty_state(ui: &mut Ui, text: &str) {
+    empty_state_hover(ui, text, None);
+}
+
+/// [`empty_state`] with a terse reason on hover.
+pub fn empty_state_hover(ui: &mut Ui, text: &str, hover: Option<&str>) {
     ui.add_space(24.0);
-    ui.vertical_centered(|ui| ui.weak(text));
+    ui.vertical_centered(|ui| {
+        let label = ui.weak(text);
+        if let Some(hover) = hover {
+            label.on_hover_text(hover);
+        }
+    });
+}
+
+/// Bytes per hex-dump row.
+pub const HEX_ROW_BYTES: usize = 16;
+
+/// Row-relative x offsets of byte `column` in a hex dump: its hex pair and its
+/// ASCII glyph, after a 16-digit address. Halves are split by an extra space.
+pub fn hex_byte_x(glyph: f32, column: usize) -> (f32, f32) {
+    let hex = 19 + column * 3 + usize::from(column >= HEX_ROW_BYTES / 2);
+    let ascii = 19 + HEX_ROW_BYTES * 3 + 3 + column;
+    (glyph * hex as f32, glyph * ascii as f32)
+}
+
+/// The width of a [`paint_hex_row`] row, including its inset.
+pub fn hex_row_width(glyph: f32) -> f32 {
+    hex_byte_x(glyph, HEX_ROW_BYTES).1 + 12.0
+}
+
+/// One read-only hex-dump row: the address, up to 16 bytes and their ASCII.
+/// `color` draws the bytes, for example muted while they are not current.
+pub fn paint_hex_row(ui: &Ui, rect: egui::Rect, address: u64, bytes: &[u8], color: Color32) {
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let bytes = &bytes[..bytes.len().min(HEX_ROW_BYTES)];
+    let glyph = glyph_width(ui);
+    let font = FontId::monospace(13.0);
+    let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+    let left = rect.left() + 6.0;
+    let y = rect.center().y;
+    let mut hex = String::with_capacity(HEX_ROW_BYTES * 3 + 1);
+    for (column, byte) in bytes.iter().enumerate() {
+        if column == HEX_ROW_BYTES / 2 {
+            hex.push(' ');
+        }
+        hex.push_str(&format!("{byte:02x} "));
+    }
+    let ascii = bytes
+        .iter()
+        .map(|&byte| {
+            if (0x20..=0x7e).contains(&byte) {
+                char::from(byte)
+            } else {
+                '.'
+            }
+        })
+        .collect::<String>();
+    let (hex_x, ascii_x) = hex_byte_x(glyph, 0);
+    for (x, text, color) in [
+        (0.0, format!("{address:016x}"), MUTED),
+        (hex_x, hex, color),
+        (ascii_x, ascii, color),
+    ] {
+        painter.text(
+            egui::pos2(left + x, y),
+            egui::Align2::LEFT_CENTER,
+            text,
+            font.clone(),
+            color,
+        );
+    }
 }
 
 /// Graph block corner radius at the current zoom.

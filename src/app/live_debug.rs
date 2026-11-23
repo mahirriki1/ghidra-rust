@@ -1,4 +1,5 @@
-//! The desktop's live debug session: run control, breakpoints and PC follow.
+//! The desktop's live debug session: run control, breakpoints, PC follow,
+//! and the read-only Registers, Stack and Memory tabs.
 //!
 //! Every debugger request runs on the session controller's own thread; the
 //! GUI only sends commands and drains events. A session is bound to the binary
@@ -9,11 +10,12 @@ use std::time::Duration;
 
 use eframe::egui::{self, RichText};
 
-use super::{DesktopApp, crop, info_without_functions};
+use super::{DesktopApp, Tab, crop, info_without_functions};
 use crate::debugger::controller::{
     BreakpointStatus, Command, Controller, Event, Launch, Snapshot, StepKind,
 };
-use crate::debugger::{MAX_BREAKPOINTS, SUPPORTED};
+use crate::debugger::{MAX_BREAKPOINTS, Register, SUPPORTED};
+use crate::live_debug_ui::{self, FrameRow, LiveAction, RegisterRow};
 use crate::search_jobs::Destination;
 use crate::theme;
 
@@ -68,6 +70,40 @@ pub(super) struct LaunchPrompt {
     run: bool,
 }
 
+/// One outstanding live memory read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MemoryRead {
+    token: u64,
+    stop_seq: u64,
+    runtime: u64,
+    length: usize,
+}
+
+struct MemoryPage {
+    stop_seq: u64,
+    runtime: u64,
+    result: Result<Vec<u8>, String>,
+}
+
+/// The Memory tab of the current session.
+#[derive(Default)]
+struct LiveMemory {
+    /// The shown page start; rsp at the first shown stop of a session.
+    address: Option<u64>,
+    text: String,
+    token: u64,
+    pending: Option<MemoryRead>,
+    page: Option<MemoryPage>,
+}
+
+impl LiveMemory {
+    fn show(&mut self, runtime: u64) {
+        let start = live_debug_ui::page_start(runtime);
+        self.address = Some(start);
+        self.text = format!("{start:x}");
+    }
+}
+
 #[derive(Default)]
 pub(super) struct LiveDebug {
     /// Desired breakpoints of binary generation `generation`: static
@@ -87,6 +123,19 @@ pub(super) struct LiveDebug {
     stop: Option<Box<Snapshot>>,
     /// How the last session's target ended, until a new session or binary.
     exit: Option<String>,
+    /// Whether the Registers, Stack and Memory tabs show: from the first
+    /// session of this binary generation until the binary changes.
+    tabs: bool,
+    /// The registers of the previous and latest shown stops of this session.
+    previous_registers: Vec<Register>,
+    last_registers: Vec<Register>,
+    /// The selected Stack row of the current stop.
+    frame: Option<usize>,
+    /// Whether Enter opens the selected frame: armed by clicking a frame,
+    /// disarmed by any other click or a focused text field, which can
+    /// surrender its focus to the same Enter.
+    frame_keys: bool,
+    memory: LiveMemory,
 }
 
 impl LiveDebug {
@@ -115,6 +164,17 @@ impl LiveDebug {
 
     pub(super) fn prompt_open(&self) -> bool {
         self.prompt.is_some()
+    }
+
+    pub(super) fn tabs_visible(&self) -> bool {
+        self.tabs
+    }
+
+    /// Whether `name` changed since the previous shown stop of this session.
+    fn register_changed(&self, name: &str, value: u64) -> bool {
+        self.previous_registers
+            .iter()
+            .any(|register| register.name == name && register.value != value)
     }
 
     /// Ends the session on quit, waiting at most `timeout`.
@@ -445,6 +505,11 @@ impl DesktopApp {
         live.breakpoint_status.clear();
         live.stop = None;
         live.exit = None;
+        live.tabs = true;
+        live.previous_registers.clear();
+        live.last_registers.clear();
+        live.frame = None;
+        live.memory = LiveMemory::default();
         live.session = Some(LiveSession {
             generation: self.generation,
             sha256,
@@ -456,6 +521,10 @@ impl DesktopApp {
     /// Drains the session's events. Only the last stop of the batch is
     /// followed; a session of another binary generation is dropped unread.
     pub(super) fn poll_live_debug(&mut self, context: &egui::Context) {
+        // Before any widget runs this frame, so the field's own Enter counts.
+        if context.egui_wants_keyboard_input() {
+            self.live.frame_keys = false;
+        }
         let Some(session) = &self.live.session else {
             return;
         };
@@ -529,6 +598,20 @@ impl DesktopApp {
                 if !loader && session.phase != Phase::Stopping {
                     session.phase = Phase::Stopped;
                 }
+                live.memory.pending = None;
+                live.frame = None;
+                live.frame_keys = false;
+                // Diffs and the default page come from stops the user sees.
+                if !loader {
+                    let registers = snapshot.registers.as_ref().map_or(&[][..], Vec::as_slice);
+                    live.previous_registers =
+                        std::mem::replace(&mut live.last_registers, registers.to_vec());
+                    if live.memory.address.is_none()
+                        && let Some(rsp) = registers.iter().find(|r| r.name == "rsp")
+                    {
+                        live.memory.show(rsp.value);
+                    }
+                }
                 live.stop = Some(snapshot);
                 !loader
             }
@@ -537,6 +620,7 @@ impl DesktopApp {
                     session.phase = Phase::Running;
                 }
                 live.stop = None;
+                live.memory.pending = None;
                 false
             }
             Event::Breakpoints { revision, status } => {
@@ -545,7 +629,34 @@ impl DesktopApp {
                 }
                 false
             }
-            Event::Memory { .. } => false,
+            Event::Memory {
+                token,
+                stop_seq,
+                runtime,
+                result,
+            } => {
+                // Only the reply to the outstanding read of the current stop.
+                let current = session.phase == Phase::Stopped
+                    && live.stop.as_ref().map(|stop| stop.stop_seq) == Some(stop_seq);
+                let Some(read) = live.memory.pending.filter(|read| {
+                    current
+                        && (read.token, read.stop_seq, read.runtime) == (token, stop_seq, runtime)
+                }) else {
+                    return false;
+                };
+                live.memory.pending = None;
+                let result = match result {
+                    Ok(bytes) if bytes.len() == read.length => Ok(bytes),
+                    Ok(_) => Err("Incomplete live memory read".into()),
+                    Err(message) => Err(crop(&message, 1024)),
+                };
+                live.memory.page = Some(MemoryPage {
+                    stop_seq,
+                    runtime,
+                    result,
+                });
+                false
+            }
             // A pause that crossed a stop is moot, not an error.
             Event::Refused { .. } if session.phase == Phase::Stopped => false,
             Event::Refused { message } => {
@@ -563,12 +674,14 @@ impl DesktopApp {
                 self.status = text.clone();
                 live.exit = Some(text);
                 live.stop = None;
+                live.memory.pending = None;
                 session.phase = Phase::Stopping;
                 false
             }
             Event::Ended { error } => {
                 live.session = None;
                 live.stop = None;
+                live.memory.pending = None;
                 live.breakpoint_status.clear();
                 match error {
                     Some(error) => self.status = crop(&error, 1024),
@@ -597,10 +710,14 @@ impl DesktopApp {
     /// Moves the selection to a stop's PC without recording history. A PC
     /// no known function decoded leaves the selection where it is.
     fn follow_pc(&mut self, pc: u64, context: &egui::Context) {
-        // Unrecorded navigation keeps Listing and Graph; other tabs switch
-        // to the Listing.
+        // Unrecorded navigation keeps Listing and Graph and switches other
+        // tabs to the Listing; a debug tab stays in front.
         if let Some(owner) = self.live_owner(pc) {
+            let tab = self.tab;
             self.navigate_location(pc, Some(owner), false, context);
+            if tab.live() {
+                self.tab = tab;
+            }
         }
     }
 
@@ -610,6 +727,213 @@ impl DesktopApp {
         match self.live_owner(pc) {
             Some(owner) => self.navigate_location(pc, Some(owner), true, context),
             None => self.status = "No known function contains the PC".into(),
+        }
+    }
+
+    /// Opens a backend-mapped static address as Go To does, with history:
+    /// code in a function whose decoded listing contains it, anything else
+    /// as data. Never a nearby address.
+    fn live_go_to_static(&mut self, address: u64, context: &egui::Context) {
+        let Some(info) = self.info.as_ref() else {
+            return;
+        };
+        let observed = |pc| {
+            self.observed_owner(pc)
+                .or_else(|| self.live.owners.get(&pc).copied())
+        };
+        match crate::search_jobs::resolve(info, address, 1, observed) {
+            Some(Destination::Code { address, owner }) => {
+                self.navigate_location(address, Some(owner), true, context)
+            }
+            Some(Destination::Data { address, length }) => {
+                self.open_search_data(address, length, context)
+            }
+            None => self.status = "Address is outside mapped program memory".into(),
+        }
+    }
+
+    /// The name and offset of the known function containing a static address.
+    fn live_function(&self, address: u64) -> Option<(String, u64)> {
+        let owner = self.live_owner(address)?;
+        let (name, _) = self.function_names(owner)?;
+        Some((crop(name, 200), address.checked_sub(owner)?))
+    }
+
+    fn live_action(&mut self, action: LiveAction, context: &egui::Context) {
+        match action {
+            LiveAction::GoTo(address) => self.live_go_to_static(address, context),
+            LiveAction::ShowMemory(runtime) => {
+                self.live.memory.show(runtime);
+                self.tab = Tab::Memory;
+            }
+            LiveAction::SelectFrame(index) => {
+                self.live.frame = Some(index);
+                self.live.frame_keys = true;
+            }
+            LiveAction::MemoryAt(runtime) => self.live.memory.show(runtime),
+            LiveAction::InvalidAddress => self.status = "Enter a hexadecimal address".into(),
+        }
+    }
+
+    pub(super) fn live_registers_tab(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
+        let Some(snapshot) = self.live.stopped() else {
+            theme::empty_state(ui, "Not stopped");
+            return;
+        };
+        let registers = match &snapshot.registers {
+            Ok(registers) => registers,
+            Err(message) => {
+                theme::empty_state_hover(ui, "Unavailable", Some(&crop(message, 200)));
+                return;
+            }
+        };
+        let rows = registers
+            .iter()
+            .enumerate()
+            .map(|(index, register)| {
+                // The backend's exact mapping of this value, never a guess.
+                let static_address = snapshot
+                    .register_locations
+                    .get(index)
+                    .filter(|location| location.runtime == register.value)
+                    .and_then(|location| location.static_address);
+                RegisterRow {
+                    name: &register.name,
+                    value: register.value,
+                    changed: self.live.register_changed(&register.name, register.value),
+                    static_address,
+                    function: static_address
+                        .and_then(|address| self.live_function(address))
+                        .map(|(name, offset)| match offset {
+                            0 => name,
+                            offset => format!("{name}+{offset:#x}"),
+                        }),
+                }
+            })
+            .collect::<Vec<_>>();
+        let action = live_debug_ui::registers(ui, &rows);
+        if let Some(action) = action {
+            self.live_action(action, context);
+        }
+    }
+
+    pub(super) fn live_stack_tab(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
+        let Some(snapshot) = self.live.stopped() else {
+            theme::empty_state(ui, "Not stopped");
+            return;
+        };
+        let frames = match &snapshot.frames {
+            Ok(frames) => frames,
+            Err(message) => {
+                theme::empty_state_hover(ui, "Unavailable", Some(&crop(message, 200)));
+                return;
+            }
+        };
+        let rows = frames
+            .iter()
+            .map(|frame| {
+                let static_address = frame.location.static_address;
+                let own = static_address.and_then(|address| self.live_function(address));
+                FrameRow {
+                    runtime: frame.location.runtime,
+                    static_address,
+                    function: match own {
+                        Some((name, _)) => Some((name, true)),
+                        None => frame.function.as_ref().map(|text| (crop(text, 200), false)),
+                    },
+                }
+            })
+            .collect::<Vec<_>>();
+        let keys = self.live.frame_keys && !self.navigation_shortcuts_blocked(context);
+        let action = live_debug_ui::stack(ui, &rows, self.live.frame, keys);
+        if !matches!(action, Some(LiveAction::SelectFrame(_)))
+            && ui.input(|input| input.pointer.any_pressed())
+        {
+            self.live.frame_keys = false;
+        }
+        if let Some(action) = action {
+            self.live_action(action, context);
+        }
+    }
+
+    pub(super) fn live_memory_tab(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
+        let Some(snapshot) = self.live.stopped() else {
+            theme::empty_state(ui, "Not stopped");
+            return;
+        };
+        let stop_seq = snapshot.stop_seq;
+        let register = |name: &str| {
+            snapshot
+                .registers
+                .as_ref()
+                .ok()?
+                .iter()
+                .find(|register| register.name == name)
+                .map(|register| register.value)
+        };
+        let (rsp, rip) = (register("rsp"), register("rip"));
+        let memory = &mut self.live.memory;
+        let page = memory
+            .page
+            .as_ref()
+            .filter(|page| Some(page.runtime) == memory.address)
+            .map(|page| live_debug_ui::MemoryPage {
+                runtime: page.runtime,
+                bytes: page.result.as_deref().map_err(String::as_str),
+                current: page.stop_seq == stop_seq,
+            });
+        let action = live_debug_ui::memory(
+            ui,
+            live_debug_ui::MemoryView {
+                address: memory.address,
+                text: &mut memory.text,
+                rsp,
+                rip,
+                page,
+            },
+        );
+        if let Some(action) = action {
+            self.live_action(action, context);
+        }
+        self.live_read_memory();
+    }
+
+    /// Requests the shown page for the current stop unless it is loaded or
+    /// already requested. Every stop re-reads it while the tab shows.
+    fn live_read_memory(&mut self) {
+        let live = &mut self.live;
+        let Some(stop_seq) = live.stopped().map(|snapshot| snapshot.stop_seq) else {
+            return;
+        };
+        let Some(runtime) = live.memory.address else {
+            return;
+        };
+        let memory = &mut live.memory;
+        let loaded = memory
+            .page
+            .as_ref()
+            .is_some_and(|page| (page.stop_seq, page.runtime) == (stop_seq, runtime));
+        let requested = memory
+            .pending
+            .is_some_and(|read| (read.stop_seq, read.runtime) == (stop_seq, runtime));
+        if loaded || requested {
+            return;
+        }
+        memory.token = memory.token.wrapping_add(1);
+        let read = MemoryRead {
+            token: memory.token,
+            stop_seq,
+            runtime,
+            length: live_debug_ui::page_length(runtime),
+        };
+        memory.pending = Some(read);
+        if let Some(session) = &live.session {
+            session.port.send(Command::ReadMemory {
+                token: read.token,
+                stop: read.stop_seq,
+                runtime: read.runtime,
+                length: read.length,
+            });
         }
     }
 
@@ -967,12 +1291,21 @@ mod tests {
         app: &mut DesktopApp,
         events: Vec<egui::Event>,
     ) -> egui::FullOutput {
+        sized_frame(context, app, events, 1400.0)
+    }
+
+    fn sized_frame(
+        context: &egui::Context,
+        app: &mut DesktopApp,
+        events: Vec<egui::Event>,
+        width: f32,
+    ) -> egui::FullOutput {
         let time = context.input(|input| input.time) + 0.1;
         let mut output = context.run_ui(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
-                    egui::vec2(1400.0, 800.0),
+                    egui::vec2(width, 800.0),
                 )),
                 time: Some(time),
                 events,
@@ -1739,6 +2072,450 @@ mod tests {
         assert_eq!(app.status, "Binary closed");
     }
 
+    const RSP: u64 = 0x7fff_ffff_e128;
+
+    fn register(name: &str, value: u64) -> Register {
+        Register {
+            name: name.into(),
+            value,
+        }
+    }
+
+    /// A breakpoint stop at static `pc` with `registers`, mapping only the
+    /// values in `mapped` to their static addresses, and two frames: `pc`
+    /// and one outside the image.
+    fn snapshot_stop(stop_seq: u64, pc: u64, registers: &[(&str, u64)], mapped: &[u64]) -> Event {
+        let registers = registers
+            .iter()
+            .map(|(name, value)| register(name, *value))
+            .collect::<Vec<_>>();
+        let register_locations = registers
+            .iter()
+            .map(|register| Location {
+                runtime: register.value,
+                static_address: mapped
+                    .contains(&register.value)
+                    .then(|| register.value - RUNTIME),
+            })
+            .collect();
+        Event::Stopped(Box::new(Snapshot {
+            stop_seq,
+            stop: Stop {
+                reason: "breakpoint-hit".into(),
+                thread: 1,
+                location: Location {
+                    runtime: RUNTIME + pc,
+                    static_address: Some(pc),
+                },
+                signal: None,
+            },
+            registers: Ok(registers),
+            frames: Ok(vec![
+                crate::debugger::Frame {
+                    location: Location {
+                        runtime: RUNTIME + pc,
+                        static_address: Some(pc),
+                    },
+                    function: Some("gdb_name".into()),
+                },
+                crate::debugger::Frame {
+                    location: Location {
+                        runtime: 0x7fff_f7c2_9d90,
+                        static_address: None,
+                    },
+                    function: Some("__libc_start_call_main".into()),
+                },
+            ]),
+            register_locations,
+        }))
+    }
+
+    fn text_shapes(output: &egui::FullOutput) -> Vec<(String, egui::Color32, egui::Pos2)> {
+        output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some((
+                    text.galley.text().to_owned(),
+                    text.fallback_color,
+                    text.pos + text.galley.rect.center().to_vec2(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn color_of(output: &egui::FullOutput, needle: &str) -> Option<egui::Color32> {
+        text_shapes(output)
+            .into_iter()
+            .find_map(|(text, color, _)| (text == needle).then_some(color))
+    }
+
+    fn position_of(output: &egui::FullOutput, needle: &str) -> egui::Pos2 {
+        text_shapes(output)
+            .into_iter()
+            .find_map(|(text, _, position)| (text == needle).then_some(position))
+            .unwrap_or_else(|| panic!("{needle} not drawn"))
+    }
+
+    fn click_at(position: egui::Pos2) -> Vec<egui::Event> {
+        let button = |pressed| egui::Event::PointerButton {
+            pos: position,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        vec![
+            egui::Event::PointerMoved(position),
+            button(true),
+            button(false),
+        ]
+    }
+
+    #[test]
+    fn register_changes_are_tinted_only_within_one_session() {
+        if !SUPPORTED {
+            return;
+        }
+        let context = scaled_context();
+        let mut app = debuggable();
+        app.tab = Tab::Registers;
+        let wire = fake_session(&mut app, Phase::Running);
+        wire.emit(snapshot_stop(2, 0x1001, &[("rax", 1), ("rbx", 7)], &[]));
+        let output = frame(&context, &mut app, vec![]);
+        assert_eq!(app.tab, Tab::Registers, "a followed stop keeps the tab");
+        assert_eq!(color_of(&output, "0x0000000000000001"), Some(theme::TEXT));
+        app.live_step();
+        wire.emit(Event::Running);
+        wire.emit(snapshot_stop(3, 0x1006, &[("rax", 2), ("rbx", 7)], &[]));
+        let output = frame(&context, &mut app, vec![]);
+        assert_eq!(app.selected, Some(0x1006));
+        assert_eq!(
+            color_of(&output, "0x0000000000000002"),
+            Some(theme::WARNING)
+        );
+        assert_eq!(color_of(&output, "0x0000000000000007"), Some(theme::TEXT));
+        // A new session compares nothing with the previous one.
+        wire.emit(Event::Ended { error: None });
+        frame(&context, &mut app, vec![]);
+        let wire = fake_session(&mut app, Phase::Running);
+        wire.emit(snapshot_stop(2, 0x1006, &[("rax", 3), ("rbx", 7)], &[]));
+        let output = frame(&context, &mut app, vec![]);
+        assert_eq!(color_of(&output, "0x0000000000000003"), Some(theme::TEXT));
+    }
+
+    #[test]
+    fn register_places_come_only_from_backend_locations() {
+        if !SUPPORTED {
+            return;
+        }
+        let context = scaled_context();
+        let mut app = debuggable();
+        app.tab = Tab::Registers;
+        let history = app.history.len();
+        let wire = fake_session(&mut app, Phase::Running);
+        // rax holds an image address the backend did not map: no place.
+        let (rip, rax) = (RUNTIME + 0x1001, RUNTIME + 0x1000);
+        wire.emit(snapshot_stop(
+            2,
+            0x1001,
+            &[("rip", rip), ("rax", rax)],
+            &[rip],
+        ));
+        let output = frame(&context, &mut app, vec![]);
+        // The texts right of each value, on its row.
+        let after = |value: u64| {
+            let value = position_of(&output, &format!("{value:#018x}"));
+            text_shapes(&output)
+                .into_iter()
+                .filter(|(_, _, at)| (at.y - value.y).abs() < 2.0 && at.x > value.x)
+                .map(|(text, _, _)| text)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(after(rip), ["entry+0x1"]);
+        assert!(after(rax).is_empty(), "{:?}", after(rax));
+        // Go to uses the mapped static address and records history.
+        app.selected = Some(0x1000);
+        app.live_action(LiveAction::GoTo(0x1001), &context);
+        assert_eq!(app.selected, Some(0x1001));
+        assert_eq!(app.tab, Tab::Listing);
+        assert!(app.history.len() > history);
+        app.live_action(LiveAction::ShowMemory(rax + 5), &context);
+        assert_eq!(app.tab, Tab::Memory);
+        assert_eq!(app.live.memory.address, Some(rax));
+    }
+
+    #[test]
+    fn stale_memory_replies_are_ignored() {
+        if !SUPPORTED {
+            return;
+        }
+        let context = scaled_context();
+        let mut app = debuggable();
+        app.tab = Tab::Memory;
+        let wire = fake_session(&mut app, Phase::Running);
+        wire.emit(snapshot_stop(2, 0x1001, &[("rsp", RSP)], &[]));
+        frame(&context, &mut app, vec![]);
+        let page = live_debug_ui::page_start(RSP);
+        let sent = wire.sent();
+        let [
+            Command::ReadMemory {
+                token,
+                stop: 2,
+                runtime,
+                length: 1024,
+            },
+        ] = sent[..]
+        else {
+            panic!("{sent:?}");
+        };
+        assert_eq!(runtime, page, "the first stop shows the page at rsp");
+        frame(&context, &mut app, vec![]);
+        assert!(wire.sent().is_empty(), "one read per stop and page");
+        let reply = |token, stop_seq, result: Result<Vec<u8>, String>| Event::Memory {
+            token,
+            stop_seq,
+            runtime: page,
+            result,
+        };
+        // Another token, another stop, and a short reply are not adopted.
+        wire.emit(reply(token + 1, 2, Ok(vec![1; 1024])));
+        wire.emit(reply(token, 1, Ok(vec![2; 1024])));
+        app.poll_live_debug(&context);
+        assert!(app.live.memory.page.is_none());
+        wire.emit(reply(token, 2, Ok(vec![3; 1024])));
+        app.poll_live_debug(&context);
+        let adopted = app.live.memory.page.as_ref().unwrap();
+        assert_eq!(adopted.result, Ok(vec![3; 1024]));
+        let output = frame(&context, &mut app, vec![]);
+        let row = format!("{page:016x}");
+        assert!(fixture::rendered_text(&output).contains(&row));
+
+        // The next stop re-reads; the previous stop's late reply is dropped.
+        app.live_step();
+        wire.emit(Event::Running);
+        wire.emit(snapshot_stop(3, 0x1006, &[("rsp", RSP - 0x100)], &[]));
+        frame(&context, &mut app, vec![]);
+        let sent = wire.sent();
+        let next = match sent[..] {
+            [
+                Command::Step(_),
+                Command::ReadMemory {
+                    token: next,
+                    stop: 3,
+                    runtime,
+                    ..
+                },
+            ] if runtime == page => next,
+            _ => panic!("{sent:?}"),
+        };
+        wire.emit(reply(token, 2, Ok(vec![4; 1024])));
+        app.poll_live_debug(&context);
+        assert_eq!(app.live.memory.page.as_ref().unwrap().stop_seq, 2);
+        // An unreadable page says so, with the reason on hover only.
+        wire.emit(reply(next, 3, Err("Cannot access memory".into())));
+        app.poll_live_debug(&context);
+        let output = frame(&context, &mut app, vec![]);
+        let texts = fixture::rendered_text(&output);
+        assert!(texts.iter().any(|text| text == "Unreadable"));
+        assert!(!texts.iter().any(|text| text.contains("Cannot access")));
+
+        // Nothing after the session ends is adopted.
+        app.live_action(LiveAction::MemoryAt(RSP + 0x1000), &context);
+        frame(&context, &mut app, vec![]);
+        let Some(&MemoryRead { token, .. }) = app.live.memory.pending.as_ref() else {
+            panic!("no read for the new page");
+        };
+        wire.emit(Event::Ended { error: None });
+        wire.emit(reply(token, 3, Ok(vec![5; 1024])));
+        app.poll_live_debug(&context);
+        assert!(app.live.memory.pending.is_none());
+        assert_eq!(app.live.memory.page.as_ref().unwrap().stop_seq, 3);
+        assert!(app.live.memory.page.as_ref().unwrap().result.is_err());
+    }
+
+    #[test]
+    fn stack_frames_navigate_only_from_mapped_locations() {
+        if !SUPPORTED {
+            return;
+        }
+        let context = scaled_context();
+        let mut app = debuggable();
+        app.tab = Tab::Stack;
+        let wire = fake_session(&mut app, Phase::Running);
+        wire.emit(snapshot_stop(2, 0x1006, &[], &[]));
+        let output = frame(&context, &mut app, vec![]);
+        // The app's own name for the image frame; GDB's text only outside it.
+        let texts = fixture::rendered_text(&output);
+        assert!(texts.iter().any(|text| text == "entry"), "{texts:?}");
+        assert!(!texts.iter().any(|text| text == "gdb_name"));
+        assert_eq!(
+            color_of(&output, "__libc_start_call_main"),
+            Some(theme::MUTED)
+        );
+        let history = (app.history.clone(), app.history_index);
+        app.selected = Some(0x1000);
+
+        // Double-clicking or Enter on the unmapped frame does nothing.
+        let outside = position_of(&output, "0x7ffff7c29d90");
+        frame(&context, &mut app, click_at(outside));
+        frame(&context, &mut app, click_at(outside));
+        assert_eq!(app.live.frame, Some(1));
+        frame(
+            &context,
+            &mut app,
+            vec![key(egui::Key::Enter, egui::Modifiers::NONE, false)],
+        );
+        frame(&context, &mut app, vec![release(egui::Key::Enter)]);
+        assert_eq!(app.tab, Tab::Stack);
+        assert_eq!(app.selected, Some(0x1000));
+        assert_eq!((app.history.clone(), app.history_index), history);
+
+        // Double-clicking the mapped frame opens it with history. Idle
+        // frames first, so these clicks do not continue a triple click.
+        for _ in 0..8 {
+            frame(&context, &mut app, vec![]);
+        }
+        let inside = position_of(&output, &format!("{:#x}", RUNTIME + 0x1006));
+        frame(&context, &mut app, click_at(inside));
+        frame(&context, &mut app, click_at(inside));
+        assert_eq!(app.tab, Tab::Listing);
+        assert_eq!(app.selected, Some(0x1006));
+        assert_ne!((app.history.clone(), app.history_index), history);
+
+        // Enter on the selected mapped frame, but not while typing.
+        app.tab = Tab::Stack;
+        app.selected = Some(0x1000);
+        app.live_action(LiveAction::SelectFrame(0), &context);
+        // The toolbar field's Enter is its own Go To of 0x1001, never the
+        // frame's 0x1006, even though it surrenders focus in that frame.
+        app.address = "1001".into();
+        context.memory_mut(|memory| memory.request_focus(egui::Id::unique("toolbar-go-to")));
+        frame(&context, &mut app, vec![]);
+        assert!(context.egui_wants_keyboard_input());
+        frame(
+            &context,
+            &mut app,
+            vec![key(egui::Key::Enter, egui::Modifiers::NONE, false)],
+        );
+        frame(&context, &mut app, vec![release(egui::Key::Enter)]);
+        assert_eq!(app.selected, Some(0x1001));
+        assert!(
+            !app.live.frame_keys,
+            "typing disarms Enter until a frame click"
+        );
+        context.memory_mut(|memory| memory.surrender_focus(egui::Id::unique("toolbar-go-to")));
+        app.tab = Tab::Stack;
+        for _ in 0..8 {
+            frame(&context, &mut app, vec![]);
+        }
+        frame(&context, &mut app, click_at(inside));
+        assert_eq!(app.tab, Tab::Stack);
+        frame(
+            &context,
+            &mut app,
+            vec![key(egui::Key::Enter, egui::Modifiers::NONE, false)],
+        );
+        assert_eq!((app.tab, app.selected), (Tab::Listing, Some(0x1006)));
+    }
+
+    #[test]
+    fn debug_tabs_stay_after_exit_and_leave_with_the_binary() {
+        if !SUPPORTED {
+            return;
+        }
+        let context = scaled_context();
+        let mut app = debuggable();
+        let tabs = |app: &DesktopApp| {
+            app.main_tab_list()
+                .into_iter()
+                .filter(|(tab, _)| tab.live())
+                .map(|(_, label)| label)
+                .collect::<Vec<_>>()
+        };
+        frame(&context, &mut app, vec![]);
+        assert!(tabs(&app).is_empty());
+        let wire = fake_session(&mut app, Phase::Running);
+        frame(&context, &mut app, vec![]);
+        assert_eq!(tabs(&app), ["Registers", "Stack", "Memory"]);
+        app.tab = Tab::Memory;
+        wire.emit(Event::Exited {
+            code: Some(19),
+            signal: None,
+        });
+        wire.emit(Event::Ended { error: None });
+        let output = frame(&context, &mut app, vec![]);
+        assert_eq!(tabs(&app).len(), 3);
+        assert!(fixture::rendered_text(&output).contains(&"Not stopped".into()));
+        assert_eq!(app.tab, Tab::Memory);
+        // A preserving reopen of the same contents keeps them.
+        let sha = app.info.as_ref().unwrap().sha256.clone();
+        app.live.bind(app.generation, &sha);
+        assert!(app.live.tabs_visible());
+        app.clear_binary();
+        assert_eq!(app.tab, Tab::Listing);
+        assert!(!app.live.tabs_visible());
+
+        // A binary change noticed while polling also takes the active tab.
+        let mut app = debuggable();
+        let _wire = fake_session(&mut app, Phase::Running);
+        app.tab = Tab::Stack;
+        app.generation += 1;
+        frame(&context, &mut app, vec![]);
+        assert!(!app.live.tabs_visible());
+        assert_eq!(app.tab, Tab::Listing);
+    }
+
+    #[test]
+    fn debug_views_render_at_fractional_scale_and_narrow_widths() {
+        if !SUPPORTED {
+            return;
+        }
+        let context = scaled_context();
+        let mut app = debuggable();
+        let wire = fake_session(&mut app, Phase::Running);
+        let rip = RUNTIME + 0x1001;
+        wire.emit(snapshot_stop(
+            2,
+            0x1001,
+            &[("rip", rip), ("rsp", RSP)],
+            &[rip],
+        ));
+        for tab in [Tab::Registers, Tab::Stack, Tab::Memory] {
+            app.tab = tab;
+            let output = frame(&context, &mut app, vec![]);
+            let texts = fixture::rendered_text(&output);
+            let expected = match tab {
+                Tab::Registers => "Value",
+                Tab::Stack => "Function",
+                _ => "rsp",
+            };
+            assert!(texts.iter().any(|text| text == expected), "{tab:?}");
+        }
+        let page = live_debug_ui::page_start(RSP);
+        let Some(&MemoryRead { token, .. }) = app.live.memory.pending.as_ref() else {
+            panic!("no read");
+        };
+        wire.emit(Event::Memory {
+            token,
+            stop_seq: 2,
+            runtime: page,
+            result: Ok((0..=255).cycle().take(1024).collect()),
+        });
+        app.poll_live_debug(&context);
+        let output = frame(&context, &mut app, vec![]);
+        let row = position_of(&output, &format!("{page:016x}"));
+        let hex = position_of(&output, "00 01 02 03 04 05 06 07  08 09 0a 0b 0c 0d 0e 0f ");
+        assert!(hex.x > row.x && (hex.y - row.y).abs() < 1.0);
+        // Narrow panes truncate cells instead of overflowing.
+        for width in [240.0, 520.0] {
+            for tab in [Tab::Registers, Tab::Stack, Tab::Memory] {
+                app.tab = tab;
+                sized_frame(&context, &mut app, vec![], width);
+            }
+        }
+    }
+
     /// Real GDB: a listing breakpoint stops the fixture and selects the PC.
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
@@ -1866,8 +2643,35 @@ mod tests {
         };
         assert_eq!(register("rip"), snapshot.stop.location.runtime);
         let pid = register("rdi");
+        let rip = register("rip");
         let process = std::path::PathBuf::from(format!("/proc/{pid}"));
         assert!(process.exists());
+        // The stack names its image frames with the app's names, and the
+        // caller frame is mapped into the image as well.
+        let frames = snapshot.frames.as_ref().unwrap();
+        assert_eq!(frames[0].location.static_address, Some(point));
+        assert!(
+            frames
+                .get(1)
+                .and_then(|f| f.location.static_address)
+                .is_some()
+        );
+        assert_eq!(app.live_function(point), Some(("debug_point".into(), 0)));
+        // The Memory tab reads live bytes at rip: the decoded instruction's.
+        app.tab = Tab::Memory;
+        app.live_action(LiveAction::MemoryAt(rip), &context);
+        app.live_read_memory();
+        settle(&mut app, "memory", &|app| app.live.memory.page.is_some());
+        assert_eq!(app.tab, Tab::Memory);
+        let page = app.live.memory.page.as_ref().unwrap();
+        let bytes = page.result.as_ref().expect("a readable code page");
+        let offset = usize::try_from(rip - page.runtime).unwrap();
+        let listing = app.listing();
+        let instruction = listing.get(listing.position(point).unwrap()).unwrap();
+        assert_eq!(
+            &bytes[offset..offset + instruction.bytes.len()],
+            &instruction.bytes[..]
+        );
         keys(&mut app, key(egui::Key::F5, egui::Modifiers::SHIFT, false));
         settle(&mut app, "end", &|app| app.live.session.is_none());
         assert!(

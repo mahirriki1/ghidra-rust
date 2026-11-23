@@ -17,7 +17,7 @@ pub(crate) const PAGE_BYTES: usize = if MAX_BYTE_READ < 4096 {
 } else {
     4096
 };
-const ROW_BYTES: usize = 16;
+const ROW_BYTES: usize = theme::HEX_ROW_BYTES;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum HexAction {
@@ -662,8 +662,7 @@ impl HexPanel {
                         font.clone(),
                         theme::MUTED,
                     );
-                    let hex_x = rect.left() + glyph * 19.0;
-                    let ascii_x = hex_x + glyph * 51.0;
+                    let ascii_x = rect.left() + theme::hex_byte_x(glyph, 0).1;
                     for offset in start..row_end {
                         let column = offset - start;
                         let Ok((byte_address, file_offset)) =
@@ -684,15 +683,13 @@ impl HexPanel {
                             '.'
                         }
                         .to_string();
+                        let (hex_dx, ascii_dx) = theme::hex_byte_x(glyph, column);
                         let hex_rect = egui::Rect::from_min_size(
-                            egui::pos2(
-                                hex_x + glyph * (column * 3 + usize::from(column >= 8)) as f32,
-                                rect.top(),
-                            ),
+                            egui::pos2(rect.left() + hex_dx, rect.top()),
                             egui::vec2(glyph * 2.5, row_height),
                         );
                         let ascii_rect = egui::Rect::from_min_size(
-                            egui::pos2(ascii_x + glyph * column as f32, rect.top()),
+                            egui::pos2(rect.left() + ascii_dx, rect.top()),
                             egui::vec2(glyph, row_height),
                         );
                         for (view, cell, text) in
