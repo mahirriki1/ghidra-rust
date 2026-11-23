@@ -1,11 +1,17 @@
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
-use std::path::Path;
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use ghidra_rust::debugger::controller::{
+    BreakpointStatus, Command as DebugCommand, Controller, Event, Launch, Snapshot, StepKind,
+};
 use ghidra_rust::debugger::{Debugger, Error, State, Stop};
 use ghidra_rust::headless::{Analyzer, Command as AnalysisCommand, Input, Options, Output};
+use ghidra_rust::model::BinaryInfo;
 
 const GDB: &str = "/usr/bin/gdb";
 
@@ -92,6 +98,14 @@ fn debugger_controls_a_real_pie_and_maps_its_stops_to_the_matching_binary() {
     );
     assert!(debugger.insert_breakpoint(u64::MAX).is_err());
     let id = debugger.insert_breakpoint(function).unwrap();
+    assert!(
+        matches!(debugger.insert_breakpoint(function), Err(Error::Invalid(message)) if message == "Breakpoint already set")
+    );
+    assert_eq!(
+        debugger.breakpoint_ids().collect::<Vec<_>>(),
+        [(function, id)],
+        "a duplicate static address must not add a second GDB breakpoint"
+    );
     debugger.resume().unwrap();
     let hit = stopped(&mut debugger);
     assert_eq!(hit.reason, "breakpoint-hit");
@@ -132,7 +146,9 @@ fn debugger_controls_a_real_pie_and_maps_its_stops_to_the_matching_binary() {
     );
     debugger.resume().unwrap();
     debugger.pause().unwrap();
-    assert_eq!(stopped(&mut debugger).reason, "signal-received");
+    let paused = stopped(&mut debugger);
+    assert_eq!(paused.reason, "signal-received");
+    assert_eq!(paused.signal.as_deref(), Some("SIGINT"));
     debugger.resume().unwrap();
     assert!(matches!(
         debugger.wait(Duration::from_secs(5)).unwrap(),
@@ -183,4 +199,412 @@ fn debugger_ends_the_session_when_the_target_replaces_its_image() {
         "{error}"
     );
     assert_eq!(debugger.state(), &State::Closed);
+}
+
+fn analysed(flags: &[&str]) -> Option<(tempfile::TempDir, PathBuf, BinaryInfo, u64)> {
+    let (dir, path, mut analysis) = fixture(flags)?;
+    let Output::Info { info, .. } = analysis.execute(AnalysisCommand::Info {}).unwrap() else {
+        panic!()
+    };
+    let debug_point = info
+        .functions
+        .iter()
+        .find(|f| f.name == "debug_point")
+        .unwrap()
+        .address;
+    Some((dir, path, *info, debug_point))
+}
+
+fn start(path: &Path, info: &BinaryInfo, breakpoints: &[u64], run: bool) -> Controller {
+    let mut launch = Launch::new(path.to_owned(), info.clone(), Arc::new(|| ()));
+    launch.breakpoints = (1, breakpoints.iter().copied().collect());
+    launch.run = run;
+    Controller::launch(launch).unwrap()
+}
+
+fn next(controller: &Controller) -> Event {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Some(event) = controller.try_recv() {
+            return event;
+        }
+        assert!(Instant::now() < deadline, "no debugger event arrived");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn next_stop(controller: &Controller) -> Snapshot {
+    loop {
+        match next(controller) {
+            Event::Stopped(snapshot) => return *snapshot,
+            Event::Running | Event::Breakpoints { .. } => (),
+            event => panic!("expected a stop, got {event:?}"),
+        }
+    }
+}
+
+fn register(snapshot: &Snapshot, name: &str) -> u64 {
+    snapshot
+        .registers
+        .as_ref()
+        .unwrap()
+        .iter()
+        .find(|register| register.name == name)
+        .unwrap()
+        .value
+}
+
+fn assert_ended(controller: &Controller, error: Option<&str>) {
+    loop {
+        match next(controller) {
+            Event::Ended { error: ended } => {
+                match (ended.as_deref(), error) {
+                    (None, None) => (),
+                    (Some(message), Some(expected)) if message.contains(expected) => (),
+                    (ended, _) => panic!("unexpected end {ended:?}, expected {error:?}"),
+                }
+                return;
+            }
+            Event::Running | Event::Breakpoints { .. } | Event::Stopped(_) => (),
+            event => panic!("expected the session to end, got {event:?}"),
+        }
+    }
+}
+
+#[test]
+fn controller_runs_to_a_breakpoint_and_reports_one_consistent_snapshot() {
+    let Some((_dir, path, info, debug_point)) = analysed(&[]) else {
+        return;
+    };
+    let controller = start(&path, &info, &[debug_point], true);
+    let Event::Breakpoints { revision, status } = next(&controller) else {
+        panic!("the initial breakpoints apply before the loader stop")
+    };
+    assert_eq!(revision, 1);
+    assert_eq!(
+        status.into_iter().collect::<Vec<_>>(),
+        [(debug_point, BreakpointStatus::Set)]
+    );
+    let loader = next_stop(&controller);
+    assert_eq!(loader.stop_seq, 1);
+    assert_eq!(
+        next(&controller),
+        Event::Running,
+        "run resumes the loader stop"
+    );
+    let hit = next_stop(&controller);
+    assert_eq!(hit.stop_seq, 2);
+    assert_eq!(hit.stop.reason, "breakpoint-hit");
+    assert_eq!(hit.stop.location.static_address, Some(debug_point));
+    assert_eq!(register(&hit, "rip"), hit.stop.location.runtime);
+    let registers = hit.registers.as_ref().unwrap();
+    assert_eq!(registers.len(), hit.register_locations.len());
+    let rip = registers.iter().position(|r| r.name == "rip").unwrap();
+    assert_eq!(hit.register_locations[rip], hit.stop.location);
+    let frames = hit.frames.as_ref().unwrap();
+    assert_eq!(frames[0].location, hit.stop.location);
+    assert!(
+        frames
+            .iter()
+            .any(|frame| frame.function.as_deref() == Some("main"))
+    );
+    assert!(controller.shutdown(Duration::from_secs(5)));
+}
+
+#[test]
+fn controller_pauses_a_sleeping_target_and_stop_kills_it() {
+    let Some((_dir, path, info, debug_point)) = analysed(&[]) else {
+        return;
+    };
+    let controller = start(&path, &info, &[debug_point], true);
+    let hit = next_stop(&controller);
+    let hit = if hit.stop_seq == 1 {
+        next_stop(&controller)
+    } else {
+        hit
+    };
+    assert_eq!(hit.stop.location.static_address, Some(debug_point));
+    // The fixture passes getpid() as the first argument.
+    let process = PathBuf::from(format!("/proc/{}/exe", register(&hit, "rdi")));
+    assert_eq!(std::fs::read_link(&process).unwrap(), path);
+    assert!(controller.send(DebugCommand::Pause));
+    assert!(
+        matches!(next(&controller), Event::Refused { .. }),
+        "a stopped target cannot pause"
+    );
+    controller.send(DebugCommand::Breakpoints {
+        revision: 2,
+        addresses: BTreeSet::new(),
+    });
+    assert!(matches!(
+        next(&controller),
+        Event::Breakpoints { revision: 2, status } if status.is_empty()
+    ));
+    controller.send(DebugCommand::Resume);
+    assert_eq!(next(&controller), Event::Running);
+    controller.send(DebugCommand::Pause);
+    let paused = next_stop(&controller);
+    assert_eq!(paused.stop.reason, "signal-received");
+    assert_eq!(paused.stop.signal.as_deref(), Some("SIGINT"));
+    assert_eq!(paused.stop_seq, hit.stop_seq + 1);
+    controller.send(DebugCommand::Stop);
+    assert_ended(&controller, None);
+    assert!(!process.exists(), "Ended follows the end of the target");
+}
+
+#[test]
+fn controller_applies_breakpoints_changed_while_running_at_the_next_stop() {
+    let Some((_dir, path, info, debug_point)) = analysed(&[]) else {
+        return;
+    };
+    let controller = start(&path, &info, &[debug_point], true);
+    while next_stop(&controller).stop.location.static_address != Some(debug_point) {}
+    controller.send(DebugCommand::Resume);
+    assert_eq!(next(&controller), Event::Running);
+    // The target is now inside sleep(1), before the second debug_point call.
+    controller.send(DebugCommand::Breakpoints {
+        revision: 7,
+        addresses: BTreeSet::new(),
+    });
+    controller.send(DebugCommand::Pause);
+    assert!(
+        matches!(next(&controller), Event::Breakpoints { revision: 7, status } if status.is_empty()),
+        "pending breakpoints apply before the next stop's snapshot"
+    );
+    let paused = next_stop(&controller);
+    assert_eq!(paused.stop.signal.as_deref(), Some("SIGINT"));
+    controller.send(DebugCommand::Resume);
+    assert_eq!(next(&controller), Event::Running);
+    assert_eq!(
+        next(&controller),
+        Event::Exited {
+            code: Some(19),
+            signal: None
+        },
+        "the removed breakpoint must not stop the second call"
+    );
+    assert_ended(&controller, None);
+}
+
+#[test]
+fn controller_reports_exit_code_and_ends() {
+    let Some((_dir, path, info, _)) = analysed(&[]) else {
+        return;
+    };
+    let controller = start(&path, &info, &[], true);
+    assert_eq!(next_stop(&controller).stop_seq, 1);
+    assert_eq!(next(&controller), Event::Running);
+    assert_eq!(
+        next(&controller),
+        Event::Exited {
+            code: Some(19),
+            signal: None
+        }
+    );
+    assert_eq!(next(&controller), Event::Ended { error: None });
+    assert!(
+        !controller.send(DebugCommand::Resume),
+        "the thread has ended"
+    );
+}
+
+#[test]
+fn controller_rejects_stale_memory_reads() {
+    let Some((_dir, path, info, debug_point)) = analysed(&[]) else {
+        return;
+    };
+    let controller = start(&path, &info, &[], false);
+    let loader = next_stop(&controller);
+    controller.send(DebugCommand::Breakpoints {
+        revision: 2,
+        addresses: [debug_point].into(),
+    });
+    assert!(matches!(
+        next(&controller),
+        Event::Breakpoints { revision: 2, .. }
+    ));
+    controller.send(DebugCommand::Step(StepKind::Instruction));
+    assert_eq!(next(&controller), Event::Running);
+    let step = next_stop(&controller);
+    assert_eq!(step.stop_seq, loader.stop_seq + 1);
+    let rip = step.stop.location.runtime;
+    controller.send(DebugCommand::ReadMemory {
+        token: 1,
+        stop: loader.stop_seq,
+        runtime: rip,
+        length: 1,
+    });
+    let Event::Memory {
+        token: 1, result, ..
+    } = next(&controller)
+    else {
+        panic!("expected a memory reply")
+    };
+    assert_eq!(result, Err("stale".into()));
+    controller.send(DebugCommand::ReadMemory {
+        token: 2,
+        stop: step.stop_seq,
+        runtime: rip,
+        length: 16,
+    });
+    let Event::Memory {
+        token: 2,
+        stop_seq,
+        runtime,
+        result,
+    } = next(&controller)
+    else {
+        panic!("expected a memory reply")
+    };
+    assert_eq!((stop_seq, runtime), (step.stop_seq, rip));
+    assert_eq!(result.unwrap().len(), 16);
+    controller.send(DebugCommand::Resume);
+    assert_eq!(next(&controller), Event::Running);
+    let hit = next_stop(&controller);
+    assert_eq!(hit.stop.location.static_address, Some(debug_point));
+    assert!(controller.shutdown(Duration::from_secs(5)));
+}
+
+#[test]
+fn controller_reports_missing_gdb() {
+    let Some((_dir, path, info, _)) = analysed(&[]) else {
+        return;
+    };
+    let missing = Path::new("/nonexistent/ghidra-rust-test/gdb");
+    let Err(error) = Debugger::launch(&path, &info, missing) else {
+        panic!("a missing GDB cannot launch")
+    };
+    assert!(matches!(error, Error::Unavailable(_)), "{error:?}");
+    assert_eq!(
+        error.to_string(),
+        "GDB is required at /nonexistent/ghidra-rust-test/gdb"
+    );
+    let mut launch = Launch::new(path, info, Arc::new(|| ()));
+    launch.gdb = missing.to_owned();
+    let controller = Controller::launch(launch).unwrap();
+    assert_ended(&controller, Some("GDB is required"));
+}
+
+#[test]
+fn controller_ends_with_an_error_when_the_target_execs() {
+    let Some((_dir, path, info, _)) = analysed(&["-DDEBUGGER_REEXEC"]) else {
+        return;
+    };
+    let controller = start(&path, &info, &[], true);
+    assert_ended(&controller, Some("replaced its executable"));
+}
+
+/// Runs to the first `debug_point` hit, keeping its breakpoint armed so the
+/// target stops again at the second call instead of exiting by itself.
+/// Returns the target's `/proc/<pid>/exe` path.
+fn running_after_first_hit(controller: &Controller, path: &Path, debug_point: u64) -> PathBuf {
+    let hit = loop {
+        let snapshot = next_stop(controller);
+        if snapshot.stop.location.static_address == Some(debug_point) {
+            break snapshot;
+        }
+    };
+    let process = PathBuf::from(format!("/proc/{}/exe", register(&hit, "rdi")));
+    assert_eq!(std::fs::read_link(&process).unwrap(), path);
+    controller.send(DebugCommand::Resume);
+    assert_eq!(next(controller), Event::Running);
+    process
+}
+
+fn wait_until_gone(process: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while process.exists() {
+        assert!(Instant::now() < deadline, "the target outlived its session");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn controller_handles_commands_after_a_pause_and_shuts_down_a_running_target() {
+    let Some((_dir, path, info, debug_point)) = analysed(&[]) else {
+        return;
+    };
+    let controller = start(&path, &info, &[debug_point], true);
+    let process = running_after_first_hit(&controller, &path, debug_point);
+    // Sent together, so both are read in one batch while the target runs.
+    controller.send(DebugCommand::Pause);
+    controller.send(DebugCommand::Resume);
+    let paused = next_stop(&controller);
+    assert_eq!(paused.stop.signal.as_deref(), Some("SIGINT"));
+    assert_eq!(
+        next(&controller),
+        Event::Running,
+        "a resume queued after a pause applies to the paused target"
+    );
+    assert!(controller.shutdown(Duration::from_millis(1500)));
+    assert!(!process.exists(), "shutdown ends the running target");
+}
+
+#[test]
+fn dropping_a_running_controller_ends_the_target() {
+    let Some((_dir, path, info, debug_point)) = analysed(&[]) else {
+        return;
+    };
+    let controller = start(&path, &info, &[debug_point], true);
+    let process = running_after_first_hit(&controller, &path, debug_point);
+    drop(controller);
+    wait_until_gone(&process);
+}
+
+#[test]
+fn controller_keeps_a_launch_paused_when_paused_before_it_runs() {
+    let Some((_dir, path, info, debug_point)) = analysed(&[]) else {
+        return;
+    };
+    let controller = start(&path, &info, &[debug_point], true);
+    // Queued long before GDB reaches the loader stop.
+    controller.send(DebugCommand::Pause);
+    let loader = next_stop(&controller);
+    assert_eq!(loader.stop_seq, 1);
+    controller.send(DebugCommand::Breakpoints {
+        revision: 2,
+        addresses: (0..=128).collect(),
+    });
+    assert!(
+        matches!(next(&controller), Event::Refused { .. }),
+        "a set larger than the breakpoint limit is refused"
+    );
+    controller.send(DebugCommand::ReadMemory {
+        token: 1,
+        stop: loader.stop_seq,
+        runtime: loader.stop.location.runtime,
+        length: 1,
+    });
+    assert!(
+        matches!(
+            next(&controller),
+            Event::Memory {
+                token: 1,
+                stop_seq: 1,
+                result: Ok(_),
+                ..
+            }
+        ),
+        "the target is still at the loader stop"
+    );
+    controller.send(DebugCommand::Resume);
+    assert_eq!(next(&controller), Event::Running);
+    let hit = next_stop(&controller);
+    assert_eq!(
+        hit.stop.location.static_address,
+        Some(debug_point),
+        "the refused set left the initial breakpoint in place"
+    );
+    assert!(controller.shutdown(Duration::from_secs(5)));
+}
+
+#[test]
+fn controller_reports_a_session_thread_that_ends_without_ended() {
+    let Some((_dir, path, info, _)) = analysed(&[]) else {
+        return;
+    };
+    let notify: Arc<dyn Fn() + Send + Sync> = Arc::new(|| panic!("notify failed"));
+    let controller = Controller::launch(Launch::new(path, info, notify)).unwrap();
+    assert_ended(&controller, Some("stopped unexpectedly"));
+    assert_eq!(controller.try_recv(), None, "Ended is reported once");
 }
