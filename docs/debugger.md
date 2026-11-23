@@ -1,17 +1,82 @@
-# Linux live debugger backend
+# Linux live debugger
 
 The Rust `debugger::Debugger` API runs a local x86-64 Linux ELF executable
 under GDB. It supports breakpoints, pause, continue, instruction stepping,
 stack frames, general registers, and reads of up to 64 KiB of live memory.
 `debugger::controller::Controller` runs one such session on its own thread.
-The desktop listing and headless JSON API have no live debugger commands yet.
+The desktop runs sessions from its **Debug** menu. The headless JSON API has
+no live debugger commands yet.
 
 The debugger types and the controller compile on every platform, and
 `debugger::SUPPORTED` reports whether this build has a backend. Only Linux
 x86-64 builds include the GDB backend. On other platforms,
 `Controller::launch` returns `Error::Unavailable`.
 
-## Try a breakpoint
+## Debug from the desktop
+
+Linux x86-64 builds show a **Debug** menu between **Analysis** and **Help**.
+It works on an x86-64 ELF executable with a file-backed entry point that you
+opened directly. A binary embedded in a project is a private copy that cannot
+run, so open the executable itself to debug it. Other builds have no Debug
+menu, and the keys below do nothing there.
+
+| Key | Action |
+| --- | --- |
+| `F5` | Start and run to the first breakpoint, or continue when stopped |
+| `Shift+F5` | Stop: end the target and the session |
+| `F6` | Pause a running target |
+| `F9` | Toggle a breakpoint at the selected instruction |
+| `F11` | Step one instruction |
+
+**Debug → Start paused** launches and stops before the first target
+instruction, usually in the ELF loader. The toolbar's run, pause, step and
+stop buttons repeat these commands for a debuggable binary. Like the other
+shortcuts, the keys do nothing while you type in a field, while a dialog or
+menu is open, or during a file operation. While a binary opens or reopens,
+only Pause and Stop respond. A held key acts once.
+
+The first start of each opened binary asks you to confirm **Run program**.
+Enter does not confirm it. The confirmation lasts until you open or reopen a
+binary, close it, or open a project.
+
+Breakpoints go on exact decoded instruction starts: the selected instruction
+in the Function listing, or the cursor row in the Program listing. Right-click
+an instruction for **Set breakpoint** or **Remove breakpoint**, and use
+**Debug → Clear breakpoints** to remove them all. A session holds up to 128.
+Breakpoints last for the opened binary and are not saved in projects.
+
+The Listing reserves a narrow gutter for debuggable binaries, so its columns
+do not move when a session starts or ends:
+
+- A filled red dot is a breakpoint, inserted when a session runs.
+- A red ring is a breakpoint added or removed while the target runs. The
+  change applies at the next stop, so a removed breakpoint can still stop
+  the target until then.
+- A grey ring with a cross could not be inserted or removed. Hover the row
+  for the reason.
+- A green arrow and row fill mark the stopped PC.
+
+At each stop, the Listing selects the PC when a known function's decoded
+listing contains it, and the Decompiler highlights the expressions that the
+engine maps to that instruction. An instruction with no engine mapping
+highlights nothing. These moves add no Back/Forward history. A stop does not
+move the selection while a binary opens, while you type in a field, or while
+the Annotations editor holds an unsaved edit. A stop outside
+the analyzed executable, for example in the loader or libc, leaves the
+selection where it was. The status bar shows the state: **Launching**,
+**Running**, **Stopped @ address** (or the runtime address outside the image),
+a fault signal such as **SIGSEGV @ address**, and **Exited 19** or **Killed by
+SIGKILL** after the target ends. Hover the stop for its thread, runtime address
+and reason. Click it, or choose **Debug → Go to PC**, to return to the PC with
+history.
+
+Run control takes one command at a time. Keys that do not apply to the
+current state, such as Pause while stopped, do nothing. Opening another binary
+or project, reopening a changed file, closing the binary, and quitting each end
+a live session without asking, and the status bar notes it. Quitting waits up to 1.5 seconds for GDB and
+the target to end.
+
+## Try a breakpoint from the Rust API
 
 Install GDB with MI3 support at `/usr/bin/gdb`. The debugger uses Linux procfs
 and PID file descriptors, which require Linux 5.3 or newer. The example runs
@@ -111,4 +176,6 @@ detached target can keep running. Debugging requires Linux x86-64; Windows
 and other platforms have no live debugger.
 
 Attach, remote targets, live memory writes, saved traces, emulation, and
-Windows debugger support are outside this backend's scope.
+Windows debugger support are outside this backend's scope. The desktop does
+not yet show registers, the stack, or memory, and has no step over, step out,
+or run to cursor.

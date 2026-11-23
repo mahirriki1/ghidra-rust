@@ -23,6 +23,25 @@ pub(crate) const SHORTCUTS: &[(&str, &str)] = &[
     ("Enter", "Listing: follow target"),
 ];
 
+/// Live debugging keys, listed only where the build has a debugger.
+pub(crate) const DEBUG_SHORTCUTS: &[(&str, &str)] = &[
+    ("F5", "Debug: start / continue"),
+    ("Shift+F5", "Debug: stop"),
+    ("F6", "Debug: pause"),
+    ("F9", "Debug: toggle breakpoint"),
+    ("F11", "Debug: step instruction"),
+];
+
+/// Every shortcut this build responds to.
+pub(crate) fn shortcuts() -> impl Iterator<Item = &'static (&'static str, &'static str)> {
+    let debug: &[_] = if crate::debugger::SUPPORTED {
+        DEBUG_SHORTCUTS
+    } else {
+        &[]
+    };
+    SHORTCUTS.iter().chain(debug)
+}
+
 #[cfg(target_os = "macos")]
 const SAVE_KEYS: &str = "Cmd+S";
 #[cfg(not(target_os = "macos"))]
@@ -123,15 +142,13 @@ fn text_width(ui: &egui::Ui, text: &str) -> f32 {
 
 fn shortcut_dimensions(ui: &egui::Ui) -> (f32, f32) {
     let padding = ui.spacing().button_padding.x * 2.0;
-    let key_width = SHORTCUTS
-        .iter()
+    let key_width = shortcuts()
         .map(|(keys, _)| keys.len())
         .max()
         .unwrap_or_default() as f32
         * theme::glyph_width(ui)
         + padding;
-    let action_width = SHORTCUTS
-        .iter()
+    let action_width = shortcuts()
         .map(|(_, action)| text_width(ui, action))
         .fold(0.0_f32, f32::max)
         + padding;
@@ -148,11 +165,11 @@ fn shortcut_table(ui: &mut egui::Ui, key_width: f32) {
     let (body, _) = ui.allocate_exact_size(
         egui::vec2(
             ui.available_width(),
-            theme::ROW_HEIGHT * SHORTCUTS.len() as f32,
+            theme::ROW_HEIGHT * shortcuts().count() as f32,
         ),
         egui::Sense::hover(),
     );
-    for (index, (keys, action)) in SHORTCUTS.iter().enumerate() {
+    for (index, (keys, action)) in shortcuts().enumerate() {
         let row = egui::Rect::from_min_size(
             body.min + egui::vec2(0.0, index as f32 * theme::ROW_HEIGHT),
             egui::vec2(body.width(), theme::ROW_HEIGHT),

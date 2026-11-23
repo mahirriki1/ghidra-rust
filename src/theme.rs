@@ -33,6 +33,12 @@ pub const NODE_RETURN: Color32 = Color32::from_rgb(90, 36, 40);
 pub const NODE_RADIUS: u8 = 3;
 /// Instructions or tokens linked to the selection, below the selection itself.
 pub const RELATED: Color32 = Color32::from_rgb(52, 42, 34);
+/// The row of a live debug session's stopped PC, in the entry-node family.
+pub const LIVE_PC: Color32 = NODE_ENTRY;
+/// A live debug breakpoint mark.
+pub const BREAKPOINT: Color32 = ERROR;
+/// Width of the Listing's breakpoint/PC gutter for debuggable binaries.
+pub const LISTING_GUTTER: f32 = 14.0;
 /// Height of one dense listing or table row; virtualized lists rely on it.
 pub const ROW_HEIGHT: f32 = 20.0;
 /// Bytes shown in the Listing's byte column before eliding the remainder.
@@ -1155,6 +1161,8 @@ pub fn listing_bytes(bytes: &[u8]) -> String {
 /// only then does the address ellipsize.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ListingColumns {
+    /// The breakpoint/PC gutter before the address, when the row has one.
+    pub gutter: Option<egui::Rangef>,
     pub address: egui::Rangef,
     pub bytes: Option<egui::Rangef>,
     pub mnemonic: egui::Rangef,
@@ -1171,8 +1179,24 @@ pub fn listing_columns(
     address_digits: usize,
     pixels_per_point: f32,
 ) -> ListingColumns {
+    listing_columns_with_gutter(width, glyph, address_digits, pixels_per_point, false)
+}
+
+/// [`listing_columns`], optionally after a fixed [`LISTING_GUTTER`] that keeps
+/// its width however narrow the row becomes.
+pub fn listing_columns_with_gutter(
+    width: f32,
+    glyph: f32,
+    address_digits: usize,
+    pixels_per_point: f32,
+    gutter: bool,
+) -> ListingColumns {
     let g = glyph.max(0.0);
-    let available = (floor_pixels(width, pixels_per_point) - LISTING_INSET - LISTING_END).max(0.0);
+    let snap = |x: f32| (x * pixels_per_point).round() / pixels_per_point;
+    let row = floor_pixels(width, pixels_per_point);
+    let gutter = gutter.then(|| egui::Rangef::new(0.0, snap(LISTING_GUTTER).min(row.max(0.0))));
+    let lead = gutter.map_or(0.0, |gutter| gutter.max);
+    let available = (row - lead - LISTING_INSET - LISTING_END).max(0.0);
     let (wide, narrow) = (2.0 * g, g);
     let address_full = address_digits as f32 * g;
     let (mnemonic_min, operands_min) = (5.0 * g, 8.0 * g);
@@ -1211,9 +1235,8 @@ pub fn listing_columns(
         gaps = (wide * scale, narrow * scale);
         mnemonic = mnemonic_min * scale;
     }
-    let snap = |x: f32| (x * pixels_per_point).round() / pixels_per_point;
-    let end = LISTING_INSET + available;
-    let mut x = LISTING_INSET;
+    let end = lead + LISTING_INSET + available;
+    let mut x = lead + LISTING_INSET;
     let mut cell = |width: f32, gap: f32| {
         let range = egui::Rangef::new(snap(x).min(end), snap(x + width).min(end));
         x += width + gap;
@@ -1224,6 +1247,7 @@ pub fn listing_columns(
     let mnemonic = cell(mnemonic, gaps.1);
     let operands = egui::Rangef::new(snap(x).min(end), end);
     ListingColumns {
+        gutter,
         address,
         bytes,
         mnemonic,
@@ -1816,6 +1840,172 @@ pub fn paint_row_selection(ui: &Ui, rect: egui::Rect) {
             ACCENT,
         );
     }
+}
+
+/// How a Listing row's breakpoint stands in the live session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BreakpointMark {
+    /// Wanted and, during a session, inserted.
+    Set,
+    /// Wanted but not yet applied to the running target.
+    Pending,
+    /// The session could not insert or remove it.
+    Failed,
+}
+
+/// Paints the breakpoint and PC marks in `gutter` (row-relative) of `rect`.
+pub fn paint_live_gutter(
+    ui: &Ui,
+    rect: egui::Rect,
+    gutter: egui::Rangef,
+    breakpoint: Option<BreakpointMark>,
+    pc: bool,
+) {
+    if (breakpoint.is_none() && !pc) || !ui.is_rect_visible(rect) {
+        return;
+    }
+    let cell = egui::Rect::from_x_y_ranges(
+        egui::Rangef::new(rect.left() + gutter.min, rect.left() + gutter.max),
+        rect.y_range(),
+    );
+    let painter = ui.painter().with_clip_rect(cell.intersect(ui.clip_rect()));
+    let center = cell.center();
+    let radius = 4.0;
+    match breakpoint {
+        Some(BreakpointMark::Set) => {
+            painter.circle_filled(center, radius, BREAKPOINT);
+        }
+        Some(BreakpointMark::Pending) => {
+            painter.circle_stroke(center, radius, Stroke::new(1.5, BREAKPOINT));
+        }
+        Some(BreakpointMark::Failed) => {
+            let stroke = Stroke::new(1.5, MUTED);
+            painter.circle_stroke(center, radius, stroke);
+            let arm = egui::vec2(2.5, 2.5);
+            painter.line_segment([center - arm, center + arm], stroke);
+            painter.line_segment(
+                [
+                    center + egui::vec2(-arm.x, arm.y),
+                    center + egui::vec2(arm.x, -arm.y),
+                ],
+                stroke,
+            );
+        }
+        None => {}
+    }
+    if pc {
+        let points = vec![
+            center + egui::vec2(-3.5, -5.0),
+            center + egui::vec2(4.5, 0.0),
+            center + egui::vec2(-3.5, 5.0),
+        ];
+        painter.add(egui::Shape::convex_polygon(
+            points,
+            EDGE_TRUE,
+            Stroke::new(1.0, VIEW),
+        ));
+    }
+}
+
+/// The stopped PC's row fill; a selected or related row keeps its own fill.
+pub fn paint_live_pc_row(ui: &Ui, rect: egui::Rect, highlighted: bool) {
+    if !highlighted && ui.is_rect_visible(rect) {
+        ui.painter().rect_filled(rect, 0, LIVE_PC);
+    }
+}
+
+/// A toolbar run-control command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunIcon {
+    Run,
+    Pause,
+    Step,
+    Stop,
+}
+
+/// A vector-painted run-control button the size of [`history_button`].
+pub fn run_control_button(
+    ui: &mut Ui,
+    icon: RunIcon,
+    enabled: bool,
+    tooltip: &str,
+) -> egui::Response {
+    let label = tooltip;
+    let response = ui.add_enabled(
+        enabled,
+        egui::Button::new("")
+            .min_size(egui::vec2(26.0, 22.0))
+            .frame_when_inactive(false),
+    );
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, response.enabled(), label));
+    if ui.is_rect_visible(response.rect) {
+        let center = response.rect.center();
+        let color = if !response.enabled() {
+            MUTED.gamma_multiply(0.45)
+        } else {
+            match icon {
+                RunIcon::Run => EDGE_TRUE,
+                RunIcon::Stop => ERROR,
+                RunIcon::Pause | RunIcon::Step => ui.style().interact(&response).fg_stroke.color,
+            }
+        };
+        let painter = ui.painter();
+        match icon {
+            RunIcon::Run => {
+                let points = vec![
+                    center + egui::vec2(-4.0, -5.5),
+                    center + egui::vec2(5.0, 0.0),
+                    center + egui::vec2(-4.0, 5.5),
+                ];
+                painter.add(egui::Shape::convex_polygon(points, color, Stroke::NONE));
+            }
+            RunIcon::Pause => {
+                for x in [-2.5, 2.5] {
+                    painter.rect_filled(
+                        egui::Rect::from_center_size(
+                            center + egui::vec2(x, 0.0),
+                            egui::vec2(2.5, 10.0),
+                        ),
+                        0,
+                        color,
+                    );
+                }
+            }
+            RunIcon::Step => {
+                // An arrow onto a bar: advance one instruction.
+                let stroke = Stroke::new(1.8, color);
+                let tip = center + egui::vec2(2.0, 0.0);
+                painter.line_segment([center - egui::vec2(5.0, 0.0), tip], stroke);
+                painter.line_segment([tip - egui::vec2(3.5, 3.5), tip], stroke);
+                painter.line_segment([tip - egui::vec2(3.5, -3.5), tip], stroke);
+                painter.line_segment(
+                    [
+                        center + egui::vec2(5.0, -5.0),
+                        center + egui::vec2(5.0, 5.0),
+                    ],
+                    stroke,
+                );
+            }
+            RunIcon::Stop => {
+                painter.rect_filled(
+                    egui::Rect::from_center_size(center, egui::vec2(9.0, 9.0)),
+                    1,
+                    color,
+                );
+            }
+        }
+    }
+    response
+        .on_hover_text(tooltip)
+        .on_disabled_hover_text(tooltip)
+}
+
+/// A clickable [`status_token`] in `color`.
+pub fn status_button_token(ui: &mut Ui, text: &str, color: Color32) -> egui::Response {
+    ui.add(
+        egui::Label::new(RichText::new(text).monospace().color(color)).sense(egui::Sense::click()),
+    )
 }
 
 /// A compact choice between `choices` in a pane's title row, one row high.

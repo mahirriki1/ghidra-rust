@@ -621,3 +621,41 @@ fn disabled_history_list_never_opens() {
     }
     assert!(!egui::Popup::is_any_open(&context));
 }
+
+#[test]
+fn listing_gutter_keeps_its_width_and_puts_cells_after_it_on_pixel_edges() {
+    for scale in [1.0, 1.25] {
+        let glyph = 7.8;
+        for width in [120.0, 180.0, 261.3, 360.0, 801.7] {
+            let plain = listing_columns(width, glyph, 16, scale);
+            assert_eq!(plain.gutter, None);
+            let columns = listing_columns_with_gutter(width, glyph, 16, scale, true);
+            let gutter = columns.gutter.expect("gutter");
+            let on_pixel = |x: f32| ((x * scale) - (x * scale).round()).abs() < 1e-3;
+            assert_eq!(gutter.min, 0.0);
+            assert!((gutter.max - LISTING_GUTTER).abs() <= 0.5 / scale + 1e-3);
+            assert!(on_pixel(gutter.max), "{scale} {width} {gutter:?}");
+            assert!(columns.address.min >= gutter.max + LISTING_INSET - 1.0 / scale);
+            let mut edges = vec![columns.address.min, columns.address.max];
+            if let Some(bytes) = columns.bytes {
+                assert!(bytes.min >= columns.address.max);
+                edges.extend([bytes.min, bytes.max]);
+            }
+            edges.extend([
+                columns.mnemonic.min,
+                columns.mnemonic.max,
+                columns.operands.min,
+            ]);
+            assert!(
+                edges.iter().copied().all(on_pixel),
+                "{scale} {width} {columns:?}"
+            );
+            assert!(edges.windows(2).all(|pair| pair[0] <= pair[1]));
+            assert!(columns.operands.max <= floor_pixels(width, scale) + 1e-3);
+            assert!(columns.mnemonic.span() > 0.0 && columns.operands.span() > 0.0);
+        }
+        // Narrower than the gutter: the gutter itself stays inside the row.
+        let tiny = listing_columns_with_gutter(8.0, glyph, 16, scale, true);
+        assert!(tiny.gutter.unwrap().max <= 8.0);
+    }
+}

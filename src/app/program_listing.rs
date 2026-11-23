@@ -871,7 +871,13 @@ impl DesktopApp {
                 .unwrap_or(0),
         );
         let glyph = theme::glyph_width(ui);
-        let columns = theme::listing_columns(body.width(), glyph, digits, ppp);
+        let columns = theme::listing_columns_with_gutter(
+            body.width(),
+            glyph,
+            digits,
+            ppp,
+            self.live_gutter(),
+        );
         theme::paint_listing_header(ui, header, &columns);
         let displayed = self.view().map(|view| view.address);
         let cursor = self.program_cursor(&layout).map(|row| row.position());
@@ -970,12 +976,23 @@ impl DesktopApp {
                     else {
                         return;
                     };
+                    let row_selected = cursor == Some(row.position());
+                    let related =
+                        displayed == Some(owner) && self.semantic.addresses.contains(&start);
                     let response = theme::row_response(
                         ui,
                         ui.scope_id().with(("program-row", start)),
                         rect,
-                        cursor == Some(row.position()),
-                        displayed == Some(owner) && self.semantic.addresses.contains(&start),
+                        row_selected,
+                        related,
+                    );
+                    self.paint_live_row(
+                        ui,
+                        rect,
+                        &columns,
+                        start,
+                        row_selected,
+                        related || response.hovered(),
                     );
                     let call = view.calls.iter().find(|call| call.address == start);
                     let callee = call
@@ -1028,6 +1045,7 @@ impl DesktopApp {
                     if let Some(evidence) = call.and_then(|call| call.no_return) {
                         hover.push(evidence.description());
                     }
+                    hover.extend(self.live_hover(start));
                     let response = if hover.is_empty() {
                         response
                     } else {

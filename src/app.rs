@@ -106,6 +106,7 @@ mod context_menu;
 mod graph_preparation;
 mod listing_cursor;
 mod listing_destinations;
+mod live_debug;
 mod managed_upgrade;
 mod program_cursor;
 mod program_listing;
@@ -173,6 +174,11 @@ enum Shortcut {
     Xrefs,
     SearchMemory,
     SearchText,
+    DebugRun,
+    DebugStop,
+    DebugPause,
+    DebugStep,
+    ToggleBreakpoint,
 }
 
 fn shortcut(event: &egui::Event) -> Option<Shortcut> {
@@ -191,6 +197,28 @@ fn shortcut(event: &egui::Event) -> Option<Shortcut> {
         && !modifiers.shift
         && !modifiers.mac_cmd
         && !modifiers.command;
+    // Live debugging keys exist only where a backend does, so other builds
+    // leave F5–F11 to the focused widget.
+    if crate::debugger::SUPPORTED {
+        if plain {
+            match key {
+                egui::Key::F5 => return Some(Shortcut::DebugRun),
+                egui::Key::F6 => return Some(Shortcut::DebugPause),
+                egui::Key::F9 => return Some(Shortcut::ToggleBreakpoint),
+                egui::Key::F11 => return Some(Shortcut::DebugStep),
+                _ => {}
+            }
+        }
+        if modifiers.shift
+            && !modifiers.ctrl
+            && !modifiers.alt
+            && !modifiers.mac_cmd
+            && !modifiers.command
+            && *key == egui::Key::F5
+        {
+            return Some(Shortcut::DebugStop);
+        }
+    }
     if plain {
         return match key {
             egui::Key::F1 => Some(Shortcut::Help),
@@ -1083,6 +1111,8 @@ pub struct DesktopApp {
     search_dialog: Option<SearchDialog>,
     /// Revisions of the mutable text sources a program-text search captures.
     source_epochs: SourceEpochs,
+    /// The live debug session, its breakpoints and trust confirmation.
+    live: live_debug::LiveDebug,
 }
 
 impl DesktopApp {
@@ -1258,6 +1288,7 @@ impl DesktopApp {
             search_form: SearchForm::default(),
             search_dialog: None,
             source_epochs: SourceEpochs::default(),
+            live: Default::default(),
         }
     }
 
@@ -1353,6 +1384,7 @@ impl DesktopApp {
     fn clear_binary(&mut self) {
         self.stop_worker();
         self.generation = self.generation.wrapping_add(1);
+        let live_ended = self.live.end(self.generation);
         self.info = None;
         self.binary_path = None;
         self.binary_protection = None;
@@ -1367,7 +1399,12 @@ impl DesktopApp {
         self.saved_result_revision = 0;
         self.undo.clear();
         self.clear_views();
-        self.status = "Binary closed".into();
+        self.status = if live_ended {
+            "Binary closed · Debug session ended"
+        } else {
+            "Binary closed"
+        }
+        .into();
     }
 
     fn clear_views(&mut self) {
@@ -3681,6 +3718,9 @@ impl DesktopApp {
                     self.project_path = None;
                     self.project_binary = None;
                 }
+                // A fresh open ends any live session; a preserving reopen
+                // keeps it only for the same contents.
+                let live_ended = self.live.bind(self.generation, &info.sha256);
                 // Replay only names the fresh worker inventory lacks or differs on.
                 let replay = project.is_some() || opening.preserve && self.info.is_some();
                 let worker_functions = if replay {
@@ -3817,6 +3857,9 @@ impl DesktopApp {
                     "Binary loaded"
                 }
                 .into();
+                if live_ended {
+                    self.status.push_str(" · Debug session ended");
+                }
                 if let Some(project) = project {
                     if self.results.preparing() {
                         self.deferred_restore = Some(project);
@@ -6479,12 +6522,20 @@ impl DesktopApp {
     }
 
     fn handle_shortcuts(&mut self, context: &egui::Context) {
-        if self.navigation_shortcuts_blocked(context) {
+        // While a binary (re)opens, only a live session's pause and stop keys
+        // stay available; they touch no worker state.
+        let live_only = self.navigation_shortcuts_blocked(context);
+        if live_only && (!self.live_session_active() || self.shortcuts_blocked_while_open(context))
+        {
             return;
         }
         let action = context.input_mut(|input| {
             let (index, action) = input.events.iter().enumerate().find_map(|(index, event)| {
                 let action = shortcut(event)?;
+                if live_only {
+                    return matches!(action, Shortcut::DebugPause | Shortcut::DebugStop)
+                        .then_some((index, action));
+                }
                 (self.info.is_some() || matches!(action, Shortcut::Help)).then_some((index, action))
             })?;
             input.events.remove(index);
@@ -6516,6 +6567,11 @@ impl DesktopApp {
             Some(Shortcut::Xrefs) => self.show_selection_xrefs(),
             Some(Shortcut::SearchMemory) => self.open_search_dialog(DialogKind::Memory),
             Some(Shortcut::SearchText) => self.open_search_dialog(DialogKind::Text),
+            Some(Shortcut::DebugRun) => self.live_run(context),
+            Some(Shortcut::DebugStop) => self.live_stop(),
+            Some(Shortcut::DebugPause) => self.live_pause(),
+            Some(Shortcut::DebugStep) => self.live_step(),
+            Some(Shortcut::ToggleBreakpoint) => self.live_toggle_breakpoint(),
             _ => {}
         }
         if action.is_some() {
@@ -6849,6 +6905,9 @@ impl DesktopApp {
                     ui.close();
                 }
             });
+            if crate::debugger::SUPPORTED {
+                ui.menu_button("Debug", |ui| self.live_menu(ui, &context));
+            }
             ui.menu_button("Help", |ui| {
                 if ui.button("Check for updates…").clicked() {
                     self.help_dialog = None;
@@ -6897,6 +6956,7 @@ impl DesktopApp {
             ui.spacing_mut().item_spacing.x = 0.0;
             self.history_menu(ui, true, &context);
             ui.spacing_mut().item_spacing.x = spacing;
+            self.live_toolbar(ui, &context);
             let entry = ui.add(
                 TextEdit::singleline(&mut self.address)
                     .id(egui::Id::unique("toolbar-go-to"))
@@ -9592,6 +9652,7 @@ impl DesktopApp {
                 let mut menu_opened = None;
                 let mut menu_chosen = None;
                 let reveal = self.pending_listing_scroll.take();
+                let gutter = self.live_gutter();
                 let (_, output) = theme::rows::<()>(
                     ui,
                     ("instruction-list", entry),
@@ -9601,12 +9662,14 @@ impl DesktopApp {
                     reveal,
                     |ui, index, rect| {
                         let instruction = listing.get(index)?;
+                        let row_selected = self.selected == Some(instruction.address);
+                        let related = self.semantic.addresses.contains(&instruction.address);
                         let response = theme::row_response(
                             ui,
                             ui.scope_id().with(("listing-row", instruction.address)),
                             rect,
-                            self.selected == Some(instruction.address),
-                            self.semantic.addresses.contains(&instruction.address),
+                            row_selected,
+                            related,
                         );
                         let call = view
                             .calls
@@ -9615,11 +9678,20 @@ impl DesktopApp {
                         let callee = call
                             .and_then(|call| call.target)
                             .and_then(|target| self.function_names(target));
-                        let columns = theme::listing_columns(
+                        let columns = theme::listing_columns_with_gutter(
                             rect.width(),
                             glyph,
                             digits,
                             ui.pixels_per_point(),
+                            gutter,
+                        );
+                        self.paint_live_row(
+                            ui,
+                            rect,
+                            &columns,
+                            instruction.address,
+                            row_selected,
+                            related || response.hovered(),
                         );
                         let elided = theme::listing_cells(
                             ui,
@@ -9669,6 +9741,7 @@ impl DesktopApp {
                         if let Some(evidence) = call.and_then(|call| call.no_return) {
                             hover.push(evidence.description());
                         }
+                        hover.extend(self.live_hover(instruction.address));
                         let response = if hover.is_empty() {
                             response
                         } else {
@@ -9691,11 +9764,12 @@ impl DesktopApp {
                         None
                     },
                 );
-                let columns = theme::listing_columns(
+                let columns = theme::listing_columns_with_gutter(
                     output.inner_rect.width(),
                     glyph,
                     digits,
                     ui.pixels_per_point(),
+                    gutter,
                 );
                 theme::paint_listing_header(ui, header, &columns);
                 if let Some(address) = selected {
@@ -10165,11 +10239,16 @@ impl DesktopApp {
         Some(display)
     }
 
-    fn status_bar(&self, ui: &mut egui::Ui) {
-        self.status_bar_at(ui, Instant::now());
+    fn status_bar(&mut self, ui: &mut egui::Ui) {
+        if self.status_bar_at(ui, Instant::now()) {
+            let context = ui.ctx().clone();
+            self.live_go_to_pc(&context);
+        }
     }
 
-    fn status_bar_at(&self, ui: &mut egui::Ui, now: Instant) {
+    /// Returns whether the live debug token asked to go to the PC.
+    fn status_bar_at(&self, ui: &mut egui::Ui, now: Instant) -> bool {
+        let mut go_to_pc = false;
         let (row, _) = ui.allocate_exact_size(
             egui::vec2(ui.available_width(), theme::ROW_HEIGHT),
             egui::Sense::hover(),
@@ -10221,6 +10300,7 @@ impl DesktopApp {
                         }
                     });
                 }
+                go_to_pc = self.live_status_token(ui);
                 let identity = self.info.as_ref().map(|info| format!(
                     "{} · {} · {} bytes", info.format, info.architecture, info.file_len,
                 ));
@@ -10254,6 +10334,7 @@ impl DesktopApp {
                 );
             },
         );
+        go_to_pc
     }
 
     fn draw(&mut self, ui: &mut egui::Ui) {
@@ -10278,6 +10359,7 @@ impl DesktopApp {
             self.poll_graph_preparation(&context);
             self.poll_worker(&context);
         }
+        self.poll_live_debug(&context);
         self.pump_text_search(&context);
         if let Some(installed) = self.updater.poll(&context) {
             self.status = "Update ready. Restarting…".into();
@@ -10349,6 +10431,7 @@ impl DesktopApp {
         self.file_dialogs.show(&context);
 
         self.browser_dialog(&context);
+        self.live_prompt_window(&context);
         self.search_dialog_window(&context);
         self.signature_window(&context);
         if self.intent.is_none()
@@ -10379,6 +10462,11 @@ impl eframe::App for DesktopApp {
         frame.finish(0);
         #[cfg(feature = "capture")]
         self.capture_tick(ui.ctx());
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Quitting ends the live target and GDB within a bounded wait.
+        self.live.shutdown(Duration::from_millis(1500));
     }
 }
 
