@@ -76,6 +76,45 @@ or project, reopening a changed file, closing the binary, and quitting each end
 a live session without asking, and the status bar notes it. Quitting waits up to 1.5 seconds for GDB and
 the target to end.
 
+## Registers, stack and memory
+
+The first session for an opened binary adds **Registers**, **Stack** and
+**Memory** tabs beside the analysis tabs and to the **View** menu. They stay
+after the target exits and leave when you open a binary or project, when
+the file changes on disk, or when you close the binary. A stop does not switch away from the debug tab you are on. While
+the target runs or no session is active, each tab shows **Not stopped**.
+
+- **Registers** lists the general registers of the stopped thread. A value
+  that changed since the previous stop of the same session is tinted. The
+  third column appears only when the debugger maps the value to a code
+  address of the executable. It names the containing function and offset
+  when a decoded listing contains the address, and otherwise shows the static
+  address, muted. Right-click a
+  register for **Copy value**, **Show in Memory**, and, for a mapped value,
+  **Go to**.
+- **Stack** lists up to 32 frames with their runtime and static addresses.
+  A caller frame's address is its return address. The app names a caller by
+  the decoded call instruction that ends at that address, never by the
+  address itself, which can be the next function's start. Frames in the
+  executable use the app's function names, so a rename shows there. Frames
+  that no decoded listing explains, and frames outside the executable, show
+  GDB's name, muted. Double-click a frame, or select it and press `Enter`, to
+  open it with Back/Forward history: the PC or the caller's call instruction
+  in the Listing. A frame in a function the app has not decoded opens as data
+  instead, as Go To does, at the stopped PC or the byte before the return
+  address. Frames outside the executable do not open.
+- **Memory** shows 1 KiB of live target memory as hex and ASCII, starting at
+  `rsp` at the first stop of each session. Enter a hexadecimal address, use
+  **rsp** or **rip**, or page with **Prev** and **Next**. The page is read
+  again at each stop while the tab shows; until the new read arrives, the
+  previous stop's bytes stay muted. A range the target cannot read shows
+  **Unreadable**, and its hover gives GDB's reason. File bytes never stand in
+  for live memory. The tab cannot write memory.
+
+All three are read-only. Their data comes from the stop that the session
+reported, and a memory reply for an older stop or an ended session is
+dropped.
+
 ## Try a breakpoint from the Rust API
 
 Install GDB with MI3 support at `/usr/bin/gdb`. The debugger uses Linux procfs
@@ -176,6 +215,6 @@ detached target can keep running. Debugging requires Linux x86-64; Windows
 and other platforms have no live debugger.
 
 Attach, remote targets, live memory writes, saved traces, emulation, and
-Windows debugger support are outside this backend's scope. The desktop does
-not yet show registers, the stack, or memory, and has no step over, step out,
-or run to cursor.
+Windows debugger support are outside this backend's scope. The desktop
+shows only the stopped thread's registers and stack, does not navigate from
+memory values, and has no step over, step out, or run to cursor.

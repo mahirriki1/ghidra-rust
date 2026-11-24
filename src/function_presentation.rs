@@ -110,6 +110,14 @@ impl<'a> Listing<'a> {
         self.position(address).is_some()
     }
 
+    /// The decoded instruction whose bytes end exactly at `end`, such as the
+    /// call before a return address.
+    pub fn ending_at(&self, end: u64) -> Option<&'a Instruction> {
+        let instruction = self.get(self.partition(end).checked_sub(1)?)?;
+        let length = u64::try_from(instruction.bytes.len()).ok()?;
+        (instruction.address.checked_add(length) == Some(end)).then_some(instruction)
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = &'a Instruction> + 'a {
         let listing = *self;
         (0..listing.len()).filter_map(move |row| listing.get(row))

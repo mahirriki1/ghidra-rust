@@ -124,7 +124,24 @@ enum Tab {
     References,
     /// Results of the current memory or program-text search.
     Search,
+    /// Live debug views, shown from the first session until the binary changes.
+    Registers,
+    Stack,
+    Memory,
 }
+
+impl Tab {
+    /// Whether this is one of the live debug tabs.
+    fn live(self) -> bool {
+        matches!(self, Self::Registers | Self::Stack | Self::Memory)
+    }
+}
+
+const LIVE_TABS: [(Tab, &str); 3] = [
+    (Tab::Registers, "Registers"),
+    (Tab::Stack, "Stack"),
+    (Tab::Memory, "Memory"),
+];
 
 /// The list shown in the left Functions dock; session-only.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1498,7 +1515,8 @@ impl DesktopApp {
         self.source_epochs.bump_inventory();
         self.source_epochs.bump_linkage();
         self.source_epochs.bump_strings();
-        if self.tab == Tab::Search {
+        // Search results and the live debug views belong to the old binary.
+        if self.tab == Tab::Search || self.tab.live() {
             self.tab = Tab::Listing;
         }
         self.advance_byte_intent();
@@ -6827,6 +6845,13 @@ impl DesktopApp {
                         ui.close();
                     }
                 }
+                if self.live.tabs_visible() {
+                    for (tab, label) in LIVE_TABS {
+                        if ui.selectable_value(&mut self.tab, tab, label).clicked() {
+                            ui.close();
+                        }
+                    }
+                }
                 ui.separator();
                 ui.checkbox(&mut self.annotations_open, "Annotations");
                 ui.checkbox(&mut self.auto_decompile, "Automatic decompilation");
@@ -9425,6 +9450,26 @@ impl DesktopApp {
         self.main_tabs(ui);
     }
 
+    /// The center dock's tabs, including the conditional ones.
+    fn main_tab_list(&self) -> Vec<(Tab, &'static str)> {
+        let mut tabs = vec![
+            (Tab::Listing, "Listing"),
+            (Tab::Graph, "Function Graph"),
+            (Tab::Strings, "Strings"),
+            (Tab::Crypto, "FindCrypt"),
+            (Tab::Decode, "Decode"),
+            (Tab::Hex, "Hex / Memory Map"),
+            (Tab::References, "References"),
+        ];
+        if self.searches.current.is_some() {
+            tabs.push((Tab::Search, "Search"));
+        }
+        if self.live.tabs_visible() {
+            tabs.extend(LIVE_TABS);
+        }
+        tabs
+    }
+
     fn main_tabs(&mut self, ui: &mut egui::Ui) {
         self.update_comment_rows();
         let saved_search = self.tab == Tab::Search
@@ -9443,18 +9488,10 @@ impl DesktopApp {
         } else {
             "Saved scan results; rescan to recompute."
         };
-        let mut tabs = vec![
-            (Tab::Listing, "Listing"),
-            (Tab::Graph, "Function Graph"),
-            (Tab::Strings, "Strings"),
-            (Tab::Crypto, "FindCrypt"),
-            (Tab::Decode, "Decode"),
-            (Tab::Hex, "Hex / Memory Map"),
-            (Tab::References, "References"),
-        ];
-        if self.searches.current.is_some() {
-            tabs.push((Tab::Search, "Search"));
+        if self.tab.live() && !self.live.tabs_visible() {
+            self.tab = Tab::Listing;
         }
+        let tabs = self.main_tab_list();
         theme::dock_tabs(
             ui,
             &mut self.tab,
@@ -9466,6 +9503,9 @@ impl DesktopApp {
         match self.tab {
             Tab::References => self.references_panel(ui),
             Tab::Search => self.search_panel(ui),
+            Tab::Registers => self.live_registers_tab(ui, &context),
+            Tab::Stack => self.live_stack_tab(ui, &context),
+            Tab::Memory => self.live_memory_tab(ui, &context),
             Tab::Graph => {
                 self.request_graph_annotations(&context);
                 let mut navigate = None;
