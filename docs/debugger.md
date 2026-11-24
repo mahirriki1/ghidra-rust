@@ -86,15 +86,23 @@ the target runs or no session is active, each tab shows **Not stopped**.
 
 - **Registers** lists the general registers of the stopped thread. A value
   that changed since the previous stop of the same session is tinted. The
-  third column names the containing function and offset only when the
-  debugger maps the value to a code address of the executable. Right-click a
+  third column appears only when the debugger maps the value to a code
+  address of the executable. It names the containing function and offset
+  when a decoded listing contains the address, and otherwise shows the static
+  address, muted. Right-click a
   register for **Copy value**, **Show in Memory**, and, for a mapped value,
   **Go to**.
 - **Stack** lists up to 32 frames with their runtime and static addresses.
-  Frames in the executable use the app's function names, so a rename shows
-  there. Other frames show GDB's name, muted. Double-click a frame with a
-  static address, or select it and press `Enter`, to open it in the Listing
-  with Back/Forward history. Frames outside the executable do not open.
+  A caller frame's address is its return address. The app names a caller by
+  the decoded call instruction that ends at that address, never by the
+  address itself, which can be the next function's start. Frames in the
+  executable use the app's function names, so a rename shows there. Frames
+  that no decoded listing explains, and frames outside the executable, show
+  GDB's name, muted. Double-click a frame, or select it and press `Enter`, to
+  open it with Back/Forward history: the PC or the caller's call instruction
+  in the Listing. A frame in a function the app has not decoded opens as data
+  instead, as Go To does, at the stopped PC or the byte before the return
+  address. Frames outside the executable do not open.
 - **Memory** shows 1 KiB of live target memory as hex and ASCII, starting at
   `rsp` at the first stop of each session. Enter a hexadecimal address, use
   **rsp** or **rip**, or page with **Prev** and **Next**. The page is read

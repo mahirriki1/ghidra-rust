@@ -18,6 +18,8 @@ pub(crate) enum LiveAction {
     /// Switch to the Memory tab at the page holding a runtime address.
     ShowMemory(u64),
     SelectFrame(usize),
+    /// Open a Stack frame that has a destination.
+    OpenFrame(usize),
     /// Show the page holding a runtime address.
     MemoryAt(u64),
     /// The address field holds no hexadecimal address.
@@ -51,6 +53,8 @@ pub(crate) struct FrameRow {
     /// The function text and whether it is the app's own name rather than
     /// GDB's.
     pub function: Option<(String, bool)>,
+    /// Whether the caller has a destination for this frame.
+    pub openable: bool,
 }
 
 pub(crate) struct MemoryPage<'a> {
@@ -88,13 +92,15 @@ fn paint_cells(ui: &egui::Ui, rect: egui::Rect, cells: &[(&str, egui::Color32, f
 pub(crate) fn registers(ui: &mut egui::Ui, rows: &[RegisterRow<'_>]) -> Option<LiveAction> {
     let glyph = theme::glyph_width(ui);
     let columns = [0.0, 10.0 * glyph, 31.0 * glyph];
-    theme::column_header(ui, &[("Register", columns[0]), ("Value", columns[1])], 0.0);
-    theme::rows(
+    // Narrow panes scroll sideways rather than cut values short.
+    let width = columns[2] + 32.0 * glyph;
+    let header = theme::column_header(ui, &[], 0.0);
+    let (action, output) = theme::rows(
         ui,
         "live-registers",
         rows.len(),
         theme::ROW_HEIGHT,
-        0.0,
+        width,
         None,
         |ui, index, rect| {
             let row = &rows[index];
@@ -144,8 +150,14 @@ pub(crate) fn registers(ui: &mut egui::Ui, rows: &[RegisterRow<'_>]) -> Option<L
             });
             action
         },
-    )
-    .0
+    );
+    theme::paint_column_header(
+        ui,
+        header,
+        &[("Register", columns[0]), ("Value", columns[1])],
+        output.state.clamped_offset().x,
+    );
+    action
 }
 
 /// The Stack table. With `keys`, Enter opens the selected mapped frame.
@@ -157,22 +169,13 @@ pub(crate) fn stack(
 ) -> Option<LiveAction> {
     let glyph = theme::glyph_width(ui);
     let columns = [0.0, 5.0 * glyph, 25.0 * glyph, 43.0 * glyph];
-    theme::column_header(
-        ui,
-        &[
-            ("#", columns[0]),
-            ("Address", columns[1]),
-            ("Static", columns[2]),
-            ("Function", columns[3]),
-        ],
-        0.0,
-    );
-    let (action, _) = theme::rows(
+    let header = theme::column_header(ui, &[], 0.0);
+    let (action, output) = theme::rows(
         ui,
         "live-stack",
         rows.len(),
         theme::ROW_HEIGHT,
-        0.0,
+        columns[3] + 32.0 * glyph,
         None,
         |ui, index, rect| {
             let row = &rows[index];
@@ -204,17 +207,26 @@ pub(crate) fn stack(
                 ],
             );
             if response.double_clicked() {
-                return row.static_address.map(LiveAction::GoTo);
+                return row.openable.then_some(LiveAction::OpenFrame(index));
             }
             response.clicked().then_some(LiveAction::SelectFrame(index))
         },
     );
+    theme::paint_column_header(
+        ui,
+        header,
+        &[
+            ("#", columns[0]),
+            ("Address", columns[1]),
+            ("Static", columns[2]),
+            ("Function", columns[3]),
+        ],
+        output.state.clamped_offset().x,
+    );
     if action.is_some() || !keys {
         return action;
     }
-    let target = selected
-        .and_then(|index| rows.get(index))
-        .and_then(|row| row.static_address)?;
+    let target = selected.filter(|index| rows.get(*index).is_some_and(|row| row.openable))?;
     let enter = ui.input_mut(|input| {
         let index = input.events.iter().position(|event| {
             matches!(
@@ -230,12 +242,13 @@ pub(crate) fn stack(
         });
         index.map(|index| input.events.remove(index)).is_some()
     });
-    enter.then_some(LiveAction::GoTo(target))
+    enter.then_some(LiveAction::OpenFrame(target))
 }
 
 pub(crate) fn memory(ui: &mut egui::Ui, view: MemoryView<'_>) -> Option<LiveAction> {
     let mut action = None;
-    ui.horizontal(|ui| {
+    // Wraps in narrow panes so every control stays reachable.
+    ui.horizontal_wrapped(|ui| {
         let previous = view
             .address
             .filter(|start| *start > 0)
@@ -255,7 +268,7 @@ pub(crate) fn memory(ui: &mut egui::Ui, view: MemoryView<'_>) -> Option<LiveActi
         let edit = ui.add(
             TextEdit::singleline(view.text)
                 .font(egui::TextStyle::Monospace)
-                .desired_width(154.0)
+                .desired_width(154.0_f32.min(ui.max_rect().width() - 8.0).max(48.0))
                 .char_limit(18)
                 .hint_text("Address"),
         );
@@ -290,9 +303,10 @@ pub(crate) fn memory(ui: &mut egui::Ui, view: MemoryView<'_>) -> Option<LiveActi
         theme::MUTED
     };
     let width = theme::hex_row_width(theme::glyph_width(ui));
+    // Each page starts at its top.
     theme::rows(
         ui,
-        "live-memory",
+        ("live-memory", page.runtime),
         bytes.len().div_ceil(theme::HEX_ROW_BYTES),
         theme::ROW_HEIGHT,
         width,
@@ -320,6 +334,90 @@ fn parse_address(text: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Runs `show` in a `width`-point pane at 1.25 pixels per point and
+    /// returns each drawn text with its rect, clip rect and elision.
+    fn narrow(
+        width: f32,
+        show: impl FnMut(&mut egui::Ui),
+    ) -> Vec<(String, egui::Rect, egui::Rect, bool)> {
+        let context = egui::Context::default();
+        theme::install(&context);
+        context.set_pixels_per_point(1.25);
+        let mut show = show;
+        let mut output = egui::FullOutput::default();
+        // A second pass settles layout sizes.
+        for _ in 0..2 {
+            output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, 400.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| show(ui),
+            );
+            output.textures_delta.clear();
+        }
+        output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) => Some((
+                    text.galley.text().to_owned(),
+                    text.galley.rect.translate(text.pos.to_vec2()),
+                    clipped.clip_rect,
+                    text.galley.elided,
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn narrow_panes_keep_memory_controls_reachable_and_values_whole() {
+        for width in [160.0, 260.0] {
+            let mut text = String::from("7fffffffe000");
+            let texts = narrow(width, |ui| {
+                memory(
+                    ui,
+                    MemoryView {
+                        address: Some(0x7fff_ffff_e000),
+                        text: &mut text,
+                        rsp: Some(0x7fff_ffff_e128),
+                        rip: Some(0x5555_5555_5139),
+                        page: None,
+                    },
+                );
+            });
+            for label in ["Prev", "Next", "rsp", "rip"] {
+                let (_, rect, clip, _) = texts
+                    .iter()
+                    .find(|(text, ..)| text == label)
+                    .unwrap_or_else(|| panic!("{label} at {width}"));
+                assert!(
+                    clip.contains_rect(*rect) && rect.right() <= width,
+                    "{label} at {width}"
+                );
+            }
+            let rows = [RegisterRow {
+                name: "rsp",
+                value: 0x7fff_ffff_e128,
+                changed: false,
+                static_address: None,
+                function: None,
+            }];
+            let texts = narrow(width, |ui| {
+                registers(ui, &rows);
+            });
+            let value = texts
+                .iter()
+                .find(|(text, ..)| text == "0x00007fffffffe128")
+                .expect("value drawn");
+            assert!(!value.3, "the value is not cut short at {width}");
+        }
+    }
 
     #[test]
     fn pages_are_aligned_and_never_cross_the_top_of_the_address_space() {

@@ -2408,7 +2408,8 @@ pub fn paint_hex_row(ui: &Ui, rect: egui::Rect, address: u64, bytes: &[u8], colo
         if column == HEX_ROW_BYTES / 2 {
             hex.push(' ');
         }
-        hex.push_str(&format!("{byte:02x} "));
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x} ");
     }
     let ascii = bytes
         .iter()

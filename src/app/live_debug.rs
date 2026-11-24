@@ -104,6 +104,41 @@ impl LiveMemory {
     }
 }
 
+/// Where opening a Stack frame goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FrameTarget {
+    /// The stopped PC's static address, opened as Go To does.
+    Static(u64),
+    /// A caller's call instruction in the function that decoded it.
+    Code { address: u64, owner: u64 },
+    /// The byte before a caller's return address, when no decoded listing
+    /// shows the call.
+    Data(u64),
+}
+
+/// The app's state that function names and owners depend on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LabelKey {
+    stop_seq: u64,
+    generation: u64,
+    revision: u64,
+    view: Option<u64>,
+    selection: u64,
+    mappings: usize,
+    comments: usize,
+    program: Option<u64>,
+    symbols: usize,
+}
+
+/// The Registers and Stack labels of one stop, resolved once per key rather
+/// than on every repaint.
+struct LiveLabels {
+    key: LabelKey,
+    registers: Vec<Option<String>>,
+    /// The app's name of each frame's function, and its destination.
+    frames: Vec<(Option<String>, Option<FrameTarget>)>,
+}
+
 #[derive(Default)]
 pub(super) struct LiveDebug {
     /// Desired breakpoints of binary generation `generation`: static
@@ -136,6 +171,7 @@ pub(super) struct LiveDebug {
     /// surrender its focus to the same Enter.
     frame_keys: bool,
     memory: LiveMemory,
+    labels: Option<LiveLabels>,
 }
 
 impl LiveDebug {
@@ -281,6 +317,16 @@ impl LiveDebug {
         };
         Some((text.into(), None, false))
     }
+}
+
+/// The backend's exact static mapping of register `index`'s value, never a
+/// guess from its range.
+fn register_static(snapshot: &Snapshot, index: usize, register: &Register) -> Option<u64> {
+    snapshot
+        .register_locations
+        .get(index)
+        .filter(|location| location.runtime == register.value)
+        .and_then(|location| location.static_address)
 }
 
 fn exit_text(code: Option<u32>, signal: Option<String>) -> String {
@@ -510,6 +556,7 @@ impl DesktopApp {
         live.last_registers.clear();
         live.frame = None;
         live.memory = LiveMemory::default();
+        live.labels = None;
         live.session = Some(LiveSession {
             generation: self.generation,
             sha256,
@@ -601,6 +648,7 @@ impl DesktopApp {
                 live.memory.pending = None;
                 live.frame = None;
                 live.frame_keys = false;
+                live.labels = None;
                 // Diffs and the default page come from stops the user sees.
                 if !loader {
                     let registers = snapshot.registers.as_ref().map_or(&[][..], Vec::as_slice);
@@ -636,8 +684,9 @@ impl DesktopApp {
                 result,
             } => {
                 // Only the reply to the outstanding read of the current stop.
-                let current = session.phase == Phase::Stopped
-                    && live.stop.as_ref().map(|stop| stop.stop_seq) == Some(stop_seq);
+                // It holds that stop's bytes even if a step was sent since,
+                // and a refused step leaves the page loaded.
+                let current = live.stop.as_ref().map(|stop| stop.stop_seq) == Some(stop_seq);
                 let Some(read) = live.memory.pending.filter(|read| {
                     current
                         && (read.token, read.stop_seq, read.runtime) == (token, stop_seq, runtime)
@@ -759,6 +808,122 @@ impl DesktopApp {
         Some((crop(name, 200), address.checked_sub(owner)?))
     }
 
+    /// The call instruction before a caller frame's return address and the
+    /// function whose decoded listing holds it. The return address itself
+    /// can be the next function's entry when the call ends its function.
+    fn live_caller(&self, return_address: u64) -> Option<(u64, u64)> {
+        if let Some(view) = self.view()
+            && let Some(call) = self.listing().ending_at(return_address)
+        {
+            return Some((call.address, view.address));
+        }
+        if !self.program_scope() {
+            return None;
+        }
+        self.program.cache.bodies().find_map(|(entry, body)| {
+            let call = body.listing().ending_at(return_address)?;
+            Some((call.address, entry))
+        })
+    }
+
+    fn live_label_key(&self, stop_seq: u64) -> LabelKey {
+        LabelKey {
+            stop_seq,
+            generation: self.generation,
+            revision: self.revision,
+            view: self.view().map(|view| view.address),
+            selection: self.selection_generation,
+            mappings: self.semantic.mappings.len(),
+            comments: self.comment_owners.len(),
+            program: self.program_scope().then(|| self.program.cache.epoch()),
+            symbols: self
+                .symbols()
+                .map_or(0, |symbols| std::ptr::from_ref(symbols) as usize),
+        }
+    }
+
+    /// Resolves the current stop's register and frame labels unless the
+    /// cached ones still apply.
+    fn live_update_labels(&mut self) {
+        let Some(snapshot) = self.live.stopped() else {
+            return;
+        };
+        let key = self.live_label_key(snapshot.stop_seq);
+        if self
+            .live
+            .labels
+            .as_ref()
+            .is_some_and(|labels| labels.key == key)
+        {
+            return;
+        }
+        let registers = snapshot
+            .registers
+            .as_ref()
+            .map_or(&[][..], Vec::as_slice)
+            .iter()
+            .enumerate()
+            .map(|(index, register)| {
+                let address = register_static(snapshot, index, register)?;
+                let (name, offset) = self.live_function(address)?;
+                Some(match offset {
+                    0 => name,
+                    offset => format!("{name}+{offset:#x}"),
+                })
+            })
+            .collect();
+        let frames = snapshot
+            .frames
+            .as_ref()
+            .map_or(&[][..], Vec::as_slice)
+            .iter()
+            .enumerate()
+            .map(|(index, frame)| {
+                let Some(address) = frame.location.static_address else {
+                    return (None, None);
+                };
+                if index == 0 {
+                    let name = self.live_function(address).map(|(name, _)| name);
+                    return (name, Some(FrameTarget::Static(address)));
+                }
+                // A caller frame is attributed through its call, never
+                // through the return address.
+                match self.live_caller(address) {
+                    Some((call, owner)) => (
+                        self.function_names(owner).map(|(name, _)| crop(name, 200)),
+                        Some(FrameTarget::Code {
+                            address: call,
+                            owner,
+                        }),
+                    ),
+                    None => (None, address.checked_sub(1).map(FrameTarget::Data)),
+                }
+            })
+            .collect();
+        self.live.labels = Some(LiveLabels {
+            key,
+            registers,
+            frames,
+        });
+    }
+
+    fn live_open_frame(&mut self, index: usize, context: &egui::Context) {
+        let target = self
+            .live
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.frames.get(index))
+            .and_then(|(_, target)| *target);
+        match target {
+            Some(FrameTarget::Static(address)) => self.live_go_to_static(address, context),
+            Some(FrameTarget::Code { address, owner }) => {
+                self.navigate_location(address, Some(owner), true, context)
+            }
+            Some(FrameTarget::Data(address)) => self.open_search_data(address, 1, context),
+            None => {}
+        }
+    }
+
     fn live_action(&mut self, action: LiveAction, context: &egui::Context) {
         match action {
             LiveAction::GoTo(address) => self.live_go_to_static(address, context),
@@ -766,6 +931,7 @@ impl DesktopApp {
                 self.live.memory.show(runtime);
                 self.tab = Tab::Memory;
             }
+            LiveAction::OpenFrame(index) => self.live_open_frame(index, context),
             LiveAction::SelectFrame(index) => {
                 self.live.frame = Some(index);
                 self.live.frame_keys = true;
@@ -776,6 +942,7 @@ impl DesktopApp {
     }
 
     pub(super) fn live_registers_tab(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
+        self.live_update_labels();
         let Some(snapshot) = self.live.stopped() else {
             theme::empty_state(ui, "Not stopped");
             return;
@@ -787,28 +954,16 @@ impl DesktopApp {
                 return;
             }
         };
+        let labels = self.live.labels.as_ref();
         let rows = registers
             .iter()
             .enumerate()
-            .map(|(index, register)| {
-                // The backend's exact mapping of this value, never a guess.
-                let static_address = snapshot
-                    .register_locations
-                    .get(index)
-                    .filter(|location| location.runtime == register.value)
-                    .and_then(|location| location.static_address);
-                RegisterRow {
-                    name: &register.name,
-                    value: register.value,
-                    changed: self.live.register_changed(&register.name, register.value),
-                    static_address,
-                    function: static_address
-                        .and_then(|address| self.live_function(address))
-                        .map(|(name, offset)| match offset {
-                            0 => name,
-                            offset => format!("{name}+{offset:#x}"),
-                        }),
-                }
+            .map(|(index, register)| RegisterRow {
+                name: &register.name,
+                value: register.value,
+                changed: self.live.register_changed(&register.name, register.value),
+                static_address: register_static(snapshot, index, register),
+                function: labels.and_then(|labels| labels.registers.get(index)?.clone()),
             })
             .collect::<Vec<_>>();
         let action = live_debug_ui::registers(ui, &rows);
@@ -818,6 +973,7 @@ impl DesktopApp {
     }
 
     pub(super) fn live_stack_tab(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
+        self.live_update_labels();
         let Some(snapshot) = self.live.stopped() else {
             theme::empty_state(ui, "Not stopped");
             return;
@@ -829,18 +985,23 @@ impl DesktopApp {
                 return;
             }
         };
+        let labels = self.live.labels.as_ref();
         let rows = frames
             .iter()
-            .map(|frame| {
-                let static_address = frame.location.static_address;
-                let own = static_address.and_then(|address| self.live_function(address));
+            .enumerate()
+            .map(|(index, frame)| {
+                let (name, target) = labels
+                    .and_then(|labels| labels.frames.get(index))
+                    .cloned()
+                    .unwrap_or_default();
                 FrameRow {
                     runtime: frame.location.runtime,
-                    static_address,
-                    function: match own {
-                        Some((name, _)) => Some((name, true)),
+                    static_address: frame.location.static_address,
+                    function: match name {
+                        Some(name) => Some((name, true)),
                         None => frame.function.as_ref().map(|text| (crop(text, 200), false)),
                     },
+                    openable: target.is_some(),
                 }
             })
             .collect::<Vec<_>>();
@@ -2514,6 +2675,260 @@ mod tests {
                 sized_frame(&context, &mut app, vec![], width);
             }
         }
+    }
+
+    fn with_frames(event: Event, frames: &[(u64, Option<u64>, &str)]) -> Event {
+        let Event::Stopped(mut snapshot) = event else {
+            unreachable!()
+        };
+        snapshot.frames = Ok(frames
+            .iter()
+            .map(|(runtime, static_address, name)| crate::debugger::Frame {
+                location: Location {
+                    runtime: *runtime,
+                    static_address: *static_address,
+                },
+                function: Some((*name).into()),
+            })
+            .collect());
+        Event::Stopped(snapshot)
+    }
+
+    /// The texts drawn on `needle`'s row, right of it.
+    fn row_after(output: &egui::FullOutput, needle: &str) -> Vec<(String, egui::Color32)> {
+        let at = position_of(output, needle);
+        text_shapes(output)
+            .into_iter()
+            .filter(|(_, _, p)| (p.y - at.y).abs() < 2.0 && p.x > at.x)
+            .map(|(text, color, _)| (text, color))
+            .collect()
+    }
+
+    fn secondary_click_at(position: egui::Pos2) -> Vec<egui::Event> {
+        let button = |pressed| egui::Event::PointerButton {
+            pos: position,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        vec![
+            egui::Event::PointerMoved(position),
+            button(true),
+            button(false),
+        ]
+    }
+
+    #[test]
+    fn caller_frames_are_named_by_their_call_and_never_by_the_next_function() {
+        if !SUPPORTED {
+            return;
+        }
+        let context = scaled_context();
+        let mut app = fixture::keyboard_app();
+        app.binary_path = Some("/nonexistent/ghidra-rust-live/fixture".into());
+        // entry ends with a 5-byte call, so its return address is exactly
+        // the entry of the next function, `next` at 0x1040.
+        fixture::show_view(
+            &mut app,
+            FunctionView {
+                address: 0x1000,
+                blocks: vec![
+                    BasicBlock {
+                        address: 0x1000,
+                        instructions: vec![instruction(0x1000, 1)],
+                    },
+                    BasicBlock {
+                        address: 0x103b,
+                        instructions: vec![instruction(0x103b, 5)],
+                    },
+                ],
+                edges: vec![],
+                calls: vec![],
+                warnings: vec![],
+            },
+        );
+        app.tab = Tab::Stack;
+        let wire = fake_session(&mut app, Phase::Running);
+        // Stopped in libc, called from entry; 0x1080 has no decoded call.
+        let stop = with_frames(
+            snapshot_stop(2, 0x1000, &[], &[]),
+            &[
+                (0x7fff_f7c4_5000, None, "abort"),
+                (RUNTIME + 0x1040, Some(0x1040), "entry"),
+                (RUNTIME + 0x1080, Some(0x1080), "gdb_other"),
+            ],
+        );
+        let Event::Stopped(mut snapshot) = stop else {
+            unreachable!()
+        };
+        snapshot.stop.location = Location {
+            runtime: 0x7fff_f7c4_5000,
+            static_address: None,
+        };
+        wire.emit(Event::Stopped(snapshot));
+        let output = frame(&context, &mut app, vec![]);
+        let caller = format!("{:#x}", RUNTIME + 0x1040);
+        let unexplained = format!("{:#x}", RUNTIME + 0x1080);
+        assert_eq!(
+            row_after(&output, &caller),
+            [("1040".into(), theme::TEXT), ("entry".into(), theme::TEXT)]
+        );
+        assert_eq!(
+            row_after(&output, &unexplained),
+            [
+                ("1080".into(), theme::TEXT),
+                ("gdb_other".into(), theme::MUTED)
+            ]
+        );
+        // Opening the caller selects its call, in entry, with history.
+        let history = app.history.len();
+        let at = position_of(&output, &caller);
+        frame(&context, &mut app, click_at(at));
+        frame(&context, &mut app, click_at(at));
+        assert_eq!(app.tab, Tab::Listing);
+        assert_eq!(app.view().map(|view| view.address), Some(0x1000));
+        assert_eq!(app.selected, Some(0x103b));
+        assert!(app.history.len() > history);
+        // An unexplained caller opens as data before its return address.
+        app.tab = Tab::Stack;
+        for _ in 0..8 {
+            frame(&context, &mut app, vec![]);
+        }
+        let at = position_of(&output, &unexplained);
+        frame(&context, &mut app, click_at(at));
+        frame(&context, &mut app, click_at(at));
+        assert_eq!(app.tab, Tab::Hex);
+        assert_eq!(app.view().map(|view| view.address), Some(0x1000));
+        assert!(app.queue.is_empty() && app.pending.is_none());
+    }
+
+    #[test]
+    fn a_memory_reply_that_crosses_a_refused_step_is_kept() {
+        if !SUPPORTED {
+            return;
+        }
+        let context = scaled_context();
+        let mut app = debuggable();
+        app.tab = Tab::Memory;
+        let wire = fake_session(&mut app, Phase::Running);
+        wire.emit(snapshot_stop(2, 0x1001, &[("rsp", RSP)], &[]));
+        frame(&context, &mut app, vec![]);
+        let token = match wire.sent()[..] {
+            [Command::ReadMemory { token, .. }] => token,
+            ref sent => panic!("{sent:?}"),
+        };
+        app.live_step();
+        wire.emit(Event::Memory {
+            token,
+            stop_seq: 2,
+            runtime: live_debug_ui::page_start(RSP),
+            result: Ok(vec![7; 1024]),
+        });
+        wire.emit(Event::Refused {
+            message: "Cannot step".into(),
+        });
+        frame(&context, &mut app, vec![]);
+        assert_eq!(app.live.phase(), Some(Phase::Stopped));
+        let page = app.live.memory.page.as_ref().expect("the reply is kept");
+        assert_eq!(
+            (page.stop_seq, page.result.as_deref()),
+            (2, Ok(&[7; 1024][..]))
+        );
+        assert_eq!(wire.sent(), [Command::Step(StepKind::Instruction)]);
+    }
+
+    #[test]
+    fn memory_and_register_controls_work_through_ui_input() {
+        if !SUPPORTED {
+            return;
+        }
+        let context = scaled_context();
+        let mut app = debuggable();
+        let wire = fake_session(&mut app, Phase::Running);
+        let rip = RUNTIME + 0x1001;
+        wire.emit(snapshot_stop(
+            2,
+            0x1001,
+            &[("rip", rip), ("rsp", RSP)],
+            &[rip],
+        ));
+        // Registers: right-click a value, then Show in Memory.
+        app.tab = Tab::Registers;
+        let output = frame(&context, &mut app, vec![]);
+        let value = position_of(&output, &format!("{RSP:#018x}"));
+        frame(&context, &mut app, secondary_click_at(value));
+        let output = frame(&context, &mut app, vec![]);
+        frame(
+            &context,
+            &mut app,
+            click_at(position_of(&output, "Show in Memory")),
+        );
+        assert_eq!(app.tab, Tab::Memory);
+        let page = live_debug_ui::page_start(RSP);
+        assert_eq!(app.live.memory.address, Some(page));
+
+        let click = |app: &mut DesktopApp, label: &str| {
+            let output = frame(&context, app, vec![]);
+            frame(&context, app, click_at(position_of(&output, label)));
+        };
+        click(&mut app, "Next");
+        assert_eq!(app.live.memory.address, Some(page + 1024));
+        click(&mut app, "Prev");
+        assert_eq!(app.live.memory.address, Some(page));
+        click(&mut app, "rip");
+        assert_eq!(
+            app.live.memory.address,
+            Some(live_debug_ui::page_start(rip))
+        );
+
+        let type_address = |app: &mut DesktopApp, text: &str| {
+            app.live.memory.text.clear();
+            // The field's hint, on the toolbar row beside Prev.
+            let output = frame(&context, app, vec![]);
+            let prev = position_of(&output, "Prev");
+            let hint = text_shapes(&output)
+                .into_iter()
+                .find(|(text, _, at)| text == "Address" && (at.y - prev.y).abs() < 4.0)
+                .expect("address field")
+                .2;
+            frame(&context, app, click_at(hint));
+            frame(&context, app, vec![egui::Event::Text(text.into())]);
+            frame(
+                &context,
+                app,
+                vec![key(egui::Key::Enter, egui::Modifiers::NONE, false)],
+            );
+            frame(&context, app, vec![release(egui::Key::Enter)]);
+        };
+        type_address(&mut app, "zz");
+        assert_eq!(app.status, "Enter a hexadecimal address");
+        assert_eq!(
+            app.live.memory.address,
+            Some(live_debug_ui::page_start(rip))
+        );
+        type_address(&mut app, "0");
+        assert_eq!(app.live.memory.address, Some(0));
+        // Prev is disabled on the first page.
+        click(&mut app, "Prev");
+        assert_eq!(app.live.memory.address, Some(0));
+        let read = app.live.memory.pending.expect("a read of page 0");
+        assert_eq!((read.runtime, read.length), (0, 1024));
+        wire.emit(Event::Memory {
+            token: read.token,
+            stop_seq: 2,
+            runtime: 0,
+            result: Err("Cannot access memory at address 0x0".into()),
+        });
+        let output = frame(&context, &mut app, vec![]);
+        assert!(fixture::rendered_text(&output).contains(&"Unreadable".into()));
+        // The last page stops short of the end of the address space.
+        app.live_action(LiveAction::MemoryAt(u64::MAX), &context);
+        frame(&context, &mut app, vec![]);
+        let read = app.live.memory.pending.expect("a read of the last page");
+        assert_eq!(
+            (read.runtime, read.length),
+            (live_debug_ui::page_start(u64::MAX), 15)
+        );
     }
 
     /// Real GDB: a listing breakpoint stops the fixture and selects the PC.
